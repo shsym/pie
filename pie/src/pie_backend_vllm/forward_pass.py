@@ -50,6 +50,18 @@ class VllmForwardPass:
         self._builder = None
         self._kv_spec = None
         self._layer_names: list[str] = []
+        # Per-model attention shape (uniform across layers for plain LLMs;
+        # mixed-attention architectures would need per-layer plans, out of
+        # scope today). Captured during _ensure_metadata_builder().
+        self._num_qo_heads: int | None = None
+        self._num_kv_heads: int | None = None
+        self._head_dim_qk: int | None = None
+        # True when the installed mask-aware impl declares it consumes the
+        # FlashInfer prefill wrapper. Set during _ensure_metadata_builder.
+        self._impl_uses_flashinfer_wrapper: bool = False
+        # Mask plumbing: lazily allocated FlashInfer wrapper, planned once
+        # per batch in transform() when the FlashInfer fast path is active.
+        self._mask_wrapper: Any | None = None
 
     # ------------------------------------------------------------------
     # Setup helpers
@@ -82,6 +94,21 @@ class VllmForwardPass:
         first_layer = attn_layers[0][1]
         backend = first_layer.attn_backend
 
+        # Capture attention shape for FlashInfer plan(). Vllm's Attention
+        # carries `num_heads` (post-TP) and `num_kv_heads`; head_size is
+        # uniform across Q/K for non-MLA architectures.
+        self._num_qo_heads = int(first_layer.num_heads)
+        self._num_kv_heads = int(first_layer.num_kv_heads)
+        self._head_dim_qk = int(first_layer.head_size)
+
+        # The installed mask-aware impl flags whether it needs the
+        # FlashInfer prefill wrapper pre-planned. We look at the first
+        # layer; mixed-impl models would need a per-layer flag, out of
+        # scope today.
+        self._impl_uses_flashinfer_wrapper = bool(
+            getattr(type(first_layer.impl), "_pie_uses_flashinfer_wrapper", False)
+        )
+
         with set_current_vllm_config(self.vllm_config):
             self._kv_spec = first_layer.get_kv_cache_spec(self.vllm_config)
             builder_cls = backend.get_builder_cls()
@@ -111,6 +138,7 @@ class VllmForwardPass:
         kv_page_indices: torch.Tensor,
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
+        custom_mask: torch.Tensor | None,
         single_token_inference_mode: bool,
         total_pages_cpu: int = 0,
     ) -> torch.Tensor:
@@ -145,12 +173,60 @@ class VllmForwardPass:
         # vllm's RoPE kernel expects int64 positions; pie uses int32.
         positions = position_ids.to(self.device, dtype=torch.int64, non_blocking=True)
 
+        # Mask plumbing: only when there's something to apply. Mask-aware
+        # `AttentionImpl` subclasses (installed at engine load) read
+        # `pie_attn_extras` from additional_kwargs; an absent key is the
+        # zero-overhead signal — those subclasses just call super().forward.
+        pie_attn_extras = None
+        if custom_mask is not None:
+            from .mask_compute import (
+                PieAttnExtras, make_flashinfer_wrapper, plan_flashinfer_wrapper,
+            )
+
+            pie_attn_extras = PieAttnExtras.build(
+                custom_mask=custom_mask,
+                query_start_loc=common.query_start_loc,
+                seq_lens=common.seq_lens,
+                block_table=common.block_table_tensor,
+                page_size=page_size,
+                device=self.device,
+            )
+
+            # Pre-plan FlashInfer wrapper ONCE for this batch IF the active
+            # impl uses it. Each masked subclass declares this via the
+            # `_pie_uses_flashinfer_wrapper` class attribute. Native pie
+            # follows the same shape: plan() per batch, run() per layer.
+            if self._impl_uses_flashinfer_wrapper:
+                if self._mask_wrapper is None:
+                    self._mask_wrapper = make_flashinfer_wrapper(
+                        128 * 1024 * 1024, self.device,
+                    )
+                plan_flashinfer_wrapper(
+                    self._mask_wrapper,
+                    extras=pie_attn_extras,
+                    kv_page_indices=kv_page_indices,
+                    kv_page_indptr=kv_page_indptr,
+                    kv_last_page_lens=kv_last_page_lens,
+                    num_qo_heads=self._num_qo_heads,
+                    num_kv_heads=self._num_kv_heads,
+                    head_dim_qk=self._head_dim_qk,
+                    q_data_type=input_embeds.dtype,
+                )
+                pie_attn_extras.flashinfer_wrapper = self._mask_wrapper
+
         with set_forward_context(
             attn_metadata=backend_metadata,
             vllm_config=self.vllm_config,
             num_tokens=common.num_actual_tokens,
             slot_mapping=slot_mapping_dict,
         ):
+            # `set_forward_context` takes its `additional_kwargs` from the
+            # platform hook, not from a kwarg, so inject ours after entering.
+            if pie_attn_extras is not None:
+                from vllm.forward_context import get_forward_context
+
+                get_forward_context().additional_kwargs["pie_attn_extras"] = pie_attn_extras
+
             hidden_states = self.model.forward(
                 input_ids=None,
                 positions=positions,
