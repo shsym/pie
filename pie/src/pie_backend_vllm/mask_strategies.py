@@ -136,14 +136,69 @@ _STRATEGY_BY_NAME: dict[str, type[_Strategy]] = {
 
 # Map of impl class names → reason for explicit refusal. Listed rather
 # than allowing auto-fallback because silent wrong-logit risk is
-# unacceptable for an inference engine.
+# unacceptable for an inference engine. To support a backend listed here,
+# add a strategy class + register in `_STRATEGY_BY_NAME` and remove the
+# entry below.
+_MLA_REASON = (
+    "MLA — compressed KV with projection-on-read; the standard "
+    "(num_blocks, page, kv_heads, head_dim) gather assumption is invalid."
+)
+_FA_REASON = (
+    "FlashAttention V1's `custom_mask` path is wired only for spec-decode "
+    "extraction, not arbitrary patterns; passing pie's BRLE mask would be "
+    "silently dropped."
+)
+_TRITON_REASON = (
+    "Triton attention kernel is causal+sliding-window only; no kernel "
+    "parameter for arbitrary masks."
+)
+
 _UNSUPPORTED_IMPLS: dict[str, str] = {
-    "MLAImpl": "MLA — compressed KV / projection-on-read; standard gather invalid.",
-    "MLACommonImpl": "MLA — compressed KV / projection-on-read; standard gather invalid.",
-    "FlashInferMLAImpl": "DeepSeek MLA via FlashInfer — no custom_mask path.",
-    "TritonMLAImpl": "DeepSeek MLA via Triton — no custom_mask path.",
-    "FlashMLAImpl": "DeepSeek MLA — no custom_mask path.",
-    "CutlassMLAImpl": "DeepSeek MLA via CUTLASS — no custom_mask path.",
+    # ---- MLA family (DeepSeek-style compressed KV) ----
+    "MLACommonImpl":           _MLA_REASON,
+    "FlashInferMLAImpl":       _MLA_REASON,
+    "FlashInferMLASparseImpl": _MLA_REASON,
+    "FlashAttnMLAImpl":        _MLA_REASON,
+    "FlashMLAImpl":            _MLA_REASON,
+    "FlashMLASparseImpl":      _MLA_REASON,
+    "CutlassMLAImpl":          _MLA_REASON,
+    "TritonMLAImpl":           _MLA_REASON,
+    "AiterMLAImpl":            _MLA_REASON,
+    "AiterTritonMLAImpl":      _MLA_REASON,
+    "ROCMAiterMLASparseImpl":  _MLA_REASON,
+    "XPUMLASparseImpl":        _MLA_REASON,
+    "SparseMLAAttentionImpl":  _MLA_REASON,
+
+    # ---- FlashAttention V1 / variants ----
+    "FlashAttentionImpl":           _FA_REASON,
+    "FlashAttentionDiffKVImpl":     _FA_REASON,
+    "AiterFlashAttentionImpl":      _FA_REASON,
+    "RocmAttentionImpl":            _FA_REASON,
+    "RocmAiterUnifiedAttentionImpl": _FA_REASON,
+
+    # ---- Triton (no arbitrary mask) ----
+    "TritonAttentionImpl": _TRITON_REASON,
+
+    # ---- FlexAttention — could be supported via mask_mod, not yet wired ----
+    "FlexAttentionImpl": (
+        "PyTorch FlexAttention. Could support arbitrary masks via mask_mod "
+        "but no strategy is registered yet. Add `_FlexStrategy` + register "
+        "if you need it; until then, switch to `FLASHINFER`."
+    ),
+
+    # ---- Speculative-decoding tree attention (custom semantics) ----
+    "TreeAttentionImpl": (
+        "Tree attention used for speculative decoding; mask is determined "
+        "by the spec tree, not by inferlet input."
+    ),
+
+    # ---- Quantized + CPU paths ----
+    "TurboQuantAttentionImpl": (
+        "Quantized attention; pie's mask path assumes unquantized K/V."
+    ),
+    "CPUAttentionBackendImpl": (
+        "CPU attention backend isn't on the production path; no strategy."
+    ),
 }
 
 
