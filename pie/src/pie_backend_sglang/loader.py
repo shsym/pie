@@ -96,8 +96,14 @@ def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriver
         port=30000,
         skip_server_warmup=True,
     )
-    # Driver-specific fields splat verbatim — names match ServerArgs.
-    server_kwargs.update({k: v for k, v in asdict(driver_config).items() if v is not None})
+    # Driver-specific fields splat verbatim — names match ServerArgs. Skip
+    # the universal pie knob `cpu_mem_budget_in_gb`; it sizes pie's host KV
+    # pool, not anything sglang owns.
+    _NON_SGLANG_FIELDS = {"cpu_mem_budget_in_gb"}
+    server_kwargs.update({
+        k: v for k, v in asdict(driver_config).items()
+        if v is not None and k not in _NON_SGLANG_FIELDS
+    })
     return ServerArgs(**server_kwargs)
 
 

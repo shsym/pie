@@ -53,3 +53,9 @@ class SGLangDriverConfig:
     # Disable sglang's radix prefix cache. Pie owns prefix sharing via its
     # own scheduler; running sglang's on top is wasted work.
     disable_radix_cache: bool = True
+
+    # Universal pie knob (not an sglang ServerArgs field). Sized in GiB; sets
+    # the pinned host KV pool that backs D2H/H2D swap. 0 disables swap. The
+    # worker forwards this into `RuntimeConfig.swap_budget_bytes`; the loader
+    # filters it out when splatting into `ServerArgs`.
+    cpu_mem_budget_in_gb: int = 0
