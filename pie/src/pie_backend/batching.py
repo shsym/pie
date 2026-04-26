@@ -56,8 +56,6 @@ class Batch:
         self.adapter_seeds: list[int] = []
         self.adapter_subpass_needed: bool = False
         self.indices_for_logits: list[int] = []
-        self.indices_for_embed_storage: list[int] = []
-        self.embed_storage_pointers: list[int] = []
 
         # Helper to decode bytes as u32 array or pass through lists
         def _decode_u32(data):

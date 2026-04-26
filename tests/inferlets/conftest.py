@@ -44,9 +44,14 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser.addoption = parser.add_argument  # convenience alias
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
     parser.add_argument("--device", default="cuda:0", help="Device(s), comma-separated")
-    parser.add_argument("--dummy", action="store_true", help="Use dummy mode (no GPU)")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per inferlet (seconds)")
     parser.add_argument("--verbose", action="store_true", help="Show stdout on failure")
+    parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy"],
+                        help="Inference driver: 'native' (pie_backend), 'vllm' (pie_backend_vllm), 'sglang' (pie_backend_sglang), 'dummy' (pie_backend_dummy)")
+    parser.add_argument("--vllm-attention-backend", default=None,
+                        help="vLLM attention backend (FLASH_ATTN / FLASHINFER / TRITON_ATTN / FLEX_ATTENTION). Default: vllm auto-picks")
+    parser.add_argument("--sglang-attention-backend", default="triton",
+                        help="SGLang attention backend (triton / flashinfer / flex_attention / fa3). Default: triton (cleanest custom-mask support)")
     return parser
 
 
@@ -139,9 +144,14 @@ TestFn = Callable[..., Coroutine]
 
 async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     from pie.server import Server
-    from pie.config import Config, ModelConfig, AuthConfig
+    from pie.config import (
+        Config, ModelConfig, ServerConfig, AuthConfig, TelemetryConfig,
+        DriverConfig,
+    )
 
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else args.device
+    if isinstance(device, str):
+        device = [device]
 
     # Clear stale wasmtime module cache to avoid linker mismatches
     # between recompiled WASM components and cached compiled modules.
@@ -149,17 +159,31 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
 
     print(f"Model:  {args.model}")
     print(f"Device: {device}")
-    print(f"Dummy:  {args.dummy}")
+    print(f"Driver: {args.driver}")
     print()
 
+    # Build the [model.X.driver.<type>] subsection content.
+    driver_subsection: dict = {}
+    if args.driver == "vllm" and args.vllm_attention_backend is not None:
+        driver_subsection["attention_backend"] = args.vllm_attention_backend
+    if args.driver == "sglang":
+        driver_subsection["attention_backend"] = args.sglang_attention_backend
+
     cfg = Config(
-        port=0,
+        server=ServerConfig(port=0),
         auth=AuthConfig(enabled=False),
-        models=[ModelConfig(
-            hf_repo=args.model,
-            device=[device] if isinstance(device, str) else device,
-            dummy_mode=args.dummy,
-        )],
+        telemetry=TelemetryConfig(),
+        models={
+            "default": ModelConfig(
+                name="default",
+                hf_repo=args.model,
+                driver=DriverConfig(
+                    type=args.driver,
+                    device=device,
+                    options=driver_subsection,
+                ),
+            )
+        },
     )
     async with Server(cfg) as server:
         client = await server.connect()

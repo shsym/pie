@@ -93,9 +93,6 @@ def run(
     ),
     port: int | None = typer.Option(None, "--port", help="Override port"),
     log: Path | None = typer.Option(None, "--log", help="Path to log file"),
-    dummy: bool = typer.Option(
-        False, "--dummy", help="Enable dummy mode (skip GPU weight loading, return random tokens)"
-    ),
     arguments: list[str] | None = typer.Argument(
         None, help="Arguments to pass to the inferlet"
     ),
@@ -123,7 +120,7 @@ def run(
         raise typer.Exit(1)
 
     try:
-        cfg = load_config(config, port=port, dummy_mode=dummy)
+        cfg = load_config(config, port=port)
     except (FileNotFoundError, ValueError) as e:
         console.print(f"[red]✗[/red] {e}")
         raise typer.Exit(1)
@@ -134,9 +131,11 @@ def run(
     lines.append(f"{'Inferlet':<15}", style="white")
     lines.append(f"{inferlet_display}\n", style="dim")
     lines.append(f"{'Model':<15}", style="white")
-    lines.append(f"{model.hf_repo}\n", style="dim")
+    lines.append(f"{model.name} ({model.hf_repo})\n", style="dim")
+    lines.append(f"{'Driver':<15}", style="white")
+    lines.append(f"{model.driver.type}\n", style="dim")
     lines.append(f"{'Device':<15}", style="white")
-    lines.append(", ".join(model.device), style="dim")
+    lines.append(", ".join(model.driver.device), style="dim")
 
     console.print()
     console.print(Panel(lines, title="Pie Run", title_align="left", border_style="dim"))
@@ -166,7 +165,7 @@ def run(
             # Resolve bare name to name@version if needed
             resolved = name
             if "@" not in resolved:
-                resolved = await client.resolve_version(resolved, cfg.registry)
+                resolved = await client.resolve_version(resolved, cfg.server.registry)
 
             # Launch and stream
             print(f"Launching {resolved}...")

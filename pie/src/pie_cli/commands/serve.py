@@ -32,9 +32,6 @@ def serve(
     monitor: bool = typer.Option(
         False, "--monitor", "-m", help="Launch real-time TUI monitor"
     ),
-    dummy: bool = typer.Option(
-        False, "--dummy", help="Enable dummy mode (skip GPU weight loading, return random tokens)"
-    ),
     no_snapshot: bool = typer.Option(
         False,
         "--no-snapshot",
@@ -42,11 +39,15 @@ def serve(
              "(overrides python_snapshot in the config file).",
     ),
 ) -> None:
-    """Start the Pie engine and enter an interactive session."""
+    """Start the Pie engine and enter an interactive session.
+
+    To skip real weight loading and serve random tokens (testing), set
+    `[model.<name>.driver].type = "dummy"` in the config TOML.
+    """
     try:
         cfg = load_config(
             config, host=host, port=port, no_auth=no_auth,
-            verbose=verbose, dummy_mode=dummy,
+            verbose=verbose,
         )
     except (FileNotFoundError, ValueError) as e:
         console.print(f"[red]✗[/red] {e}")
@@ -55,16 +56,18 @@ def serve(
         raise typer.Exit(1)
 
     if no_snapshot:
-        cfg.python_snapshot = False
+        cfg.server.python_snapshot = False
 
     model = cfg.primary_model
     lines = Text()
     lines.append(f"{'Host':<15}", style="white")
-    lines.append(f"{cfg.host}:{cfg.port}\n", style="dim")
+    lines.append(f"{cfg.server.host}:{cfg.server.port}\n", style="dim")
     lines.append(f"{'Model':<15}", style="white")
-    lines.append(f"{model.hf_repo}\n", style="dim")
+    lines.append(f"{model.name} ({model.hf_repo})\n", style="dim")
+    lines.append(f"{'Driver':<15}", style="white")
+    lines.append(f"{model.driver.type}\n", style="dim")
     lines.append(f"{'Device':<15}", style="white")
-    lines.append(", ".join(model.device), style="dim")
+    lines.append(", ".join(model.driver.device), style="dim")
 
     console.print()
     console.print(Panel(lines, title="Pie Engine", title_align="left", border_style="dim"))
@@ -80,12 +83,12 @@ def serve(
 
                 model_cfg = cfg.primary_model
                 provider = PieMetricsProvider(
-                    host=cfg.host,
-                    port=cfg.port,
+                    host=cfg.server.host,
+                    port=cfg.server.port,
                     internal_token=server.token,
                     config={
-                        "model": model_cfg.name or model_cfg.hf_repo,
-                        "tp_size": model_cfg.tensor_parallel_size or len(model_cfg.device),
+                        "model": model_cfg.name,
+                        "tp_size": model_cfg.driver.tensor_parallel_size,
                         "max_batch": model_cfg.max_batch_tokens or 32,
                     },
                 )
