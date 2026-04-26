@@ -103,12 +103,14 @@ class VllmForwardPass:
         self._num_kv_heads = int(first_layer.num_kv_heads)
         self._head_dim_qk = int(first_layer.head_size)
 
-        # The installed mask-aware impl flags whether it needs the
-        # FlashInfer prefill wrapper pre-planned. We look at the first
-        # layer; mixed-impl models would need a per-layer flag, out of
-        # scope today.
+        # The installed mask strategy flags whether it needs the FlashInfer
+        # prefill wrapper pre-planned this batch. We read from the first
+        # layer's strategy; mixed-impl models would need a per-layer flag,
+        # out of scope today.
+        from .mask_strategies import first_attention_strategy
+        strategy = first_attention_strategy(self.vllm_config)
         self._impl_uses_flashinfer_wrapper = bool(
-            getattr(type(first_layer.impl), "_pie_uses_flashinfer_wrapper", False)
+            getattr(strategy, "pie_uses_flashinfer_wrapper", False)
         )
 
         with set_current_vllm_config(self.vllm_config):

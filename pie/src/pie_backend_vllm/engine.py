@@ -85,7 +85,7 @@ class VllmEngine:
         from .forward_pass import VllmForwardPass
         from .kv_cache import allocate_and_bind_kv_cache, allocate_host_pool
         from .loader import load_vllm_model
-        from .mask_impls import install_mask_aware_impls
+        from .mask_strategies import install_mask_strategies
 
         def _log(msg: str, level: str = "INFO"):
             if log_queue is not None:
@@ -110,11 +110,11 @@ class VllmEngine:
         )
         _log("Loaded vllm model", "DEBUG")
 
-        # Install mask-aware AttentionImpl subclasses in place. Idempotent;
-        # each layer's `impl.__class__` is re-typed to a Pie-mask-aware
-        # subclass so an absent `pie_attn_extras` is a single dict.get and
-        # zero kernel-time overhead. See mask_impls.py.
-        install_mask_aware_impls(loaded.vllm_config)
+        # Wrap each attn layer's impl in a mask-aware proxy. Idempotent;
+        # an absent `pie_attn_extras` makes the proxy a single dict.get
+        # plus a delegating call. See mask_strategies.py for the per-
+        # backend strategies and the refusal policy on unsupported impls.
+        install_mask_strategies(loaded.vllm_config)
 
         # `kv_page_size` is not on the lean RuntimeConfig — the shared RPC
         # worker reads it via `engine.capabilities().kv_page_size`, which
