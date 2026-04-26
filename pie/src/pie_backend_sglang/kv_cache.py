@@ -78,6 +78,16 @@ def _rebind_pool_buffers(
 
     kv_cache_at_layer: list[torch.Tensor] = []
 
+    # Free sglang's pre-allocated buffers up front. Without this we hold
+    # both the original `(size+page_size, h, d)` tensors AND our parallel
+    # `(2, num_blocks, page_size, h, d)` tensors for the duration of
+    # rebind, doubling KV memory and OOMing under tight `mem_fraction_static`.
+    # Replacing the list entries below would only drop refs after the
+    # caching allocator has already failed to grow.
+    pool.k_buffer = [None] * num_layers
+    pool.v_buffer = [None] * num_layers
+    torch.cuda.empty_cache()
+
     for layer_idx in range(num_layers):
         # Allocate the pie-shaped storage. Layout: K block then V block per layer.
         # `tensor[0]` is K (contiguous, shape (num_blocks, page_size, h, d));

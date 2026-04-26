@@ -402,6 +402,16 @@ def _leader_loop(
             )
         engine.save_adapter(**args)
 
+    # `kv_page_size` and `max_dist_size` are NativeRuntimeConfig-only after
+    # the universal/native config split. Fall back to the engine's
+    # capability handshake (which every driver implements) for kv_page_size,
+    # and to a sensible default for max_dist_size which only matters for
+    # distribution-mode sampling responses.
+    _kv_page_size = getattr(config, "kv_page_size", None)
+    if _kv_page_size is None:
+        _kv_page_size = engine.capabilities().kv_page_size
+    _max_dist_size = getattr(config, "max_dist_size", 32)
+
     def _handle_fire_batch(**kwargs) -> dict:
         t_start = time.perf_counter()
 
@@ -409,8 +419,8 @@ def _leader_loop(
         t0 = time.perf_counter()
         batch = Batch(
             kwargs,
-            config.kv_page_size,
-            config.max_dist_size,
+            _kv_page_size,
+            _max_dist_size,
             engine.adapters,
             vocab_size=getattr(
                 engine.model_config,
