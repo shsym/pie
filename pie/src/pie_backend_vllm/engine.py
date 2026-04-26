@@ -116,11 +116,6 @@ class VllmEngine:
         # backend strategies and the refusal policy on unsupported impls.
         install_mask_strategies(loaded.vllm_config)
 
-        # `kv_page_size` is not on the lean RuntimeConfig — the shared RPC
-        # worker reads it via `engine.capabilities().kv_page_size`, which
-        # we already source from `vllm_config.cache_config.block_size` in
-        # `capabilities()` below.
-
         kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)
 
@@ -159,10 +154,10 @@ class VllmEngine:
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
             # Only forward the mask when there's something to apply — the
-            # patched Attention.forward checks for absence as the zero-overhead
-            # signal. inputs["custom_mask"] is always populated (BRLE decoded
-            # to all-True when no mask was supplied), so we gate on the
-            # explicit `has_custom_mask` flag.
+            # mask-aware impl proxy checks `pie_attn_extras` presence as the
+            # zero-overhead signal. `inputs["custom_mask"]` is always
+            # populated (BRLE-decoded to all-True when no mask was supplied),
+            # so we gate on the explicit `has_custom_mask` flag instead.
             custom_mask=inputs["custom_mask"] if inputs.get("has_custom_mask") else None,
             single_token_inference_mode=inputs["single_token_inference_mode"],
             total_pages_cpu=inputs.get("total_pages_cpu", 0),
@@ -178,7 +173,7 @@ class VllmEngine:
     def init_adapter(self, *args, **kwargs):
         raise NotImplementedError(
             "Adapters are not yet supported on the vllm backend. "
-            "Use --backend native for adapter workloads."
+            "Use the `native` driver for adapter workloads."
         )
 
     def update_adapter(self, *args, **kwargs):

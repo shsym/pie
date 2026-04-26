@@ -1,10 +1,14 @@
 """Custom-attention-mask compute primitives for `pie_backend_vllm`.
 
-This module owns the *kernels and data layout*: building per-batch extras
-from pie's BRLE mask, the universal SDPA gather fallback, and the FlashInfer
-prefill-wrapper helpers. Per-backend dispatch lives in `mask_impls.py`,
-which subclasses each `AttentionImpl` and overrides `_compute_with_mask` to
-call into the helper here.
+Module split (with `mask_strategies.py`):
+
+  * **mask_compute.py** (this file) — *data + kernels*: `PieAttnExtras`
+    construction from pie's BRLE mask, the universal SDPA gather, and
+    the FlashInfer prefill-wrapper helpers. No vllm dispatch logic.
+
+  * **mask_strategies.py** — *per-backend routing*: a proxy that wraps
+    each `AttentionImpl` and dispatches to a strategy class which calls
+    the helpers here.
 
 KV layouts we recognize:
   FlashAttn V1:                   (2, num_blocks, block_size, num_kv_heads, head_dim)
@@ -157,7 +161,7 @@ def split_kv(kv_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 # ----------------------------------------------------------------------------
-# Universal SDPA gather path (the default `_compute_with_mask`)
+# Universal SDPA gather path
 # ----------------------------------------------------------------------------
 
 

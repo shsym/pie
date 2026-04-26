@@ -21,7 +21,8 @@ from .attn_metadata import build_common_metadata
 
 @dataclass(frozen=True)
 class AttentionShape:
-    """Shape parameters for one attention layer.
+    """Shape parameters for one attention layer. Frozen so the same value
+    can be used as a dict key (we set-compare to detect uniformity).
 
     Plain LLMs have a single shape across all layers. Mixed-attention
     architectures (Gemma3 sliding+full, Qwen3-Next hybrid) carry different
@@ -215,10 +216,11 @@ class VllmForwardPass:
         # vllm's RoPE kernel expects int64 positions; pie uses int32.
         positions = position_ids.to(self.device, dtype=torch.int64, non_blocking=True)
 
-        # Mask plumbing: only when there's something to apply. Mask-aware
-        # `AttentionImpl` subclasses (installed at engine load) read
-        # `pie_attn_extras` from additional_kwargs; an absent key is the
-        # zero-overhead signal — those subclasses just call super().forward.
+        # Mask plumbing: only when there's something to apply. The mask-
+        # aware impl proxies (installed at engine load — see
+        # `mask_strategies.install_mask_strategies`) read `pie_attn_extras`
+        # from additional_kwargs. Absent key is the zero-overhead signal:
+        # the proxy delegates straight to the wrapped impl's forward.
         pie_attn_extras = None
         if custom_mask is not None:
             from .mask_compute import (

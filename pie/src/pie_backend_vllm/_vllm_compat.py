@@ -54,7 +54,8 @@ from vllm.v1.worker.utils import bind_kv_cache
 # Per-backend impl classes — imported lazily because vllm's per-backend
 # modules pull in heavy deps (flashinfer kernels, fa3 wheels, etc.). Most
 # call sites need just one impl, so we expose a getter that imports on
-# demand.
+# demand. The getter is in `__all__`; the class itself is *not* re-exported
+# at module import time, by design.
 def get_flashinfer_impl():
     from vllm.v1.attention.backends.flashinfer import FlashInferImpl
     return FlashInferImpl

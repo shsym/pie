@@ -1,6 +1,10 @@
 """Per-backend strategies for routing pie's BRLE-decoded mask into vllm's
 attention kernels.
 
+Pairs with `mask_compute.py`: this file owns *dispatch* (which backend
+gets which kernel call); `mask_compute.py` owns *kernels and data layout*
+(`PieAttnExtras`, the SDPA gather, the FlashInfer wrapper helpers).
+
 Architecture
 ------------
 Vllm's V1 attention separates layer-level bookkeeping (`Attention.forward`)
@@ -43,7 +47,7 @@ depend on non-causal attention. Add a strategy + register in
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
 from .mask_compute import PieAttnExtras, sdpa_gather_path
 
@@ -235,9 +239,16 @@ class PieMaskedAttentionImplProxy:
 
     Read paths like `impl.scale`, `impl.kv_sharing_target_layer_name`,
     `impl.do_kv_cache_update(...)` continue to work via `__getattr__`.
+
+    Detection: pie's own code looks for `_pie_proxy_marker` (class attr,
+    leading underscore = internal contract) rather than `isinstance(...,
+    PieMaskedAttentionImplProxy)` because the proxy fakes its `__class__`
+    for vllm's benefit (see the property below) and isinstance against
+    the proxy class returns False.
     """
 
-    # Marker so install is idempotent (re-wrapping a proxy is a no-op).
+    # Sentinel class attribute pie's own install/discovery code reads.
+    # Not for external use; underscore signals the internal contract.
     _pie_proxy_marker = True
 
     __slots__ = ("_impl", "_strategy", "_dispatch_super")
