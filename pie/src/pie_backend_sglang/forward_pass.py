@@ -2,16 +2,17 @@
 
 `pie_backend.engine.Engine` calls three methods on its `forward_pass` object:
 `embed_inputs(inputs) -> hidden`, `transform(...) -> hidden`, and
-`sample(hidden, sampling_metadata) -> dict`. We satisfy that contract here
-while delegating the actual compute to SGLang's ModelRunner.
+`sample(hidden, sampling_metadata) -> dict`. We delegate the actual compute
+to SGLang's ModelRunner.
 
 Pie supports multiple sampling positions per request (best-of-n, distribution
 mode in prefill, multi-step parallel generation). SGLang's default
-LogitsProcessor gathers logits to *one* position per request — the last
+`LogitsProcessor` gathers logits to *one* position per request — the last
 extend-token. To preserve pie's contract we replace the model's
-LogitsProcessor with a passthrough that returns the full per-token hidden
-state tensor; we then apply pie's per-output `indices_for_logits` gather and
-the LM head ourselves inside `sample_common`.
+LogitsProcessor with `_HiddenCapture`, which stashes the full per-token
+hidden state tensor; `sample()` then applies pie's per-output
+`indices_for_logits` gather + the LM head + sampling itself via
+`pie_backend.model.common.sample_common`.
 """
 
 from __future__ import annotations
@@ -23,20 +24,19 @@ import torch
 from pie_backend.config import RuntimeConfig
 from pie_backend.model.common import sample_common
 
-from .forward_batch import build_sglang_forward_batch, compute_mask_indptr
+from .forward_batch import build_sglang_forward_batch
 from .mask_hooks import make_mask_strategy
 
 
 class _HiddenCapture(torch.nn.Module):
     """Drop-in replacement for `runner.model.logits_processor`.
 
-    SGLang models assign their LogitsProcessor as a `nn.Module` child, so we
-    inherit from `torch.nn.Module` to satisfy `__setattr__`'s typecheck.
-
-    SGLang models call:
-        self.logits_processor(input_ids, hidden_states, lm_head, forward_batch, aux=None)
-    expecting a `LogitsProcessorOutput`. We sidestep the LM head + per-request
-    gather and just stash the full per-token hidden states for our caller.
+    SGLang models assign their LogitsProcessor as a `nn.Module` child, so
+    we inherit from `torch.nn.Module` to satisfy `__setattr__`'s typecheck.
+    Models call us as `self.logits_processor(input_ids, hidden_states,
+    lm_head, forward_batch, aux=None)` — we stash the full per-token
+    hidden_states for `transform()` to read and return a sentinel
+    `LogitsProcessorOutput` (the caller doesn't read its fields).
     """
 
     def __init__(self):
@@ -44,31 +44,20 @@ class _HiddenCapture(torch.nn.Module):
         self.captured: torch.Tensor | None = None
 
     def forward(self, input_ids, hidden_states, lm_head, forward_batch, aux=None):
-        # Stash and return a sentinel LogitsProcessorOutput that carries the
-        # full per-token hidden states. SGLang's model.forward returns this
-        # directly — we'll pull `.hidden_states` out in `transform()`.
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-
         self.captured = hidden_states
-        # `next_token_logits=None` is allowed and signals that no logits are
-        # available (multi-item scoring path). The caller doesn't read it.
-        return LogitsProcessorOutput(
-            next_token_logits=None,
-            hidden_states=hidden_states,
-        )
+        return LogitsProcessorOutput(next_token_logits=None, hidden_states=hidden_states)
 
 
 class SGLangForwardPass:
     """Thin shim around an SGLang ModelRunner.
 
     Contract:
-      - `embed_inputs(inputs)`: passthrough — SGLang's `forward()` does its
-        own input embedding.
-      - `transform(...)`: builds a ForwardBatch from pie's inputs, invokes
-        `runner.forward()` with the LM-head-stage hijacked, returns full
-        per-token hidden states `(num_query_tokens, hidden_dim)`.
-      - `sample(hidden, sampling_metadata)`: gathers the indices pie
-        requested, applies the LM head, runs pie's sampler.
+      - `embed_inputs(inputs)`: passthrough — sglang owns input embedding.
+      - `transform(...)`: build a `ForwardBatch`, hand pie's mask to the
+        strategy, run `runner.forward()`, return per-token hidden states.
+      - `sample(hidden, sampling_metadata)`: gather pie's requested
+        indices, apply the LM head, run pie's sampler.
     """
 
     def __init__(
@@ -83,29 +72,23 @@ class SGLangForwardPass:
         self.page_size = page_size
         self.device = torch.device(runtime_config.device)
 
-        # Install the hidden-state capture once; keep a handle so transform()
-        # can read what was captured.
+        # One-shot install: hidden-state capture replaces the LogitsProcessor;
+        # mask strategy patches the attention backend.
         self._capture = _HiddenCapture()
         runner.model.logits_processor = self._capture
-
-        # Install the per-backend custom-mask strategy. One-shot monkeypatch
-        # on the `runner.attn_backend` instance; we feed it pie's mask each
-        # transform() call.
         self._mask_strategy = make_mask_strategy(runner.attn_backend)
 
-        # Resolve the LM head once. Used by sample() as `lm_head_fn`.
-        # ParallelLMHead with TP > 1 needs an all-gather, but for v1 we only
-        # support TP=1; the matmul-against-weight path matches sglang's own
-        # `_compute_lm_head` for that case.
+        # ParallelLMHead with TP > 1 needs an all-gather; for v1 we only
+        # support TP=1 and the matmul-against-weight path matches sglang's
+        # `_compute_lm_head` (layers/logits_processor.py:891-913).
         self._lm_head_module = runner.model.lm_head
 
     # ------------------------------------------------------------------
-    # Pie contract methods
+    # Pie contract
     # ------------------------------------------------------------------
 
     def embed_inputs(self, inputs: dict) -> dict:
-        # SGLang's forward() owns input embedding; nothing to do here.
-        return inputs
+        return inputs  # sglang's forward() owns input embedding.
 
     def transform(
         self,
@@ -122,11 +105,10 @@ class SGLangForwardPass:
         custom_mask: torch.Tensor | None = None,
         adapter_subpass=None,
     ) -> torch.Tensor:
-        inputs = input_embeds
-        fb = build_sglang_forward_batch(
+        fb, meta = build_sglang_forward_batch(
             runner=self.runner,
             inputs={
-                "token_ids": inputs["token_ids"],
+                "token_ids": input_embeds["token_ids"],
                 "position_ids": position_ids,
                 "qo_indptr": qo_indptr,
                 "kv_page_indices": kv_page_indices,
@@ -137,63 +119,41 @@ class SGLangForwardPass:
             device=self.device,
         )
 
-        # Hand pie's BRLE-decoded mask to the strategy. Pie always emits a
-        # mask; for purely causal workloads it just encodes the upper-tri
-        # pattern. We compute mask_indptr from the FB's CSR-derived seq_lens.
+        # Pie always emits a mask; strategies apply it either via
+        # `apply_to_forward_batch` (FlashInfer) or via their hooked
+        # `init_forward_metadata` (Triton/Flex/TorchNative), reading from
+        # `set()` state.
         if custom_mask is not None:
-            mask_indptr = compute_mask_indptr(
-                fb._pie_qo_indptr_np, fb._pie_seq_lens_np, self.device
-            )
-            self._mask_strategy.set(custom_mask, mask_indptr, fb._pie_seq_lens_np)
-            # Strategies that route the mask through ForwardBatch fields
-            # (FlashInfer's `cross_attention_custom_mask`, etc.) stamp it
-            # here, before sglang's init_forward_metadata reads from the FB.
+            self._mask_strategy.set(custom_mask, meta.mask_indptr)
             self._mask_strategy.apply_to_forward_batch(fb)
-        else:
-            self._mask_strategy.clear()
 
-        # Run the model. Our `_HiddenCapture` runs in place of the
-        # LogitsProcessor and stashes full per-token hidden states. The
-        # mask strategy's hooked `init_forward_metadata` runs from inside
-        # `runner.forward(fb)` and patches `attn_backend.forward_metadata`.
         self._capture.captured = None
         try:
             self.runner.forward(fb)
         finally:
-            # Don't leak stale mask state across fire_batch calls — the next
-            # batch may have a different shape.
             self._mask_strategy.clear()
 
-        hidden_states = self._capture.captured
-        if hidden_states is None:
+        if self._capture.captured is None:
             raise RuntimeError(
-                "pie_backend_sglang: hidden states were not captured. The model "
-                "may not have called its logits_processor (unexpected forward path)."
+                "pie_backend_sglang: hidden states were not captured. The "
+                "model didn't call its logits_processor (unexpected forward path)."
             )
-        return hidden_states
+        return self._capture.captured
 
     # ------------------------------------------------------------------
     # Sampling
     # ------------------------------------------------------------------
 
     def _lm_head_fn(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Apply the LM head to the gathered per-output hidden states.
-
-        Mirrors sglang's `LogitsProcessor._compute_lm_head` (TP=1 path) at
-        layers/logits_processor.py:891-913.
-        """
+        """Apply the LM head. Mirrors sglang's `_compute_lm_head` (TP=1)."""
         lm_head = self._lm_head_module
         if hasattr(lm_head, "weight"):
-            return torch.matmul(
-                hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-            )
-        # Fallback to module call for unusual lm_heads (LoRA-wrapped, GGUF).
-        return lm_head(hidden_states)
+            return torch.matmul(hidden_states.to(lm_head.weight.dtype), lm_head.weight.T)
+        return lm_head(hidden_states)  # LoRA-wrapped / GGUF fallback.
 
     def sample(self, hidden_states: torch.Tensor, sampling_metadata: dict) -> dict:
         if not sampling_metadata or sampling_metadata.get("indices_for_logits") is None:
             return {"tokens": [], "dists": [], "spec_tokens": [], "spec_positions": []}
-
         return sample_common(
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,

@@ -7,28 +7,39 @@ Pie emits per-batch metadata in CSR form:
   - `kv_last_page_lens[r]`  → valid token count in request r's last block
 
 SGLang's `ForwardBatch` (and the attention backends downstream of it) consume:
-  - `req_pool_indices: (batch,)`  — slot in `req_to_token_pool` for each request
-  - `seq_lens: (batch,)`           — total sequence length per request
-  - `extend_seq_lens, extend_prefix_lens` — split for prefill
-  - `out_cache_loc: (num_query_tokens,)` — flat token slot for each query token
+  - `req_pool_indices: (batch,)`        — slot in `req_to_token_pool` per request
+  - `seq_lens: (batch,)`                — total sequence length per request
+  - `extend_seq_lens, extend_prefix_lens` — prefill split
+  - `out_cache_loc: (num_query_tokens,)` — destination slot per query token
   - `req_to_token_pool.req_to_token[req_pool_idx, :seq_len]` — slot per token
 
-We bypass SGLang's `req_to_token_pool.alloc()` and write the table directly:
-for each request, expand its CSR block list into per-token slots
-`block_id * page_size + offset`, where `block_id` is owned by pie's Rust
-scheduler and `offset` is the within-block position.
-
-`out_cache_loc` similarly maps each query token to its destination slot. The
-shape matches pie's `slot_mapping` in the vllm path.
+We bypass `req_to_token_pool.alloc()` and write rows directly: for request r,
+expand its CSR block list into per-token slots `block_id * page_size + offset`,
+where `block_id` is owned by pie's Rust scheduler. `out_cache_loc` is the
+per-query-token slice of those same rows (so we compute it from the rows
+rather than running a second numba kernel).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numba
 import numpy as np
 import torch
+
+
+@dataclass(frozen=True)
+class BatchMeta:
+    """Per-batch state the mask strategies and forward_pass need after the
+    `ForwardBatch` is built. Returned alongside the FB so we don't tunnel
+    fields through `_pie_*` attributes on a torch dataclass.
+    """
+
+    seq_lens_np: np.ndarray         # int32, (batch,) — full kv length per request
+    qo_indptr_np: np.ndarray        # int32, (batch+1,) — pie's CSR
+    mask_indptr: torch.Tensor       # int64, (batch+1,) on device — flat mask offsets
 
 
 @numba.njit(cache=True, parallel=False)
@@ -41,64 +52,32 @@ def _build_req_to_token_rows(
 ):
     """Expand CSR block IDs into a `(batch, max_seq_len)` per-token slot table.
 
-    Each row r of `out` is filled with `seq_lens[r]` valid slot indices; the
-    rest is left as zeros (SGLang's kernels guard via `seq_lens`).
+    Each row r is filled with `seq_lens[r]` valid slot indices; the rest is
+    left as zeros (SGLang's kernels guard via `seq_lens`).
     """
     batch = kv_page_indptr.shape[0] - 1
     for r in range(batch):
         s_r = seq_lens[r]
         page_base = kv_page_indptr[r]
         for i in range(s_r):
-            page_idx = i // page_size
-            offset = i % page_size
-            block_id = kv_page_indices[page_base + page_idx]
-            out[r, i] = block_id * page_size + offset
+            block_id = kv_page_indices[page_base + i // page_size]
+            out[r, i] = block_id * page_size + (i % page_size)
 
 
-@numba.njit(cache=True, parallel=False)
-def _build_out_cache_loc(
-    qo_indptr: np.ndarray,           # int32 (batch+1,)
-    kv_page_indices: np.ndarray,     # int32 (total_pages,)
-    kv_page_indptr: np.ndarray,      # int32 (batch+1,)
-    seq_lens: np.ndarray,            # int32 (batch,)
-    page_size: int,
-    out: np.ndarray,                 # int64 (num_query_tokens,)
-):
-    """For each query token, its destination flat slot in the KV pool.
-
-    Mirrors `attn_metadata._build_slot_mapping` in the vllm backend.
-    """
-    batch = qo_indptr.shape[0] - 1
-    for r in range(batch):
-        q_start = qo_indptr[r]
-        q_end = qo_indptr[r + 1]
-        q_len = q_end - q_start
-        s_r = seq_lens[r]
-        page_base = kv_page_indptr[r]
-        first_pos = s_r - q_len
-        for i in range(q_len):
-            p = first_pos + i
-            page_idx = p // page_size
-            offset = p % page_size
-            block_id = kv_page_indices[page_base + page_idx]
-            out[q_start + i] = block_id * page_size + offset
-
-
-def compute_mask_indptr(
+def _compute_mask_indptr(
     qo_indptr_np: np.ndarray,
     seq_lens_np: np.ndarray,
     device: torch.device,
 ) -> torch.Tensor:
-    """Per-request offset into pie's flat BRLE-decoded mask buffer.
+    """Cumulative offset into pie's flat BRLE-decoded mask buffer.
 
     For request r with `query_len_r = qo_indptr[r+1] - qo_indptr[r]` query
     tokens and `seq_lens[r]` total kv tokens, the mask occupies
-    `query_len_r * seq_lens[r]` consecutive bools, indexed row-major as
-    `mask[q_idx][kv_idx]`. mask_indptr is the cumulative-sum of those sizes.
+    `query_len_r * seq_lens[r]` consecutive bools. mask_indptr is the
+    cumulative-sum of those sizes.
 
-    Matches what sglang's Triton/AITER/Wave kernels expect:
-    `cur_seq_mask_start_idx = mask_indptr[r]` per
-    triton_ops/extend_attention.py:286.
+    Matches `cur_seq_mask_start_idx = mask_indptr[r]` in
+    sglang/layers/attention/triton_ops/extend_attention.py:286.
     """
     batch = qo_indptr_np.shape[0] - 1
     if batch == 0:
@@ -112,22 +91,18 @@ def compute_mask_indptr(
 
 def build_sglang_forward_batch(
     *,
-    runner: Any,                     # sglang.srt.model_executor.model_runner.ModelRunner
+    runner: Any,                     # sglang ModelRunner
     inputs: dict,
     page_size: int,
     device: torch.device,
-):
-    """Build a `ForwardBatch` from pie's `inputs` dict.
-
-    Returns the populated ForwardBatch object ready for `runner.forward(...)`.
-    """
+) -> tuple[Any, BatchMeta]:
+    """Build a `ForwardBatch` + `BatchMeta` from pie's `inputs` dict."""
     from sglang.srt.model_executor.forward_batch_info import (
         ForwardBatch,
         ForwardMode,
     )
 
-    # ---- Pull pie's CSR metadata to numpy (cheap, already on CPU as int32) ----
-
+    # ---- Pie's CSR metadata to numpy (cheap; already int32 on CPU) ----
     qo_indptr_np = inputs["qo_indptr"].cpu().to(torch.int32).numpy()
     kv_idx_np = inputs["kv_page_indices"].cpu().to(torch.int32).numpy()
     kv_indptr_np = inputs["kv_page_indptr"].cpu().to(torch.int32).numpy()
@@ -141,16 +116,11 @@ def build_sglang_forward_batch(
     seq_lens_np = ((pages_per_req - 1) * page_size + kv_last_np).astype(np.int32)
     extend_seq_lens_np = (qo_indptr_np[1:] - qo_indptr_np[:-1]).astype(np.int32)
     extend_prefix_lens_np = (seq_lens_np - extend_seq_lens_np).astype(np.int32)
-    extend_num_tokens = int(extend_seq_lens_np.sum())
 
-    # ---- Allocate / write req_to_token_pool.req_to_token rows ----
-
-    # We claim the first `batch_size` slots. SGLang's pool initializes
-    # free_slots = list(range(size)); we ignore that bookkeeping and just
-    # write rows directly. Pie's runtime owns block IDs; sglang's pool only
-    # owns the lookup table.
+    # ---- req_to_token rows (per-request, per-token slot table) ----
+    # We claim the first `batch_size` slots; pie's runtime owns block IDs and
+    # the pool's free-list bookkeeping is unused.
     req_pool_indices_np = np.arange(batch_size, dtype=np.int32)
-    req_to_token = runner.req_to_token_pool.req_to_token
 
     if batch_size > 0:
         max_seq_len = int(seq_lens_np.max())
@@ -158,48 +128,43 @@ def build_sglang_forward_batch(
         _build_req_to_token_rows(
             kv_idx_np, kv_indptr_np, seq_lens_np, page_size, rows_np
         )
-        rows = torch.from_numpy(rows_np).to(device, non_blocking=True)
-        # Write into the pool's table at our chosen slots.
-        req_pool_indices_t = torch.from_numpy(req_pool_indices_np).to(device)
-        # `req_to_token[req_pool_indices_t, :max_seq_len] = rows`
-        req_to_token[req_pool_indices_t, :max_seq_len] = rows
     else:
         max_seq_len = 0
+        rows_np = np.zeros((0, 0), dtype=np.int32)
 
-    # ---- out_cache_loc (per query token destination slot) ----
+    rows = torch.from_numpy(rows_np).to(device, non_blocking=True)
 
+    # Write rows into sglang's pool at our chosen slots.
+    if batch_size > 0:
+        req_pool_indices_t = torch.from_numpy(req_pool_indices_np).to(device)
+        runner.req_to_token_pool.req_to_token[req_pool_indices_t, :max_seq_len] = rows
+
+    # ---- out_cache_loc (per-query-token destination slot) ----
+    # For request r the query tokens occupy positions [s_r - q_r, s_r) within
+    # the request. Their slot indices are exactly that slice of `rows[r]`.
     if num_query_tokens > 0:
-        out_cache_np = np.zeros(num_query_tokens, dtype=np.int64)
-        _build_out_cache_loc(
-            qo_indptr_np, kv_idx_np, kv_indptr_np, seq_lens_np,
-            page_size, out_cache_np,
-        )
-        out_cache_loc = torch.from_numpy(out_cache_np).to(device, non_blocking=True)
+        out_cache_loc = torch.empty(num_query_tokens, dtype=torch.int64, device=device)
+        for r in range(batch_size):
+            q_start, q_end = int(qo_indptr_np[r]), int(qo_indptr_np[r + 1])
+            q_len = q_end - q_start
+            first_pos = int(seq_lens_np[r]) - q_len
+            out_cache_loc[q_start:q_end] = rows[r, first_pos:first_pos + q_len]
     else:
         out_cache_loc = torch.empty(0, dtype=torch.int64, device=device)
 
-    # ---- Tensors for ForwardBatch ----
-
-    seq_lens_t = torch.from_numpy(seq_lens_np).to(torch.int64).to(device, non_blocking=True)
+    # ---- ForwardBatch tensors ----
     seq_lens_cpu_t = torch.from_numpy(seq_lens_np).to(torch.int64)
+    seq_lens_t = seq_lens_cpu_t.to(device, non_blocking=True)
     req_pool_indices_t = torch.from_numpy(req_pool_indices_np).to(torch.int64).to(device)
     extend_seq_lens_t = torch.from_numpy(extend_seq_lens_np).to(device, non_blocking=True)
     extend_prefix_lens_t = torch.from_numpy(extend_prefix_lens_np).to(device, non_blocking=True)
-
-    # We keep pie's caller-supplied position_ids verbatim (matches vllm path).
     positions = inputs["position_ids"].to(device=device, dtype=torch.int64, non_blocking=True)
 
-    # We always run the EXTEND path. Pie issues prefill+decode through the
-    # same code path and SGLang's decode kernel doesn't support custom_mask
-    # nor pie's per-token positions cleanly. The EXTEND kernel handles
-    # length-1 query tokens fine; per-request `extend_seq_lens=1, prefix_lens=N`.
-    forward_mode = ForwardMode.EXTEND
-
-    # Lazily fill ForwardBatch — we bypass init_new() because we're not
-    # constructing through ScheduleBatch/ModelWorkerBatch. We populate just
-    # what the attention backend needs.
+    # We always use EXTEND. SGLang's decode kernel doesn't accept custom_mask
+    # nor pie's caller-supplied positions; the extend kernel handles
+    # query_len=1 fine via per-request `extend_seq_lens=1, prefix_lens=N`.
     fb = ForwardBatch(
-        forward_mode=forward_mode,
+        forward_mode=ForwardMode.EXTEND,
         batch_size=batch_size,
         input_ids=inputs["token_ids"].to(device=device, dtype=torch.int32, non_blocking=True),
         req_pool_indices=req_pool_indices_t,
@@ -208,7 +173,7 @@ def build_sglang_forward_batch(
         seq_lens_sum=int(seq_lens_np.sum()),
         seq_lens_cpu=seq_lens_cpu_t,
         positions=positions,
-        extend_num_tokens=extend_num_tokens,
+        extend_num_tokens=int(extend_seq_lens_np.sum()),
         extend_seq_lens=extend_seq_lens_t,
         extend_prefix_lens=extend_prefix_lens_t,
         extend_prefix_lens_cpu=extend_prefix_lens_np.tolist(),
@@ -217,12 +182,9 @@ def build_sglang_forward_batch(
         token_to_kv_pool=runner.token_to_kv_pool,
         attn_backend=runner.attn_backend,
     )
-
-    # Tunnel pie's per-request seq_lens (numpy, CPU) onto the FB so the mask
-    # strategy can reuse them for FlexAttention's per-batch mask_mod without
-    # re-deriving from CSR metadata. Hidden under `_pie_*` to avoid colliding
-    # with future SGLang fields.
-    fb._pie_seq_lens_np = seq_lens_np
-    fb._pie_qo_indptr_np = qo_indptr_np
-
-    return fb
+    meta = BatchMeta(
+        seq_lens_np=seq_lens_np,
+        qo_indptr_np=qo_indptr_np,
+        mask_indptr=_compute_mask_indptr(qo_indptr_np, seq_lens_np, device),
+    )
+    return fb, meta

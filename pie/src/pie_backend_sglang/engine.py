@@ -1,9 +1,9 @@
 """SGLang-backed inference engine.
 
-Mirrors `pie_backend.engine.Engine`'s public surface so the worker can use
-either driver interchangeably. Internally, the model and kernels come from
-SGLang; the surrounding RPC, batching, telemetry, and dispatch scaffolding
-are imported directly from `pie_backend`.
+Mirrors `pie_backend.engine.Engine`'s public surface so pie's worker
+(`pie_backend.worker.run_worker`) can drive native, vllm, and sglang
+interchangeably. The model and kernels come from SGLang; pie owns the
+RPC, batching, telemetry, and dispatch around it.
 """
 
 from __future__ import annotations
@@ -21,11 +21,8 @@ from .config import SGLangDriverConfig
 
 
 class SGLangEngine:
-    """Inference engine that delegates the forward pass to an SGLang ModelRunner.
-
-    Public surface matches `pie_backend.engine.Engine`. See `VllmEngine` for
-    the canonical sibling reference.
-    """
+    """Inference engine that delegates the forward pass to an SGLang
+    ModelRunner. Public surface matches `pie_backend.engine.Engine`."""
 
     config: RuntimeConfig
     driver_config: SGLangDriverConfig
@@ -37,7 +34,6 @@ class SGLangEngine:
     adapter_at_layer: list
     adapters: dict
     arch_type: str
-    info: dict
     snapshot_dir: str | None
 
     def __init__(
@@ -49,7 +45,6 @@ class SGLangEngine:
         kv_cache_at_layer: list,
         adapter_at_layer: list,
         arch_type: str,
-        info: dict,
         snapshot_dir: str | None = None,
         kv_cache_at_layer_host: list | None = None,
         swap_pool_size: int = 0,
@@ -63,7 +58,6 @@ class SGLangEngine:
         self.swap_pool_size = swap_pool_size
         self.adapter_at_layer = adapter_at_layer
         self.arch_type = arch_type
-        self.info = info
         self.snapshot_dir = snapshot_dir
         self.adapters = {}
 
@@ -81,10 +75,6 @@ class SGLangEngine:
         from .kv_cache import _rebind_pool_buffers
         from .forward_pass import SGLangForwardPass
 
-        def _log(msg: str, level: str = "INFO"):
-            if log_queue is not None:
-                log_queue.put({"message": msg, "level": level})
-
         if config.rank == 0:
             telemetry.init_telemetry(
                 enabled=config.telemetry_enabled,
@@ -98,21 +88,19 @@ class SGLangEngine:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(config.random_seed)
 
-        _log("Loading sglang model", "DEBUG")
         loaded = load_sglang_model(
-            config, driver_config, log_queue=log_queue, compute_pg=compute_process_group
+            config, driver_config,
+            log_queue=log_queue, compute_pg=compute_process_group,
         )
-        _log("Loaded sglang model", "DEBUG")
-
         # Rebind sglang's k_buffer/v_buffer to pie-shaped storage so the swap
         # RPC handlers see the canonical (num_blocks, 2, page_size, h, d) layout.
-        kv_cache_at_layer, num_blocks, page_size = _rebind_pool_buffers(loaded, config)
+        kv_cache_at_layer, num_blocks = _rebind_pool_buffers(loaded, config)
         config.max_num_kv_pages = num_blocks
 
         forward_pass = SGLangForwardPass(
             runner=loaded.runner,
             runtime_config=config,
-            page_size=page_size,
+            page_size=int(loaded.runner.page_size),
         )
 
         return cls(
@@ -123,16 +111,12 @@ class SGLangEngine:
             kv_cache_at_layer=kv_cache_at_layer,
             adapter_at_layer=[],
             arch_type=loaded.arch_type,
-            info=loaded.info,
             snapshot_dir=loaded.snapshot_dir,
-            kv_cache_at_layer_host=[],
-            swap_pool_size=0,
         )
 
     @torch.inference_mode()
     def fire_batch(self, inputs: dict, sampling_metadata: dict) -> dict:
         passthrough = self.forward_pass.embed_inputs(inputs)
-
         gathered_logits = self.forward_pass.transform(
             input_embeds=passthrough,
             position_ids=inputs["position_ids"],
@@ -145,7 +129,6 @@ class SGLangEngine:
             total_pages_cpu=inputs.get("total_pages_cpu", 0),
             custom_mask=inputs.get("custom_mask"),
         )
-
         return self.forward_pass.sample(gathered_logits, sampling_metadata)
 
     # ------------------------------------------------------------------
@@ -172,17 +155,15 @@ class SGLangEngine:
     # ------------------------------------------------------------------
 
     def query(self, query: str) -> str:
-        if query == "ping":
-            return "pong"
-        return "unknown query"
+        return "pong" if query == "ping" else "unknown query"
 
     def capabilities(self):
-        """Report this backend's resolved capacities up to pie's runtime.
+        """Report this backend's resolved capacities to pie's runtime.
 
-        Sources values from the loaded SGLang ModelRunner / ServerArgs so
-        the user's preferences are reconciled against what sglang's chosen
-        attention kernel actually supports (page_size in particular may
-        differ from what the user asked for).
+        Sources values from the loaded SGLang `ModelRunner` so the user's
+        preferences are reconciled against what the chosen attention
+        kernel actually supports (page_size in particular may differ from
+        what was requested via `[model.X.driver.sglang]`).
         """
         from pie.capabilities import BackendCapabilities
 
@@ -197,23 +178,19 @@ class SGLangEngine:
         if not self.snapshot_dir:
             raise RuntimeError("snapshot_dir is empty; loader did not resolve it.")
 
-        dtype_str = str(self.config.activation_dtype).removeprefix("torch.")
-
-        # SGLang derives `max_running_requests` and `max_total_num_tokens`
-        # from `mem_fraction_static`. We surface those as pie's batch limits.
-        max_batch_size = int(getattr(runner, "max_running_requests", 256))
-        max_batch_tokens = int(getattr(runner, "max_total_num_tokens", 10240))
-
         return BackendCapabilities(
             total_pages=int(self.config.max_num_kv_pages),
             kv_page_size=int(runner.page_size),
             swap_pool_size=int(self.swap_pool_size),
-            max_batch_tokens=max_batch_tokens,
-            max_batch_size=max_batch_size,
+            # sglang sets these on `ModelRunner` after `init_memory_pool` —
+            # they're load-bearing for pie's scheduler so fail loudly if
+            # they're missing rather than defaulting silently.
+            max_batch_tokens=int(runner.max_total_num_tokens),
+            max_batch_size=int(runner.max_running_requests),
             arch_name=self.arch_type,
             vocab_size=int(sglang_mc.vocab_size),
             max_model_len=int(sglang_mc.context_len),
-            activation_dtype=dtype_str,
+            activation_dtype=str(self.config.activation_dtype).removeprefix("torch."),
             snapshot_dir=str(self.snapshot_dir),
         )
 
