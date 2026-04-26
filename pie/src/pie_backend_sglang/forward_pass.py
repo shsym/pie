@@ -145,6 +145,10 @@ class SGLangForwardPass:
                 fb._pie_qo_indptr_np, fb._pie_seq_lens_np, self.device
             )
             self._mask_strategy.set(custom_mask, mask_indptr, fb._pie_seq_lens_np)
+            # Strategies that route the mask through ForwardBatch fields
+            # (FlashInfer's `cross_attention_custom_mask`, etc.) stamp it
+            # here, before sglang's init_forward_metadata reads from the FB.
+            self._mask_strategy.apply_to_forward_batch(fb)
         else:
             self._mask_strategy.clear()
 

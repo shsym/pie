@@ -16,22 +16,24 @@ Coverage matrix (sglang upstream as of this branch):
 
   ✓ Triton                  — first-class custom_mask + mask_indptr fields.
   ✓ AITER, Wave             — same ForwardMetadata shape as Triton.
+  ✓ FlashInfer              — same kernel pie's *native* uses; routes via
+                              `forward_batch.cross_attention_custom_mask`.
   ✓ TorchFlex               — captured-tensor mask_mod via FlexAttention.
   ✓ TorchNative             — attn_mask param to scaled_dot_product_attention.
-  ⚠ FlashInfer              — supported by the kernel; adapter routes through
-                              spec_info, so we wrap the indices-updater. (TODO)
-  ✗ FA3 / FA4               — kernel has no arbitrary-mask path; warn.
-  ✗ trtllm_mha / intel_amx  — fused kernels without an exposed mask param;
-                              warn.
+  ✗ FA3 / FA4               — refused at engine init; kernel has no
+                              arbitrary-mask path.
+  ✗ trtllm_mha / intel_amx  — refused; fused kernels without exposed mask.
+  ✗ MLA / NSA / dual_chunk  — refused; specialized kernels.
 
-Inferlets that don't need a custom mask still work on every backend; the
-warnings only fire when pie's runtime sends a mask AND the backend can't
-honor it.
+Backends that can't honor a custom mask are rejected at engine init via
+`_UnsupportedBackendError` — pie's runtime always sends a mask, so silently
+ignoring it would produce wrong tokens for inferlets that rely on
+non-causal attention (Jacobi, tree decoding, attention sink, etc.). The
+user must pick a supported `attention_backend`.
 """
 
 from __future__ import annotations
 
-import warnings
 from typing import Any
 
 import torch
@@ -63,6 +65,15 @@ class _CustomMaskStrategy:
         self._mask = None
         self._indptr = None
         self._seq_lens_np = None
+
+    def apply_to_forward_batch(self, fb: Any) -> None:
+        """Optional hook for strategies that route the mask via fields on
+        the ForwardBatch (e.g. FlashInfer's `cross_attention_custom_mask`).
+
+        Strategies that work via monkey-patched `init_forward_metadata`
+        leave this as a no-op.
+        """
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -343,36 +354,35 @@ class _TorchNativeStrategy(_CustomMaskStrategy):
 
 
 # ---------------------------------------------------------------------------
-# Null strategy — backends that can't honor a custom mask
+# FlashInfer — route via `forward_batch.cross_attention_custom_mask`
 # ---------------------------------------------------------------------------
 
 
-class _NullStrategy(_CustomMaskStrategy):
-    """For backends that don't expose a custom-mask path. Warns once if pie's
-    runtime sends a non-trivially-non-causal mask."""
+class _FlashInferStrategy(_CustomMaskStrategy):
+    """Hook for `FlashInferAttnBackend`.
 
-    supports_custom_mask = False
+    SGLang's flashinfer adapter, when `spec_info is None` (normal extend),
+    pulls `forward_batch.cross_attention_custom_mask` through to
+    `BatchPrefillWithPagedKVCacheWrapper.begin_forward(custom_mask=...)`
+    — see flashinfer_backend.py:514, 1431, 1490. The kernel layout for
+    that mask is per-request rectangular `query_len × seq_len` flat,
+    which is exactly what pie's BRLE decoder produces. So instead of
+    monkeypatching anything, we just stamp the mask onto each
+    ForwardBatch in `apply_to_forward_batch` and let sglang's path do
+    its thing.
 
-    def __init__(self, attn_backend: Any, name: str):
-        super().__init__(attn_backend)
-        self._name = name
-        self._warned = False
+    NB: this is the same kernel pie's *native* backend uses today (both
+    pin `flashinfer-python==0.6.8.post1`). Performance ceiling matches
+    native; the only overhead vs Triton is FlashInfer's per-step plan().
+    """
 
-    def set(self, mask, indptr, seq_lens_np):
-        super().set(mask, indptr, seq_lens_np)
-        if mask is not None and not self._warned:
-            warnings.warn(
-                f"pie_backend_sglang: SGLang attention backend "
-                f"{self._name!r} does not expose a custom-mask kernel path; "
-                "pie's per-token mask will be ignored. Inferlets that rely "
-                "on non-causal attention (Jacobi, tree decoding, attention "
-                "sink with custom patterns) will produce incorrect tokens. "
-                "Set `[model.X.driver.sglang] attention_backend = \"triton\"` "
-                "to enable.",
-                RuntimeWarning,
-                stacklevel=3,
-            )
-            self._warned = True
+    supports_custom_mask = True
+
+    def apply_to_forward_batch(self, fb: Any) -> None:
+        # Pie always emits a mask; for purely-causal workloads it
+        # encodes the upper-triangular pattern and the kernel is happy.
+        if self._mask is not None:
+            fb.cross_attention_custom_mask = self._mask
 
 
 # ---------------------------------------------------------------------------
@@ -380,23 +390,100 @@ class _NullStrategy(_CustomMaskStrategy):
 # ---------------------------------------------------------------------------
 
 
+# Map from `type(attn_backend).__name__` to strategy class. Adding a new
+# backend means appending one entry here. Strategy class names are listed
+# instead of imported eagerly so the module stays cheap to load.
+_STRATEGY_BY_NAME: dict[str, type[_CustomMaskStrategy]] = {
+    # NVIDIA / AMD with first-class custom_mask + mask_indptr in
+    # ForwardMetadata (same Triton-style kernel signature):
+    "TritonAttnBackend": _TritonStyleStrategy,
+    "AiterAttnBackend": _TritonStyleStrategy,
+    "WaveAttnBackend": _TritonStyleStrategy,
+    # FlashInfer — same kernel pie native uses; mask routes via
+    # `forward_batch.cross_attention_custom_mask` in normal extend mode:
+    "FlashInferAttnBackend": _FlashInferStrategy,
+    # PyTorch FlexAttention — mask_mod callable:
+    "TorchFlexAttnBackend": _FlexStrategy,
+    # Pure PyTorch SDPA fallback:
+    "TorchNativeAttnBackend": _TorchNativeStrategy,
+}
+
+
+# Backends explicitly known to NOT support arbitrary custom masks, with
+# the canonical reason. We refuse to load on these rather than silently
+# producing wrong tokens for inferlets that depend on the mask.
+_UNSUPPORTED_BACKENDS: dict[str, str] = {
+    "FlashAttentionBackend": (
+        "FlashAttention v3/v4's kernel only consults `custom_mask` for "
+        "speculative-decoding mask extraction; arbitrary attention "
+        "patterns aren't a parameter of the kernel."
+    ),
+    "FlashInferMLAAttnBackend": (
+        "DeepSeek MLA kernels don't take a custom_mask parameter."
+    ),
+    "FlashMLABackend": "DeepSeek MLA — no custom_mask support.",
+    "CutlassMLABackend": "DeepSeek MLA via CUTLASS — no custom_mask support.",
+    "TRTLLMMLABackend": "DeepSeek MLA via TensorRT-LLM — no custom_mask support.",
+    "TRTLLMHAAttnBackend": (
+        "TensorRT-LLM's flashinfer.{prefill,decode}.trtllm_batch_* "
+        "kernels are causal-only."
+    ),
+    "IntelAMXAttnBackend": (
+        "Intel AMX dispatches to fused C++ ops without a mask parameter."
+    ),
+    "NativeSparseAttnBackend": (
+        "DeepSeek-V3.2 native sparse attention; mask is fixed by the "
+        "sparsity pattern."
+    ),
+    "DualChunkFlashAttentionBackend": (
+        "Qwen 1M dual-chunk attention — mask is fixed by the chunking scheme."
+    ),
+}
+
+
+class _UnsupportedBackendError(RuntimeError):
+    """Raised when the user picks an sglang attention backend that can't
+    honor pie's custom_mask. Listed early so engine load fails before any
+    inferlet runs."""
+
+
 def make_mask_strategy(attn_backend: Any) -> _CustomMaskStrategy:
     """Pick the right strategy for an attention backend instance.
 
     Dispatches on the class name to avoid pulling in every sglang
-    attention-backend module at import time.
+    attention-backend module at import time. Raises
+    `_UnsupportedBackendError` for backends that can't honor pie's
+    custom_mask — pie's runtime always emits one, and silently dropping
+    it would produce wrong tokens for inferlets that rely on non-causal
+    patterns (Jacobi, tree decoding, attention sink, etc.).
     """
     name = type(attn_backend).__name__
 
-    if name in ("TritonAttnBackend", "AiterAttnBackend", "WaveAttnBackend"):
-        return _TritonStyleStrategy(attn_backend)
-    if name == "TorchFlexAttnBackend":
-        return _FlexStrategy(attn_backend)
-    if name == "TorchNativeAttnBackend":
-        return _TorchNativeStrategy(attn_backend)
+    cls = _STRATEGY_BY_NAME.get(name)
+    if cls is not None:
+        return cls(attn_backend)
 
-    # FlashInfer, FA3/FA4, trtllm_mha, intel_amx, ascend, MLA variants — all
-    # fall through to Null. They either have a custom_mask path that's
-    # gated through speculative-decoding-only structures (FlashInfer) or
-    # genuinely don't support arbitrary masks (FA3, intel_amx).
-    return _NullStrategy(attn_backend, name)
+    reason = _UNSUPPORTED_BACKENDS.get(name)
+    supported = sorted(_STRATEGY_BY_NAME)
+    if reason is not None:
+        msg = (
+            f"pie_backend_sglang refuses to load with attention_backend "
+            f"resolved to {name!r}: {reason} "
+            f"Pie's runtime always emits a custom_mask buffer; silently "
+            f"ignoring it would produce wrong tokens for inferlets that "
+            f"rely on non-causal attention. Set "
+            f"`[model.X.driver.sglang] attention_backend = \"triton\"` "
+            f"(or one of {supported}) instead."
+        )
+    else:
+        # Unknown class name — be conservative and refuse, but tell the
+        # user how to add it. New sglang attention backends land
+        # occasionally; add the class name to either _STRATEGY_BY_NAME or
+        # _UNSUPPORTED_BACKENDS once you've checked the kernel path.
+        msg = (
+            f"pie_backend_sglang doesn't know how to route custom_mask "
+            f"through SGLang attention backend {name!r}. Either add a "
+            f"strategy in pie_backend_sglang/mask_hooks.py or pick one of "
+            f"the verified backends: {supported}."
+        )
+    raise _UnsupportedBackendError(msg)
