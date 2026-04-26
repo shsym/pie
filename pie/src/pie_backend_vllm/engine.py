@@ -124,10 +124,10 @@ class VllmEngine:
             loaded.model, enforce_eager=bool(driver_config.enforce_eager),
         )
 
-        # The shared RPC worker reads `config.kv_page_size` to build batches.
-        # Vllm's chosen page size lives in `cache_config.block_size`; copy it
-        # back so the worker sees the right value.
-        config.kv_page_size = int(loaded.vllm_config.cache_config.block_size)
+        # `kv_page_size` is not on the lean RuntimeConfig — the shared RPC
+        # worker reads it via `engine.capabilities().kv_page_size`, which
+        # we already source from `vllm_config.cache_config.block_size` in
+        # `capabilities()` below.
 
         kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)

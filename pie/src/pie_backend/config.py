@@ -85,17 +85,10 @@ class RuntimeConfig:
     # Engine-computed at load time. None pre-load; set by the engine.
     max_num_kv_pages: int | None = None
 
-    # Page size (in tokens) of the chosen KV layout. Required by the shared
-    # RPC worker (`_handle_fire_batch` builds a `Batch` with this). Native
-    # drivers set it from their config; the vllm driver sets it from vllm's
-    # resolved `cache_config.block_size` post-load. Default 16 matches both
-    # native default and vllm default.
-    kv_page_size: int = 16
-
-    # Sampling-distribution width cap (top-k tracked when an inferlet asks
-    # for the distribution). Read by `Batch.get_sampling_metadata`. Native
-    # default is 32.
-    max_dist_size: int = 32
+    # NOTE: `kv_page_size` and `max_dist_size` are NativeRuntimeConfig-only.
+    # The shared RPC worker (`_handle_fire_batch`) falls back to
+    # `engine.capabilities().kv_page_size` for drivers (vllm/sglang) that
+    # don't carry them on their config — see pie_backend/worker.py.
 
     # ---------- properties ----------
     @property
@@ -207,14 +200,14 @@ class NativeRuntimeConfig(RuntimeConfig):
     keeps reading `runtime_config.X` unchanged.
     """
 
-    # Memory + KV layout. `kv_page_size` is on the universal RuntimeConfig
-    # because the shared RPC worker reads it; native's value lives there.
+    # Memory + KV layout
     gpu_mem_utilization: float = 0.8
+    kv_page_size: int = 16
 
-    # Batching limits the native scheduler / kernels enforce.
-    # `max_dist_size` is on the universal RuntimeConfig (shared with vllm).
+    # Batching limits the native scheduler / kernels enforce
     max_batch_tokens: int = 10240
     max_batch_size: int = 512
+    max_dist_size: int = 32
     max_num_embeds: int = 128
 
     # Adapter pool sizing (CmaesAdapter)
