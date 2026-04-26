@@ -627,6 +627,152 @@ __global__ void __launch_bounds__(BN, 4) batched_randn_matmul_sectioned_kernel(
 }
 
 // ============================================================================
+//  Multi-input sectioned matmul kernel.
+//
+//  Like batched_randn_matmul_sectioned, but each output section reads from a
+//  DIFFERENT slice of the input. The reduction dim is shared (`x_width`)
+//  across sections; each section has its own `x_start` column offset into
+//  the packed input.
+//
+//  This collapses the 3 UP matmul calls in the LoRA adapter into a single
+//  launch: x_packed = [d_q | d_k | d_v] (B, 3·rank), output sections
+//  Q/K/V each pull from their respective rank-wide input slice.
+//
+//  The full x row fits comfortably in shared memory for typical LoRA
+//  configurations (rank · num_sections ≤ 64), so all sections share one
+//  cooperative load.
+// ============================================================================
+
+struct MultiInputSections {
+    int x_starts[4];     // input col offset per section
+    int widths[4];       // output col width per section (used as noise's section_global_cols)
+    int64_t offsets[4];  // seed offset per section
+    int n;
+};
+
+template<typename XT, typename ST, typename OT, int BN, bool HAS_MEAN>
+__global__ void __launch_bounds__(BN, 4)
+batched_randn_matmul_multi_input_sectioned_kernel(
+    const XT* __restrict__ x,         // (B, sum_in)
+    const int64_t* __restrict__ seeds,
+    const ST* __restrict__ S,         // (x_width, sum_out)
+    const ST* __restrict__ W_mean,    // optional, same shape as S
+    int stride_Wi, int stride_Wo,
+    OT* __restrict__ y,               // (B, sum_out)
+    int B, int sum_in, int x_width, int O,
+    int stride_xb, int stride_xi,
+    int stride_Si, int stride_So,
+    int stride_yb, int stride_yo,
+    MultiInputSections sec,
+    float alpha, float beta
+) {
+    ZIG_KERNEL_PROLOGUE(BN);
+
+    int b       = blockIdx.y;
+    int n_tile  = blockIdx.x;
+    int t       = threadIdx.x;
+    int o_local = n_tile * BN + t;
+
+    // Find which output section this thread is in. The loop walks sections
+    // in order; once we find one whose end exceeds o_local, we stop.
+    // (`done` flag is necessary: with unequal section widths, the original
+    // accumulator-style check `o_local >= boundary + widths[s]` would
+    // erroneously match later sections when boundary hasn't yet advanced.)
+    int sec_idx = 0;
+    int boundary = 0;
+    int sec_width = sec.widths[0];
+    int sec_x_start = sec.x_starts[0];
+    int64_t sec_seed_offset = sec.offsets[0];
+    bool done = false;
+    #pragma unroll
+    for (int s = 0; s < 4; s++) {
+        if (s < sec.n && !done) {
+            int next_boundary = boundary + sec.widths[s];
+            if (o_local < next_boundary) {
+                done = true;
+            } else {
+                boundary = next_boundary;
+                sec_idx = s + 1;
+                sec_width = (s + 1 < sec.n) ? sec.widths[s + 1] : 0;
+                sec_x_start = (s + 1 < sec.n) ? sec.x_starts[s + 1] : 0;
+                sec_seed_offset = (s + 1 < sec.n) ? sec.offsets[s + 1] : 0;
+            }
+        }
+    }
+    int o_in_section = o_local - boundary;
+
+    int64_t seed_val = seeds[b];
+    if (seed_val == 0) {
+        if (o_local < O) {
+            float y_old = (beta != 0.0f) ? (float)y[b * stride_yb + o_local * stride_yo] : 0.0f;
+            y[b * stride_yb + o_local * stride_yo] = (OT)(beta * y_old);
+        }
+        return;
+    }
+    uint32_t seed = (uint32_t)(seed_val + sec_seed_offset);
+
+    const uint32_t section_global_cols = (uint32_t)sec_width;
+    const int o_abs = o_in_section;  // col_offset=0 (multi-input is single-GPU only)
+
+    // Cooperative load: all of x[b, 0:sum_in] into shared memory. Capped at
+    // 128 floats which covers up to rank=32, num_sections=4.
+    constexpr int X_MAX = 128;
+    __shared__ float x_sh[X_MAX];
+    const int x_base = b * stride_xb;
+    for (int j = t; j < sum_in; j += BN) {
+        x_sh[j] = (float)x[x_base + j * stride_xi];
+    }
+    __syncthreads();
+
+    const bool active = (o_local < O);
+    const int packs = (x_width + 3) / 4;
+
+    float acc = 0.0f;
+    if (active) {
+        for (int kp = 0; kp < packs; kp++) {
+            int row0 = kp * 4;
+
+            uint32_t offset = (uint32_t)kp * section_global_cols + (uint32_t)o_abs;
+            Normals4 w = philox_4_normals(seed, offset ZIG_LUT_ARG);
+
+            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+            if (row0     < x_width) s0 = (float)S[(row0    ) * stride_Si + o_local * stride_So];
+            if (row0 + 1 < x_width) s1 = (float)S[(row0 + 1) * stride_Si + o_local * stride_So];
+            if (row0 + 2 < x_width) s2 = (float)S[(row0 + 2) * stride_Si + o_local * stride_So];
+            if (row0 + 3 < x_width) s3 = (float)S[(row0 + 3) * stride_Si + o_local * stride_So];
+
+            float x0 = 0.0f, x1 = 0.0f, x2 = 0.0f, x3 = 0.0f;
+            if (row0     < x_width) x0 = x_sh[sec_x_start + row0    ];
+            if (row0 + 1 < x_width) x1 = x_sh[sec_x_start + row0 + 1];
+            if (row0 + 2 < x_width) x2 = x_sh[sec_x_start + row0 + 2];
+            if (row0 + 3 < x_width) x3 = x_sh[sec_x_start + row0 + 3];
+
+            if constexpr (HAS_MEAN) {
+                float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
+                if (row0     < x_width) m0 = (float)W_mean[(row0    ) * stride_Wi + o_local * stride_Wo];
+                if (row0 + 1 < x_width) m1 = (float)W_mean[(row0 + 1) * stride_Wi + o_local * stride_Wo];
+                if (row0 + 2 < x_width) m2 = (float)W_mean[(row0 + 2) * stride_Wi + o_local * stride_Wo];
+                if (row0 + 3 < x_width) m3 = (float)W_mean[(row0 + 3) * stride_Wi + o_local * stride_Wo];
+                acc = fmaf(x0, m0 + s0 * w.n0, acc);
+                acc = fmaf(x1, m1 + s1 * w.n1, acc);
+                acc = fmaf(x2, m2 + s2 * w.n2, acc);
+                acc = fmaf(x3, m3 + s3 * w.n3, acc);
+            } else {
+                acc = fmaf(x0 * s0, w.n0, acc);
+                acc = fmaf(x1 * s1, w.n1, acc);
+                acc = fmaf(x2 * s2, w.n2, acc);
+                acc = fmaf(x3 * s3, w.n3, acc);
+            }
+        }
+    }
+
+    if (active) {
+        float y_old = (beta != 0.0f) ? (float)y[b * stride_yb + o_local * stride_yo] : 0.0f;
+        y[b * stride_yb + o_local * stride_yo] = (OT)(alpha * acc + beta * y_old);
+    }
+}
+
+// ============================================================================
 //  Generate kernel.
 // ============================================================================
 //
@@ -909,6 +1055,54 @@ void launch_matmul_wide(
     }
 }
 
+template<typename XT, typename ST, typename OT, int BN>
+void launch_matmul_multi_input_sectioned(
+    const torch::Tensor& x, const torch::Tensor& seeds, const torch::Tensor& S,
+    torch::Tensor& y,
+    MultiInputSections sec, float alpha, float beta,
+    const torch::Tensor* W_mean_opt
+) {
+    const int B = (int)x.size(0);
+    const int sum_in = (int)x.size(1);
+    const int x_width = (int)S.size(0);
+    const int O = (int)S.size(1);
+
+    const int tiles_n = (O + BN - 1) / BN;
+    dim3 grid(tiles_n, B);
+    dim3 block(BN);
+
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    if (W_mean_opt != nullptr) {
+        const auto& W = *W_mean_opt;
+        batched_randn_matmul_multi_input_sectioned_kernel<XT, ST, OT, BN, true><<<grid, block, 0, stream>>>(
+            x.data_ptr<XT>(),
+            seeds.data_ptr<int64_t>(),
+            S.data_ptr<ST>(),
+            W.data_ptr<ST>(),
+            (int)W.stride(0), (int)W.stride(1),
+            y.data_ptr<OT>(),
+            B, sum_in, x_width, O,
+            (int)x.stride(0), (int)x.stride(1),
+            (int)S.stride(0), (int)S.stride(1),
+            (int)y.stride(0), (int)y.stride(1),
+            sec, alpha, beta
+        );
+    } else {
+        batched_randn_matmul_multi_input_sectioned_kernel<XT, ST, OT, BN, false><<<grid, block, 0, stream>>>(
+            x.data_ptr<XT>(),
+            seeds.data_ptr<int64_t>(),
+            S.data_ptr<ST>(),
+            nullptr, 0, 0,
+            y.data_ptr<OT>(),
+            B, sum_in, x_width, O,
+            (int)x.stride(0), (int)x.stride(1),
+            (int)S.stride(0), (int)S.stride(1),
+            (int)y.stride(0), (int)y.stride(1),
+            sec, alpha, beta
+        );
+    }
+}
+
 template<typename ST, int BN, int BM>
 void launch_generate(
     const torch::Tensor& seeds, const torch::Tensor& S, torch::Tensor& y,
@@ -1121,6 +1315,102 @@ torch::Tensor batched_randn_matmul_sectioned_cuda(
     return y;
 }
 
+torch::Tensor batched_randn_matmul_multi_input_sectioned_cuda(
+    torch::Tensor x, torch::Tensor seeds, torch::Tensor S,
+    std::vector<int64_t> x_starts,
+    std::vector<int64_t> section_widths,
+    std::vector<int64_t> section_offsets,
+    c10::optional<torch::Tensor> out_opt,
+    double alpha,
+    double beta,
+    c10::optional<torch::Tensor> W_mean_opt
+) {
+    TORCH_CHECK(x.is_cuda() && S.is_cuda(), "x and S must be CUDA");
+    TORCH_CHECK(x.dim() == 2 && S.dim() == 2);
+    TORCH_CHECK(x_starts.size() == section_widths.size() && x_starts.size() == section_offsets.size(),
+                "x_starts/section_widths/section_offsets length mismatch");
+    TORCH_CHECK(section_widths.size() >= 1 && section_widths.size() <= 4, "up to 4 sections supported");
+    const int64_t B = x.size(0);
+    const int64_t sum_in = x.size(1);
+    const int64_t x_width = S.size(0);
+    const int64_t O = S.size(1);
+    TORCH_CHECK(sum_in <= 128, "multi-input sectioned: total packed input width must be <= 128");
+
+    int64_t total_out = 0;
+    for (auto w : section_widths) total_out += w;
+    TORCH_CHECK(total_out == O, "sum(section_widths) must equal S.shape[1]");
+
+    MultiInputSections sec{};
+    sec.n = (int)section_widths.size();
+    for (int i = 0; i < sec.n; i++) {
+        sec.widths[i]   = (int)section_widths[i];
+        sec.offsets[i]  = section_offsets[i];
+        sec.x_starts[i] = (int)x_starts[i];
+        TORCH_CHECK(sec.x_starts[i] + (int)x_width <= (int)sum_in,
+                    "x_starts[i] + x_width must fit in sum_in");
+    }
+
+    torch::Tensor y;
+    float kernel_alpha = (float)alpha;
+    float kernel_beta = (float)beta;
+    if (out_opt.has_value()) {
+        y = *out_opt;
+        TORCH_CHECK(y.size(0) == B && y.size(1) == O, "out shape mismatch");
+        TORCH_CHECK(
+            y.scalar_type() == torch::kFloat32
+            || y.scalar_type() == torch::kFloat16
+            || y.scalar_type() == torch::kBFloat16,
+            "out must be float32, float16, or bfloat16");
+    } else {
+        y = torch::empty({B, O}, x.options().dtype(torch::kFloat32));
+        kernel_beta = 0.0f;
+    }
+
+    const torch::Tensor* W_mean_ptr = nullptr;
+    if (W_mean_opt.has_value()) {
+        const auto& W = *W_mean_opt;
+        TORCH_CHECK(W.is_cuda(), "W_mean must be CUDA");
+        TORCH_CHECK(W.scalar_type() == S.scalar_type(), "W_mean dtype must match S dtype");
+        TORCH_CHECK(W.dim() == 2 && W.size(0) == S.size(0) && W.size(1) == S.size(1),
+                    "W_mean shape must equal S shape");
+        W_mean_ptr = &W;
+    }
+
+    auto dispatch_bn = [&](auto xt_tag, auto st_tag, auto ot_tag) {
+        using XT = typename decltype(xt_tag)::type;
+        using ST = typename decltype(st_tag)::type;
+        using OT = typename decltype(ot_tag)::type;
+        if (O <= 32)       launch_matmul_multi_input_sectioned<XT, ST, OT, 32>(x, seeds, S, y, sec, kernel_alpha, kernel_beta, W_mean_ptr);
+        else if (O <= 64)  launch_matmul_multi_input_sectioned<XT, ST, OT, 64>(x, seeds, S, y, sec, kernel_alpha, kernel_beta, W_mean_ptr);
+        else                launch_matmul_multi_input_sectioned<XT, ST, OT, 128>(x, seeds, S, y, sec, kernel_alpha, kernel_beta, W_mean_ptr);
+    };
+
+    auto xdt = x.scalar_type();
+    auto sdt = S.scalar_type();
+    auto odt = y.scalar_type();
+    auto ot_dispatch = [&](auto xt_tag, auto st_tag) {
+        using XT = typename decltype(xt_tag)::type;
+        using ST = typename decltype(st_tag)::type;
+        if (odt == torch::kFloat32)       dispatch_bn(type_tag<XT>{}, type_tag<ST>{}, type_tag<float>{});
+        else if (odt == torch::kFloat16)  dispatch_bn(type_tag<XT>{}, type_tag<ST>{}, type_tag<at::Half>{});
+        else if (odt == torch::kBFloat16) dispatch_bn(type_tag<XT>{}, type_tag<ST>{}, type_tag<at::BFloat16>{});
+        else TORCH_CHECK(false, "unsupported output dtype");
+    };
+    if      (xdt == torch::kFloat16   && sdt == torch::kFloat32)  ot_dispatch(type_tag<at::Half>{},     type_tag<float>{});
+    else if (xdt == torch::kFloat16   && sdt == torch::kFloat16)  ot_dispatch(type_tag<at::Half>{},     type_tag<at::Half>{});
+    else if (xdt == torch::kFloat16   && sdt == torch::kBFloat16) ot_dispatch(type_tag<at::Half>{},     type_tag<at::BFloat16>{});
+    else if (xdt == torch::kFloat32   && sdt == torch::kFloat32)  ot_dispatch(type_tag<float>{},        type_tag<float>{});
+    else if (xdt == torch::kFloat32   && sdt == torch::kFloat16)  ot_dispatch(type_tag<float>{},        type_tag<at::Half>{});
+    else if (xdt == torch::kFloat32   && sdt == torch::kBFloat16) ot_dispatch(type_tag<float>{},        type_tag<at::BFloat16>{});
+    else if (xdt == torch::kBFloat16  && sdt == torch::kFloat32)  ot_dispatch(type_tag<at::BFloat16>{}, type_tag<float>{});
+    else if (xdt == torch::kBFloat16  && sdt == torch::kFloat16)  ot_dispatch(type_tag<at::BFloat16>{}, type_tag<at::Half>{});
+    else if (xdt == torch::kBFloat16  && sdt == torch::kBFloat16) ot_dispatch(type_tag<at::BFloat16>{}, type_tag<at::BFloat16>{});
+    else TORCH_CHECK(false, "unsupported dtype combination");
+
+    return y;
+}
+
+
 torch::Tensor batched_randn_generate_cuda(
     torch::Tensor seeds, torch::Tensor S,
     int64_t col_offset, int64_t global_cols
@@ -1163,6 +1453,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("x"), py::arg("seeds"), py::arg("S"),
           py::arg("section_widths"), py::arg("section_offsets"),
           py::arg("col_offset") = 0, py::arg("global_cols") = 0,
+          py::arg("out") = c10::nullopt,
+          py::arg("alpha") = 1.0,
+          py::arg("beta") = 0.0,
+          py::arg("W_mean") = c10::nullopt);
+    m.def("batched_randn_matmul_multi_input_sectioned",
+          &batched_randn_matmul_multi_input_sectioned_cuda,
+          "batched_randn_matmul where each output section pulls from a "
+          "different slice of the packed input (CUDA, single-GPU only)",
+          py::arg("x"), py::arg("seeds"), py::arg("S"),
+          py::arg("x_starts"),
+          py::arg("section_widths"),
+          py::arg("section_offsets"),
           py::arg("out") = c10::nullopt,
           py::arg("alpha") = 1.0,
           py::arg("beta") = 0.0,

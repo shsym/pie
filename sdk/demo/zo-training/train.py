@@ -74,10 +74,14 @@ class TrainingConfig:
     inferlet_names: dict[str, str] = field(
         default_factory=lambda: {
             "es-init": "es-init@0.1.5",
-            "es-rollout": "es-rollout@0.1.5",
+            "es-rollout": "es-rollout@0.1.6",
             "es-update": "es-update@0.1.5",
         }
     )
+
+    # When False, rollouts skip the adapter entirely (no ZO perturbation).
+    # Used for A/B latency comparisons; training-meaningful runs leave it True.
+    use_adapter: bool = True
 
     # --- Dataset ---
     dataset: str = "math"  # "countdown" or "math"
@@ -185,6 +189,7 @@ async def run_rollouts(
             "rollouts": [{"uid": uid, "task": problem, "seed": int(seed)}],
             "max_num_outputs": config.max_tokens_gen,
             "system_prompt": config.system_prompt,
+            "use_adapter": config.use_adapter,
         }
         t0 = time.time()
         res_json = await launch_and_collect(client, inferlet, inp)

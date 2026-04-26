@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
+import os
 import queue
 import socket
 import time
@@ -271,7 +272,7 @@ def _bootstrap(
         devices=py_devices,
         scheduler=pie_runtime.SchedulerConfig(
             request_timeout_secs=120,
-            max_wait_ms=50,
+            max_wait_ms=int(os.environ.get("PIE_MAX_WAIT_MS", "50")),
             min_batch_for_optimization=8,
         ),
         default_token_budget=model.default_token_budget,
