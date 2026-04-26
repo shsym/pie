@@ -49,7 +49,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .mask_compute import PieAttnExtras, sdpa_gather_path
+from .mask_compute import PieAttnExtras
 
 
 # ----------------------------------------------------------------------------
@@ -101,23 +101,12 @@ class _FlashInferStrategy(_Strategy):
     The wrapper itself is built and planned in `forward_pass.transform()`
     once per batch and stashed on `extras.flashinfer_wrapper`. The strategy
     just runs it.
-
-    Setting `PIE_VLLM_MASK_FORCE_SDPA=1` falls back to the universal SDPA
-    gather. Debug-only — not a production toggle.
     """
 
     pie_uses_flashinfer_wrapper = True
 
     def run(self, impl, layer, query, key, value, kv_cache, attn_metadata,
             output, extras):
-        import os
-
-        if os.environ.get("PIE_VLLM_MASK_FORCE_SDPA"):
-            sdpa_gather_path(
-                layer=layer, query=query, kv_cache=kv_cache,
-                extras=extras, output=output,
-            )
-            return
         if extras.flashinfer_wrapper is None:
             raise RuntimeError(
                 "pie_backend_vllm: FlashInfer strategy reached run() but "

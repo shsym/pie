@@ -1,12 +1,10 @@
 """Direct A/B harness for the custom-mask paths in pie_backend_vllm.
 
 Runs the same synthetic forward pass — identical token IDs, positions, KV
-pages, and BRLE attention mask — through three backends:
+pages, and BRLE attention mask — through both backends:
 
   * pie_backend       (FlashInfer reference, gold standard)
-  * pie_backend_vllm + PieMaskedFlashInferImpl (the production fast path)
-  * pie_backend_vllm + SDPA gather (the universal fallback, forced via
-    PIE_VLLM_MASK_FORCE_SDPA=1 — debug knob, not a production toggle)
+  * pie_backend_vllm + _FlashInferStrategy (the production fast path)
 
 For each, we print:
   * the sampled (argmax) token at the last position
@@ -276,8 +274,8 @@ def main():
     parser.add_argument("--native-only", action="store_true")
     parser.add_argument(
         "--paths",
-        default="native,vllm-sdpa,vllm-flashinfer",
-        help="Comma-separated subset of {native,vllm-sdpa,vllm-flashinfer}",
+        default="native,vllm-flashinfer",
+        help="Comma-separated subset of {native,vllm-flashinfer}",
     )
     args = parser.parse_args()
 
@@ -307,19 +305,7 @@ def main():
                               n_warmup=args.n_warmup, n_runs=args.n_runs)
             r_no = benchmark(engine, inputs_pkg, args.page_size, with_mask=False,
                              n_warmup=args.n_warmup, n_runs=args.n_runs)
-        elif path == "vllm-sdpa":
-            # Force the universal SDPA gather path via the debug knob inside
-            # PieMaskedFlashInferImpl._compute_with_mask. Production never
-            # sets this — the active impl subclass picks the path structurally.
-            os.environ["PIE_VLLM_MASK_FORCE_SDPA"] = "1"
-            engine = load_vllm_engine(args.model, device=args.device)
-            r_yes = benchmark(engine, inputs_pkg, args.page_size, with_mask=True,
-                              n_warmup=args.n_warmup, n_runs=args.n_runs)
-            r_no = benchmark(engine, inputs_pkg, args.page_size, with_mask=False,
-                             n_warmup=args.n_warmup, n_runs=args.n_runs)
-            os.environ.pop("PIE_VLLM_MASK_FORCE_SDPA", None)
         elif path == "vllm-flashinfer":
-            os.environ.pop("PIE_VLLM_MASK_FORCE_SDPA", None)
             engine = load_vllm_engine(args.model, device=args.device)
             r_yes = benchmark(engine, inputs_pkg, args.page_size, with_mask=True,
                               n_warmup=args.n_warmup, n_runs=args.n_runs)
