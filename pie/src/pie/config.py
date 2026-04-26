@@ -44,12 +44,18 @@ class ModelConfig:
     kv_page_size: int = 16
     # Inference backend: "native" uses pie_backend (pie's own model code +
     # flashinfer/metal kernels); "vllm" uses pie_backend_vllm (vllm model code
-    # under pie's RPC surface). Selected once per `pie serve` invocation.
+    # under pie's RPC surface); "sglang" uses pie_backend_sglang. Selected once
+    # per `pie serve` invocation.
     backend: str = "native"
     # Passthrough for vllm's attention backend selector (e.g. "FLASHINFER",
     # "FLASH_ATTN", "FLEX_ATTENTION", "TRITON_ATTN", "ROCM_AITER", "PALLAS").
     # "AUTO" lets vllm pick per-platform. Only consulted when backend == "vllm".
     vllm_attn_backend: str = "AUTO"
+    # Passthrough for sglang's attention backend selector (e.g. "triton",
+    # "flashinfer", "flex_attention", "fa3"). Only consulted when
+    # backend == "sglang". "triton" is the default — it has the cleanest
+    # custom-mask path and works on all NVIDIA SM 7.5+.
+    sglang_attn_backend: str = "triton"
     max_batch_tokens: int | None = None
     max_dist_size: int = 32
     max_num_embeds: int = 128
@@ -290,6 +296,9 @@ def load_config(
             activation_dtype=mc.get("activation_dtype", "bfloat16"),
             weight_dtype=mc.get("weight_dtype", "bfloat16"),
             kv_page_size=mc.get("kv_page_size", 16),
+            backend=mc.get("backend", "native"),
+            vllm_attn_backend=mc.get("vllm_attn_backend", "AUTO"),
+            sglang_attn_backend=mc.get("sglang_attn_backend", "triton"),
             max_batch_tokens=mc.get("max_batch_tokens"),
             max_dist_size=mc.get("max_dist_size", 32),
             max_num_embeds=mc.get("max_num_embeds", 128),

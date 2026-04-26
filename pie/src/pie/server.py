@@ -149,11 +149,13 @@ def _bootstrap(
     backend_kind = (model.backend or "native").lower()
     if backend_kind == "vllm":
         from pie_backend_vllm import worker
+    elif backend_kind == "sglang":
+        from pie_backend_sglang import worker
     elif backend_kind == "native":
         from pie_backend import worker
     else:
         raise ValueError(
-            f"Unknown backend {model.backend!r}. Expected 'native' or 'vllm'."
+            f"Unknown backend {model.backend!r}. Expected 'native', 'vllm', or 'sglang'."
         )
 
     # Derive paths
@@ -272,10 +274,15 @@ def _bootstrap(
 
     group0_meta = device_metadata_by_group.get(0, {})
 
+    # Backend may override the user-requested kv_page_size to match its
+    # attention kernel's preferred value. Fall back to the static config when
+    # the worker didn't report one (e.g. older backends).
+    chosen_kv_page_size = int(group0_meta.get("kv_page_size", model.kv_page_size))
+
     py_model = pie_runtime.ModelConfig(
         name=model.hf_repo,
         arch_name=group0_meta.get("arch_name", "dummy"),
-        kv_page_size=model.kv_page_size,
+        kv_page_size=chosen_kv_page_size,
         tokenizer_path=str(Path(group0_meta.get("snapshot_dir", "")) / "tokenizer.json"),
         devices=py_devices,
         scheduler=pie_runtime.SchedulerConfig(

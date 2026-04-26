@@ -94,6 +94,10 @@ class RuntimeConfig:
     # the native backend; only consulted by pie_backend_vllm.loader.
     vllm_attn_backend: str = "AUTO"
 
+    # SGLang-specific: attention-backend selector ("triton", "flashinfer",
+    # "flex_attention", "fa3", ...). Ignored by other backends.
+    sglang_attn_backend: str = "triton"
+
     # =========================================================================
     # Convenience Properties (formerly in model.Config)
     # =========================================================================
@@ -181,6 +185,7 @@ class RuntimeConfig:
         dummy_mode: bool = False,
         cpu_mem_budget_in_gb: int = 0,
         vllm_attn_backend: str = "AUTO",
+        sglang_attn_backend: str = "triton",
     ) -> "RuntimeConfig":
         """
         Factory method to build a validated and resolved RuntimeConfig.
@@ -277,6 +282,7 @@ class RuntimeConfig:
             dummy_mode=dummy_mode,
             swap_budget_bytes=cpu_mem_budget_in_gb * (1 << 30),
             vllm_attn_backend=vllm_attn_backend,
+            sglang_attn_backend=sglang_attn_backend,
         )
 
     def print(self) -> None:

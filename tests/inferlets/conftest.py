@@ -47,10 +47,12 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser.add_argument("--dummy", action="store_true", help="Use dummy mode (no GPU)")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per inferlet (seconds)")
     parser.add_argument("--verbose", action="store_true", help="Show stdout on failure")
-    parser.add_argument("--backend", default="native", choices=["native", "vllm"],
-                        help="Inference backend: 'native' (pie_backend) or 'vllm' (pie_backend_vllm)")
+    parser.add_argument("--backend", default="native", choices=["native", "vllm", "sglang"],
+                        help="Inference backend: 'native' (pie_backend), 'vllm' (pie_backend_vllm), or 'sglang' (pie_backend_sglang)")
     parser.add_argument("--vllm-attn-backend", default="AUTO",
                         help="vLLM attention backend hint (e.g., FLASH_ATTN, FLASHINFER); only used when --backend=vllm")
+    parser.add_argument("--sglang-attn-backend", default="triton",
+                        help="SGLang attention backend (e.g., triton, flashinfer, flex_attention); only used when --backend=sglang")
     return parser
 
 
@@ -165,6 +167,7 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
             dummy_mode=args.dummy,
             backend=args.backend,
             vllm_attn_backend=args.vllm_attn_backend,
+            sglang_attn_backend=args.sglang_attn_backend,
         )],
     )
     async with Server(cfg) as server:
