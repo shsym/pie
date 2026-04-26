@@ -466,7 +466,14 @@ def decode_brle_batch(
         rle_start = mask_indptr[k]
         rle_end = mask_indptr[k + 1]
         global_bit_start = token_acc_seq_lens[k]
-        valid_len = position_ids[k] + 1
+        # Row size is the request's full seq_len (extracted from the
+        # cumulative offsets we precomputed). Capping at `position_ids[k] + 1`
+        # — as the previous code did — silently dropped any True bits the
+        # inferlet emitted past the diagonal, so non-causal patterns
+        # (Jacobi, tree decoding, attention sink with explicit forward bits)
+        # decoded as effectively causal. For purely-causal masks this is a
+        # no-op since the runtime emits zero bits past the diagonal anyway.
+        valid_len = token_acc_seq_lens[k + 1] - token_acc_seq_lens[k]
 
         curr_bit_pos = global_bit_start
         bits_consumed = 0
