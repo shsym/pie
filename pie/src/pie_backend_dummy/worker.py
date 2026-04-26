@@ -1,8 +1,7 @@
-"""Worker entry point for the vllm driver.
+"""Worker entry point for the `dummy` driver.
 
-Delegates the universal lifecycle (distributed init, group setup, ready-queue
-handshake, leader/follower dispatch) to `pie_backend.worker.run_worker`, then
-plugs in vllm-specific engine construction.
+Reuses pie_backend's engine machinery with `dummy_mode=True` to skip real
+weight loading. Useful for tests and scheduler/runtime smoke checks.
 """
 
 from __future__ import annotations
@@ -22,16 +21,10 @@ def worker_main(
     group_topology: list[list[int]],
     ready_queue,
 ):
-    """Worker entry point — `vllm` driver.
-
-    `driver_config` is `VllmDriverConfig` as a dict; vllm's own knobs live
-    on the typed dataclass and never leak into pie's `RuntimeConfig`.
-    """
+    """Worker entry point — `dummy` driver."""
+    from pie_backend.config import NativeRuntimeConfig
+    from pie_backend.engine import Engine
     from pie_backend.worker import run_worker
-    from .config import VllmDriverConfig
-    from .engine import VllmEngine
-
-    vllm_cfg = VllmDriverConfig(**driver_config)
 
     run_worker(
         local_rank=local_rank,
@@ -41,5 +34,9 @@ def worker_main(
         model_config=model_config,
         group_topology=group_topology,
         ready_queue=ready_queue,
-        build_engine=lambda cfg, pg: VllmEngine.load(cfg, vllm_cfg, compute_process_group=pg),
+        build_engine=lambda cfg, pg: Engine.load(cfg, compute_process_group=pg),
+        # Dummy uses NativeRuntimeConfig with `dummy_mode=True` so Engine.load
+        # takes its dummy branch (no real weight load, returns random tokens).
+        runtime_config_extras={**driver_config, "dummy_mode": True},
+        config_cls=NativeRuntimeConfig,
     )

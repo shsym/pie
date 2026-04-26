@@ -1,9 +1,9 @@
 """SGLang-backed inference engine.
 
-Mirrors `pie_backend.engine.Engine`'s public surface so worker.py can use
-either backend interchangeably. Internally, the model and kernels come from
-SGLang; the surrounding RPC, batching, telemetry, and dispatch scaffolding are
-imported directly from `pie_backend`.
+Mirrors `pie_backend.engine.Engine`'s public surface so the worker can use
+either driver interchangeably. Internally, the model and kernels come from
+SGLang; the surrounding RPC, batching, telemetry, and dispatch scaffolding
+are imported directly from `pie_backend`.
 """
 
 from __future__ import annotations
@@ -17,16 +17,18 @@ from pie_backend.config import RuntimeConfig
 from pie_backend import telemetry
 
 from . import _require_sglang
+from .config import SGLangDriverConfig
 
 
 class SGLangEngine:
     """Inference engine that delegates the forward pass to an SGLang ModelRunner.
 
-    Public surface matches `pie_backend.engine.Engine`. See `VllmEngine` in the
-    sibling vllm backend for the canonical reference.
+    Public surface matches `pie_backend.engine.Engine`. See `VllmEngine` for
+    the canonical sibling reference.
     """
 
     config: RuntimeConfig
+    driver_config: SGLangDriverConfig
     forward_pass: object
     model_config: object
     kv_cache_at_layer: list[torch.Tensor]
@@ -41,6 +43,7 @@ class SGLangEngine:
     def __init__(
         self,
         config: RuntimeConfig,
+        driver_config: SGLangDriverConfig,
         model_config,
         forward_pass,
         kv_cache_at_layer: list,
@@ -52,6 +55,7 @@ class SGLangEngine:
         swap_pool_size: int = 0,
     ):
         self.config = config
+        self.driver_config = driver_config
         self.model_config = model_config
         self.forward_pass = forward_pass
         self.kv_cache_at_layer = kv_cache_at_layer
@@ -67,6 +71,7 @@ class SGLangEngine:
     def load(
         cls,
         config: RuntimeConfig,
+        driver_config: SGLangDriverConfig,
         log_queue: object = None,
         compute_process_group=None,
     ) -> "SGLangEngine":
@@ -94,15 +99,15 @@ class SGLangEngine:
             torch.cuda.manual_seed_all(config.random_seed)
 
         _log("Loading sglang model", "DEBUG")
-        loaded = load_sglang_model(config, log_queue=log_queue, compute_pg=compute_process_group)
+        loaded = load_sglang_model(
+            config, driver_config, log_queue=log_queue, compute_pg=compute_process_group
+        )
         _log("Loaded sglang model", "DEBUG")
 
         # Rebind sglang's k_buffer/v_buffer to pie-shaped storage so the swap
         # RPC handlers see the canonical (num_blocks, 2, page_size, h, d) layout.
         kv_cache_at_layer, num_blocks, page_size = _rebind_pool_buffers(loaded, config)
         config.max_num_kv_pages = num_blocks
-        # Honor sglang's chosen page size (may differ from the TOML hint).
-        config.kv_page_size = page_size
 
         forward_pass = SGLangForwardPass(
             runner=loaded.runner,
@@ -112,6 +117,7 @@ class SGLangEngine:
 
         return cls(
             config=config,
+            driver_config=driver_config,
             model_config=loaded.sglang_model_config,
             forward_pass=forward_pass,
             kv_cache_at_layer=kv_cache_at_layer,
@@ -125,9 +131,6 @@ class SGLangEngine:
 
     @torch.inference_mode()
     def fire_batch(self, inputs: dict, sampling_metadata: dict) -> dict:
-        # We collapse embed/transform: SGLang's forward() owns input embedding.
-        # `embed_inputs` returns the inputs dict as a passthrough; transform()
-        # builds the ForwardBatch and runs the model.
         passthrough = self.forward_pass.embed_inputs(inputs)
 
         gathered_logits = self.forward_pass.transform(
@@ -151,7 +154,7 @@ class SGLangEngine:
     def init_adapter(self, *args, **kwargs):
         raise NotImplementedError(
             "Adapters are not yet supported on the sglang backend. "
-            "Use --backend native for adapter workloads."
+            "Use --driver native for adapter workloads."
         )
 
     def update_adapter(self, *args, **kwargs):
@@ -171,6 +174,47 @@ class SGLangEngine:
         if query == "ping":
             return "pong"
         return "unknown query"
+
+    def capabilities(self):
+        """Report this backend's resolved capacities up to pie's runtime.
+
+        Sources values from the loaded SGLang ModelRunner / ServerArgs so
+        the user's preferences are reconciled against what sglang's chosen
+        attention kernel actually supports (page_size in particular may
+        differ from what the user asked for).
+        """
+        from pie.capabilities import BackendCapabilities
+
+        runner = self.forward_pass.runner
+        sglang_mc = runner.model_config
+
+        if self.config.max_num_kv_pages is None:
+            raise RuntimeError(
+                "config.max_num_kv_pages was not set by the loader — KV cache "
+                "rebind must run before capabilities() is called."
+            )
+        if not self.snapshot_dir:
+            raise RuntimeError("snapshot_dir is empty; loader did not resolve it.")
+
+        dtype_str = str(self.config.activation_dtype).removeprefix("torch.")
+
+        # SGLang derives `max_running_requests` and `max_total_num_tokens`
+        # from `mem_fraction_static`. We surface those as pie's batch limits.
+        max_batch_size = int(getattr(runner, "max_running_requests", 256))
+        max_batch_tokens = int(getattr(runner, "max_total_num_tokens", 10240))
+
+        return BackendCapabilities(
+            total_pages=int(self.config.max_num_kv_pages),
+            kv_page_size=int(runner.page_size),
+            swap_pool_size=int(self.swap_pool_size),
+            max_batch_tokens=max_batch_tokens,
+            max_batch_size=max_batch_size,
+            arch_name=self.arch_type,
+            vocab_size=int(sglang_mc.vocab_size),
+            max_model_len=int(sglang_mc.context_len),
+            activation_dtype=dtype_str,
+            snapshot_dir=str(self.snapshot_dir),
+        )
 
 
 # Alias so worker code that imports `Engine` from this module works.

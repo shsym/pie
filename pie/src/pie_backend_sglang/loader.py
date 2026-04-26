@@ -1,17 +1,18 @@
 """Resolve an SGLang model + ModelRunner for the requested HF repo.
 
-Builds an `sglang.srt.server_args.ServerArgs` and an `sglang.srt.configs.model_config.ModelConfig`
-from pie's `RuntimeConfig`, brings up sglang's distributed environment on top of
-pie's pre-initialized `torch.distributed`, instantiates `ModelRunner`, and
-returns a `LoadedModel` bundle that `engine.py` consumes.
+Builds an `sglang.srt.server_args.ServerArgs` from the universal
+`RuntimeConfig` plus the typed `SGLangDriverConfig`, brings up sglang's
+distributed environment on top of pie's pre-initialized `torch.distributed`,
+instantiates `ModelRunner`, and returns a `LoadedModel` bundle that
+`engine.py` consumes.
 
-This is the analog of `pie_backend_vllm/loader.py`. The high-level shape is
-identical; only the SGLang-specific constructor calls change.
+This is the analog of `pie_backend_vllm/loader.py`. SGLangDriverConfig fields
+mirror `ServerArgs` so the values splat verbatim.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,8 @@ import torch
 import torch.distributed as dist
 
 from pie_backend.config import RuntimeConfig
+
+from .config import SGLangDriverConfig
 
 
 # Map pie's RuntimeConfig.activation_dtype (torch.dtype) to sglang's string form.
@@ -60,56 +63,55 @@ class LoadedModel:
     runner: Any                # sglang.srt.model_executor.model_runner.ModelRunner
     server_args: Any           # sglang.srt.server_args.ServerArgs
     sglang_model_config: Any   # sglang.srt.configs.model_config.ModelConfig
-    arch_type: str             # HF architecture string, e.g. "Qwen2ForCausalLM"
+    arch_type: str             # HF architecture string, e.g. "Qwen3ForCausalLM"
     info: dict
     snapshot_dir: str | None
-    page_size: int             # sglang's chosen page size (== pie's kv_page_size)
+    page_size: int             # sglang's chosen page size
     num_kv_layers: int
 
 
-def _build_sglang_server_args(config: RuntimeConfig) -> Any:
-    """Build an SGLang ServerArgs from pie's RuntimeConfig.
+def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriverConfig) -> Any:
+    """Build an SGLang ServerArgs from the universal RuntimeConfig + driver knobs.
 
-    We only set the fields pie cares about; everything else uses sglang's
-    defaults. `__post_init__` handles validation and platform-specific
-    normalization.
+    Driver-config field names match `ServerArgs` so we splat them in directly.
     """
     from sglang.srt.server_args import ServerArgs
 
-    dtype_str = _DTYPE_TO_STR.get(config.activation_dtype, "auto")
+    if config.activation_dtype not in _DTYPE_TO_STR:
+        raise ValueError(
+            f"Unsupported activation_dtype for sglang driver: {config.activation_dtype}. "
+            f"Expected one of {list(_DTYPE_TO_STR)}."
+        )
+    dtype_str = _DTYPE_TO_STR[config.activation_dtype]
 
-    # SGLang's `device` is the *device kind* (cuda/cpu/...), not the index.
-    # The index flows through `gpu_id` to ModelRunner.
+    # sglang's `device` is the device kind (cuda/cpu/...), not the index.
+    # Index flows through `gpu_id` to ModelRunner.
     device_kind = "cuda" if str(config.device).startswith("cuda") else str(config.device)
 
-    args = ServerArgs(
+    # Universal fields go through pie's RuntimeConfig.
+    server_kwargs = dict(
         model_path=config.hf_repo,
-        # Pie owns tokenization (Rust runtime). Skip sglang's tokenizer init.
-        skip_tokenizer_init=True,
-        trust_remote_code=True,
+        skip_tokenizer_init=True,        # pie owns tokenization
         dtype=dtype_str,
-        # pie's gpu_mem_utilization → sglang's mem_fraction_static
-        mem_fraction_static=config.gpu_mem_utilization,
-        page_size=config.kv_page_size,
         device=device_kind,
         tp_size=config.tensor_parallel_size,
-        attention_backend=config.sglang_attn_backend,
+        random_seed=config.random_seed,
+        download_dir=config.cache_dir,
         # We don't run sglang's HTTP server; these fields are inert here.
         host="127.0.0.1",
         port=30000,
-        # SGLang uses cuda graphs by default; mirror pie's flag.
-        disable_cuda_graph=not config.use_cuda_graphs,
-        # Don't try to start a real RPC server; we drive ModelRunner directly.
         skip_server_warmup=True,
-        random_seed=config.random_seed,
-        download_dir=config.cache_dir,
-        # Disable features pie doesn't need (and that often pull in extra deps).
-        disable_radix_cache=True,
     )
-    return args
+
+    # Driver-specific fields splat verbatim — names match ServerArgs.
+    for k, v in asdict(driver_config).items():
+        if v is not None:
+            server_kwargs[k] = v
+
+    return ServerArgs(**server_kwargs)
 
 
-def _ensure_sglang_distributed(server_args: Any, rank: int, gpu_id: int, tp_size: int) -> None:
+def _ensure_sglang_distributed(rank: int, gpu_id: int, tp_size: int) -> None:
     """Bring up sglang's parallel state on top of pie's torch.distributed init.
 
     SGLang's `init_distributed_environment` is idempotent: if `torch.distributed`
@@ -157,6 +159,7 @@ def _ensure_sglang_distributed(server_args: Any, rank: int, gpu_id: int, tp_size
 
 def load_sglang_model(
     config: RuntimeConfig,
+    driver_config: SGLangDriverConfig,
     log_queue: object = None,
     compute_pg=None,
 ) -> LoadedModel:
@@ -175,11 +178,10 @@ def load_sglang_model(
         gpu_id = config.rank
 
     _log(f"Building SGLang ServerArgs for {config.hf_repo}", "DEBUG")
-    server_args = _build_sglang_server_args(config)
+    server_args = _build_sglang_server_args(config, driver_config)
 
     # ModelRunner.init_torch_distributed reads env vars MASTER_ADDR/MASTER_PORT.
-    # Pie's worker._init_distributed sets them via FileStore; for the single-rank
-    # path we still need the env vars to be set so sglang doesn't blow up.
+    # Set them so sglang doesn't blow up on the single-rank path.
     import os
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29500")
@@ -187,7 +189,6 @@ def load_sglang_model(
     os.environ.setdefault("WORLD_SIZE", str(config.tensor_parallel_size))
     os.environ.setdefault("LOCAL_RANK", str(gpu_id))
 
-    # Build SGLang's ModelConfig (separate from ServerArgs; reads HF config).
     from sglang.srt.configs.model_config import ModelConfig as SGLangModelConfig
     sglang_model_config = SGLangModelConfig.from_server_args(server_args)
 
@@ -195,14 +196,9 @@ def load_sglang_model(
 
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-    # ModelRunner internally:
-    #   - calls init_torch_distributed (idempotent w/ pre-init)
-    #   - loads the model
-    #   - allocates KV cache via init_memory_pool
-    #   - sets up the attention backend
     runner = ModelRunner(
         model_config=sglang_model_config,
-        mem_fraction_static=server_args.mem_fraction_static or config.gpu_mem_utilization,
+        mem_fraction_static=server_args.mem_fraction_static,
         gpu_id=gpu_id,
         tp_rank=config.rank,
         tp_size=config.tensor_parallel_size,
@@ -216,12 +212,8 @@ def load_sglang_model(
 
     _log("Model loaded via SGLang", "INFO")
 
-    # Pull architecture string from HF config (matches vllm path).
     arches = list(sglang_model_config.hf_config.architectures)
     arch_type = arches[0] if arches else "Unknown"
-
-    # Resolve the chosen page_size — sglang may override what we asked for
-    # depending on the attention backend.
     chosen_page_size = int(runner.page_size)
 
     info = {

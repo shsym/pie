@@ -12,7 +12,7 @@ import random
 import numpy as np
 import torch
 
-from .config import RuntimeConfig
+from .config import NativeRuntimeConfig as RuntimeConfig
 from .loader import ModelLoader
 from .adapter import AdapterSubpass, CmaesAdapter
 from . import model as model_registry
@@ -147,10 +147,6 @@ class Engine:
         # Warmup CUDA graphs if supported
         if hasattr(forward_pass, "warmup_cuda_graphs"):
             forward_pass.warmup_cuda_graphs(kv_cache_at_layer)
-
-        # Compact weight memory layout for GPU locality (MPS TLB optimization)
-        if hasattr(forward_pass, "compact_weights"):
-            forward_pass.compact_weights()
 
         # Allocate CPU swap pool (pinned host memory)
         host_kv, pool_size = cls._create_host_kv_cache(
@@ -474,3 +470,35 @@ class Engine:
                 return "pong"
             case _:
                 return "unknown query"
+
+    def capabilities(self):
+        """Report this backend's resolved capacities up to pie's runtime.
+
+        See `pie.capabilities.BackendCapabilities` for the contract.
+        """
+        from pie.capabilities import BackendCapabilities
+
+        hf_cfg = self.info.get("hf_config", {}) if isinstance(self.info, dict) else {}
+        # max_model_len: prefer max_position_embeddings; some configs use
+        # max_sequence_length instead.
+        max_model_len = int(
+            hf_cfg.get("max_position_embeddings")
+            or hf_cfg.get("max_sequence_length")
+            or 0
+        )
+        vocab_size = int(
+            getattr(self.model_config, "num_vocabs", None)
+            or getattr(self.model_config, "vocab_size", 0)
+        )
+        return BackendCapabilities(
+            total_pages=int(self.config.max_num_kv_pages or 0),
+            kv_page_size=int(self.config.kv_page_size),
+            swap_pool_size=int(self.swap_pool_size),
+            max_batch_tokens=int(self.config.max_batch_tokens or 0),
+            max_batch_size=int(self.config.max_batch_size or 0),
+            arch_name=self.arch_type,
+            vocab_size=vocab_size,
+            max_model_len=max_model_len,
+            activation_dtype=str(self.config.activation_dtype).removeprefix("torch."),
+            snapshot_dir=str(self.snapshot_dir) if self.snapshot_dir else "",
+        )

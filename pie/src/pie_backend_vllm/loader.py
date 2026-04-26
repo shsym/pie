@@ -65,40 +65,38 @@ class LoadedModel:
     snapshot_dir: str | None
 
 
-def _build_vllm_config(config: RuntimeConfig) -> Any:
-    """Build a VllmConfig from pie's RuntimeConfig via the EngineArgs path.
+def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
+    """Build a VllmConfig from pie's `RuntimeConfig` (universal slice) and
+    `VllmDriverConfig` (vllm-native knobs).
 
-    EngineArgs is vllm's canonical entry point: it does HF config resolution,
-    architecture detection, sane defaults, dtype coercion, and produces a
-    fully-validated VllmConfig.
+    Driver config field names mirror EngineArgs exactly, so we splat them
+    into EngineArgs as kwargs.
     """
+    from dataclasses import asdict
     from vllm.engine.arg_utils import EngineArgs
 
-    dtype_str = _DTYPE_TO_STR.get(config.activation_dtype, "auto")
+    if config.activation_dtype not in _DTYPE_TO_STR:
+        raise ValueError(
+            f"Unsupported activation_dtype for vllm driver: {config.activation_dtype}. "
+            f"Expected one of {list(_DTYPE_TO_STR)}."
+        )
+    dtype_str = _DTYPE_TO_STR[config.activation_dtype]
 
-    # Attention backend: read from the RuntimeConfig if pie's CLI set it.
-    # `vllm_attn_backend` flows from pie's ModelConfig; "AUTO" → vllm picks.
-    attn_backend = getattr(config, "vllm_attn_backend", "AUTO")
-    if attn_backend == "AUTO":
-        attn_backend_arg = None
-    else:
-        attn_backend_arg = attn_backend
-
+    # Universal fields go through pie's RuntimeConfig.
     engine_kwargs = dict(
         model=config.hf_repo,
         dtype=dtype_str,
         tensor_parallel_size=config.tensor_parallel_size,
-        gpu_memory_utilization=config.gpu_mem_utilization,
-        block_size=config.kv_page_size,
         seed=config.random_seed,
         skip_tokenizer_init=True,        # pie owns tokenization
-        enforce_eager=not config.use_cuda_graphs,
         download_dir=config.cache_dir,
     )
-    if attn_backend_arg is not None:
-        # vllm 0.19+ surfaces this via EngineArgs.attention_backend, which is
-        # then routed into VllmConfig.attention_config.backend.
-        engine_kwargs["attention_backend"] = attn_backend_arg
+
+    # Driver-specific fields splat verbatim — names match EngineArgs.
+    # `None` means "leave default" (vllm picks).
+    for k, v in asdict(driver_config).items():
+        if v is not None:
+            engine_kwargs[k] = v
 
     args = EngineArgs(**engine_kwargs)
     return args.create_engine_config()
@@ -158,6 +156,7 @@ def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> No
 
 def load_vllm_model(
     config: RuntimeConfig,
+    driver_config,
     log_queue: object = None,
     compute_pg=None,
 ) -> LoadedModel:
@@ -177,7 +176,7 @@ def load_vllm_model(
         local_rank = config.rank
 
     _log(f"Building VllmConfig for {config.hf_repo}", "DEBUG")
-    vllm_config = _build_vllm_config(config)
+    vllm_config = _build_vllm_config(config, driver_config)
 
     # vllm's parallel state and model construction both consult
     # `get_current_vllm_config()` — they must run inside `set_current_vllm_config`.
@@ -199,7 +198,12 @@ def load_vllm_model(
     # Architecture string (first arch in the HF config). Used for telemetry
     # and as the `arch_type` reported back through pie's ready handshake.
     arches = list(vllm_config.model_config.hf_text_config.architectures)
-    arch_type = arches[0] if arches else "Unknown"
+    if not arches:
+        raise RuntimeError(
+            f"vllm's HF config for {config.hf_repo} has no `architectures` field. "
+            "Pie needs at least one HF architecture string."
+        )
+    arch_type = arches[0]
 
     info = {
         "architecture": {"type": arch_type, "all": arches},
@@ -218,7 +222,13 @@ def load_vllm_model(
     # extensions; that's heavy and irrelevant on the vllm path.)
     snapshot_dir = _resolve_hf_snapshot_dir(config.hf_repo)
     if snapshot_dir is None:
-        _log(f"Could not resolve HF snapshot dir for {config.hf_repo}", "WARN")
+        raise RuntimeError(
+            f"Could not resolve a local snapshot dir for {config.hf_repo!r}. "
+            "vllm has loaded weights but huggingface_hub.snapshot_download "
+            "(local_files_only) found no cached snapshot. Pie's Rust runtime "
+            "needs the snapshot path for tokenizer.json. Verify the HF cache "
+            "is populated (e.g., run `huggingface-cli download <repo>`)."
+        )
 
     # `attn_backend` is resolved lazily inside vllm's Attention layers — we
     # don't pin it here; metadata builder reads it from the layer at first

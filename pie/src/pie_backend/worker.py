@@ -10,7 +10,6 @@ and the two worker roles:
 from __future__ import annotations
 
 import warnings
-import sys
 
 
 # =============================================================================
@@ -112,7 +111,8 @@ def _setup_compute_process_groups(group_topology: list[list[int]]) -> dict:
 # =============================================================================
 
 
-def worker_main(
+def run_worker(
+    *,
     local_rank: int,
     world_size: int,
     devices: list[str],
@@ -120,34 +120,128 @@ def worker_main(
     model_config: dict,
     group_topology: list[list[int]],
     ready_queue,
+    build_engine,
+    runtime_config_extras: dict | None = None,
+    config_cls=None,
 ):
-    """Worker process entry point for mp.spawn.
+    """Generic worker body shared across drivers (native / vllm / dummy).
 
-    Each worker:
-    1. Computes its group membership and TP rank
-    2. Initializes torch.distributed
-    3. Sets up process groups
-    4. Creates RuntimeConfig + Engine
-    5. Group leaders: create RpcServer, report server_name via ready_queue
-       Non-leaders: report ready, run follower loop
+    Owns the universal lifecycle: tqdm lock, torch.distributed init, group
+    setup, RuntimeConfig assembly, ready-queue handshake, and leader/follower
+    dispatch. Driver-specific work happens inside `build_engine`:
 
-    Args:
-        local_rank: Rank of this worker (0 to world_size-1)
-        world_size: Total number of workers
-        devices: List of device strings (one per rank)
-        master_port: Port for torch.distributed rendezvous
-        model_config: Model configuration dict (passed to RuntimeConfig.from_args)
-        group_topology: List of groups, each containing ranks
-        ready_queue: Queue to signal readiness: (rank, server_name|None, metadata|None)
+        engine = build_engine(runtime_config, compute_pg)
+
+    `runtime_config_extras` is merged into the kwargs passed to
+    `<config_cls>.from_args` after `model_config`. Drivers whose knobs live
+    on the runtime config subclass (native, dummy → NativeRuntimeConfig) pass
+    their `driver_config` dict here. Drivers that hold knobs in their own
+    typed config (vllm) pass nothing and use the universal `RuntimeConfig`.
+
+    `config_cls` selects the dataclass: `RuntimeConfig` for vllm,
+    `NativeRuntimeConfig` for native/dummy. Defaults to `RuntimeConfig`.
+
+    CUDA cleanup is wrapped around the body so leaks don't survive a
+    crashed worker.
     """
+    import gc
+    import threading
+    import inspect
+
     import torch
-    # On Jetson unified memory, CMA allocations leak if not explicitly freed
-    # before process exit — the driver does not reclaim on process death.
+    import torch.distributed as dist
+    from tqdm import tqdm
+
+    from pie import _runtime as pie_runtime
+    from pie_backend.config import RuntimeConfig
+
+    if config_cls is None:
+        config_cls = RuntimeConfig
+
+    # Workers only need thread-safety for tqdm, not the default
+    # multiprocessing.RLock (creates a POSIX semaphore that leaks when the
+    # worker is terminated).
+    tqdm.set_lock(threading.RLock())
+
+    rank = local_rank
     try:
-        _worker_body(
-            local_rank, world_size, devices, master_port,
-            model_config, group_topology, ready_queue,
+        # Determine group membership
+        my_group_id = 0
+        tp_rank = 0
+        for i, group in enumerate(group_topology):
+            if rank in group:
+                my_group_id = i
+                tp_rank = group.index(rank)
+                break
+        tp_degree = len(group_topology[my_group_id])
+
+        # Distributed init (TP > 1 only; single-rank skips for latency)
+        if world_size > 1:
+            _init_distributed(rank, world_size, master_port, devices[rank])
+            # Side-effect: also creates leader-inclusive groups used by
+            # downstream broadcast paths.
+            _setup_process_groups(group_topology)
+            compute_pg_map = _setup_compute_process_groups(group_topology)
+        else:
+            device_str = devices[rank]
+            if device_str.startswith("cuda"):
+                torch.cuda.set_device(device_str)
+            compute_pg_map = {}
+
+        # Build the runtime config (lean RuntimeConfig for vllm,
+        # NativeRuntimeConfig for native/dummy). Universal kwargs come from
+        # `model_config`; driver-specific kwargs from `runtime_config_extras`.
+        # `device`/`devices`/`tensor_parallel_size` are passed explicitly
+        # below (per-rank values), so they should never come through
+        # `merged_source`.
+        valid_keys = set(inspect.signature(config_cls.from_args).parameters.keys())
+        merged_source = model_config | (runtime_config_extras or {})
+        merged = {
+            k: v for k, v in merged_source.items()
+            if k in valid_keys and v is not None
+        }
+        group_devices = [devices[r] for r in group_topology[my_group_id]]
+        config = config_cls.from_args(
+            **merged,
+            devices=group_devices,
+            rank=tp_rank,
+            tensor_parallel_size=tp_degree,
         )
+
+        compute_pg = compute_pg_map.get(my_group_id)
+        engine = build_engine(config, compute_pg)
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        is_group_leader = tp_rank == 0
+        try:
+            if is_group_leader:
+                server = pie_runtime.RpcServer.create()
+                server_name = server.server_name()
+                ready_queue.put((rank, server_name, engine.capabilities()))
+
+                stop_event = threading.Event()
+                _leader_loop(
+                    engine=engine,
+                    server=server,
+                    stop_event=stop_event,
+                    compute_pg=compute_pg,
+                    group_topology=group_topology,
+                    group_id=my_group_id,
+                )
+            else:
+                ready_queue.put((rank, None, None))
+                _follower_loop(
+                    engine=engine,
+                    compute_pg=compute_pg,
+                    leader_rank=group_topology[my_group_id][0],
+                    group_id=my_group_id,
+                    config=config,
+                )
+        finally:
+            if dist.is_initialized():
+                dist.destroy_process_group()
     except Exception:
         import traceback
         traceback.print_exc()
@@ -159,138 +253,40 @@ def worker_main(
                 torch.cuda.reset_peak_memory_stats()
             except Exception:
                 pass
-        import gc
         gc.collect()
 
 
-def _worker_body(
+def worker_main(
     local_rank: int,
     world_size: int,
     devices: list[str],
     master_port: int,
     model_config: dict,
+    driver_config: dict,
     group_topology: list[list[int]],
     ready_queue,
 ):
-    """Inner body of worker_main, separated for CUDA cleanup guarantee."""
-    rank = local_rank
+    """Worker entry point — `native` driver.
 
-    # Workers only need thread-safety for tqdm, not the default
-    # multiprocessing.RLock which creates a POSIX semaphore that leaks
-    # when the worker is terminated.
-    import threading
-    from tqdm import tqdm
-    tqdm.set_lock(threading.RLock())
-
-
-    import torch
-    from pie import _runtime as pie_runtime
+    `driver_config` is `NativeDriverConfig` as a dict; native's knobs live
+    on `NativeRuntimeConfig` (a subclass of the universal `RuntimeConfig`),
+    so we forward the dict to `run_worker` as `runtime_config_extras`.
+    """
+    from pie_backend.config import NativeRuntimeConfig
     from pie_backend.engine import Engine
-    from pie_backend.config import RuntimeConfig
-    import torch.distributed as dist
-    import threading
 
-    # — Determine group membership —
-
-    # — Determine group membership —
-    my_group_id = 0
-    tp_rank = 0
-    for i, group in enumerate(group_topology):
-        if rank in group:
-            my_group_id = i
-            tp_rank = group.index(rank)
-            break
-
-    tp_degree = len(group_topology[my_group_id])
-
-    # — Initialize distributed —
-    if world_size > 1:
-        _init_distributed(rank, world_size, master_port, devices[rank])
-    else:
-        device_str = devices[rank]
-        if device_str.startswith("cuda"):
-            torch.cuda.set_device(device_str)
-
-    # — Setup process groups —
-    if world_size > 1:
-        pg_map = _setup_process_groups(group_topology)
-        compute_pg_map = _setup_compute_process_groups(group_topology)
-    else:
-        pg_map = {}
-        compute_pg_map = {}
-
-    # — Create runtime config —
-    group_devices = [devices[r] for r in group_topology[my_group_id]]
-
-    # Pass model_config directly — RuntimeConfig.from_args() owns all defaults.
-    # Filter to only keys that from_args() accepts (ModelConfig may have
-    # extra keys like default_token_budget that only the Rust runtime uses).
-    import inspect
-    valid_keys = set(inspect.signature(RuntimeConfig.from_args).parameters.keys())
-    filtered_config = {
-        k: v for k, v in model_config.items()
-        if k in valid_keys
-        and k not in ("device", "devices", "tensor_parallel_size")
-        and v is not None
-    }
-
-    config = RuntimeConfig.from_args(
-        **filtered_config,
-        devices=group_devices,
-        rank=tp_rank,
-        world_size=tp_degree,
-        tensor_parallel_size=tp_degree,
+    run_worker(
+        local_rank=local_rank,
+        world_size=world_size,
+        devices=devices,
+        master_port=master_port,
+        model_config=model_config,
+        group_topology=group_topology,
+        ready_queue=ready_queue,
+        build_engine=lambda cfg, pg: Engine.load(cfg, compute_process_group=pg),
+        runtime_config_extras=driver_config,
+        config_cls=NativeRuntimeConfig,
     )
-
-    # — Load engine (loads model on this GPU) —
-    compute_pg = compute_pg_map.get(my_group_id)
-    engine = Engine.load(config, compute_process_group=compute_pg)
-
-    # Sync all workers before signaling ready
-    if dist.is_initialized():
-        dist.barrier()
-
-    is_group_leader = tp_rank == 0
-
-    try:
-        if is_group_leader:
-            # Create RPC server for Rust to connect to
-            server = pie_runtime.RpcServer.create()
-            server_name = server.server_name()
-
-            metadata = {
-                "total_pages": getattr(config, "max_num_kv_pages", 0),
-                "max_batch_tokens": getattr(config, "max_batch_tokens", 10240),
-                "max_batch_size": getattr(config, "max_batch_size", 128),
-                "arch_name": engine.arch_type,
-                "snapshot_dir": str(engine.snapshot_dir) if engine.snapshot_dir else "",
-                "swap_pool_size": engine.swap_pool_size,
-            }
-
-            ready_queue.put((rank, server_name, metadata))
-
-            # Run RPC loop — Rust connects as client
-            stop_event = threading.Event()
-            _leader_loop(
-                engine=engine,
-                server=server,
-                stop_event=stop_event,
-                compute_pg=compute_pg,
-                group_topology=group_topology,
-                group_id=my_group_id,
-            )
-        else:
-            ready_queue.put((rank, None, None))
-            _follower_loop(
-                engine=engine,
-                compute_pg=compute_pg,
-                leader_rank=group_topology[my_group_id][0],
-                group_id=my_group_id,
-                config=config,
-            )
-    finally:
-        if dist.is_initialized():
-            dist.destroy_process_group()
 
 
 # =============================================================================
@@ -679,7 +675,6 @@ def _follower_loop(
     leader_rank: int,
     group_id: int,
     config=None,
-    result_queue=None,
 ) -> None:
     """Broadcast loop for TP followers.
 
@@ -692,7 +687,6 @@ def _follower_loop(
     from pie_backend import utils
 
     device = config.device if config else "cuda:0"
-    is_group_leader_of_secondary = (result_queue is not None)
 
     shutdown_requested = False
 
@@ -730,17 +724,11 @@ def _follower_loop(
                         if dist.get_world_size(group=compute_pg) > 1:
                             dist.barrier(group=compute_pg)
 
-                    result = engine.fire_batch(inputs, sampling_metadata)
-
-                    # If secondary group leader, push result to queue
-                    if is_group_leader_of_secondary:
-                        result_queue.put(result)
+                    engine.fire_batch(inputs, sampling_metadata)
                 except Exception as e:
                     print(f"Worker {config.rank if config else '?'} fire_batch error: {e}")
                     if torch.cuda.is_available():
                         torch.cuda.synchronize()
-                    if is_group_leader_of_secondary:
-                        result_queue.put(None)
 
             elif msg_type == "INIT_ADAPTER":
                 engine.init_adapter(**msg["kwargs"])

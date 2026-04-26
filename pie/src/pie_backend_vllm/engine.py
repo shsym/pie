@@ -48,6 +48,7 @@ class VllmEngine:
     def __init__(
         self,
         config: RuntimeConfig,
+        driver_config,
         model_config,
         forward_pass,
         kv_cache_at_layer: list,
@@ -59,6 +60,7 @@ class VllmEngine:
         swap_pool_size: int = 0,
     ):
         self.config = config
+        self.driver_config = driver_config
         self.model_config = model_config
         self.forward_pass = forward_pass
         self.kv_cache_at_layer = kv_cache_at_layer
@@ -74,6 +76,7 @@ class VllmEngine:
     def load(
         cls,
         config: RuntimeConfig,
+        driver_config,
         log_queue: object = None,
         compute_process_group=None,
     ) -> "VllmEngine":
@@ -101,10 +104,12 @@ class VllmEngine:
             torch.cuda.manual_seed_all(config.random_seed)
 
         _log("Loading vllm model", "DEBUG")
-        loaded = load_vllm_model(config, log_queue=log_queue, compute_pg=compute_process_group)
+        loaded = load_vllm_model(
+            config, driver_config, log_queue=log_queue, compute_pg=compute_process_group
+        )
         _log("Loaded vllm model", "DEBUG")
 
-        kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config)
+        kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)
 
         forward_pass = VllmForwardPass(
@@ -117,6 +122,7 @@ class VllmEngine:
 
         return cls(
             config=config,
+            driver_config=driver_config,
             model_config=loaded.model_config,
             forward_pass=forward_pass,
             kv_cache_at_layer=kv_cache_at_layer,
@@ -175,7 +181,58 @@ class VllmEngine:
             return "pong"
         return "unknown query"
 
+    def capabilities(self):
+        """Report this backend's resolved capacities up to pie's runtime.
 
-# Alias so worker code that imports `Engine` from this module works
-# regardless of whether the backend is native or vllm.
-Engine = VllmEngine
+        Sources every value from vllm's resolved `VllmConfig` rather than
+        echoing the user's `RuntimeConfig`. In particular `kv_page_size`
+        comes from the attention backend's chosen block size, which may
+        differ from what the user requested.
+
+        Fails loudly if any expected value is missing — the runtime/Rust
+        side relies on these being correct, so silent defaulting is unsafe.
+        """
+        from pie.capabilities import BackendCapabilities
+
+        vc = self.forward_pass.vllm_config
+        mc = vc.model_config
+        cc = vc.cache_config
+
+        if self.config.max_num_kv_pages is None:
+            raise RuntimeError(
+                "config.max_num_kv_pages was not set by the loader — KV cache "
+                "allocation must run before capabilities() is called."
+            )
+        if not self.snapshot_dir:
+            raise RuntimeError("snapshot_dir is empty; loader did not resolve it.")
+
+        dtype_str = str(mc.dtype).removeprefix("torch.")
+        if dtype_str.startswith("torch."):
+            raise RuntimeError(
+                f"Could not normalize activation dtype {mc.dtype!r}; expected a "
+                "torch.dtype with a 'torch.' prefix."
+            )
+
+        # vllm expresses batch limits as max_num_seqs / max_num_batched_tokens.
+        # Capabilities normalizes them to max_batch_size / max_batch_tokens
+        # for pie's runtime side. If max_num_batched_tokens is None (vllm
+        # default), use scheduler_config's resolved value.
+        max_batch_size = int(self.driver_config.max_num_seqs)
+        max_batch_tokens = self.driver_config.max_num_batched_tokens
+        if max_batch_tokens is None:
+            max_batch_tokens = int(vc.scheduler_config.max_num_batched_tokens)
+        else:
+            max_batch_tokens = int(max_batch_tokens)
+
+        return BackendCapabilities(
+            total_pages=int(self.config.max_num_kv_pages),
+            kv_page_size=int(cc.block_size),
+            swap_pool_size=int(self.swap_pool_size),
+            max_batch_tokens=max_batch_tokens,
+            max_batch_size=max_batch_size,
+            arch_name=self.arch_type,
+            vocab_size=int(mc.get_vocab_size()),
+            max_model_len=int(mc.max_model_len),
+            activation_dtype=dtype_str,
+            snapshot_dir=str(self.snapshot_dir),
+        )
