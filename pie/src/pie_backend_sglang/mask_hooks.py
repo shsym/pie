@@ -231,34 +231,31 @@ class _TorchNativeStrategy(_CustomMaskStrategy):
         req_pool_indices, seq_lens, extend_prefix_lens, extend_seq_lens,
         scaling=None, enable_gqa=False, causal=False,
     ):
+        # We pass an (ext_q, seq_kv) mask straight to SDPA — no query
+        # padding (sglang's reference padded with `torch.empty` and threw
+        # away the dummy rows; with our explicit mask we don't need that).
         query = query.movedim(0, query.dim() - 2)
         start_q = 0
         for r in range(seq_lens.shape[0]):
             ext_q = int(extend_seq_lens[r])
-            pre_q = int(extend_prefix_lens[r])
             seq_kv = int(seq_lens[r])
             end_q = start_q + ext_q
 
             per_req_q = query[:, start_q:end_q, :]
-            # Pad query rows so SDPA's per-query masks align with kv [0, seq_kv).
-            per_req_q_full = torch.empty(
-                (per_req_q.shape[0], seq_kv, per_req_q.shape[2]),
-                dtype=per_req_q.dtype, device=per_req_q.device,
-            )
-            per_req_q_full[:, pre_q:, :] = per_req_q
-
             k, v = self._gather_kv(
                 k_cache, v_cache, req_to_token, req_pool_indices[r],
                 seq_kv, query.dim(), per_req_q.dtype,
             )
-            attn_mask, is_causal_arg = self._attn_args(r, seq_kv, seq_kv, causal)
+            # Pie's mask for request r is (ext_q × seq_kv) — one row per
+            # extend query token, full kv-length wide.
+            attn_mask, is_causal_arg = self._attn_args(r, ext_q, seq_kv, causal)
 
-            out_full = self._sdpa(
-                per_req_q_full.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+            out = self._sdpa(
+                per_req_q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
                 attn_mask=attn_mask, enable_gqa=enable_gqa, scale=scaling,
                 is_causal=is_causal_arg,
             ).squeeze(0).movedim(query.dim() - 2, 0)
-            output[start_q:end_q, :, :] = out_full[pre_q:, :, :]
+            output[start_q:end_q, :, :] = out
             start_q = end_q
         return output
 
