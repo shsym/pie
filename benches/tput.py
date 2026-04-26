@@ -88,6 +88,18 @@ async def run_benchmark(args):
             "use_cuda_graphs": args.use_cuda_graphs,
             "cpu_mem_budget_in_gb": args.cpu_mem_budget,
         }
+    elif args.driver == "sglang":
+        # sglang's vocabulary differs: `mem_fraction_static` instead of
+        # `gpu_memory_utilization`, `disable_cuda_graph` (negation),
+        # `cpu_mem_budget_in_gb` is pie-universal (filtered out before
+        # ServerArgs splat in pie_backend_sglang/loader.py).
+        driver_subsection = {
+            "mem_fraction_static": args.gpu_mem_util,
+            "disable_cuda_graph": not args.use_cuda_graphs,
+            "cpu_mem_budget_in_gb": args.cpu_mem_budget,
+        }
+        if args.sglang_attention_backend is not None:
+            driver_subsection["attention_backend"] = args.sglang_attention_backend
     else:  # dummy
         driver_subsection = {}
 
@@ -233,10 +245,12 @@ def main():
     parser.add_argument("--default-token-budget", type=int, required=True, help="Default token budget per process (required)")
     parser.add_argument("--max-concurrent-processes", type=int, default=None, help="Maximum number of concurrent processes (default: None)")
     parser.add_argument("--max-batch-size", type=int, default=512, help="Maximum batch size for inference (default: 512)")
-    parser.add_argument("--driver", default="native", choices=["native", "vllm", "dummy"],
-                        help="Inference driver: 'native', 'vllm', or 'dummy'")
+    parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy"],
+                        help="Inference driver: 'native', 'vllm', 'sglang', or 'dummy'")
     parser.add_argument("--vllm-attention-backend", default=None,
                         help="vLLM attention backend (FLASH_ATTN / FLASHINFER / etc.). Only used when --driver=vllm")
+    parser.add_argument("--sglang-attention-backend", default=None,
+                        help="SGLang attention backend (triton / flashinfer / flex_attention / fa3). Only used when --driver=sglang")
     parser.add_argument("--use-cuda-graphs", action="store_true",
                         help="Enable CUDA graphs (vllm: piecewise compile + graph capture; native: FlashInfer planning)")
 

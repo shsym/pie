@@ -12,11 +12,11 @@ To bridge: allocate one `(2, num_blocks, page_size, h, d)` tensor per layer
 ourselves, replace SGLang's `k_buffer[i]` / `v_buffer[i]` with contiguous
 views into dim 0, and expose a permuted `(num_blocks, 2, page_size, h, d)`
 view for pie. The permuted view is non-contiguous but PyTorch's advanced
-indexing — used by pie's swap handlers — reads it correctly.
+indexing — used by pie's swap handlers — reads and writes it correctly.
 
-For v1 we skip the host pool: pie's vllm sibling does the same since the
-swap handlers' bounds check would index an empty list. Set
-`cpu_mem_budget_in_gb = 0` in pie's TOML.
+The pinned host pool that backs D2H/H2D swap is allocated by
+`_create_host_kv_cache` (further down in this module), sized from
+`cpu_mem_budget_in_gb` on the user's TOML.
 """
 
 from __future__ import annotations
@@ -100,3 +100,44 @@ def _rebind_pool_buffers(
         )
 
     return kv_cache_at_layer, num_blocks
+
+
+def _create_host_kv_cache(
+    gpu_kv: list[torch.Tensor],
+    swap_budget_bytes: int,
+) -> tuple[list[torch.Tensor], int]:
+    """Allocate pinned CPU tensors mirroring the rebound GPU KV layout.
+
+    Returns `(host_tensors, pool_size)`. The shape contract — `(pool_size,
+    2, page_size, kv_heads, dim_head)` per layer — matches what pie's
+    `worker._handle_copy_d2h` / `_h2d` / `_h2h` expect; they `index_copy_`
+    along dim 0 and rely on the trailing axes lining up with
+    `kv_cache_at_layer[layer]`. If the budget is 0 or there are no GPU KV
+    layers, returns `([], 0)`.
+    """
+    if swap_budget_bytes <= 0 or not gpu_kv:
+        return [], 0
+
+    num_layers = len(gpu_kv)
+    _, two, page_size, kv_heads, dim_head = gpu_kv[0].shape
+    dtype = gpu_kv[0].dtype
+    bytes_per_element = gpu_kv[0].element_size()
+
+    per_page_bytes = num_layers * two * page_size * kv_heads * dim_head * bytes_per_element
+    pool_size = swap_budget_bytes // per_page_bytes
+    if pool_size == 0:
+        return [], 0
+
+    # pin_memory is CUDA-only; non-CUDA builds get a plain CPU tensor.
+    use_pinned = torch.cuda.is_available()
+    host_kv: list[torch.Tensor] = []
+    for _ in range(num_layers):
+        t = torch.zeros(
+            (pool_size, two, page_size, kv_heads, dim_head),
+            dtype=dtype, device="cpu",
+        )
+        if use_pinned:
+            t = t.pin_memory()
+        host_kv.append(t)
+
+    return host_kv, pool_size

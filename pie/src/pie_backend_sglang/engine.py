@@ -72,7 +72,7 @@ class SGLangEngine:
         _require_sglang()
 
         from .loader import load_sglang_model
-        from .kv_cache import _rebind_pool_buffers
+        from .kv_cache import _rebind_pool_buffers, _create_host_kv_cache
         from .forward_pass import SGLangForwardPass
 
         if config.rank == 0:
@@ -103,6 +103,13 @@ class SGLangEngine:
             page_size=int(loaded.runner.page_size),
         )
 
+        # Pinned host KV pool — sized from `cpu_mem_budget_in_gb`. Indexing
+        # contract matches native: `host_kv[layer][slot]` is one block worth
+        # of (K, V) data, ready for `index_copy_` in the swap RPC handlers.
+        host_kv, pool_size = _create_host_kv_cache(
+            kv_cache_at_layer, config.swap_budget_bytes,
+        )
+
         return cls(
             config=config,
             driver_config=driver_config,
@@ -112,6 +119,8 @@ class SGLangEngine:
             adapter_at_layer=[],
             arch_type=loaded.arch_type,
             snapshot_dir=loaded.snapshot_dir,
+            kv_cache_at_layer_host=host_kv,
+            swap_pool_size=pool_size,
         )
 
     @torch.inference_mode()

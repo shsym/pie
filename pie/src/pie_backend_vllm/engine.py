@@ -82,10 +82,9 @@ class VllmEngine:
     ) -> "VllmEngine":
         _require_vllm()
 
-        from .forward_pass import VllmForwardPass
-        from .kv_cache import allocate_and_bind_kv_cache, allocate_host_pool
         from .loader import load_vllm_model
-        from .mask_impls import install_mask_aware_impls
+        from .kv_cache import allocate_and_bind_kv_cache, allocate_host_pool
+        from .forward_pass import VllmForwardPass
 
         def _log(msg: str, level: str = "INFO"):
             if log_queue is not None:
@@ -109,17 +108,6 @@ class VllmEngine:
             config, driver_config, log_queue=log_queue, compute_pg=compute_process_group
         )
         _log("Loaded vllm model", "DEBUG")
-
-        # Install mask-aware AttentionImpl subclasses in place. Idempotent;
-        # each layer's `impl.__class__` is re-typed to a Pie-mask-aware
-        # subclass so an absent `pie_attn_extras` is a single dict.get and
-        # zero kernel-time overhead. See mask_impls.py.
-        install_mask_aware_impls(loaded.vllm_config)
-
-        # `kv_page_size` is not on the lean RuntimeConfig — the shared RPC
-        # worker reads it via `engine.capabilities().kv_page_size`, which
-        # we already source from `vllm_config.cache_config.block_size` in
-        # `capabilities()` below.
 
         kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)
@@ -158,12 +146,6 @@ class VllmEngine:
             kv_page_indices=inputs["kv_page_indices"],
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
-            # Only forward the mask when there's something to apply — the
-            # patched Attention.forward checks for absence as the zero-overhead
-            # signal. inputs["custom_mask"] is always populated (BRLE decoded
-            # to all-True when no mask was supplied), so we gate on the
-            # explicit `has_custom_mask` flag.
-            custom_mask=inputs["custom_mask"] if inputs.get("has_custom_mask") else None,
             single_token_inference_mode=inputs["single_token_inference_mode"],
             total_pages_cpu=inputs.get("total_pages_cpu", 0),
         )
