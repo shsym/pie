@@ -141,11 +141,20 @@ def _bootstrap(
     """Spawn workers, collect ready signals, bootstrap the Rust runtime."""
     from pie import _runtime as pie_runtime
     from pie import path as pie_path
-    from pie_backend import worker
     import torch
     import torch.multiprocessing as mp
 
     model = config.primary_model
+
+    backend_kind = (model.backend or "native").lower()
+    if backend_kind == "vllm":
+        from pie_backend_vllm import worker
+    elif backend_kind == "native":
+        from pie_backend import worker
+    else:
+        raise ValueError(
+            f"Unknown backend {model.backend!r}. Expected 'native' or 'vllm'."
+        )
 
     # Derive paths
     auth_dir = str(pie_path.get_auth_dir())

@@ -89,6 +89,11 @@ class RuntimeConfig:
     # CPU swap budget (bytes). 0 = disabled.
     swap_budget_bytes: int = 0
 
+    # vLLM-specific: attention-backend hint (FLASHINFER / FLASH_ATTN / TRITON_ATTN
+    # / FLEX_ATTENTION / etc.). "AUTO" lets vllm select per-platform. Ignored by
+    # the native backend; only consulted by pie_backend_vllm.loader.
+    vllm_attn_backend: str = "AUTO"
+
     # =========================================================================
     # Convenience Properties (formerly in model.Config)
     # =========================================================================
@@ -175,6 +180,7 @@ class RuntimeConfig:
         tensor_parallel_size: int = 1,
         dummy_mode: bool = False,
         cpu_mem_budget_in_gb: int = 0,
+        vllm_attn_backend: str = "AUTO",
     ) -> "RuntimeConfig":
         """
         Factory method to build a validated and resolved RuntimeConfig.
@@ -270,6 +276,7 @@ class RuntimeConfig:
             adapter_path=resolved_adapter_path,
             dummy_mode=dummy_mode,
             swap_budget_bytes=cpu_mem_budget_in_gb * (1 << 30),
+            vllm_attn_backend=vllm_attn_backend,
         )
 
     def print(self) -> None:

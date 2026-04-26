@@ -42,6 +42,14 @@ class ModelConfig:
     activation_dtype: str = "bfloat16"
     weight_dtype: str = "bfloat16"
     kv_page_size: int = 16
+    # Inference backend: "native" uses pie_backend (pie's own model code +
+    # flashinfer/metal kernels); "vllm" uses pie_backend_vllm (vllm model code
+    # under pie's RPC surface). Selected once per `pie serve` invocation.
+    backend: str = "native"
+    # Passthrough for vllm's attention backend selector (e.g. "FLASHINFER",
+    # "FLASH_ATTN", "FLEX_ATTENTION", "TRITON_ATTN", "ROCM_AITER", "PALLAS").
+    # "AUTO" lets vllm pick per-platform. Only consulted when backend == "vllm".
+    vllm_attn_backend: str = "AUTO"
     max_batch_tokens: int | None = None
     max_dist_size: int = 32
     max_num_embeds: int = 128

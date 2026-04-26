@@ -56,9 +56,13 @@ cu126 = [
 cu128 = [
     "torch>=2.7.1",
     "torchao>=0.14.1",
-    "flashinfer-python>=0.6.1",
-    "flashinfer-cubin>=0.6.1",
-    "flashinfer-jit-cache>=0.6.1",
+    # All three flashinfer packages must agree on the patch version — the
+    # Python wrapper, the cubin loader, and the precompiled C ops have
+    # ABI-coupled signatures. vllm pins flashinfer-python==0.6.8.post1,
+    # so we lock the other two to match.
+    "flashinfer-python==0.6.8.post1",
+    "flashinfer-cubin==0.6.8.post1",
+    "flashinfer-jit-cache==0.6.8.post1",
 ]
 
 # --- Metal (macOS) ---
@@ -69,6 +73,14 @@ metal = [
     "pyobjc-framework-Metal>=10.0,<11.0",
     "pyobjc-framework-MetalKit>=10.0,<11.0",
     "pyobjc-framework-Cocoa>=10.0,<11.0",
+]
+
+# --- vLLM backend (CUDA / ROCm / XPU / TPU) ---
+# Pinned tight to the version we test against; bumped weekly via automation.
+# Sourced from the sibling `vllm/` checkout so we track upstream tip, not
+# the stale `vllm` PyPI metadata (the cu128 mirror lags far behind upstream).
+vllm = [
+    "vllm",
 ]
 
 [project.scripts]
@@ -91,6 +103,10 @@ explicit = true
 # Local workspace member
 pie-client = { path = "../client/python", editable = true }
 
+# Track upstream vllm via the sibling checkout. Pin behavior is "whatever is
+# checked out" — bump via `git -C ../../vllm pull` then re-sync.
+vllm = { path = "../../vllm", editable = true }
+
 # Torch: use PyTorch index for cu126 (cu128 resolves from PyPI)
 torch = [
     { index = "pytorch-cu126", extra = "cu126" },
@@ -103,7 +119,7 @@ flashinfer-jit-cache = [
 
 [tool.maturin]
 python-source = "src"
-python-packages = ["pie", "pie_cli", "pie_backend", "pie_kernels"]
+python-packages = ["pie", "pie_cli", "pie_backend", "pie_backend_vllm", "pie_kernels"]
 module-name = "pie._runtime"
 manifest-path = "../runtime/Cargo.toml"
 features = ["pyo3/extension-module"]
