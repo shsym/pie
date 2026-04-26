@@ -37,11 +37,18 @@ class Server:
     Usage::
 
         from pie.server import Server
-        from pie.config import Config, ModelConfig, AuthConfig
+        from pie.config import (
+            Config, ModelConfig, ServerConfig, AuthConfig, DriverConfig,
+        )
 
         cfg = Config(
+            server=ServerConfig(),
             auth=AuthConfig(enabled=False),
-            models=[ModelConfig(hf_repo="Qwen/Qwen3-0.6B")],
+            models={"default": ModelConfig(
+                name="default",
+                hf_repo="Qwen/Qwen3-0.6B",
+                driver=DriverConfig(type="native", device=["cuda:0"]),
+            )},
         )
         async with Server(cfg) as server:
             client = await server.connect()
@@ -52,8 +59,8 @@ class Server:
     def __init__(self, config: Config):
         self._config = copy.copy(config)
         # Auto-assign a free port if not specified.
-        if self._config.port == 0:
-            self._config.port = _find_free_port()
+        if self._config.server.port == 0:
+            self._config.server.port = _find_free_port()
 
         # Filled during __aenter__
         self._handle: Any = None
@@ -109,7 +116,7 @@ class Server:
     @property
     def url(self) -> str:
         """WebSocket URL for client connections."""
-        return f"ws://{self._config.host}:{self._config.port}"
+        return f"ws://{self._config.server.host}:{self._config.server.port}"
 
     @property
     def token(self) -> str:
@@ -139,21 +146,41 @@ def _bootstrap(
     timeout: float = 1200.0,
 ) -> tuple[Any, list]:
     """Spawn workers, collect ready signals, bootstrap the Rust runtime."""
+    import importlib
+
     from pie import _runtime as pie_runtime
     from pie import path as pie_path
+    from pie.drivers import resolve_driver
     import torch
     import torch.multiprocessing as mp
 
-    model = config.primary_model
+    if len(config.models) > 1:
+        # Multi-model is in the schema (`Config.models: dict[str, ModelConfig]`)
+        # but the bootstrap loop below spawns workers for one model only. When
+        # multi-model is wired up, replace this with a per-model worker pool.
+        raise NotImplementedError(
+            f"Multi-model bootstrap not yet supported: {sorted(config.models)}. "
+            "Configure exactly one [model.<name>] section for now."
+        )
 
-    backend_kind = (model.backend or "native").lower()
-    if backend_kind == "vllm":
-        from pie_backend_vllm import worker
-    elif backend_kind == "native":
-        from pie_backend import worker
-    else:
+    model = config.primary_model
+    driver = model.driver
+
+    # Resolve the driver via the registry. This validates that the
+    # `type = "..."` discriminator names a registered driver and gives us
+    # the worker module path + typed config class.
+    spec = resolve_driver(driver.type)
+    worker = importlib.import_module(spec.worker_module)
+
+    # Build the typed driver config dataclass from the [model.X.driver.<type>]
+    # subsection. Unknown keys raise (the dataclass field set is the schema).
+    try:
+        driver_options = spec.config_cls(**driver.options)
+    except TypeError as e:
         raise ValueError(
-            f"Unknown backend {model.backend!r}. Expected 'native' or 'vllm'."
+            f"Model {model.name!r}: invalid keys in [model.{model.name}.driver."
+            f"{driver.type}] — {e}. Allowed fields: "
+            f"{[f.name for f in __import__('dataclasses').fields(spec.config_cls)]}"
         )
 
     # Derive paths
@@ -161,8 +188,8 @@ def _bootstrap(
     program_dir = str(pie_path.get_program_dir())
     log_dir = str(pie_path.get_log_dir())
 
-    # Validate devices
-    device_value = model.device if isinstance(model.device, list) else [model.device]
+    # Validate devices (universal driver field)
+    device_value = list(driver.device)
     world_size = len(device_value)
 
     available_gpus = torch.cuda.device_count()
@@ -177,31 +204,38 @@ def _bootstrap(
                 )
 
     # Calculate topology
-    tp_degree = model.tensor_parallel_size
-    if tp_degree is None:
+    tp_degree = driver.tensor_parallel_size
+    if tp_degree <= 0:
         tp_degree = world_size
-        console.print(
-            f"[yellow]![/yellow] tensor_parallel_size not set, defaulting to {tp_degree} (use all GPUs)"
-        )
 
     group_topology = worker.calculate_topology(world_size, tp_degree)
     num_groups = len(group_topology)
 
     console.print("[dim]Starting runtime...[/dim]")
-    console.print(f"[dim]  {world_size} devices, {num_groups} groups (TP={tp_degree})[/dim]")
+    console.print(
+        f"[dim]  driver={driver.type}, {world_size} devices, "
+        f"{num_groups} group(s), TP={tp_degree}[/dim]"
+    )
 
     # Spawn workers
     mp.set_start_method("spawn", force=True)
     master_port = 29500 + random.randint(0, 1000)
 
-    # Build model_config dict for worker (worker_main still expects a dict)
-    model_config_dict = asdict(model)
-    model_config_dict.pop("name", None)
-    model_config_dict.update({
+    # Pack only the keys workers actually consume via `RuntimeConfig.from_args`.
+    # The model name and admission policy go directly to the Rust ModelConfig
+    # (further below); `tensor_parallel_size` is passed explicitly to the
+    # worker as `tp_degree`. Per-driver knobs travel separately in
+    # `driver_options_dict`.
+    model_config_dict = {
+        "hf_repo": model.hf_repo,
+        "activation_dtype": driver.activation_dtype,
+        "random_seed": driver.random_seed,
         "telemetry_enabled": config.telemetry.enabled,
         "telemetry_endpoint": config.telemetry.endpoint,
         "telemetry_service_name": config.telemetry.service_name,
-    })
+    }
+
+    driver_options_dict = asdict(driver_options)
 
     spawn_ctx = mp.get_context("spawn")
     ready_queue = spawn_ctx.Queue()
@@ -213,6 +247,7 @@ def _bootstrap(
             device_value,
             master_port,
             model_config_dict,
+            driver_options_dict,
             group_topology,
             ready_queue,
         ),
@@ -222,10 +257,13 @@ def _bootstrap(
         daemon=True,
     )
 
-    # Collect ready signals
+    # Collect ready signals (each leader sends a BackendCapabilities;
+    # followers send None).
+    from pie.capabilities import BackendCapabilities
+
     connected_ranks: set[int] = set()
     server_names_by_group: dict[int, str] = {}
-    device_metadata_by_group: dict[int, dict] = {}
+    capabilities_by_group: dict[int, BackendCapabilities] = {}
     start_wait = time.time()
 
     while len(connected_ranks) < world_size:
@@ -241,13 +279,18 @@ def _bootstrap(
             raise TimeoutError(f"Timed out waiting for {world_size} workers")
 
         try:
-            rank, server_name, metadata = ready_queue.get(timeout=0.2)
+            rank, server_name, payload = ready_queue.get(timeout=0.2)
             connected_ranks.add(rank)
             if server_name is not None:
+                if not isinstance(payload, BackendCapabilities):
+                    raise RuntimeError(
+                        f"Worker {rank} sent unexpected ready payload "
+                        f"{type(payload).__name__}; expected BackendCapabilities."
+                    )
                 for gid, group in enumerate(group_topology):
                     if rank in group:
                         server_names_by_group[gid] = server_name
-                        device_metadata_by_group[gid] = metadata or {}
+                        capabilities_by_group[gid] = payload
                         break
             console.print(f"[dim]  Worker {rank} ready ({len(connected_ranks)}/{world_size})[/dim]")
         except queue.Empty:
@@ -256,27 +299,48 @@ def _bootstrap(
     ready_queue.close()
     ready_queue.join_thread()
 
-    # Build Rust config and bootstrap
+    # Every group must have a leader that reported capabilities; otherwise
+    # we have no source of truth for KV page count, kv_page_size, etc.
+    missing_groups = [gid for gid in range(num_groups) if gid not in capabilities_by_group]
+    if missing_groups:
+        raise RuntimeError(
+            f"No BackendCapabilities received from groups {missing_groups}. "
+            "Each group leader must publish capabilities before bootstrap."
+        )
+
+    # Surface what the backend actually negotiated. Useful when the user
+    # asked for kv_page_size=8 and the backend resolved to 16, etc.
+    group0_caps = capabilities_by_group[0]
+    console.print(
+        f"[dim]  Backend capacities: "
+        f"arch={group0_caps.arch_name}, "
+        f"kv_page_size={group0_caps.kv_page_size}, "
+        f"total_pages={group0_caps.total_pages}, "
+        f"swap_pool={group0_caps.swap_pool_size}, "
+        f"vocab={group0_caps.vocab_size}, "
+        f"max_model_len={group0_caps.max_model_len}, "
+        f"dtype={group0_caps.activation_dtype}[/dim]"
+    )
+
+    # Build Rust config from the per-group capabilities.
     py_devices = []
     for gid in range(num_groups):
-        meta = device_metadata_by_group.get(gid, {})
+        caps = capabilities_by_group[gid]
         py_devices.append(
             pie_runtime.DeviceConfig(
                 hostname=server_names_by_group[gid],
-                total_pages=meta.get("total_pages", 0),
-                max_batch_tokens=meta.get("max_batch_tokens", 10240),
-                max_batch_size=meta.get("max_batch_size", 128),
-                cpu_pages=meta.get("swap_pool_size", 0),
+                total_pages=caps.total_pages,
+                max_batch_tokens=caps.max_batch_tokens,
+                max_batch_size=caps.max_batch_size,
+                cpu_pages=caps.swap_pool_size,
             )
         )
 
-    group0_meta = device_metadata_by_group.get(0, {})
-
     py_model = pie_runtime.ModelConfig(
-        name=model.hf_repo,
-        arch_name=group0_meta.get("arch_name", "dummy"),
-        kv_page_size=model.kv_page_size,
-        tokenizer_path=str(Path(group0_meta.get("snapshot_dir", "")) / "tokenizer.json"),
+        name=model.name,                              # the [model.X] table key
+        arch_name=group0_caps.arch_name,
+        kv_page_size=group0_caps.kv_page_size,        # backend's resolved value
+        tokenizer_path=str(Path(group0_caps.snapshot_dir) / "tokenizer.json"),
         devices=py_devices,
         scheduler=pie_runtime.SchedulerConfig(
             request_timeout_secs=120,
@@ -289,10 +353,10 @@ def _bootstrap(
     )
 
     rust_config = pie_runtime.Config(
-        host=config.host,
-        port=config.port,
-        verbose=config.verbose,
-        registry=config.registry,
+        host=config.server.host,
+        port=config.server.port,
+        verbose=config.server.verbose,
+        registry=config.server.registry,
         auth_enabled=config.auth.enabled,
         auth_dir=auth_dir,
         program_dir=program_dir,
@@ -301,9 +365,9 @@ def _bootstrap(
         telemetry_endpoint=config.telemetry.endpoint,
         telemetry_service_name=config.telemetry.service_name,
         models=[py_model],
-        allow_filesystem=config.allow_filesystem,
-        max_concurrent_processes=config.max_concurrent_processes,
-        python_snapshot=config.python_snapshot,
+        allow_filesystem=config.server.allow_filesystem,
+        max_concurrent_processes=config.server.max_concurrent_processes,
+        python_snapshot=config.server.python_snapshot,
     )
 
     runtime_handle = pie_runtime.bootstrap(rust_config)

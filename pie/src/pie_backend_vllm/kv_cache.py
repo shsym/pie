@@ -61,6 +61,7 @@ def _compute_num_blocks(
 def allocate_and_bind_kv_cache(
     loaded: "LoadedModel",
     config: RuntimeConfig,
+    driver_config,
 ) -> list[torch.Tensor]:
     """Allocate the GPU KV cache and bind it to every attention layer.
 
@@ -75,8 +76,6 @@ def allocate_and_bind_kv_cache(
     vllm_config = loaded.vllm_config
     fc = vllm_config.compilation_config.static_forward_context
 
-    # Filter to actual attention layers (skip things like cross-attention only
-    # heads or layers that share KV with another layer).
     attn_layers: dict[str, "AttentionLayerBase"] = {
         name: layer for name, layer in fc.items()
         if isinstance(layer, AttentionLayerBase)
@@ -85,9 +84,6 @@ def allocate_and_bind_kv_cache(
     if not attn_layers:
         raise RuntimeError("No attention layers found in vllm forward context.")
 
-    # All layers share the same spec for single-attention-type models — pull
-    # the spec from the first layer and assert uniformity. Mamba / hybrid
-    # models break this and aren't supported in v1.
     with set_current_vllm_config(vllm_config):
         first_spec = next(iter(attn_layers.values())).get_kv_cache_spec(vllm_config)
     page_size_bytes = first_spec.page_size_bytes
@@ -101,7 +97,7 @@ def allocate_and_bind_kv_cache(
         page_size_bytes=page_size_bytes,
         num_layers=len(attn_layers),
         device=device,
-        gpu_mem_utilization=config.gpu_mem_utilization,
+        gpu_mem_utilization=driver_config.gpu_memory_utilization,
     )
     config.max_num_kv_pages = num_blocks
 
