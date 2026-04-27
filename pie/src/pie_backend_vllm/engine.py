@@ -72,6 +72,13 @@ class VllmEngine:
         self.snapshot_dir = snapshot_dir
         self.adapters = {}
 
+        # Speculative decoding: backend-side n-gram drafter. Verification
+        # and splice live in the shared `pie_backend.batching.Batch`; this
+        # engine owns drafting via `spec_step`. Buffers are lazy-init so
+        # the numba JIT cost is only paid when spec is actually used.
+        self._ngram_buffers = None
+        self._ngram_history: dict[int, list[int]] = {}
+
     @classmethod
     def load(
         cls,
@@ -164,6 +171,144 @@ class VllmEngine:
         )
 
         return self.forward_pass.sample(hidden_states, sampling_metadata)
+
+    # ------------------------------------------------------------------
+    # Speculative decoding: NGRAM drafter
+    # ------------------------------------------------------------------
+    #
+    # `spec_step` is the contract `pie_backend.worker._populate_next_drafts`
+    # probes for via `getattr`. Verification + splice are shared (live in
+    # `Batch.get_spec_expanded_*` and `Batch.verify_drafts`); this engine
+    # only owns the drafter side.
+
+    def _ensure_ngram(self):
+        """Lazy-init the numba kernel + scratch buffers on first proposal."""
+        if self._ngram_buffers is not None:
+            return self._ngram_buffers
+        if not getattr(self.driver_config, "spec_ngram_enabled", False):
+            return None
+        from vllm.v1.spec_decode.ngram_proposer import batch_propose_numba
+
+        max_model_len = int(self.info.get("max_model_len", 0)) or 4096
+        max_num_seqs = int(getattr(self.driver_config, "max_num_seqs", 256))
+        k = int(self.driver_config.spec_ngram_num_drafts)
+        min_n = int(self.driver_config.spec_ngram_min_n)
+        max_n = int(self.driver_config.spec_ngram_max_n)
+        if min_n < 1 or max_n < min_n:
+            raise ValueError(
+                "VllmDriverConfig: spec_ngram_min_n must be >= 1 and "
+                f"<= spec_ngram_max_n (got min={min_n}, max={max_n})"
+            )
+
+        # Trigger numba JIT once with a zeroed batch so the first real
+        # call doesn't pay the compile cost on the inference critical path.
+        draft_buf = np.zeros((max_num_seqs, k), dtype=np.int32)
+        num_drafts_buf = np.zeros(max_num_seqs, dtype=np.int32)
+        batch_propose_numba(
+            [0],
+            np.zeros(1, dtype=np.int32),
+            np.zeros((1, max_model_len), dtype=np.int32),
+            min_n, max_n, max_model_len, k,
+            np.zeros((1, k), dtype=np.int32),
+            np.zeros(1, dtype=np.int32),
+        )
+
+        self._ngram_buffers = {
+            "fn": batch_propose_numba,
+            "draft_buf": draft_buf,
+            "num_drafts_buf": num_drafts_buf,
+            "max_model_len": max_model_len,
+            "max_num_seqs": max_num_seqs,
+            "k": k,
+            "min_n": min_n,
+            "max_n": max_n,
+        }
+        return self._ngram_buffers
+
+    def spec_step(
+        self, sessions: list[tuple[int, list[int]]]
+    ) -> list[list[int]]:
+        """Per-session NGRAM step: observe accepted, then propose drafts.
+
+        `sessions[i] = (session_id, just_accepted_tokens)` for one request.
+        Appends accepted tokens to the per-session history (capped by
+        `max_model_len`), runs vllm's longest-suffix-match n-gram kernel
+        over the per-batch dense token array, and returns one chain per
+        session (possibly empty if no match was found).
+        """
+        bufs = self._ensure_ngram()
+        if bufs is None or not sessions:
+            return [[] for _ in sessions]
+
+        max_model_len = bufs["max_model_len"]
+        max_num_seqs = bufs["max_num_seqs"]
+        k = bufs["k"]
+        B = len(sessions)
+        if B > max_num_seqs:
+            raise RuntimeError(
+                f"VllmEngine.spec_step: batch size {B} exceeds "
+                f"max_num_seqs {max_num_seqs}"
+            )
+
+        # Update histories. The kernel only reads positions < max_model_len,
+        # so an oversized history loses its head — n-gram match still works
+        # over the retained suffix.
+        for sid, accepted in sessions:
+            hist = self._ngram_history.get(sid)
+            if hist is None:
+                hist = []
+                self._ngram_history[sid] = hist
+            if accepted:
+                hist.extend(int(t) for t in accepted)
+                if len(hist) > max_model_len:
+                    del hist[: len(hist) - max_model_len]
+
+        # Dense [B, max_model_len] tokens + per-session length, the shape
+        # the numba kernel expects. Allocated fresh per call — a persistent
+        # scratch buffer would have to be cleared anyway.
+        token_ids_cpu = np.zeros((B, max_model_len), dtype=np.int32)
+        num_tokens = np.zeros(B, dtype=np.int32)
+        active_indices: list[int] = []
+        for i, (sid, _accepted) in enumerate(sessions):
+            hist = self._ngram_history[sid]
+            n = len(hist)
+            if n == 0:
+                continue
+            token_ids_cpu[i, :n] = hist
+            num_tokens[i] = n
+            active_indices.append(i)
+
+        if not active_indices:
+            return [[] for _ in sessions]
+
+        draft_buf = bufs["draft_buf"]
+        num_drafts_buf = bufs["num_drafts_buf"]
+        # Clear only the rows we'll write to; numba reads num_drafts_buf[i]
+        # to decide whether row i is valid.
+        for i in active_indices:
+            num_drafts_buf[i] = 0
+        bufs["fn"](
+            active_indices,
+            num_tokens,
+            token_ids_cpu,
+            bufs["min_n"], bufs["max_n"], max_model_len, k,
+            draft_buf,
+            num_drafts_buf,
+        )
+
+        out: list[list[int]] = []
+        active_set = set(active_indices)
+        for i in range(B):
+            if i in active_set and num_drafts_buf[i] > 0:
+                out.append(draft_buf[i, : num_drafts_buf[i]].tolist())
+            else:
+                out.append([])
+        return out
+
+    def spec_release(self, session_ids: list[int]) -> None:
+        """Drop per-session history for finished/evicted contexts."""
+        for sid in session_ids:
+            self._ngram_history.pop(sid, None)
 
     # ------------------------------------------------------------------
     # Adapters — deferred. v1 raises clearly so workloads that need them

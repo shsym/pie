@@ -244,6 +244,12 @@ class Batch:
         self.output_spec_flags = args["output_spec_flags"]
         self.sampler_seeds_arr = _decode_u32(args["sampler_seeds"])
 
+        # ===== CONTEXT IDS (per request) =====
+        # Stable per-context identifier. Used by backends that maintain
+        # per-context state (e.g. n-gram drafter token history) as the
+        # session key — see worker._populate_next_drafts.
+        self.context_ids = list(args.get("context_ids", []))
+
         # ===== LOGIT MASKS (BRLE per request → bool matrix) =====
         logit_masks_u32 = _decode_u32(args["logit_masks"]).astype(np.int32)
         logit_mask_indptr = _decode_u32(args["logit_mask_indptr"]).astype(np.int32)

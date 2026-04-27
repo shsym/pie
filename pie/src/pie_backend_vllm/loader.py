@@ -93,8 +93,18 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     )
 
     # Driver-specific fields splat verbatim — names match EngineArgs.
-    # `None` means "leave default" (vllm picks).
+    # `None` means "leave default" (vllm picks). Pie-only knobs that don't
+    # correspond to vllm EngineArgs are filtered out: spec_ngram_* drive
+    # pie's NGRAM drafter (engine-side, see VllmEngine.spec_step).
+    _PIE_ONLY_KEYS = {
+        "spec_ngram_enabled",
+        "spec_ngram_num_drafts",
+        "spec_ngram_min_n",
+        "spec_ngram_max_n",
+    }
     for k, v in asdict(driver_config).items():
+        if k in _PIE_ONLY_KEYS:
+            continue
         if v is not None:
             engine_kwargs[k] = v
 

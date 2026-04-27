@@ -38,3 +38,16 @@ class VllmDriverConfig:
     # KV cache block size override. None = vllm picks based on attention
     # backend's allowed sizes (FlashInfer: 16/32/64; FlashAttention: 16/32).
     block_size: int | None = None
+
+    # ---- Speculative decoding (NGRAM, backend-supplied drafts) ----
+    # When True, VllmEngine.spec_step proposes linear draft continuations.
+    # Verification + splice run in the shared `pie_backend.batching.Batch`
+    # path; the engine only owns drafting. Field names mirror
+    # SGLangDriverConfig so configs port across backends.
+    spec_ngram_enabled: bool = False
+    # Drafts proposed per accepted iteration.
+    spec_ngram_num_drafts: int = 4
+    # n-gram match window (mirrors vllm's
+    # SpeculativeConfig.prompt_lookup_min/max). Requires 1 ≤ min ≤ max.
+    spec_ngram_min_n: int = 2
+    spec_ngram_max_n: int = 4
