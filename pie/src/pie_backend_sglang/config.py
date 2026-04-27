@@ -60,6 +60,24 @@ class SGLangDriverConfig:
     # filters it out when splatting into `ServerArgs`.
     cpu_mem_budget_in_gb: int = 0
 
+    # ---- CMA-ES adapter (zero-order training) ----
+    # When True, allocates per-layer adapter storage and class-swaps
+    # `QKVParallelLinear` on every decoder layer for an adapter-aware
+    # wrapper that adds the noisy DOWN/UP-projection contribution to
+    # Q/K/V at forward time. Required for ZO/CMA-ES training inferlets
+    # (e.g., sdk/demo/zo-training/). Disabled by default — enabling
+    # forces `disable_cuda_graph=True` since the v1 wrapper isn't graph-
+    # capture-friendly (the sub pass-or-not branch needs a record-with /
+    # record-without-adapter pair to be CUDA-graph safe; deferred).
+    enable_adapter: bool = False
+    # Per-engine adapter slot capacity and max LoRA rank. Mirror of the
+    # fields on `pie_backend.config.NativeRuntimeConfig`; placed here
+    # rather than on the base RuntimeConfig so the change is sglang-
+    # scoped (matches the user's "no cross-cutting native changes for
+    # now" guidance).
+    max_num_adapters: int = 32
+    max_adapter_rank: int = 8
+
     # ---- Speculative decoding (NGRAM, backend-supplied drafts) ----
     # When True, the engine maintains an n-gram trie of recently-accepted
     # tokens and proposes linear draft continuations to the runtime as
