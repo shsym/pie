@@ -108,11 +108,19 @@ def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriver
         "spec_ngram_num_drafts",
         "spec_ngram_max_depth",
         "spec_ngram_capacity",
+        "enable_adapter",
+        "max_num_adapters",
+        "max_adapter_rank",
     }
     server_kwargs.update({
         k: v for k, v in asdict(driver_config).items()
         if v is not None and k not in _NON_SGLANG_FIELDS
     })
+    # Adapter mode requires graph-mode-OFF in v1: the QKVAdapterWrapper's
+    # subpass-or-not branch needs a record-with / record-without-adapter
+    # graph pair to be capture-safe, which we haven't built yet.
+    if driver_config.enable_adapter:
+        server_kwargs["disable_cuda_graph"] = True
     return ServerArgs(**server_kwargs)
 
 

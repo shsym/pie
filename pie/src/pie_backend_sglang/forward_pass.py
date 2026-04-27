@@ -83,6 +83,10 @@ class SGLangForwardPass:
         # `_compute_lm_head` (layers/logits_processor.py:891-913).
         self._lm_head_module = runner.model.lm_head
 
+        # Set by `Engine.load` when adapter mode is enabled; stays None
+        # otherwise so `transform()` skips the slot writes.
+        self.adapter_subpass_slot = None
+
     # ------------------------------------------------------------------
     # Pie contract
     # ------------------------------------------------------------------
@@ -127,11 +131,21 @@ class SGLangForwardPass:
             self._mask_strategy.set(custom_mask, meta.mask_indptr)
             self._mask_strategy.apply_to_forward_batch(fb)
 
+        # CMA-ES adapter: hand the per-batch subpass to the QKV wrappers
+        # via the slot they hold a reference to. No-op when adapter mode
+        # is disabled (slot is None) or when this batch has no adapter
+        # tokens (subpass is None).
+        slot = self.adapter_subpass_slot
+        if slot is not None:
+            slot.current = adapter_subpass
+
         self._capture.captured = None
         try:
             self.runner.forward(fb)
         finally:
             self._mask_strategy.clear()
+            if slot is not None:
+                slot.current = None
 
         if self._capture.captured is None:
             raise RuntimeError(

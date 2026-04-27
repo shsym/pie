@@ -61,6 +61,10 @@ class TrainingConfig:
     local: bool = False
     model: str = "meta-llama/Llama-3.2-1B-Instruct"
     device: str = "cuda:0"
+    # `native` = pie_backend (flashinfer); `sglang` = pie_backend_sglang.
+    # When `sglang`, the driver is configured with `enable_adapter=True`
+    # so the QKV adapter wrappers get installed at engine load.
+    driver: str = "native"
     gpu_mem_util: float = 0.8
     cpu_mem_budget: int = 12
     max_concurrent_processes: int = 256
@@ -301,7 +305,10 @@ class ESTrainer:
     async def _setup_local(self):
         """Spin up an in-process Pie server and connect."""
         from pie.server import Server
-        from pie.config import Config, ModelConfig, AuthConfig
+        from pie.config import (
+            Config, ModelConfig, ServerConfig, AuthConfig,
+            TelemetryConfig, DriverConfig,
+        )
 
         device = (
             [d.strip() for d in self.config.device.split(",")]
@@ -309,21 +316,43 @@ class ESTrainer:
             else [self.config.device]
         )
 
+        # Driver-specific subsection (`[model.X.driver.<type>]`).
+        driver_subsection: dict = {}
+        if self.config.driver == "sglang":
+            # ZO training requires the QKV adapter wrappers; without
+            # enable_adapter the four adapter RPCs would still be wired
+            # but spec_propose etc. wouldn't fire and adapter math would
+            # be a no-op. Setting it here keeps the script ergonomic.
+            driver_subsection["enable_adapter"] = True
+            driver_subsection["mem_fraction_static"] = self.config.gpu_mem_util
+            if self.config.cpu_mem_budget > 0:
+                driver_subsection["cpu_mem_budget_in_gb"] = self.config.cpu_mem_budget
+        elif self.config.cpu_mem_budget > 0:
+            # Native / dummy honour cpu_mem_budget_in_gb directly.
+            driver_subsection["cpu_mem_budget_in_gb"] = self.config.cpu_mem_budget
+
         cfg = Config(
-            port=0,
+            server=ServerConfig(port=0),
             auth=AuthConfig(enabled=False),
-            max_concurrent_processes=self.config.max_concurrent_processes,
-            models=[ModelConfig(
-                hf_repo=self.config.model,
-                device=device,
-                gpu_mem_utilization=self.config.gpu_mem_util,
-                cpu_mem_budget_in_gb=self.config.cpu_mem_budget,
-                default_token_budget=self.config.default_token_budget,
-                max_batch_size=self.config.max_batch_size,
-            )],
+            telemetry=TelemetryConfig(),
+            models={
+                "default": ModelConfig(
+                    name="default",
+                    hf_repo=self.config.model,
+                    driver=DriverConfig(
+                        type=self.config.driver,
+                        device=device,
+                        options=driver_subsection,
+                    ),
+                    default_token_budget=self.config.default_token_budget,
+                ),
+            },
         )
 
-        tqdm.write(f"🚀 Starting local Pie server (model={self.config.model}, device={device})...")
+        tqdm.write(
+            f"🚀 Starting local Pie server "
+            f"(model={self.config.model}, device={device}, driver={self.config.driver})..."
+        )
         server = await self._exit_stack.enter_async_context(Server(cfg))
         self._server = server
         client = await server.connect()

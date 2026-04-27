@@ -122,13 +122,35 @@ class SGLangEngine:
             kv_cache_at_layer, config.swap_budget_bytes,
         )
 
+        # Adapter setup is opt-in (gated by driver_config.enable_adapter).
+        # When off, we skip both the per-layer storage allocation and the
+        # QKVParallelLinear class-swap, keeping the non-adapter path
+        # bit-identical to before.
+        if driver_config.enable_adapter:
+            adapter_at_layer = cls._create_adapter_cache(
+                loaded.sglang_model_config, config, driver_config,
+            )
+            # Install QKV adapter wrappers + create the per-engine subpass
+            # slot the wrappers read from at forward time. Safe to install
+            # AFTER load_sglang_model only because adapter mode forces
+            # `disable_cuda_graph=True` in the loader (see loader.py); no
+            # captured graphs exist to be invalidated by the swap.
+            from .adapter_hooks import SubpassSlot, install_adapter_wrappers
+
+            adapter_subpass_slot = SubpassSlot()
+            install_adapter_wrappers(loaded.runner, adapter_subpass_slot)
+            forward_pass.adapter_subpass_slot = adapter_subpass_slot
+        else:
+            adapter_at_layer = []
+            forward_pass.adapter_subpass_slot = None
+
         return cls(
             config=config,
             driver_config=driver_config,
             model_config=loaded.sglang_model_config,
             forward_pass=forward_pass,
             kv_cache_at_layer=kv_cache_at_layer,
-            adapter_at_layer=[],
+            adapter_at_layer=adapter_at_layer,
             arch_type=loaded.arch_type,
             snapshot_dir=loaded.snapshot_dir,
             kv_cache_at_layer_host=host_kv,
@@ -265,6 +287,23 @@ class SGLangEngine:
     @torch.inference_mode()
     def fire_batch(self, inputs: dict, sampling_metadata: dict) -> dict:
         passthrough = self.forward_pass.embed_inputs(inputs)
+
+        # Build the per-batch CMA-ES adapter subpass when adapter tokens
+        # are present in the wire request. The wrappers installed at load
+        # time will read it via `adapter_subpass_slot.current`. Mirrors
+        # `pie_backend.engine.fire_batch` (engine.py:303-311).
+        adapter_subpass = None
+        if inputs.get("adapter_indices"):
+            from .adapter import AdapterSubpass
+
+            adapter_subpass = AdapterSubpass(
+                adapter_at_layer=self.adapter_at_layer,
+                adapter_indices=inputs["adapter_indices"],
+                adapter_extras=self.adapters,
+                rand_seeds=inputs["adapter_seeds"],
+                qo_indptr=inputs["qo_indptr"],
+            )
+
         gathered_logits = self.forward_pass.transform(
             input_embeds=passthrough,
             position_ids=inputs["position_ids"],
@@ -276,26 +315,160 @@ class SGLangEngine:
             single_token_inference_mode=inputs["single_token_inference_mode"],
             total_pages_cpu=inputs.get("total_pages_cpu", 0),
             custom_mask=inputs.get("custom_mask"),
+            adapter_subpass=adapter_subpass,
         )
         return self.forward_pass.sample(gathered_logits, sampling_metadata)
 
     # ------------------------------------------------------------------
-    # Adapters — deferred. Same stance as vllm backend.
+    # CMA-ES adapters
     # ------------------------------------------------------------------
+    # Per-layer (down, up) storage is shared via `self.adapter_at_layer`;
+    # injection into Q/K/V happens in `adapter_hooks.install_adapter_wrappers`,
+    # which class-swaps sglang's `QKVParallelLinear`. TP=1 only in v1.
 
-    def init_adapter(self, *args, **kwargs):
-        raise NotImplementedError(
-            "Adapters are not yet supported on the sglang backend. "
-            "Use --driver native for adapter workloads."
+    @staticmethod
+    def _create_adapter_cache(
+        sglang_model_config,
+        runtime_config: RuntimeConfig,
+        driver_config: SGLangDriverConfig,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Per-layer (down, up) shared storage.
+
+        Layout (per layer):
+          down: (max_num_adapters, hidden_size, max_adapter_rank * 3)
+          up  : (max_num_adapters, max_adapter_rank,
+                 head_dim * (local_num_q_heads + local_num_kv_heads * 2))
+        """
+        tp = runtime_config.tensor_parallel_size
+        cfg = sglang_model_config
+        local_num_q_heads = cfg.num_attention_heads // tp
+        local_num_kv_heads = cfg.num_key_value_heads // tp
+        local_sum_out = cfg.head_dim * (local_num_q_heads + local_num_kv_heads * 2)
+        max_num_adapters = int(driver_config.max_num_adapters)
+        max_adapter_rank = int(driver_config.max_adapter_rank)
+
+        return [
+            (
+                torch.zeros(
+                    (
+                        max_num_adapters,
+                        cfg.hidden_size,
+                        max_adapter_rank * 3,
+                    ),
+                    dtype=runtime_config.activation_dtype,
+                    device=runtime_config.device,
+                ),
+                torch.zeros(
+                    (
+                        max_num_adapters,
+                        max_adapter_rank,
+                        local_sum_out,
+                    ),
+                    dtype=runtime_config.activation_dtype,
+                    device=runtime_config.device,
+                ),
+            )
+            for _ in range(cfg.num_hidden_layers)
+        ]
+
+    @torch.inference_mode()
+    def init_adapter(
+        self,
+        adapter_ptr: int,
+        rank: int,
+        alpha: float,
+        population_size: int,
+        mu_fraction: float,
+        initial_sigma: float,
+    ):
+        """Initialize a CMA-ES adapter slot."""
+        from .adapter import CmaesAdapter
+
+        cfg = self.model_config
+        max_num_adapters = int(self.driver_config.max_num_adapters)
+
+        if adapter_ptr >= max_num_adapters:
+            raise ValueError(
+                f"Adapter pointer {adapter_ptr} exceeds max_num_adapters "
+                f"{max_num_adapters}"
+            )
+
+        tp_size = self.config.tensor_parallel_size
+        gpu_rank = self.config.rank % tp_size
+
+        local_num_q_heads = cfg.num_attention_heads // tp_size
+        local_num_kv_heads = cfg.num_key_value_heads // tp_size
+
+        local_out_features = [
+            cfg.head_dim * local_num_q_heads,
+            cfg.head_dim * local_num_kv_heads,
+            cfg.head_dim * local_num_kv_heads,
+        ]
+
+        self.adapters[adapter_ptr] = CmaesAdapter(
+            adapter_id=adapter_ptr,
+            adapter_at_layer=self.adapter_at_layer,
+            rank=rank,
+            alpha=alpha,
+            in_features=cfg.hidden_size,
+            out_features=local_out_features,
+            num_layers=cfg.num_hidden_layers,
+            population_size=population_size,
+            mu_fraction=mu_fraction,
+            initial_sigma=initial_sigma,
+            min_sigma=1e-7,
+            min_var=1e-8,
+            max_var=1e4,
+            device=self.config.device,
+            dtype=self.config.activation_dtype,
+            gpu_rank=gpu_rank,
+            world_size=tp_size,
+            adapter_path=self.config.adapter_path,
         )
 
-    def update_adapter(self, *args, **kwargs):
-        raise NotImplementedError("Adapters are not yet supported on the sglang backend.")
+    @torch.inference_mode()
+    def update_adapter(
+        self,
+        adapter_ptr: int,
+        scores: list[float],
+        seeds: list[int],
+        max_sigma: float,
+    ):
+        """Run one CMA-ES iteration on the named adapter."""
+        from .adapter import CmaesAdapter
 
-    def load_adapter(self, *args, **kwargs):
-        raise NotImplementedError("Adapters are not yet supported on the sglang backend.")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.config.device)
 
-    def save_adapter(self, *args, **kwargs):
+        if adapter_ptr in self.adapters:
+            adapter = self.adapters[adapter_ptr]
+            if isinstance(adapter, CmaesAdapter):
+                adapter.update(scores, seeds, max_sigma)
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(self.config.device)
+
+    def load_adapter(self, adapter_ptr: int, name: str, data: bytes) -> None:
+        """Load adapter weights + CMA-ES state from a checkpoint."""
+        from .adapter import CmaesAdapter
+
+        if adapter_ptr in self.adapters:
+            adapter = self.adapters[adapter_ptr]
+            if isinstance(adapter, CmaesAdapter):
+                if self.config.world_size > 1:
+                    name = f"{name}_rank{self.config.rank}"
+                adapter.upload(name, data)
+
+    def save_adapter(self, adapter_ptr: int, name: str) -> bytes:
+        """Snapshot adapter weights + CMA-ES state to a checkpoint."""
+        from .adapter import CmaesAdapter
+
+        if adapter_ptr in self.adapters:
+            adapter = self.adapters[adapter_ptr]
+            if isinstance(adapter, CmaesAdapter):
+                if self.config.world_size > 1:
+                    name = f"{name}_rank{self.config.rank}"
+                return adapter.download(name)
         return b""
 
     # ------------------------------------------------------------------
