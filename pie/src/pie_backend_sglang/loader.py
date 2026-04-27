@@ -96,8 +96,23 @@ def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriver
         port=30000,
         skip_server_warmup=True,
     )
-    # Driver-specific fields splat verbatim — names match ServerArgs.
-    server_kwargs.update({k: v for k, v in asdict(driver_config).items() if v is not None})
+    # Driver-specific fields splat verbatim — names match ServerArgs. Skip
+    # universal pie knobs that don't correspond to sglang ServerArgs:
+    #   - cpu_mem_budget_in_gb sizes pie's host KV pool.
+    #   - spec_ngram_* drive pie's own NGRAM drafter (engine-side, see
+    #     SGLangEngine.spec_propose); they don't map to sglang's
+    #     speculative_algorithm path.
+    _NON_SGLANG_FIELDS = {
+        "cpu_mem_budget_in_gb",
+        "spec_ngram_enabled",
+        "spec_ngram_num_drafts",
+        "spec_ngram_max_depth",
+        "spec_ngram_capacity",
+    }
+    server_kwargs.update({
+        k: v for k, v in asdict(driver_config).items()
+        if v is not None and k not in _NON_SGLANG_FIELDS
+    })
     return ServerArgs(**server_kwargs)
 
 

@@ -53,3 +53,23 @@ class SGLangDriverConfig:
     # Disable sglang's radix prefix cache. Pie owns prefix sharing via its
     # own scheduler; running sglang's on top is wasted work.
     disable_radix_cache: bool = True
+
+    # Universal pie knob (not an sglang ServerArgs field). Sized in GiB; sets
+    # the pinned host KV pool that backs D2H/H2D swap. 0 disables swap. The
+    # worker forwards this into `RuntimeConfig.swap_budget_bytes`; the loader
+    # filters it out when splatting into `ServerArgs`.
+    cpu_mem_budget_in_gb: int = 0
+
+    # ---- Speculative decoding (NGRAM, backend-supplied drafts) ----
+    # When True, the engine maintains an n-gram trie of recently-accepted
+    # tokens and proposes linear draft continuations to the runtime as
+    # `next_spec_tokens` in TokensWithSpeculation responses. The inferlet
+    # opts in by calling `output_speculative_tokens(true)`; otherwise the
+    # drafts are dropped at response packaging.
+    spec_ngram_enabled: bool = False
+    # Number of drafts proposed per accepted iteration.
+    spec_ngram_num_drafts: int = 4
+    # Maximum trie depth — longer ngrams are not stored.
+    spec_ngram_max_depth: int = 18
+    # Trie capacity in tokens (approximate node budget).
+    spec_ngram_capacity: int = 1_000_000
