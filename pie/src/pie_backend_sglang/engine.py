@@ -61,6 +61,18 @@ class SGLangEngine:
         self.snapshot_dir = snapshot_dir
         self.adapters = {}
 
+        # Speculative decoding: backend-side n-gram drafter. Lazy-init on
+        # first use so the import cost is paid only when spec is enabled.
+        self._ngram_corpus = None
+        # Per-session token history. Keyed by an opaque session ID the
+        # worker provides (currently the first KV page id, which is stable
+        # for an active context). Without this, every iteration's `accepted`
+        # is only 1-3 tokens long — too short to either (a) populate the
+        # trie usefully or (b) anchor a deep trie match. We append accepted
+        # tokens per iteration and feed the recent suffix as the query +
+        # the full sequence as the trie insertion.
+        self._ngram_history: dict[int, list[int]] = {}
+
     @classmethod
     def load(
         cls,
@@ -122,6 +134,133 @@ class SGLangEngine:
             kv_cache_at_layer_host=host_kv,
             swap_pool_size=pool_size,
         )
+
+    # ------------------------------------------------------------------
+    # Speculative decoding: NGRAM drafter
+    # ------------------------------------------------------------------
+    #
+    # `spec_step` is the contract the worker probes for via `getattr` —
+    # sglang-specific and gated by `driver_config.spec_ngram_enabled`. The
+    # native pie_backend Engine does not implement it (intentional).
+
+    def _ensure_ngram(self):
+        """Lazy-init the NgramCorpus on first proposal/observation."""
+        if self._ngram_corpus is not None:
+            return self._ngram_corpus
+        if not self.driver_config.spec_ngram_enabled:
+            return None
+        from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+
+        self._ngram_corpus = NgramCorpus(
+            max_trie_depth=int(self.driver_config.spec_ngram_max_depth),
+            min_bfs_breadth=1,
+            # Linear (non-tree) drafts only in v1 — the Pie API has no way
+            # to convey a tree mask back to the inferlet for next-iteration
+            # input_speculative_tokens, so we restrict to a single best path.
+            max_bfs_breadth=1,
+            draft_token_num=int(self.driver_config.spec_ngram_num_drafts),
+            match_type="BFS",
+            capacity=int(self.driver_config.spec_ngram_capacity),
+        )
+        return self._ngram_corpus
+
+    def spec_step(
+        self, sessions: list[tuple[int, list[int]]]
+    ) -> list[list[int]]:
+        """Per-session NGRAM step: observe accepted, then propose drafts.
+
+        `sessions[i] = (session_id, just_accepted_tokens)` for one request.
+        The engine appends the accepted tokens to the per-session history,
+        re-inserts the (capped) full history into the trie so it grows with
+        each iteration, then queries the trie using the recent suffix as
+        the anchor. Returns `drafts[i]` — the proposed continuation
+        (possibly empty if the trie doesn't have a match yet).
+
+        `session_id` is opaque — any stable per-context value works. The
+        worker uses the request's first KV page id, which is stable across
+        iterations for an unevicted context.
+        """
+        corpus = self._ensure_ngram()
+        if corpus is None or not sessions:
+            return [[] for _ in sessions]
+
+        max_depth = int(self.driver_config.spec_ngram_max_depth)
+        # Update per-session histories and gather (history, recent suffix).
+        all_histories: list[list[int]] = []
+        anchors: list[list[int]] = []
+        for sid, accepted in sessions:
+            hist = self._ngram_history.get(sid, [])
+            if accepted:
+                hist = hist + [int(t) for t in accepted]
+                # Cap at max_depth × 4 to bound memory; the trie itself
+                # only indexes the last max_depth tokens of any insert.
+                cap = max_depth * 4
+                if len(hist) > cap:
+                    hist = hist[-cap:]
+                self._ngram_history[sid] = hist
+            all_histories.append(hist)
+            # Anchor for matching: the recent suffix up to max_depth tokens.
+            # Shorter anchors → faster but matches less specifically.
+            anchor = hist[-max_depth:] if hist else []
+            anchors.append(anchor)
+
+        # Insert full histories into the trie. `batch_put` indexes all
+        # n-grams within each sequence, so re-inserting the same history
+        # each iteration is idempotent for the slice that was already
+        # there and incremental for the new tail.
+        useful = [h for h in all_histories if len(h) >= 2]
+        if useful:
+            corpus.batch_put(useful)
+
+        # Stateless query — `erase_match_state` below clears these IDs
+        # before they could collide with a future call, so they only need
+        # to be unique within this batch.
+        req_ids = [f"q{i}" for i in range(len(anchors))]
+        # `batch_get` requires non-empty token contexts; substitute a
+        # single zero token for any empty anchor and skip its result.
+        sanitized = [a if a else [0] for a in anchors]
+        total_lens = [len(s) for s in sanitized]
+        try:
+            corpus.synchronize()
+            decoding_ids, tree_mask = corpus.batch_get(
+                req_ids=req_ids,
+                batch_tokens=sanitized,
+                total_lens=total_lens,
+            )
+        finally:
+            corpus.erase_match_state(req_ids)
+
+        n_drafts = int(self.driver_config.spec_ngram_num_drafts)
+        ids_arr = np.asarray(decoding_ids).reshape(-1, n_drafts)
+        # tree_mask is shape (num_queries × n_drafts × n_drafts), serialized
+        # flat. Row k indicates which prior positions position k attends to;
+        # for our linear (max_bfs_breadth=1) configuration, position k is
+        # part of the chain iff `mask[k][k-1] == 1`. The leading column is
+        # always 1 (everything attends to position 0, the anchor echo).
+        mask_arr = np.asarray(tree_mask).reshape(-1, n_drafts, n_drafts)
+        out: list[list[int]] = []
+        for i, a in enumerate(anchors):
+            if not a:
+                out.append([])
+                continue
+            row = ids_arr[i]
+            mask = mask_arr[i]
+            # Walk forward starting at position 1 (position 0 is the anchor
+            # echo — `row[0] == anchor[-1]`, NOT a real prediction). Stop
+            # at the first position k where `mask[k][k-1] == 0`, meaning
+            # the trie didn't extend the chain.
+            chain: list[int] = []
+            for k in range(1, n_drafts):
+                if int(mask[k][k - 1]) == 0:
+                    break
+                chain.append(int(row[k]))
+            out.append(chain)
+        return out
+
+    def spec_release(self, session_ids: list[int]) -> None:
+        """Drop per-session history for finished/evicted contexts."""
+        for sid in session_ids:
+            self._ngram_history.pop(sid, None)
 
     @torch.inference_mode()
     def fire_batch(self, inputs: dict, sampling_metadata: dict) -> dict:

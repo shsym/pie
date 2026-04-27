@@ -300,6 +300,84 @@ _STATUS_INVALID_PARAMS = 2
 _STATUS_INTERNAL_ERROR = 3
 
 
+def _populate_next_drafts(batch, sampling_results: dict, engine) -> None:
+    """Ask the engine for next-iteration drafts for spec-output requests.
+
+    Looks for `engine.spec_step(sessions)` on the engine — backends that
+    don't implement it (native flashinfer, vllm) are no-ops here. For each
+    request that asked for `output_speculative_tokens(true)`, builds a
+    `(session_id, accepted_tokens)` pair and hands it to `spec_step`,
+    which observes the just-accepted tokens (extending per-session
+    history) and proposes a draft continuation. The result is stuffed
+    into `sampling_results['spec_tokens']` / `['spec_positions']`, and
+    `Batch.create_responses` packs it into TokensWithSpeculation.
+
+    Session ID: the request's first physical KV page ID (stable for an
+    active context across iterations). Eviction would invalidate it, but
+    a new context just gets a new session.
+    """
+    step = getattr(engine, "spec_step", None)
+    if step is None:
+        return
+
+    num_requests = len(batch.request_output_counts)
+    output_flags = batch.output_spec_flags
+    spec_accepted_all = sampling_results.get("spec_accepted_tokens", None)
+    final_tokens = sampling_results.get("tokens", [])
+
+    sessions: list[tuple[int, list[int]]] = []
+    next_draft_base: list[int] = []  # one entry per `sessions` entry
+    spec_request_idx: list[int] = []
+
+    cursor = 0  # walks over inferlet sampler slots in final_tokens
+    for i in range(num_requests):
+        num_outputs = int(batch.request_output_counts[i])
+        if spec_accepted_all is not None and spec_accepted_all[i] is not None:
+            accepted = list(spec_accepted_all[i])
+        else:
+            accepted = []
+            for k in range(cursor, cursor + num_outputs):
+                if int(batch.sampler_types[k]) != 0:
+                    accepted.append(int(final_tokens[k]))
+        cursor += num_outputs
+
+        if not output_flags[i] or not accepted:
+            continue
+
+        # Stable per-context session id: first physical KV page id for this
+        # request. Pages get pushed to kv_page_indices in stable order
+        # (committed, then working), so index 0 == the context's first
+        # committed page — stable across iterations of the same context.
+        page_start = int(batch.kv_page_indptr[i])
+        page_end = int(batch.kv_page_indptr[i + 1])
+        if page_end == page_start:
+            continue  # No KV page; can't form a session id (shouldn't happen).
+        session_id = int(batch.kv_page_indices[page_start])
+        last_pending_pos = int(batch.position_ids[batch.qo_indptr[i + 1] - 1])
+
+        sessions.append((session_id, accepted))
+        next_draft_base.append(last_pending_pos + len(accepted))
+        spec_request_idx.append(i)
+
+    if not sessions:
+        return
+
+    drafts_per_session = step(sessions)
+
+    spec_tokens_per_req: list[list[int] | None] = [None] * num_requests
+    spec_positions_per_req: list[list[int] | None] = [None] * num_requests
+    for s_idx, req_i in enumerate(spec_request_idx):
+        chain = drafts_per_session[s_idx]
+        if not chain:
+            continue
+        base = next_draft_base[s_idx]
+        spec_tokens_per_req[req_i] = chain
+        spec_positions_per_req[req_i] = [base + 1 + k for k in range(len(chain))]
+
+    sampling_results["spec_tokens"] = spec_tokens_per_req
+    sampling_results["spec_positions"] = spec_positions_per_req
+
+
 def _leader_loop(
     engine,
     server,
@@ -433,15 +511,26 @@ def _leader_loop(
 
         device = config.device
 
-        # Create GPU tensors
+        # Create GPU tensors. When the batch carries draft tokens, use the
+        # spec-expanded views so the forward pass embeds drafts alongside
+        # pending tokens and the sampler emits an extra verification block
+        # whose tokens `batch.verify_drafts` consumes after fire_batch.
         t0 = time.perf_counter()
-        inputs = batch.get_model_inputs(device)
+        if batch.has_speculative_inputs:
+            inputs = batch.get_spec_expanded_model_inputs(device)
+        else:
+            inputs = batch.get_model_inputs(device)
         t_get_inputs = time.perf_counter() - t0
 
         t0 = time.perf_counter()
-        sampling_metadata = batch.get_sampling_metadata(
-            device, config.activation_dtype
-        )
+        if batch.has_speculative_inputs:
+            sampling_metadata = batch.get_spec_expanded_sampling_metadata(
+                device, config.activation_dtype
+            )
+        else:
+            sampling_metadata = batch.get_sampling_metadata(
+                device, config.activation_dtype
+            )
         t_get_sampling_meta = time.perf_counter() - t0
 
         # Broadcast to TP followers if multi-GPU
@@ -475,6 +564,19 @@ def _leader_loop(
         t0 = time.perf_counter()
         sampling_results = engine.fire_batch(inputs, sampling_metadata)
         t_inference = time.perf_counter() - t0
+
+        # Verify drafts (no-op for non-spec batches). Mutates sampling_results
+        # to add per-request `spec_accepted_tokens` so create_responses can
+        # emit Output::TokensWithSpeculation for spec-mode requests.
+        if batch.has_speculative_inputs:
+            batch.verify_drafts(sampling_results)
+
+        # Backend-supplied next-iteration drafts (NGRAM on sglang). Engines
+        # without a `spec_step` method (e.g. native flashinfer) skip this
+        # block entirely. We only ask the engine for drafts on requests that
+        # set output_speculative_tokens(true) — otherwise the response would
+        # drop them at packaging anyway.
+        _populate_next_drafts(batch, sampling_results, engine)
 
         # Package responses
         t0 = time.perf_counter()

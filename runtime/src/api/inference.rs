@@ -310,11 +310,16 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             .map(convert_sampler)
             .collect();
 
-        // Save data needed for context::append_working_page_tokens() before moving into request
+        // Save data needed for context::append_working_page_tokens() before
+        // moving into request. We also clone the speculative arrays so we
+        // can append the verified-prefix to the working-page lineage once
+        // the response tells us how many drafts were accepted.
         let num_input_tokens = tokens.len();
         let fill_tokens = tokens.clone();
         let fill_positions = positions.clone();
         let fill_masks = masks.clone();
+        let spec_tokens_for_fill = speculative_tokens.clone();
+        let spec_positions_for_fill = speculative_positions.clone();
 
         let context_id = pass.context_id
             .ok_or_else(|| anyhow::anyhow!("ForwardPass requires a context"))?;
@@ -406,12 +411,36 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 //     );
                 // }
                 // Step 3: Mark input tokens as forwarded WHILE still Pinned
-                // (non-evictable).  This ensures working_page_tokens + lineage are consistent
+                // (non-evictable). This ensures working_page_tokens + lineage are consistent
                 // before the context becomes Active (evictable).
-                if num_input_tokens > 0 {
+                //
+                // For speculative-decoding flows, the forward pass also
+                // wrote KV for every speculative token (accepted or not).
+                // The SDK's stream code accounts for this exact pattern:
+                //   * lineage += pending + ALL_drafts
+                //   * truncate(n_rejected) to drop the tail of rejected drafts
+                //   * commit_working_pages(...) using the post-truncate state
+                // So we append the FULL speculative chain here and rely on
+                // the SDK to call `truncate_working_page_tokens(n_rejected)`
+                // afterwards. Skipping that truncate would leave stale
+                // entries in the lineage; in practice the SDK's
+                // `Stream::generate_step` always issues it.
+                let mut all_fill_tokens = fill_tokens;
+                let mut all_fill_positions = fill_positions;
+                let mut all_fill_masks = fill_masks;
+                if !spec_tokens_for_fill.is_empty() {
+                    all_fill_tokens.extend_from_slice(&spec_tokens_for_fill);
+                    all_fill_positions.extend_from_slice(&spec_positions_for_fill);
+                    // Synthesize causal masks for each spec token, matching
+                    // the convention applied above for un-masked inputs.
+                    for &pos in &spec_positions_for_fill {
+                        all_fill_masks.push(Brle::all_true((pos + 1) as usize));
+                    }
+                }
+                if !all_fill_tokens.is_empty() {
                     if let Err(e) = context::append_working_page_tokens(
-                        model_id, context_id, fill_tokens,
-                        fill_positions, fill_masks, adapter_id, adapter_seed,
+                        model_id, context_id, all_fill_tokens,
+                        all_fill_positions, all_fill_masks, adapter_id, adapter_seed,
                     ).await {
                         context::unpin(model_id, context_id);
                         tracing::warn!("context::fill failed for ctx {context_id}: {e:#}");

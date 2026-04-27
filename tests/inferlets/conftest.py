@@ -55,6 +55,11 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser.add_argument("--cpu-mem-gb", type=int, default=0,
                         help="Pinned host KV pool size in GiB. 0 = swap disabled. "
                              "Native and sglang both honor this; vllm doesn't yet.")
+    parser.add_argument("--spec-ngram", action="store_true",
+                        help="Enable backend NGRAM speculative-decoding drafts "
+                             "(sglang driver only).")
+    parser.add_argument("--spec-num-drafts", type=int, default=4,
+                        help="Number of NGRAM draft tokens proposed per iteration.")
     return parser
 
 
@@ -173,6 +178,9 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
         driver_subsection["attention_backend"] = args.sglang_attention_backend
     if args.cpu_mem_gb > 0 and args.driver in ("native", "sglang", "dummy"):
         driver_subsection["cpu_mem_budget_in_gb"] = args.cpu_mem_gb
+    if args.driver == "sglang" and args.spec_ngram:
+        driver_subsection["spec_ngram_enabled"] = True
+        driver_subsection["spec_ngram_num_drafts"] = args.spec_num_drafts
 
     cfg = Config(
         server=ServerConfig(port=0),

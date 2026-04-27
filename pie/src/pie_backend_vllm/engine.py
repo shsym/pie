@@ -82,9 +82,10 @@ class VllmEngine:
     ) -> "VllmEngine":
         _require_vllm()
 
-        from .loader import load_vllm_model
-        from .kv_cache import allocate_and_bind_kv_cache, allocate_host_pool
         from .forward_pass import VllmForwardPass
+        from .kv_cache import allocate_and_bind_kv_cache, allocate_host_pool
+        from .loader import load_vllm_model
+        from .mask_strategies import install_mask_strategies
 
         def _log(msg: str, level: str = "INFO"):
             if log_queue is not None:
@@ -108,6 +109,12 @@ class VllmEngine:
             config, driver_config, log_queue=log_queue, compute_pg=compute_process_group
         )
         _log("Loaded vllm model", "DEBUG")
+
+        # Wrap each attn layer's impl in a mask-aware proxy. Idempotent;
+        # an absent `pie_attn_extras` makes the proxy a single dict.get
+        # plus a delegating call. See mask_strategies.py for the per-
+        # backend strategies and the refusal policy on unsupported impls.
+        install_mask_strategies(loaded.vllm_config)
 
         kv_cache_at_layer = allocate_and_bind_kv_cache(loaded, config, driver_config)
         host_kv, pool_size = allocate_host_pool(kv_cache_at_layer, config.swap_budget_bytes)
@@ -146,6 +153,12 @@ class VllmEngine:
             kv_page_indices=inputs["kv_page_indices"],
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
+            # Only forward the mask when there's something to apply — the
+            # mask-aware impl proxy checks `pie_attn_extras` presence as the
+            # zero-overhead signal. `inputs["custom_mask"]` is always
+            # populated (BRLE-decoded to all-True when no mask was supplied),
+            # so we gate on the explicit `has_custom_mask` flag instead.
+            custom_mask=inputs["custom_mask"] if inputs.get("has_custom_mask") else None,
             single_token_inference_mode=inputs["single_token_inference_mode"],
             total_pages_cpu=inputs.get("total_pages_cpu", 0),
         )
@@ -160,7 +173,7 @@ class VllmEngine:
     def init_adapter(self, *args, **kwargs):
         raise NotImplementedError(
             "Adapters are not yet supported on the vllm backend. "
-            "Use --backend native for adapter workloads."
+            "Use the `native` driver for adapter workloads."
         )
 
     def update_adapter(self, *args, **kwargs):
