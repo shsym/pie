@@ -1,10 +1,10 @@
-"""KV cache rebinding for the SGLang backend.
+"""KV cache rebinding for the SGLang driver.
 
 SGLang allocates `MHATokenToKVPool.k_buffer[layer]` and `.v_buffer[layer]`
 during ModelRunner construction — each shape `(num_blocks*page_size, h, d)`,
 flat token-slot indexed.
 
-Pie's swap RPCs in `pie_backend.worker._handle_copy_*` operate on
+Pie's swap RPCs in `pie_driver.worker._handle_copy_*` operate on
 `engine.kv_cache_at_layer[layer]` indexed by *block ID*, expecting each
 layer's tensor to look like `(num_blocks, 2, page_size, h, d)`.
 
@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pie_backend.config import RuntimeConfig
+from pie_driver.config import RuntimeConfig
 
 if TYPE_CHECKING:
     from .loader import LoadedModel
@@ -45,7 +45,7 @@ def _rebind_pool_buffers(
     pool = loaded.runner.token_to_kv_pool
     if not isinstance(pool, MHATokenToKVPool):
         raise NotImplementedError(
-            f"pie_backend_sglang v1 only supports MHATokenToKVPool; got "
+            f"pie_driver_sgl v1 only supports MHATokenToKVPool; got "
             f"{type(pool).__name__}. MLA / hybrid models are not yet supported."
         )
 
@@ -54,7 +54,7 @@ def _rebind_pool_buffers(
     head_dim = int(pool.head_dim)
     if head_dim != int(pool.v_head_dim):
         raise NotImplementedError(
-            f"pie_backend_sglang v1 requires k_head_dim == v_head_dim "
+            f"pie_driver_sgl v1 requires k_head_dim == v_head_dim "
             f"(got {head_dim} vs {pool.v_head_dim})."
         )
 

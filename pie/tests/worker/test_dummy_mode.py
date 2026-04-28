@@ -30,7 +30,7 @@ def test_runtime_config():
     print("TEST 2: RuntimeConfig with dummy_mode")
     print("=" * 60)
     
-    from pie_backend.config import RuntimeConfig
+    from pie_driver.config import RuntimeConfig
     
     config = RuntimeConfig.from_args(
         hf_repo='dummy-model',
@@ -51,8 +51,8 @@ def test_runtime_initialization():
     print("TEST 3: Engine initialization in dummy mode")
     print("=" * 60)
     
-    from pie_backend.config import RuntimeConfig
-    from pie_backend.engine import Engine
+    from pie_driver.config import RuntimeConfig
+    from pie_driver.engine import Engine
     
     config = RuntimeConfig.from_args(
         hf_repo='dummy-model',
@@ -186,8 +186,8 @@ def test_kv_cache_minimal():
     print("TEST 9: KV cache is minimal")
     print("=" * 60)
     
-    from pie_backend.config import RuntimeConfig
-    from pie_backend.engine import Engine
+    from pie_driver.config import RuntimeConfig
+    from pie_driver.engine import Engine
     
     config = RuntimeConfig.from_args(
         hf_repo='dummy-model',

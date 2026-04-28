@@ -1,4 +1,4 @@
-"""KV cache allocation for the vllm backend.
+"""KV cache allocation for the vllm driver.
 
 Pie cedes physical bytes to vllm: vllm's selected attention backend picks the
 KV layout (FlashAttn: `(2, num_blocks, block_size, kv_heads, head)`, FlashInfer:
@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from pie_backend.config import RuntimeConfig
+from pie_driver.config import RuntimeConfig
 
 if TYPE_CHECKING:
     from .loader import LoadedModel
@@ -159,6 +159,6 @@ def allocate_host_pool(
     # Until per-backend block-dim awareness is wired, refuse non-zero budgets
     # rather than silently producing wrong tokens after a swap.
     raise NotImplementedError(
-        "CPU swap pool not yet supported on the vllm backend (Phase 1.5). "
+        "CPU swap pool not yet supported on the vllm driver (Phase 1.5). "
         "Set swap_budget_bytes=0 / cpu_mem_budget_in_gb=0 for now."
     )

@@ -1,5 +1,5 @@
 """
-Weight schema classes for PIE backend.
+Weight schema classes for the Pie driver.
 
 Extracted from loader.py to break circular imports between
 loader → hf_utils → model → loader.

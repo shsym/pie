@@ -1,11 +1,11 @@
-"""Sglang-backend-local copy of `pie_kernels.rand_mv` — dispatches to a
+"""Sglang-driver-local copy of `pie_kernels.rand_mv` — dispatches to a
 Triton/CUDA backend on NVIDIA, Metal on Apple Silicon, otherwise raises.
 
 This is a deliberate fork of `pie_kernels.rand_mv`. Keeping a private copy
-under `pie_backend_sglang` lets the sglang adapter path tweak shapes /
+under `pie_driver_sgl` lets the sglang adapter path tweak shapes /
 JIT-compile flags / tensor-layout assumptions for sglang's
 `QKVParallelLinear` outputs without affecting the native flashinfer
-backend's adapter math (which has its own copy under `pie_kernels`).
+driver's adapter math (which has its own copy under `pie_kernels`).
 
 `RAND_MV_AVAILABLE` reports whether either backend is usable; callers
 should gate invocations on it rather than catching `RuntimeError`.

@@ -1,6 +1,6 @@
 """Worker entry point for the `dummy` driver.
 
-Reuses pie_backend's engine machinery with `dummy_mode=True` to skip real
+Reuses pie_driver's engine machinery with `dummy_mode=True` to skip real
 weight loading. Useful for tests and scheduler/runtime smoke checks.
 """
 
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 
 # Re-export for parity with other workers (server.py imports this).
-from pie_backend.worker import calculate_topology  # noqa: F401
+from pie_driver.worker import calculate_topology  # noqa: F401
 
 
 def worker_main(
@@ -22,9 +22,9 @@ def worker_main(
     ready_queue,
 ):
     """Worker entry point — `dummy` driver."""
-    from pie_backend.config import NativeRuntimeConfig
-    from pie_backend.engine import Engine
-    from pie_backend.worker import run_worker
+    from pie_driver.config import NativeRuntimeConfig
+    from pie_driver.engine import Engine
+    from pie_driver.worker import run_worker
 
     run_worker(
         local_rank=local_rank,

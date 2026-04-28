@@ -1,4 +1,4 @@
-"""Custom-attention-mask compute primitives for `pie_backend_vllm`.
+"""Custom-attention-mask compute primitives for `pie_driver_vllm`.
 
 Module split (with `mask_strategies.py`):
 
@@ -68,7 +68,7 @@ class PieAttnExtras:
         # span is fixed-width = `seq_lens[req(token)]`. The decoder writes
         # True bits into the first `position_ids[k] + 1` cells of that
         # span and leaves the rest zero-padded — but the *offsets* are
-        # seq-len-padded. See `pie_backend.batching.Batch.__init__`
+        # seq-len-padded. See `pie_driver.batching.Batch.__init__`
         # (token_acc_seq_lens_np).
         qsl_cpu = query_start_loc.detach().cpu()
         seq_lens_cpu = seq_lens.detach().cpu()

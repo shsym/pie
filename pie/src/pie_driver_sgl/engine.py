@@ -1,7 +1,7 @@
 """SGLang-backed inference engine.
 
-Mirrors `pie_backend.engine.Engine`'s public surface so pie's worker
-(`pie_backend.worker.run_worker`) can drive native, vllm, and sglang
+Mirrors `pie_driver.engine.Engine`'s public surface so pie's worker
+(`pie_driver.worker.run_worker`) can drive native, vllm, and sglang
 interchangeably. The model and kernels come from SGLang; pie owns the
 RPC, batching, telemetry, and dispatch around it.
 """
@@ -13,8 +13,8 @@ import random
 import numpy as np
 import torch
 
-from pie_backend.config import RuntimeConfig
-from pie_backend import telemetry
+from pie_driver.config import RuntimeConfig
+from pie_driver import telemetry
 
 from . import _require_sglang
 from .config import SGLangDriverConfig
@@ -22,7 +22,7 @@ from .config import SGLangDriverConfig
 
 class SGLangEngine:
     """Inference engine that delegates the forward pass to an SGLang
-    ModelRunner. Public surface matches `pie_backend.engine.Engine`."""
+    ModelRunner. Public surface matches `pie_driver.engine.Engine`."""
 
     config: RuntimeConfig
     driver_config: SGLangDriverConfig
@@ -61,7 +61,7 @@ class SGLangEngine:
         self.snapshot_dir = snapshot_dir
         self.adapters = {}
 
-        # Speculative decoding: backend-side n-gram drafter. Lazy-init on
+        # Speculative decoding: driver-side n-gram drafter. Lazy-init on
         # first use so the import cost is paid only when spec is enabled.
         self._ngram_corpus = None
         # Per-session token history. Keyed by an opaque session ID the
@@ -163,7 +163,7 @@ class SGLangEngine:
     #
     # `spec_step` is the contract the worker probes for via `getattr` —
     # sglang-specific and gated by `driver_config.spec_ngram_enabled`. The
-    # native pie_backend Engine does not implement it (intentional).
+    # native pie_driver Engine does not implement it (intentional).
 
     def _ensure_ngram(self):
         """Lazy-init the NgramCorpus on first proposal/observation."""
@@ -291,7 +291,7 @@ class SGLangEngine:
         # Build the per-batch CMA-ES adapter subpass when adapter tokens
         # are present in the wire request. The wrappers installed at load
         # time will read it via `adapter_subpass_slot.current`. Mirrors
-        # `pie_backend.engine.fire_batch` (engine.py:303-311).
+        # `pie_driver.engine.fire_batch` (engine.py:303-311).
         adapter_subpass = None
         if inputs.get("adapter_indices"):
             from .adapter import AdapterSubpass
@@ -479,14 +479,14 @@ class SGLangEngine:
         return "pong" if query == "ping" else "unknown query"
 
     def capabilities(self):
-        """Report this backend's resolved capacities to pie's runtime.
+        """Report this driver's resolved capacities to pie's runtime.
 
         Sources values from the loaded SGLang `ModelRunner` so the user's
         preferences are reconciled against what the chosen attention
         kernel actually supports (page_size in particular may differ from
         what was requested via `[model.X.driver.sglang]`).
         """
-        from pie.capabilities import BackendCapabilities
+        from pie.capabilities import DriverCapabilities
 
         runner = self.forward_pass.runner
         sglang_mc = runner.model_config
@@ -499,7 +499,7 @@ class SGLangEngine:
         if not self.snapshot_dir:
             raise RuntimeError("snapshot_dir is empty; loader did not resolve it.")
 
-        return BackendCapabilities(
+        return DriverCapabilities(
             total_pages=int(self.config.max_num_kv_pages),
             kv_page_size=int(runner.page_size),
             swap_pool_size=int(self.swap_pool_size),

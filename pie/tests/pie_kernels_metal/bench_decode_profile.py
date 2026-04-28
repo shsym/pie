@@ -18,8 +18,8 @@ sys.path.insert(0, "src")
 import torch
 import torch.nn.functional as fun
 
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
+from pie_driver.engine import Engine
+from pie_driver.config import RuntimeConfig
 
 
 def bench(fn, warmup=5, iters=20):

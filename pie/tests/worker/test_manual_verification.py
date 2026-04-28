@@ -1,8 +1,8 @@
 import sys
 import torch
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
-from pie_backend import message
+from pie_driver.engine import Engine
+from pie_driver.config import RuntimeConfig
+from pie_driver import message
 
 
 def test_manual():

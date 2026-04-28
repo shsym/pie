@@ -1,7 +1,7 @@
 """Worker entry point for the sglang driver.
 
 Delegates the universal lifecycle (distributed init, group setup, ready-queue
-handshake, leader/follower dispatch) to `pie_backend.worker.run_worker`, then
+handshake, leader/follower dispatch) to `pie_driver.worker.run_worker`, then
 plugs in sglang-specific engine construction.
 """
 
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 
 # Re-export for parity with other workers (server.py imports this).
-from pie_backend.worker import calculate_topology  # noqa: F401
+from pie_driver.worker import calculate_topology  # noqa: F401
 
 
 def worker_main(
@@ -27,7 +27,7 @@ def worker_main(
     `driver_config` is `SGLangDriverConfig` as a dict; sglang-native knobs
     live on the typed dataclass and never leak into pie's `RuntimeConfig`.
     """
-    from pie_backend.worker import run_worker
+    from pie_driver.worker import run_worker
     from .config import SGLangDriverConfig
     from .engine import SGLangEngine
 

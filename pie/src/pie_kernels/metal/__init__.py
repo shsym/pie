@@ -1,6 +1,6 @@
 """pie_kernels.metal: Metal-accelerated kernels for macOS (Apple Silicon).
 
-Mirrors the subset of the upstream `flashinfer` API that pie_backend uses, so
+Mirrors the subset of the upstream `flashinfer` API that pie_driver uses, so
 `pie_kernels` can dispatch between this module and upstream `flashinfer` based
 on device availability.
 """

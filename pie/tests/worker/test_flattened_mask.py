@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
-from pie_backend.batching import Batch
-from pie_backend.config import RuntimeConfig
+from pie_driver.batching import Batch
+from pie_driver.config import RuntimeConfig
 from unittest.mock import MagicMock
 
 

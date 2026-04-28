@@ -1,6 +1,6 @@
 import torch
-from pie_backend.config import RuntimeConfig
-from pie_backend.model.llama3 import ModelConfig as Llama3Config
+from pie_driver.config import RuntimeConfig
+from pie_driver.model.llama3 import ModelConfig as Llama3Config
 
 
 def test_gpu_mem_utilization():
@@ -44,7 +44,7 @@ def test_gpu_mem_utilization():
     model_config = Llama3Config.from_dict(llama3_spec)
 
     # We need to mock get_available_memory or just run it and see if it runs
-    # pie_backend.model.llama3 imports get_available_memory from ..utils
+    # pie_driver.model.llama3 imports get_available_memory from ..utils
     # We can rely on it returning something valid for CPU.
 
     # Run eval

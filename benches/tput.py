@@ -92,7 +92,7 @@ async def run_benchmark(args):
         # sglang's vocabulary differs: `mem_fraction_static` instead of
         # `gpu_memory_utilization`, `disable_cuda_graph` (negation),
         # `cpu_mem_budget_in_gb` is pie-universal (filtered out before
-        # ServerArgs splat in pie_backend_sglang/loader.py).
+        # ServerArgs splat in pie_driver_sgl/loader.py).
         driver_subsection = {
             "mem_fraction_static": args.gpu_mem_util,
             "disable_cuda_graph": not args.use_cuda_graphs,

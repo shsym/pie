@@ -1,4 +1,4 @@
-"""HuggingFace utilities for PIE backend.
+"""HuggingFace utilities for the Pie driver.
 
 This module provides utilities for:
 - Resolving HuggingFace cache paths

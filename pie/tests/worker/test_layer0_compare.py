@@ -9,8 +9,8 @@ sys.path.insert(0, "src")
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
+from pie_driver.engine import Engine
+from pie_driver.config import RuntimeConfig
 
 
 def manual_rms_norm(x, weight, eps):

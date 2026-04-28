@@ -1,6 +1,6 @@
-"""Adapter that exposes an SGLang ModelRunner under pie_backend's ForwardPass contract.
+"""Adapter that exposes an SGLang ModelRunner under pie_driver's ForwardPass contract.
 
-`pie_backend.engine.Engine` calls three methods on its `forward_pass` object:
+`pie_driver.engine.Engine` calls three methods on its `forward_pass` object:
 `embed_inputs(inputs) -> hidden`, `transform(...) -> hidden`, and
 `sample(hidden, sampling_metadata) -> dict`. We delegate the actual compute
 to SGLang's ModelRunner.
@@ -12,7 +12,7 @@ extend-token. To preserve pie's contract we replace the model's
 LogitsProcessor with `_HiddenCapture`, which stashes the full per-token
 hidden state tensor; `sample()` then applies pie's per-output
 `indices_for_logits` gather + the LM head + sampling itself via
-`pie_backend.model.common.sample_common`.
+`pie_driver.model.common.sample_common`.
 """
 
 from __future__ import annotations
@@ -21,8 +21,8 @@ from typing import Any
 
 import torch
 
-from pie_backend.config import RuntimeConfig
-from pie_backend.model.common import sample_common
+from pie_driver.config import RuntimeConfig
+from pie_driver.model.common import sample_common
 
 from .forward_batch import build_sglang_forward_batch
 from .mask_hooks import make_mask_strategy
@@ -149,7 +149,7 @@ class SGLangForwardPass:
 
         if self._capture.captured is None:
             raise RuntimeError(
-                "pie_backend_sglang: hidden states were not captured. The "
+                "pie_driver_sgl: hidden states were not captured. The "
                 "model didn't call its logits_processor (unexpected forward path)."
             )
         return self._capture.captured

@@ -1,5 +1,5 @@
 """
-Batch management for PIE backend inference.
+Batch management for Pie driver inference.
 
 This module provides the Batch dataclass that holds inference batch state
 and handles tensor creation and response packaging.
@@ -245,7 +245,7 @@ class Batch:
         self.sampler_seeds_arr = _decode_u32(args["sampler_seeds"])
 
         # ===== CONTEXT IDS (per request) =====
-        # Stable per-context identifier. Used by backends that maintain
+        # Stable per-context identifier. Used by drivers that maintain
         # per-context state (e.g. n-gram drafter token history) as the
         # session key — see worker._populate_next_drafts.
         self.context_ids = list(args.get("context_ids", []))
@@ -331,7 +331,7 @@ class Batch:
     # ------------------------------------------------------------------
     #
     # When a request supplies draft tokens (`spec_token_ids` non-empty),
-    # the wire format keeps drafts in a separate channel. The backend has
+    # the wire format keeps drafts in a separate channel. The driver has
     # to splice them into the forward: per request, append the draft
     # tokens after the pending tokens (matching the layout the model will
     # see) and grow `qo_indptr`, `kv_last_page_lens`, the attention mask,

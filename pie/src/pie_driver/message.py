@@ -1,8 +1,8 @@
 """
-Message types for PIE backend communication.
+Message types for Pie driver communication.
 
 This module defines all the request and response message structures used for
-communication between the PIE backend and clients using msgspec.
+communication between the Pie driver and clients using msgspec.
 """
 
 from typing import Optional

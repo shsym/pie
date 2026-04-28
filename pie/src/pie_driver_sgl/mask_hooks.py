@@ -114,7 +114,7 @@ class _FlashInferStrategy(_CustomMaskStrategy):
     """SGLang's flashinfer adapter, when `spec_info is None` (normal extend),
     threads `forward_batch.cross_attention_custom_mask` straight into
     `BatchPrefillWithPagedKVCacheWrapper.begin_forward(custom_mask=...)`
-    — the same kernel pie's native backend uses today (both pin
+    — the same kernel pie's native driver uses today (both pin
     `flashinfer-python==0.6.8.post1`). No monkey-patching: just stamp the
     mask onto the FB before sglang's `init_forward_metadata` reads it.
     """
@@ -348,7 +348,7 @@ def make_mask_strategy(attn_backend: Any) -> _CustomMaskStrategy:
     supported = sorted(_STRATEGY_BY_NAME)
     if reason := _UNSUPPORTED_BACKENDS.get(name):
         msg = (
-            f"pie_backend_sglang refuses to load with attention_backend "
+            f"pie_driver_sgl refuses to load with attention_backend "
             f"resolved to {name!r}: {reason} Pie's runtime always emits a "
             f"custom_mask buffer; silently ignoring it would produce wrong "
             f"tokens for inferlets that rely on non-causal attention. Set "
@@ -358,9 +358,9 @@ def make_mask_strategy(attn_backend: Any) -> _CustomMaskStrategy:
     else:
         # Unknown class — refuse, but tell the user how to register it.
         msg = (
-            f"pie_backend_sglang doesn't know how to route custom_mask "
+            f"pie_driver_sgl doesn't know how to route custom_mask "
             f"through SGLang attention backend {name!r}. Either add a "
-            f"strategy in pie_backend_sglang/mask_hooks.py or pick one of "
+            f"strategy in pie_driver_sgl/mask_hooks.py or pick one of "
             f"the verified backends: {supported}."
         )
     raise _UnsupportedBackendError(msg)

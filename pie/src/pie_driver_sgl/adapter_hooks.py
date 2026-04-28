@@ -1,4 +1,4 @@
-"""CMA-ES adapter injection for the sglang backend.
+"""CMA-ES adapter injection for the sglang driver.
 
 We follow sglang's own LoRA pattern: at engine load time, walk
 `runner.model.layers[*].self_attn.qkv_proj` and class-swap each one for a

@@ -61,7 +61,7 @@ class TrainingConfig:
     local: bool = False
     model: str = "meta-llama/Llama-3.2-1B-Instruct"
     device: str = "cuda:0"
-    # `native` = pie_backend (flashinfer); `sglang` = pie_backend_sglang.
+    # `native` = pie_driver (flashinfer); `sglang` = pie_driver_sgl.
     # When `sglang`, the driver is configured with `enable_adapter=True`
     # so the QKV adapter wrappers get installed at engine load.
     driver: str = "native"

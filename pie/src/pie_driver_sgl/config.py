@@ -71,14 +71,14 @@ class SGLangDriverConfig:
     # record-without-adapter pair to be CUDA-graph safe; deferred).
     enable_adapter: bool = False
     # Per-engine adapter slot capacity and max LoRA rank. Mirror of the
-    # fields on `pie_backend.config.NativeRuntimeConfig`; placed here
+    # fields on `pie_driver.config.NativeRuntimeConfig`; placed here
     # rather than on the base RuntimeConfig so the change is sglang-
     # scoped (matches the user's "no cross-cutting native changes for
     # now" guidance).
     max_num_adapters: int = 32
     max_adapter_rank: int = 8
 
-    # ---- Speculative decoding (NGRAM, backend-supplied drafts) ----
+    # ---- Speculative decoding (NGRAM, driver-supplied drafts) ----
     # When True, the engine maintains an n-gram trie of recently-accepted
     # tokens and proposes linear draft continuations to the runtime as
     # `next_spec_tokens` in TokensWithSpeculation responses. The inferlet

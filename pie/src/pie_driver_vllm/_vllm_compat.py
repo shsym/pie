@@ -1,4 +1,4 @@
-"""Single re-export point for every vllm internal `pie_backend_vllm` touches.
+"""Single re-export point for every vllm internal `pie_driver_vllm` touches.
 
 Pie depends on a handful of vllm symbols that aren't part of vllm's stable
 public API — `FlashInferImpl`, `AttentionLayerBase`, `get_attention_context`,

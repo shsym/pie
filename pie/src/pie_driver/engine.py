@@ -472,11 +472,11 @@ class Engine:
                 return "unknown query"
 
     def capabilities(self):
-        """Report this backend's resolved capacities up to pie's runtime.
+        """Report this driver's resolved capacities up to pie's runtime.
 
-        See `pie.capabilities.BackendCapabilities` for the contract.
+        See `pie.capabilities.DriverCapabilities` for the contract.
         """
-        from pie.capabilities import BackendCapabilities
+        from pie.capabilities import DriverCapabilities
 
         hf_cfg = self.info.get("hf_config", {}) if isinstance(self.info, dict) else {}
         # max_model_len: prefer max_position_embeddings; some configs use
@@ -490,7 +490,7 @@ class Engine:
             getattr(self.model_config, "num_vocabs", None)
             or getattr(self.model_config, "vocab_size", 0)
         )
-        return BackendCapabilities(
+        return DriverCapabilities(
             total_pages=int(self.config.max_num_kv_pages or 0),
             kv_page_size=int(self.config.kv_page_size),
             swap_pool_size=int(self.swap_pool_size),

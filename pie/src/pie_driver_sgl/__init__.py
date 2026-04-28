@@ -1,4 +1,4 @@
-# Pie Backend (SGLang) — `sglang` driver. Uses sglang's model definitions,
+# Pie Driver (SGLang) — `sglang` driver. Uses sglang's model definitions,
 # attention kernels, and KV cache plumbing under pie's RPC surface. SGLang
 # is an optional dependency: install via `pie-server[sglang]`.
 
@@ -6,7 +6,7 @@ from __future__ import annotations
 
 
 _SGLANG_INSTALL_HINT = (
-    "pie_backend_sglang requires SGLang. Install with `pip install pie-server[sglang]` "
+    "pie_driver_sgl requires SGLang. Install with `pip install pie-server[sglang]` "
     "or `uv sync --extra sglang`."
 )
 
@@ -25,6 +25,6 @@ from .config import SGLangDriverConfig
 register_driver(DriverSpec(
     name="sglang",
     config_cls=SGLangDriverConfig,
-    worker_module="pie_backend_sglang.worker",
+    worker_module="pie_driver_sgl.worker",
     extras=("sglang",),
 ))

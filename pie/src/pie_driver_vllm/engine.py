@@ -1,9 +1,9 @@
 """vLLM-backed inference engine.
 
-Mirrors `pie_backend.engine.Engine`'s public surface so that worker.py can use
-either backend interchangeably. Internally, the model and kernels come from
+Mirrors `pie_driver.engine.Engine`'s public surface so that worker.py can use
+either driver interchangeably. Internally, the model and kernels come from
 vllm; the surrounding RPC, batching, telemetry, and adapter scaffolding are
-imported directly from `pie_backend`.
+imported directly from `pie_driver`.
 """
 
 from __future__ import annotations
@@ -13,8 +13,8 @@ import random
 import numpy as np
 import torch
 
-from pie_backend.config import RuntimeConfig
-from pie_backend import telemetry
+from pie_driver.config import RuntimeConfig
+from pie_driver import telemetry
 
 from . import _require_vllm
 
@@ -22,7 +22,7 @@ from . import _require_vllm
 class VllmEngine:
     """Inference engine that delegates the forward pass to a vllm model.
 
-    Public surface matches `pie_backend.engine.Engine`:
+    Public surface matches `pie_driver.engine.Engine`:
       - `Engine.load(config, ...)` classmethod
       - `engine.fire_batch(inputs, sampling_metadata) -> list`
       - `engine.kv_cache_at_layer`, `engine.kv_cache_at_layer_host`
@@ -72,8 +72,8 @@ class VllmEngine:
         self.snapshot_dir = snapshot_dir
         self.adapters = {}
 
-        # Speculative decoding: backend-side n-gram drafter. Verification
-        # and splice live in the shared `pie_backend.batching.Batch`; this
+        # Speculative decoding: driver-side n-gram drafter. Verification
+        # and splice live in the shared `pie_driver.batching.Batch`; this
         # engine owns drafting via `spec_step`. Buffers are lazy-init so
         # the numba JIT cost is only paid when spec is actually used.
         self._ngram_buffers = None
@@ -176,7 +176,7 @@ class VllmEngine:
     # Speculative decoding: NGRAM drafter
     # ------------------------------------------------------------------
     #
-    # `spec_step` is the contract `pie_backend.worker._populate_next_drafts`
+    # `spec_step` is the contract `pie_driver.worker._populate_next_drafts`
     # probes for via `getattr`. Verification + splice are shared (live in
     # `Batch.get_spec_expanded_*` and `Batch.verify_drafts`); this engine
     # only owns the drafter side.
@@ -317,15 +317,15 @@ class VllmEngine:
 
     def init_adapter(self, *args, **kwargs):
         raise NotImplementedError(
-            "Adapters are not yet supported on the vllm backend. "
+            "Adapters are not yet supported on the vllm driver. "
             "Use the `native` driver for adapter workloads."
         )
 
     def update_adapter(self, *args, **kwargs):
-        raise NotImplementedError("Adapters are not yet supported on the vllm backend.")
+        raise NotImplementedError("Adapters are not yet supported on the vllm driver.")
 
     def load_adapter(self, *args, **kwargs):
-        raise NotImplementedError("Adapters are not yet supported on the vllm backend.")
+        raise NotImplementedError("Adapters are not yet supported on the vllm driver.")
 
     def save_adapter(self, *args, **kwargs):
         return b""
@@ -340,7 +340,7 @@ class VllmEngine:
         return "unknown query"
 
     def capabilities(self):
-        """Report this backend's resolved capacities up to pie's runtime.
+        """Report this driver's resolved capacities up to pie's runtime.
 
         Sources every value from vllm's resolved `VllmConfig` rather than
         echoing the user's `RuntimeConfig`. In particular `kv_page_size`
@@ -350,7 +350,7 @@ class VllmEngine:
         Fails loudly if any expected value is missing — the runtime/Rust
         side relies on these being correct, so silent defaulting is unsafe.
         """
-        from pie.capabilities import BackendCapabilities
+        from pie.capabilities import DriverCapabilities
 
         vc = self.forward_pass.vllm_config
         mc = vc.model_config
@@ -382,7 +382,7 @@ class VllmEngine:
         else:
             max_batch_tokens = int(max_batch_tokens)
 
-        return BackendCapabilities(
+        return DriverCapabilities(
             total_pages=int(self.config.max_num_kv_pages),
             kv_page_size=int(cc.block_size),
             swap_pool_size=int(self.swap_pool_size),

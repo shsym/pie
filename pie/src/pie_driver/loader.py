@@ -1,5 +1,5 @@
 """
-Model loading for PIE backend.
+Model loading for the Pie driver.
 
 This module handles the messy file I/O, ztensor vs safetensors,
 TOML parsing, and weight schema loading.

@@ -7,7 +7,7 @@ Builds an `sglang.srt.server_args.ServerArgs` from the universal
 torch.distributed up first; sglang's idempotent init layers TP/PP groups
 on top.
 
-This is the analog of `pie_backend_vllm/loader.py`. SGLangDriverConfig
+This is the analog of `pie_driver_vllm/loader.py`. SGLangDriverConfig
 fields mirror `ServerArgs` so values splat verbatim.
 """
 
@@ -19,7 +19,7 @@ from typing import Any
 
 import torch
 
-from pie_backend.config import RuntimeConfig
+from pie_driver.config import RuntimeConfig
 
 from .config import SGLangDriverConfig
 

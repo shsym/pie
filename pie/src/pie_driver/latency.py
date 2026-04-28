@@ -1,7 +1,4 @@
-"""Latency tracking for fire_batch stages.
-
-Extracted from backend.py to keep the Engine focused on inference.
-"""
+"""Latency tracking for fire_batch stages."""
 
 from __future__ import annotations
 

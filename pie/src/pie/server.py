@@ -258,13 +258,13 @@ def _bootstrap(
         daemon=True,
     )
 
-    # Collect ready signals (each leader sends a BackendCapabilities;
+    # Collect ready signals (each leader sends a DriverCapabilities;
     # followers send None).
-    from pie.capabilities import BackendCapabilities
+    from pie.capabilities import DriverCapabilities
 
     connected_ranks: set[int] = set()
     server_names_by_group: dict[int, str] = {}
-    capabilities_by_group: dict[int, BackendCapabilities] = {}
+    capabilities_by_group: dict[int, DriverCapabilities] = {}
     start_wait = time.time()
 
     while len(connected_ranks) < world_size:
@@ -283,10 +283,10 @@ def _bootstrap(
             rank, server_name, payload = ready_queue.get(timeout=0.2)
             connected_ranks.add(rank)
             if server_name is not None:
-                if not isinstance(payload, BackendCapabilities):
+                if not isinstance(payload, DriverCapabilities):
                     raise RuntimeError(
                         f"Worker {rank} sent unexpected ready payload "
-                        f"{type(payload).__name__}; expected BackendCapabilities."
+                        f"{type(payload).__name__}; expected DriverCapabilities."
                     )
                 for gid, group in enumerate(group_topology):
                     if rank in group:
@@ -305,15 +305,15 @@ def _bootstrap(
     missing_groups = [gid for gid in range(num_groups) if gid not in capabilities_by_group]
     if missing_groups:
         raise RuntimeError(
-            f"No BackendCapabilities received from groups {missing_groups}. "
+            f"No DriverCapabilities received from groups {missing_groups}. "
             "Each group leader must publish capabilities before bootstrap."
         )
 
-    # Surface what the backend actually negotiated. Useful when the user
-    # asked for kv_page_size=8 and the backend resolved to 16, etc.
+    # Surface what the driver actually negotiated. Useful when the user
+    # asked for kv_page_size=8 and the driver resolved to 16, etc.
     group0_caps = capabilities_by_group[0]
     console.print(
-        f"[dim]  Backend capacities: "
+        f"[dim]  Driver capacities: "
         f"arch={group0_caps.arch_name}, "
         f"kv_page_size={group0_caps.kv_page_size}, "
         f"total_pages={group0_caps.total_pages}, "
@@ -340,7 +340,7 @@ def _bootstrap(
     py_model = pie_runtime.ModelConfig(
         name=model.name,                              # the [model.X] table key
         arch_name=group0_caps.arch_name,
-        kv_page_size=group0_caps.kv_page_size,        # backend's resolved value
+        kv_page_size=group0_caps.kv_page_size,        # driver's resolved value
         tokenizer_path=str(Path(group0_caps.snapshot_dir) / "tokenizer.json"),
         devices=py_devices,
         scheduler=pie_runtime.SchedulerConfig(
@@ -382,21 +382,21 @@ def _bootstrap(
 
 
 
-def _check(backend_processes: list) -> bool:
-    """Check if all backend processes are still alive."""
-    for ctx in backend_processes:
+def _check(driver_processes: list) -> bool:
+    """Check if all driver processes are still alive."""
+    for ctx in driver_processes:
         for p in ctx.processes:
             if not p.is_alive() and p.exitcode != 0:
-                log.error("Backend process exited unexpectedly (exit code %s)", p.exitcode)
+                log.error("Driver process exited unexpectedly (exit code %s)", p.exitcode)
                 return False
     return True
 
 
 def _terminate(
     server_handle: Any | None,
-    backend_processes: list,
+    driver_processes: list,
 ) -> None:
-    """Terminate the runtime and backend processes."""
+    """Terminate the runtime and driver processes."""
 
     if server_handle is not None:
         try:
@@ -407,7 +407,7 @@ def _terminate(
 
     time.sleep(1.0)
 
-    for ctx in backend_processes:
+    for ctx in driver_processes:
         try:
             for p in ctx.processes:
                 if p.is_alive():

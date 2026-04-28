@@ -1,10 +1,10 @@
-"""CMA-ES adapter (sglang-backend copy).
+"""CMA-ES adapter (sglang driver copy).
 
-Forked from `pie_backend.adapter`. Kept as a separate copy so the sglang
+Forked from `pie_driver.adapter`. Kept as a separate copy so the sglang
 adapter path can iterate on shape/layout assumptions specific to sglang's
 `QKVParallelLinear` (fused-Q/K/V) outputs without affecting the native
-flashinfer backend's adapter math. The corresponding rand_mv kernel is
-also forked under `pie_backend_sglang.rand_mv`.
+flashinfer driver's adapter math. The corresponding rand_mv kernel is
+also forked under `pie_driver_sgl.rand_mv`.
 """
 
 from __future__ import annotations

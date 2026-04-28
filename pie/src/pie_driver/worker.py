@@ -1,4 +1,4 @@
-"""Worker process for Pie multi-GPU backend.
+"""Worker process for Pie multi-GPU driver.
 
 This module contains everything that runs inside a spawned child process:
 topology calculation, torch.distributed initialization, process group setup,
@@ -153,7 +153,7 @@ def run_worker(
     from tqdm import tqdm
 
     from pie import _runtime as pie_runtime
-    from pie_backend.config import RuntimeConfig
+    from pie_driver.config import RuntimeConfig
 
     if config_cls is None:
         config_cls = RuntimeConfig
@@ -272,8 +272,8 @@ def worker_main(
     on `NativeRuntimeConfig` (a subclass of the universal `RuntimeConfig`),
     so we forward the dict to `run_worker` as `runtime_config_extras`.
     """
-    from pie_backend.config import NativeRuntimeConfig
-    from pie_backend.engine import Engine
+    from pie_driver.config import NativeRuntimeConfig
+    from pie_driver.engine import Engine
 
     run_worker(
         local_rank=local_rank,
@@ -290,7 +290,7 @@ def worker_main(
 
 
 # =============================================================================
-# Leader Loop (absorbs server.py + fire_batch from backend.py)
+# Leader Loop
 # =============================================================================
 
 # RPC status codes (must match Rust)
@@ -303,7 +303,7 @@ _STATUS_INTERNAL_ERROR = 3
 def _populate_next_drafts(batch, sampling_results: dict, engine) -> None:
     """Ask the engine for next-iteration drafts for spec-output requests.
 
-    Looks for `engine.spec_step(sessions)` on the engine — backends that
+    Looks for `engine.spec_step(sessions)` on the engine — drivers that
     don't implement it (native flashinfer, vllm) are no-ops here. For each
     request that asked for `output_speculative_tokens(true)`, builds a
     `(session_id, accepted_tokens)` pair and hands it to `spec_step`,
@@ -400,9 +400,9 @@ def _leader_loop(
     import time
     import msgpack
     import torch.distributed as dist
-    from pie_backend import utils, message
-    from pie_backend.batching import Batch
-    from pie_backend.latency import StepTiming, LatencyStats
+    from pie_driver import utils, message
+    from pie_driver.batching import Batch
+    from pie_driver.latency import StepTiming, LatencyStats
 
     config = engine.config
     latency_stats = LatencyStats(enabled=config.telemetry_enabled)
@@ -575,7 +575,7 @@ def _leader_loop(
         if batch.has_speculative_inputs:
             batch.verify_drafts(sampling_results)
 
-        # Backend-supplied next-iteration drafts (NGRAM on sglang). Engines
+        # Driver-supplied next-iteration drafts (NGRAM on sglang). Engines
         # without a `spec_step` method (e.g. native flashinfer) skip this
         # block entirely. We only ask the engine for drafts on requests that
         # set output_speculative_tokens(true) — otherwise the response would
@@ -781,7 +781,7 @@ def _leader_loop(
 
 
 # =============================================================================
-# Follower Loop (absorbs Backend.worker_loop)
+# Follower Loop
 # =============================================================================
 
 
@@ -800,7 +800,7 @@ def _follower_loop(
     import signal
     import torch
     import torch.distributed as dist
-    from pie_backend import utils
+    from pie_driver import utils
 
     device = config.device if config else "cuda:0"
 

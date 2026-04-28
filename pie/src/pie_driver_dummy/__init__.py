@@ -1,7 +1,7 @@
 """Dummy driver — registers `type = "dummy"` for tests and benchmarking.
 
 Skips weight loading and runs random-token generation through the same
-pie_backend machinery. Useful for verifying scheduler/runtime plumbing
+pie_driver machinery. Useful for verifying scheduler/runtime plumbing
 without needing a real GPU model load.
 """
 
@@ -14,6 +14,6 @@ from .config import DummyDriverConfig
 register_driver(DriverSpec(
     name="dummy",
     config_cls=DummyDriverConfig,
-    worker_module="pie_backend_dummy.worker",
+    worker_module="pie_driver_dummy.worker",
     extras=(),
 ))

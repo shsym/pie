@@ -1,6 +1,6 @@
-"""Adapter that exposes a vllm model under pie_backend's ForwardPass contract.
+"""Adapter that exposes a vllm model under pie_driver's ForwardPass contract.
 
-`pie_backend.engine.Engine` calls three methods on its `forward_pass` object:
+`pie_driver.engine.Engine` calls three methods on its `forward_pass` object:
 `embed_inputs(inputs) -> hidden`, `transform(...) -> hidden`, and
 `sample(hidden, sampling_metadata) -> list`. We satisfy that contract here
 while delegating the actual compute to vllm.
@@ -13,8 +13,8 @@ from typing import Any
 
 import torch
 
-from pie_backend.config import RuntimeConfig
-from pie_backend.model.common import sample_common
+from pie_driver.config import RuntimeConfig
+from pie_driver.model.common import sample_common
 
 from .attn_metadata import build_common_metadata
 
@@ -42,7 +42,7 @@ class VllmForwardPass:
     `transform` builds vllm-style attention metadata from pie's batch dicts,
     enters `set_forward_context`, and runs the vllm model's forward.
 
-    `sample` reuses pie_backend's `sample_common`, calling the vllm model's
+    `sample` reuses pie_driver's `sample_common`, calling the vllm model's
     `compute_logits` as the LM head.
     """
 
@@ -156,7 +156,7 @@ class VllmForwardPass:
         if len(shapes) == 1:
             return next(iter(shapes))
         raise NotImplementedError(
-            "pie_backend_vllm: model has mixed attention shapes across "
+            "pie_driver_vllm: model has mixed attention shapes across "
             f"layers ({len(shapes)} distinct shapes). FlashInfer plan() is "
             "currently one-shape-per-batch; per-layer planning is not yet "
             f"implemented. Shapes seen: {sorted(shapes, key=str)}."
@@ -287,7 +287,7 @@ class VllmForwardPass:
     # ------------------------------------------------------------------
 
     def sample(self, hidden_states: torch.Tensor, sampling_metadata: dict) -> dict:
-        """Sample via pie_backend's sample_common; vllm's LM head is the lm_head_fn."""
+        """Sample via pie_driver's sample_common; vllm's LM head is the lm_head_fn."""
         return sample_common(
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,

@@ -1,5 +1,5 @@
 """
-Common modeling components for PIE backend.
+Common modeling components for the Pie driver.
 """
 
 from __future__ import annotations

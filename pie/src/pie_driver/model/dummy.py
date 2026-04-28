@@ -1,5 +1,5 @@
 """
-Dummy model implementation for PIE backend.
+Dummy model implementation for the Pie driver.
 
 This module provides a DummyForwardPass class that mimics the interface of
 real model forward passes (like llama3.ForwardPass) but performs no actual

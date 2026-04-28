@@ -1,4 +1,4 @@
-# Pie Backend (vLLM) — `vllm` driver. Uses vllm's model definitions and
+# Pie Driver (vLLM) — `vllm` driver. Uses vllm's model definitions and
 # kernels under pie's RPC surface. vLLM is an optional dependency: install
 # via `pie-server[vllm]`.
 
@@ -14,7 +14,7 @@ os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
 
 
 _VLLM_INSTALL_HINT = (
-    "pie_backend_vllm requires vLLM. Install with `pip install pie-server[vllm]` "
+    "pie_driver_vllm requires vLLM. Install with `pip install pie-server[vllm]` "
     "or `uv sync --extra vllm`."
 )
 
@@ -33,6 +33,6 @@ from .config import VllmDriverConfig
 register_driver(DriverSpec(
     name="vllm",
     config_cls=VllmDriverConfig,
-    worker_module="pie_backend_vllm.worker",
+    worker_module="pie_driver_vllm.worker",
     extras=("vllm",),
 ))

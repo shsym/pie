@@ -16,7 +16,7 @@ driver-config redesign:
   * `NativeDriverConfig` — TOML-shape `[model.X.driver.native]` block. The
     user-facing config; gets merged into `NativeRuntimeConfig.from_args`.
 
-Vllm's analogue lives in `pie_backend_vllm.config.VllmDriverConfig`.
+Vllm's analogue lives in `pie_driver_vllm.config.VllmDriverConfig`.
 """
 
 from __future__ import annotations
@@ -88,7 +88,7 @@ class RuntimeConfig:
     # NOTE: `kv_page_size` and `max_dist_size` are NativeRuntimeConfig-only.
     # The shared RPC worker (`_handle_fire_batch`) falls back to
     # `engine.capabilities().kv_page_size` for drivers (vllm/sglang) that
-    # don't carry them on their config — see pie_backend/worker.py.
+    # don't carry them on their config — see pie_driver/worker.py.
 
     # ---------- properties ----------
     @property
@@ -196,7 +196,7 @@ class NativeRuntimeConfig(RuntimeConfig):
     native-only knobs.
 
     Field names match pie's existing internal vocabulary (kv_page_size,
-    gpu_mem_utilization, etc.) so model code under `pie_backend/model/`
+    gpu_mem_utilization, etc.) so model code under `pie_driver/model/`
     keeps reading `runtime_config.X` unchanged.
     """
 

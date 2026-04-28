@@ -109,7 +109,7 @@ class _FlashInferStrategy(_Strategy):
             output, extras):
         if extras.flashinfer_wrapper is None:
             raise RuntimeError(
-                "pie_backend_vllm: FlashInfer strategy reached run() but "
+                "pie_driver_vllm: FlashInfer strategy reached run() but "
                 "extras.flashinfer_wrapper is None. forward_pass.transform() "
                 "should have planned the wrapper for this batch."
             )
@@ -202,15 +202,15 @@ def _resolve_strategy(impl_cls: type) -> _Strategy:
         return cls()
     if reason := _UNSUPPORTED_IMPLS.get(name):
         raise NotImplementedError(
-            f"pie_backend_vllm: refusing to load with attention impl "
+            f"pie_driver_vllm: refusing to load with attention impl "
             f"{name!r}: {reason} Pie's runtime always emits a custom_mask "
             f"buffer; ignoring it would silently produce wrong tokens for "
             f"inferlets that depend on non-causal attention. Pick a "
             f"verified backend instead: {sorted(_STRATEGY_BY_NAME)}."
         )
     raise NotImplementedError(
-        f"pie_backend_vllm: no mask strategy registered for impl {name!r}. "
-        f"Either add a strategy in pie_backend_vllm/mask_strategies.py "
+        f"pie_driver_vllm: no mask strategy registered for impl {name!r}. "
+        f"Either add a strategy in pie_driver_vllm/mask_strategies.py "
         f"(see _FlashInferStrategy as a template) or pick a verified "
         f"backend: {sorted(_STRATEGY_BY_NAME)}."
     )

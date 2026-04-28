@@ -24,8 +24,8 @@ except ImportError:
 # Add src to path for imports
 sys.path.insert(0, "src")
 
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
+from pie_driver.engine import Engine
+from pie_driver.config import RuntimeConfig
 
 
 def format_chat_prompt(
@@ -231,7 +231,7 @@ def test_forward_pass_components(model_name: str = "openai/gpt-oss-20b"):
 
     # Test query
     print("\n[2] Testing query (ping)...")
-    from pie_backend import message
+    from pie_driver import message
     value = engine.query("ping")
     print(f"    ✓ Response: {value}")
 

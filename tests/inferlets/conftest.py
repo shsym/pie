@@ -47,7 +47,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per inferlet (seconds)")
     parser.add_argument("--verbose", action="store_true", help="Show stdout on failure")
     parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy"],
-                        help="Inference driver: 'native' (pie_backend), 'vllm' (pie_backend_vllm), 'sglang' (pie_backend_sglang), 'dummy' (pie_backend_dummy)")
+                        help="Inference driver: 'native' (pie_driver), 'vllm' (pie_driver_vllm), 'sglang' (pie_driver_sgl), 'dummy' (pie_driver_dummy)")
     parser.add_argument("--vllm-attention-backend", default=None,
                         help="vLLM attention backend (FLASH_ATTN / FLASHINFER / TRITON_ATTN / FLEX_ATTENTION). Default: vllm auto-picks")
     parser.add_argument("--sglang-attention-backend", default="triton",
@@ -56,7 +56,7 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
                         help="Pinned host KV pool size in GiB. 0 = swap disabled. "
                              "Native and sglang both honor this; vllm doesn't yet.")
     parser.add_argument("--spec-ngram", action="store_true",
-                        help="Enable backend NGRAM speculative-decoding drafts "
+                        help="Enable driver-supplied NGRAM speculative-decoding drafts "
                              "(sglang and vllm drivers).")
     parser.add_argument("--spec-num-drafts", type=int, default=4,
                         help="Number of NGRAM draft tokens proposed per iteration.")

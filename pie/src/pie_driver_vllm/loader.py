@@ -13,7 +13,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from pie_backend.config import RuntimeConfig
+from pie_driver.config import RuntimeConfig
 
 
 # Map pie's RuntimeConfig.activation_dtype (torch.dtype) to vllm's string form.
@@ -226,7 +226,7 @@ def load_vllm_model(
     # Snapshot dir: pie's Rust runtime needs a local filesystem path that
     # contains tokenizer.json (and the HF config). vllm's `model_config.model`
     # is just the HF repo name like "Qwen/Qwen3-0.6B", so we resolve it to
-    # the cached snapshot via huggingface_hub. (We avoid `pie_backend.hf_utils`
+    # the cached snapshot via huggingface_hub. (We avoid `pie_driver.hf_utils`
     # because it transitively imports `pie_kernels` which JIT-compiles CUDA
     # extensions; that's heavy and irrelevant on the vllm path.)
     snapshot_dir = _resolve_hf_snapshot_dir(config.hf_repo)
