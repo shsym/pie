@@ -15,6 +15,28 @@ if RAND_MV_AVAILABLE:
 _HAS_FUSED_RAND_MV = RAND_MV_AVAILABLE and hasattr(
     rand_mv, "batched_randn_matmul_sectioned"
 )
+_HAS_MULTI_INPUT_SECTIONED = RAND_MV_AVAILABLE and hasattr(
+    rand_mv, "batched_randn_matmul_multi_input_sectioned"
+)
+
+# Direct handles to the raw pybind ext callables — used in the hot path to
+# skip the Python wrapper's per-call overhead (~5–10 μs/call of asserts +
+# seeds.to() + list(tuple) + float() + torch.no_grad). Caller (_FastPlan)
+# is responsible for ensuring inputs are already correctly typed.
+#
+# We use the 10-round BM variant (the wrappers' n_rounds=10 default) so
+# the noise sequence matches what the wrappers would produce.
+_EXT_SECTIONED = None
+_EXT_MULTI_INPUT_SECTIONED = None
+if RAND_MV_AVAILABLE:
+    try:
+        from pie_kernels.cuda.rand_mv_new import BM as _BM10
+        # BM is a _LazyVariant — touching .ext forces compilation/binding.
+        _ext_mod = _BM10.ext
+        _EXT_SECTIONED = _ext_mod.batched_randn_matmul_sectioned
+        _EXT_MULTI_INPUT_SECTIONED = _ext_mod.batched_randn_matmul_multi_input_sectioned
+    except (ImportError, AttributeError):
+        pass
 
 
 def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
@@ -48,6 +70,36 @@ def run_length_encode(data: list[int]) -> list[tuple[int, int]]:
     return encoded
 
 
+class _FastPlan:
+    """Pre-computed per-(rle-group) state for the CUDA + CmaesAdapter path.
+
+    Built once at AdapterSubpass.__init__; consumed in the per-layer hot path
+    so that execute() does no attribute-chain lookups, no isinstance checks,
+    no tuple constructions, and no geometry arithmetic.
+    """
+    __slots__ = (
+        "x_start", "x_end", "B",
+        "rand_seeds", "rank_lora", "scaling",
+        "expected_stride0", "sum_out",
+        "qkv_down_scratch",  # pre-sliced scratch view (None if B too large)
+        "rank_x3",            # 3 * rank_lora
+        # Per-layer arrays:
+        "Wd_layers", "Wu_layers", "Sd_layers", "Su_layers",
+        # Pre-formatted list args for direct ext.* calls (no tuple→list
+        # conversion or float() on the hot path):
+        "section_widths_d_list",       # [rank, rank, rank]
+        "section_offsets_d_lists",     # [[li, li+100, li+200], ...] per layer
+        "x_starts_u_list",             # [0, rank, 2*rank]
+        "section_widths_u_list",       # [local_d_q, local_d_k, local_d_v]
+        "section_offsets_u_lists",     # [[-li, ...], ...] per layer
+        "global_cols_d",               # = 3 * rank_lora (Sd.shape[1])
+        # Fallback (3-UP) state for world_size != 1 OR non-contiguous q_state:
+        "Wu_q_layers", "Wu_k_layers", "Wu_v_layers",
+        "Su_q_layers", "Su_k_layers", "Su_v_layers",
+        "local_d_q", "local_d_k", "local_d_v",
+    )
+
+
 class AdapterSubpass:
 
     def __init__(
@@ -64,6 +116,85 @@ class AdapterSubpass:
         self.rand_seeds = rand_seeds
         self.adapter_indices_rle = run_length_encode(self.adapter_indices)
         self.qo_indptr = qo_indptr
+        # Try to pre-build fast-path plans. None if any group disqualifies
+        # (non-CUDA, non-CmaesAdapter); execute() falls back to legacy.
+        self._fast_plans = self._build_fast_plans() if _HAS_FUSED_RAND_MV else None
+
+    def _build_fast_plans(self) -> list[_FastPlan] | None:
+        plans: list[_FastPlan] = []
+        i = 0
+        for adapter_index, count in self.adapter_indices_rle:
+            x_start = self.qo_indptr[i]
+            x_end = self.qo_indptr[i + count]
+            i += count
+            B = x_end - x_start
+            if B == 0:
+                continue  # nothing to do for this group; drop it from the plan list
+            adapter_info = self.adapter_extras[adapter_index]
+            if not isinstance(adapter_info, CmaesAdapter):
+                return None  # legacy adapter present; can't build a fast plan
+
+            num_layers = adapter_info.num_layers
+            rank_lora = adapter_info.rank
+            out_indptr = adapter_info.out_features_indptr
+            local_d_q = out_indptr[1] - out_indptr[0]
+            local_d_k = out_indptr[2] - out_indptr[1]
+            local_d_v = out_indptr[3] - out_indptr[2]
+            sum_out = local_d_q + local_d_k + local_d_v
+
+            Wd_layers = [self.adapter_at_layer[li][0][adapter_index] for li in range(num_layers)]
+            Wu_layers = [self.adapter_at_layer[li][1][adapter_index] for li in range(num_layers)]
+
+            p = _FastPlan()
+            p.x_start = x_start
+            p.x_end = x_end
+            p.B = B
+            # Ensure the seeds slice is GPU int64; the raw ext call needs no
+            # further coercion. The slicing returns a view of the same dtype,
+            # so this is normally cheap or a no-op.
+            rseeds = self.rand_seeds[x_start:x_end]
+            if rseeds.dtype != torch.int64 or not rseeds.is_cuda:
+                rseeds = rseeds.to(device="cuda", dtype=torch.int64)
+            p.rand_seeds = rseeds
+            p.rank_lora = rank_lora
+            p.rank_x3 = 3 * rank_lora
+            p.scaling = adapter_info.alpha / float(rank_lora)
+            p.expected_stride0 = sum_out
+            p.sum_out = sum_out
+            p.local_d_q = local_d_q
+            p.local_d_k = local_d_k
+            p.local_d_v = local_d_v
+            p.global_cols_d = 3 * rank_lora
+            p.qkv_down_scratch = (
+                adapter_info._cast_qkv_down_scratch[:B, : 3 * rank_lora]
+                if B <= adapter_info._scratch_max_B else None
+            )
+            p.Wd_layers = Wd_layers
+            p.Wu_layers = Wu_layers
+            p.Sd_layers = adapter_info.qkv_down_sigma  # already a list, kept by reference
+            p.Su_layers = adapter_info.qkv_up_sigma
+            # Pre-format constant args as plain Python lists (pybind expects
+            # std::vector<int64_t>). Done once at __init__ so the hot path
+            # doesn't construct lists per kernel call.
+            p.section_widths_d_list = [rank_lora, rank_lora, rank_lora]
+            p.section_offsets_d_lists = [
+                [li, li + 100, li + 200] for li in range(num_layers)
+            ]
+            p.x_starts_u_list = [0, rank_lora, 2 * rank_lora]
+            p.section_widths_u_list = [local_d_q, local_d_k, local_d_v]
+            p.section_offsets_u_lists = [
+                [-li, -(li + 100), -(li + 200)] for li in range(num_layers)
+            ]
+            # 3-UP fallback views (only consumed when world_size != 1 or
+            # qkv_proj is non-contiguous):
+            p.Wu_q_layers = [Wu[:, out_indptr[0]:out_indptr[1]] for Wu in Wu_layers]
+            p.Wu_k_layers = [Wu[:, out_indptr[1]:out_indptr[2]] for Wu in Wu_layers]
+            p.Wu_v_layers = [Wu[:, out_indptr[2]:out_indptr[3]] for Wu in Wu_layers]
+            p.Su_q_layers = [Su[:, out_indptr[0]:out_indptr[1]] for Su in p.Su_layers]
+            p.Su_k_layers = [Su[:, out_indptr[1]:out_indptr[2]] for Su in p.Su_layers]
+            p.Su_v_layers = [Su[:, out_indptr[2]:out_indptr[3]] for Su in p.Su_layers]
+            plans.append(p)
+        return plans
 
     def execute(
         self,
@@ -75,6 +206,94 @@ class AdapterSubpass:
         rank: int = 0,
         world_size: int = 1,
     ):
+        if self._fast_plans is not None:
+            self._execute_fast(layer_idx, xs, q_state, k_state, v_state, rank, world_size)
+            return
+        self._execute_legacy(layer_idx, xs, q_state, k_state, v_state, rank, world_size)
+
+    def _execute_fast(
+        self, layer_idx, xs, q_state, k_state, v_state, rank, world_size,
+    ):
+        # Direct ext.* calls — bypass the Python wrappers (no asserts, no
+        # seeds.to(), no list(tuple), no float() — all preformatted in plan).
+        ext_s = _EXT_SECTIONED
+        ext_mi = _EXT_MULTI_INPUT_SECTIONED
+        # Wrapper kept for the rare 3-UP fallback path.
+        _matmul = rand_mv.batched_randn_matmul
+        for p in self._fast_plans:
+            x = xs[p.x_start:p.x_end]
+            qkv_down = p.qkv_down_scratch
+            if qkv_down is None:
+                qkv_down = torch.empty(
+                    p.B, p.rank_x3, device=x.device, dtype=x.dtype
+                )
+            # ext signature (positional):
+            #   x, seeds, S, section_widths, section_offsets,
+            #   col_offset, global_cols, out, alpha, beta, W_mean
+            ext_s(
+                x, p.rand_seeds, p.Sd_layers[layer_idx],
+                p.section_widths_d_list, p.section_offsets_d_lists[layer_idx],
+                0, p.global_cols_d,
+                qkv_down, 1.0, 0.0,
+                p.Wd_layers[layer_idx],
+            )
+            if (
+                world_size == 1 and ext_mi is not None
+                and q_state.stride(0) == p.expected_stride0
+                and q_state.stride(1) == 1
+            ):
+                qkv_full = q_state[p.x_start:p.x_end].as_strided(
+                    (p.B, p.sum_out), q_state.stride(),
+                )
+                # ext signature (positional):
+                #   x, seeds, S, x_starts, section_widths, section_offsets,
+                #   out, alpha, beta, W_mean
+                ext_mi(
+                    qkv_down, p.rand_seeds, p.Su_layers[layer_idx],
+                    p.x_starts_u_list, p.section_widths_u_list,
+                    p.section_offsets_u_lists[layer_idx],
+                    qkv_full, p.scaling, 1.0,
+                    p.Wu_layers[layer_idx],
+                )
+                continue
+            # 3-UP fallback (TP world_size != 1 or non-contiguous qkv_proj).
+            d_q, d_k, d_v = torch.split(
+                qkv_down, [p.rank_lora, p.rank_lora, p.rank_lora], dim=-1,
+            )
+            global_d_q = p.local_d_q * world_size
+            global_d_k = p.local_d_k * world_size
+            global_d_v = p.local_d_v * world_size
+            _matmul(
+                d_q, p.rand_seeds, p.Su_q_layers[layer_idx],
+                W_mean=p.Wu_q_layers[layer_idx],
+                out=q_state[p.x_start:p.x_end],
+                alpha=p.scaling, beta=1.0,
+                seed_offset=-layer_idx,
+                col_offset=rank * p.local_d_q, global_cols=global_d_q,
+            )
+            _matmul(
+                d_k, p.rand_seeds, p.Su_k_layers[layer_idx],
+                W_mean=p.Wu_k_layers[layer_idx],
+                out=k_state[p.x_start:p.x_end],
+                alpha=p.scaling, beta=1.0,
+                seed_offset=-(layer_idx + 100),
+                col_offset=rank * p.local_d_k, global_cols=global_d_k,
+            )
+            _matmul(
+                d_v, p.rand_seeds, p.Su_v_layers[layer_idx],
+                W_mean=p.Wu_v_layers[layer_idx],
+                out=v_state[p.x_start:p.x_end],
+                alpha=p.scaling, beta=1.0,
+                seed_offset=-(layer_idx + 200),
+                col_offset=rank * p.local_d_v, global_cols=global_d_v,
+            )
+
+    def _execute_legacy(
+        self, layer_idx, xs, q_state, k_state, v_state, rank, world_size,
+    ):
+        # Reached when _fast_plans is None — i.e., either no CUDA backend
+        # (Metal) or at least one group is a non-CmaesAdapter. Always uses
+        # the eager bmm path with optional CUDA noise injection.
         i = 0
         for adapter_index, count in self.adapter_indices_rle:
 
@@ -110,97 +329,6 @@ class AdapterSubpass:
             global_d_k = local_d_k * world_size
             global_d_v = local_d_v * world_size
 
-            if _HAS_FUSED_RAND_MV and is_cmaes:
-                # FAST PATH (CUDA): 2 kernels per layer when world_size == 1.
-                #
-                #   1× sectioned DOWN  — writes model-dtype scratch directly.
-                #   1× sectioned UP    — writes Q/K/V noise+mean directly into
-                #                         the contiguous qkv_proj backing
-                #                         tensor with alpha=scaling, beta=1.0.
-                #
-                # The UP-sectioned path requires world_size == 1 because the
-                # sectioned kernel takes one global col_offset/global_cols
-                # pair, which can't honour per-Q/K/V tensor-parallel sharding.
-                # Falls back to 3 separate UP kernels (4 launches total) when
-                # world_size > 1.
-                B = x.size(0)
-                if B == 0:
-                    i += count
-                    continue
-
-                Sd = adapter_info.qkv_down_sigma[layer_idx]  # (I, 3*rank)
-                if B <= adapter_info._scratch_max_B:
-                    qkv_down = adapter_info._cast_qkv_down_scratch[:B, : 3 * rank_lora]
-                else:
-                    qkv_down = torch.empty(
-                        B, 3 * rank_lora, device=x.device, dtype=x.dtype
-                    )
-                rand_mv.batched_randn_matmul_sectioned(
-                    x, rand_seeds, Sd,
-                    section_widths=(rank_lora, rank_lora, rank_lora),
-                    section_offsets=(layer_idx, layer_idx + 100, layer_idx + 200),
-                    W_mean=Wd, out=qkv_down, beta=0.0,
-                )
-
-                Su = adapter_info.qkv_up_sigma[layer_idx]  # (rank, LOCAL_d_sum)
-
-                if world_size == 1:
-                    # Reconstruct the contiguous qkv_proj view that backs
-                    # q/k/v_state — they are leftmost/middle/rightmost slices
-                    # of a single (B, sum_out) cublas output. Reusing one
-                    # sectioned launch + one fused matmul collapses 3 UP
-                    # kernels into 1.
-                    sum_out = local_d_q + local_d_k + local_d_v
-                    qkv_full = q_state[x_start:x_end].as_strided(
-                        (B, sum_out),
-                        q_state.stride(),
-                    )
-                    rand_mv.batched_randn_matmul_sectioned(
-                        qkv_down, rand_seeds, Su,
-                        section_widths=(local_d_q, local_d_k, local_d_v),
-                        section_offsets=(-layer_idx, -(layer_idx + 100), -(layer_idx + 200)),
-                        W_mean=Wu,
-                        out=qkv_full,
-                        alpha=scaling, beta=1.0,
-                    )
-                else:
-                    # TP fallback: per-Q/K/V col_offset/global_cols can't be
-                    # expressed via a single sectioned call.
-                    Su_q_local = Su[:, out_indptr[0] : out_indptr[1]]
-                    Su_k_local = Su[:, out_indptr[1] : out_indptr[2]]
-                    Su_v_local = Su[:, out_indptr[2] : out_indptr[3]]
-                    d_q, d_k, d_v = torch.split(
-                        qkv_down, [rank_lora, rank_lora, rank_lora], dim=-1
-                    )
-                    rand_mv.batched_randn_matmul(
-                        d_q, rand_seeds, Su_q_local,
-                        W_mean=Wu_q_local,
-                        out=q_state[x_start:x_end],
-                        alpha=scaling, beta=1.0,
-                        seed_offset=-layer_idx,
-                        col_offset=rank * local_d_q, global_cols=global_d_q,
-                    )
-                    rand_mv.batched_randn_matmul(
-                        d_k, rand_seeds, Su_k_local,
-                        W_mean=Wu_k_local,
-                        out=k_state[x_start:x_end],
-                        alpha=scaling, beta=1.0,
-                        seed_offset=-(layer_idx + 100),
-                        col_offset=rank * local_d_k, global_cols=global_d_k,
-                    )
-                    rand_mv.batched_randn_matmul(
-                        d_v, rand_seeds, Su_v_local,
-                        W_mean=Wu_v_local,
-                        out=v_state[x_start:x_end],
-                        alpha=scaling, beta=1.0,
-                        seed_offset=-(layer_idx + 200),
-                        col_offset=rank * local_d_v, global_cols=global_d_v,
-                    )
-
-                i += count
-                continue
-
-            # LEGACY PATH (Metal, or non-CMAES adapter on any backend).
             qkv_down = x @ Wd
             d_q, d_k, d_v = torch.split(
                 qkv_down, [rank_lora, rank_lora, rank_lora], dim=-1

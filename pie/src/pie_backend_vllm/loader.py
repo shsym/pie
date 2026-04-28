@@ -73,7 +73,7 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     into EngineArgs as kwargs.
     """
     from dataclasses import asdict
-    from vllm.engine.arg_utils import EngineArgs
+    from ._vllm_compat import EngineArgs
 
     if config.activation_dtype not in _DTYPE_TO_STR:
         raise ValueError(
@@ -93,8 +93,18 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     )
 
     # Driver-specific fields splat verbatim — names match EngineArgs.
-    # `None` means "leave default" (vllm picks).
+    # `None` means "leave default" (vllm picks). Pie-only knobs that don't
+    # correspond to vllm EngineArgs are filtered out: spec_ngram_* drive
+    # pie's NGRAM drafter (engine-side, see VllmEngine.spec_step).
+    _PIE_ONLY_KEYS = {
+        "spec_ngram_enabled",
+        "spec_ngram_num_drafts",
+        "spec_ngram_min_n",
+        "spec_ngram_max_n",
+    }
     for k, v in asdict(driver_config).items():
+        if k in _PIE_ONLY_KEYS:
+            continue
         if v is not None:
             engine_kwargs[k] = v
 
@@ -116,9 +126,9 @@ def _ensure_vllm_distributed(vllm_config: Any, rank: int, local_rank: int) -> No
     groups that model layers consult during construction.
     """
     import tempfile, datetime
-    from vllm.distributed import (
-        init_distributed_environment,
+    from ._vllm_compat import (
         ensure_model_parallel_initialized,
+        init_distributed_environment,
     )
 
     parallel_config = vllm_config.parallel_config
@@ -180,8 +190,7 @@ def load_vllm_model(
 
     # vllm's parallel state and model construction both consult
     # `get_current_vllm_config()` — they must run inside `set_current_vllm_config`.
-    from vllm.config import set_current_vllm_config
-    from vllm.model_executor.model_loader import get_model_loader
+    from ._vllm_compat import get_model_loader, set_current_vllm_config
 
     with set_current_vllm_config(vllm_config):
         _log("Bringing up vllm parallel state", "DEBUG")

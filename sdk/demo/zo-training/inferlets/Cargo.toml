@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["es-init", "es-rollout", "es-update"]
+members = ["es-init", "es-rollout", "es-update", "bench-tpot"]
 
 [workspace.dependencies]
 inferlet = { path = "../../../rust/inferlet" }

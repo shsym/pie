@@ -68,10 +68,12 @@ def allocate_and_bind_kv_cache(
     Returns the per-layer tensor list in layer-index order, which pie's worker
     treats as `engine.kv_cache_at_layer` for the swap RPCs.
     """
-    from vllm.config import set_current_vllm_config
-    from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-    from vllm.model_executor.models.utils import extract_layer_index
-    from vllm.v1.worker.utils import bind_kv_cache
+    from ._vllm_compat import (
+        AttentionLayerBase,
+        bind_kv_cache,
+        extract_layer_index,
+        set_current_vllm_config,
+    )
 
     vllm_config = loaded.vllm_config
     fc = vllm_config.compilation_config.static_forward_context

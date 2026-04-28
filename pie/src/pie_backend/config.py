@@ -85,6 +85,11 @@ class RuntimeConfig:
     # Engine-computed at load time. None pre-load; set by the engine.
     max_num_kv_pages: int | None = None
 
+    # NOTE: `kv_page_size` and `max_dist_size` are NativeRuntimeConfig-only.
+    # The shared RPC worker (`_handle_fire_batch`) falls back to
+    # `engine.capabilities().kv_page_size` for drivers (vllm/sglang) that
+    # don't carry them on their config — see pie_backend/worker.py.
+
     # ---------- properties ----------
     @property
     def device(self) -> torch.device:

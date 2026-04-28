@@ -243,6 +243,11 @@ pub struct BatchedForwardPassRequest {
     pub spec_indptr: ByteVec,
     pub output_spec_flags: Vec<bool>,
 
+    // === Context (per request) ===
+    // Stable per-context identifier — preferred session key for backends
+    // that maintain per-context state (e.g. n-gram drafter token history).
+    pub context_ids: Vec<ContextId>,
+
     // === Inference hints ===
     pub single_token_mode: bool,
 
@@ -278,6 +283,7 @@ impl BatchedForwardPassRequest {
             spec_position_ids: ByteVec(Vec::new()),
             spec_indptr: ByteVec(vec![0]),
             output_spec_flags: Vec::new(),
+            context_ids: Vec::new(),
             single_token_mode: true,
             device_id,
         }
@@ -333,6 +339,9 @@ impl BatchedForwardPassRequest {
         self.spec_position_ids.0.extend(&req.speculative_positions);
         self.spec_indptr.0.push(self.spec_token_ids.0.len() as u32);
         self.output_spec_flags.push(req.output_speculative_tokens);
+
+        // Context (stable id for per-context backend state)
+        self.context_ids.push(req.context_id);
 
         // Inference hint
         if req.tokens.len() > 1 {

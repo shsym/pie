@@ -54,7 +54,7 @@ else:
         if key in _ext_cache:
             return _ext_cache[key]
         ext = load(
-            name=f"rand_mv_cuda_v9_m{rng_method}_r{rounds}",
+            name=f"rand_mv_cuda_v13_m{rng_method}_r{rounds}",
             sources=[os.path.join(_HERE, "cuda_kernels.cu")],
             extra_cuda_cflags=[
                 "-O3",
@@ -76,9 +76,24 @@ else:
         return ext
 
     def _bind(ext):
-        """Wrap a compiled extension with the public matmul/generate API."""
+        """Wrap a compiled extension with the public matmul/generate API.
 
-        @torch.no_grad()
+        Wrappers are intentionally lean: pybind11's casters already validate
+        and convert types (Python tuple → std::vector<int64_t>, Python int/
+        float → C++ double, etc.), so we skip redundant list()/float()/int()
+        coercions. ``seeds.to()`` is gated on a cheap dtype/device check so a
+        no-op coercion doesn't pay the ~1 μs Python overhead. ``torch.no_grad``
+        is omitted because the underlying CUDA op does not produce
+        autograd-tracked tensors and primary callers run inside
+        ``torch.inference_mode()`` already.
+        """
+
+        def _ensure_seeds(seeds, target_device):
+            # Skip the ~1 μs .to() call when seeds is already correctly typed.
+            if seeds.dtype is torch.int64 and seeds.device == target_device:
+                return seeds
+            return seeds.to(device=target_device, dtype=torch.int64)
+
         def matmul(x, seeds, S, *, n_rounds=10, out_dtype=None,
                    col_offset=0, global_cols=None,
                    seed_offset=0, out=None, alpha=1.0, beta=0.0,
@@ -100,14 +115,39 @@ else:
                 out_dtype = x.dtype
             if global_cols is None:
                 global_cols = O
-            seeds_dev = seeds.to(device=x.device, dtype=torch.int64)
+            seeds_dev = _ensure_seeds(seeds, x.device)
             y = ext.batched_randn_matmul(
                 x, seeds_dev, S, col_offset, global_cols,
-                int(seed_offset), out, float(alpha), float(beta), W_mean,
+                seed_offset, out, alpha, beta, W_mean,
             )
             return y.to(out_dtype) if (out is None and out_dtype != torch.float32) else y
 
-        @torch.no_grad()
+        def matmul_multi_input_sectioned(
+            x, seeds, S, *,
+            x_starts, section_widths, section_offsets,
+            out=None, alpha=1.0, beta=0.0, out_dtype=None,
+            W_mean=None,
+        ):
+            """Multi-input sectioned matmul. Each output section reads from a
+            different slice of the packed input x. The reduction dim is
+            S.shape[0] for every section. Single-GPU only (no col_offset/
+            global_cols sharding)."""
+            assert x.is_cuda and S.is_cuda
+            assert x.dim() == 2 and S.dim() == 2
+            assert (
+                len(x_starts) == len(section_widths) == len(section_offsets)
+            )
+            assert sum(section_widths) == S.shape[1]
+            seeds_dev = _ensure_seeds(seeds, x.device)
+            y = ext.batched_randn_matmul_multi_input_sectioned(
+                x, seeds_dev, S,
+                x_starts, section_widths, section_offsets,
+                out, alpha, beta, W_mean,
+            )
+            if out is None and out_dtype is not None and out_dtype != torch.float32:
+                y = y.to(out_dtype)
+            return y
+
         def matmul_sectioned(x, seeds, S, *,
                              section_widths, section_offsets,
                              col_offset=0, global_cols=None,
@@ -120,39 +160,46 @@ else:
             assert len(section_widths) == len(section_offsets)
             assert sum(section_widths) == S.shape[1]
             if global_cols is None:
-                global_cols = int(S.shape[1])
-            seeds_dev = seeds.to(device=x.device, dtype=torch.int64)
+                global_cols = S.shape[1]
+            seeds_dev = _ensure_seeds(seeds, x.device)
             y = ext.batched_randn_matmul_sectioned(
                 x, seeds_dev, S,
-                list(section_widths), list(section_offsets),
+                section_widths, section_offsets,
                 col_offset, global_cols,
-                out, float(alpha), float(beta), W_mean,
+                out, alpha, beta, W_mean,
             )
             if out is None and out_dtype is not None and out_dtype != torch.float32:
                 y = y.to(out_dtype)
             return y
 
-        @torch.no_grad()
         def generate(seeds, S, *, n_rounds=10, device=None,
                      dtype=torch.float32, col_offset=0, global_cols=None):
             if device is None:
                 device = S.device if S.is_cuda else torch.device("cuda")
-            seeds_dev = seeds.to(device=device, dtype=torch.int64)
-            S_dev = S.to(device=device)
+            seeds_dev = _ensure_seeds(seeds, device)
+            S_dev = S.to(device=device) if S.device != device else S
             assert S_dev.dim() == 2
             if global_cols is None:
-                global_cols = int(S_dev.size(1))
+                global_cols = S_dev.size(1)
             y = ext.batched_randn_generate(seeds_dev, S_dev, col_offset, global_cols)
             return y.to(dtype) if dtype != torch.float32 else y
 
+        # `ext` is the raw pybind module. The Python wrappers above add
+        # validation, dtype/device coercion, and tuple→list conversion.
+        # Hot-path callers that already know their inputs are correct can
+        # call ext.* directly to skip ~5–10 μs/call of Python overhead.
         return types.SimpleNamespace(
             batched_randn_matmul=matmul,
             batched_randn_matmul_sectioned=matmul_sectioned,
+            batched_randn_matmul_multi_input_sectioned=matmul_multi_input_sectioned,
             batched_randn_generate=generate,
+            ext=ext,
         )
 
     # Only BM7 (the default) is eager — the rest compile on first access so
     # that `import rand_mv_cuda` in a fresh env doesn't build every variant.
+    # After first resolution, attributes are copied to the instance so
+    # subsequent accesses skip ``__getattr__`` (saves ~1 μs/call in hot paths).
     class _LazyVariant:
         def __init__(self, rng_method: int, rounds: int):
             self._rng_method = rng_method
@@ -161,54 +208,34 @@ else:
         def _resolve(self):
             if self._mod is None:
                 self._mod = _bind(_get_ext(self._rng_method, self._rounds))
+                for k, v in vars(self._mod).items():
+                    setattr(self, k, v)
             return self._mod
         def __getattr__(self, name):
+            # Triggered only before first _resolve() (or for names not on
+            # the bound namespace).
             return getattr(self._resolve(), name)
 
     BM7    = _bind(_get_ext(0,  7))
     BM     = _LazyVariant(0, 10)
     PROBIT = _LazyVariant(1, 10)
     ZIG    = _LazyVariant(2, 10)
+    # BM is the default n_rounds=10 variant — every hot-path top-level call
+    # routes to it. Resolve eagerly so dispatch doesn't pay the __getattr__
+    # tax on the first batch of every fresh run.
+    BM._resolve()
 
-    # Public top-level API — `n_rounds` routes to the matching variant so the
-    # function is a true drop-in for the Triton version. Anything <= 7 uses
-    # BM7 (fastest); anything >= 8 uses BM (matches Triton's default of 10).
-    def batched_randn_matmul(x, seeds, S, *, n_rounds=10, out_dtype=None,
-                             col_offset=0, global_cols=None,
-                             seed_offset=0, out=None, alpha=1.0, beta=0.0,
-                             W_mean=None):
-        impl = BM7 if n_rounds <= 7 else BM
-        return impl.batched_randn_matmul(
-            x, seeds, S,
-            n_rounds=n_rounds, out_dtype=out_dtype,
-            col_offset=col_offset, global_cols=global_cols,
-            seed_offset=seed_offset, out=out, alpha=alpha, beta=beta,
-            W_mean=W_mean,
-        )
-
-    def batched_randn_matmul_sectioned(x, seeds, S, *,
-                                       section_widths, section_offsets,
-                                       n_rounds=10, out_dtype=None,
-                                       col_offset=0, global_cols=None,
-                                       out=None, alpha=1.0, beta=0.0,
-                                       W_mean=None):
-        impl = BM7 if n_rounds <= 7 else BM
-        return impl.batched_randn_matmul_sectioned(
-            x, seeds, S,
-            section_widths=section_widths, section_offsets=section_offsets,
-            col_offset=col_offset, global_cols=global_cols,
-            out=out, alpha=alpha, beta=beta, out_dtype=out_dtype,
-            W_mean=W_mean,
-        )
-
-    def batched_randn_generate(seeds, S, *, n_rounds=10, device=None,
-                               dtype=torch.float32, col_offset=0, global_cols=None):
-        impl = BM7 if n_rounds <= 7 else BM
-        return impl.batched_randn_generate(
-            seeds, S,
-            n_rounds=n_rounds, device=device, dtype=dtype,
-            col_offset=col_offset, global_cols=global_cols,
-        )
+    # Public top-level API.
+    #
+    # The default n_rounds=10 (BM) path is a *direct alias* to BM's wrapper —
+    # zero dispatch overhead. Callers needing the BM7 variant must use the
+    # `BM7.*` namespace directly, or the `_route(n_rounds, fn)` helper below.
+    # No production caller passes a non-default n_rounds, so flattening this
+    # is worth ~9 μs/call of kwarg repacking on the hot path.
+    batched_randn_matmul                       = BM.batched_randn_matmul
+    batched_randn_matmul_sectioned             = BM.batched_randn_matmul_sectioned
+    batched_randn_matmul_multi_input_sectioned = BM.batched_randn_matmul_multi_input_sectioned
+    batched_randn_generate                     = BM.batched_randn_generate
 
     # ==================================================================
     #  Tests (mirror baseline.py's run_tests() but driven by our impls).

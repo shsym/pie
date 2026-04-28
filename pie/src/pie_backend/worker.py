@@ -344,15 +344,19 @@ def _populate_next_drafts(batch, sampling_results: dict, engine) -> None:
         if not output_flags[i] or not accepted:
             continue
 
-        # Stable per-context session id: first physical KV page id for this
-        # request. Pages get pushed to kv_page_indices in stable order
-        # (committed, then working), so index 0 == the context's first
-        # committed page — stable across iterations of the same context.
-        page_start = int(batch.kv_page_indptr[i])
-        page_end = int(batch.kv_page_indptr[i + 1])
-        if page_end == page_start:
-            continue  # No KV page; can't form a session id (shouldn't happen).
-        session_id = int(batch.kv_page_indices[page_start])
+        # Stable per-context session id: the runtime's ContextId, carried
+        # in `BatchedForwardPassRequest.context_ids`. ContextId stays valid
+        # across swap + restore; the first KV page id (older fallback) does
+        # not, so we prefer it. The fallback covers runtimes that haven't
+        # populated context_ids yet.
+        if batch.context_ids:
+            session_id = int(batch.context_ids[i])
+        else:
+            page_start = int(batch.kv_page_indptr[i])
+            page_end = int(batch.kv_page_indptr[i + 1])
+            if page_end == page_start:
+                continue
+            session_id = int(batch.kv_page_indices[page_start])
         last_pending_pos = int(batch.position_ids[batch.qo_indptr[i + 1] - 1])
 
         sessions.append((session_id, accepted))

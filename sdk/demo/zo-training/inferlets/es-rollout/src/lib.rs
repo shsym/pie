@@ -24,7 +24,13 @@ struct Input {
     max_num_outputs: usize,
     /// Rollout tasks.
     rollouts: Vec<Rollout>,
+    /// If false, skip the adapter (no perturbation). Used for A/B latency
+    /// comparisons. Defaults to true to preserve existing behaviour.
+    #[serde(default = "default_true")]
+    use_adapter: bool,
 }
+
+fn default_true() -> bool { true }
 
 #[derive(Deserialize, Debug)]
 #[allow(dead_code)]
@@ -40,8 +46,14 @@ async fn main(input: Input) -> Result<Vec<String>> {
         .ok_or("No models available")?;
     let model = Model::load(&model_name)?;
 
-    let adapter = Adapter::open(&model, &input.name)
-        .ok_or_else(|| format!("Adapter '{}' not found", input.name))?;
+    let adapter = if input.use_adapter {
+        Some(
+            Adapter::open(&model, &input.name)
+                .ok_or_else(|| format!("Adapter '{}' not found", input.name))?,
+        )
+    } else {
+        None
+    };
 
     let sampler = Sampler::TopP((0.6, 0.95));
     let mut results: Vec<String> = Vec::with_capacity(input.rollouts.len());
@@ -52,12 +64,13 @@ async fn main(input: Input) -> Result<Vec<String>> {
         ctx.user(&rollout.task);
         ctx.cue();
 
-        let text = ctx.generate(sampler.clone())
-            .with_adapter(&adapter)
-            .with_zo_seed(rollout.seed)
-            .with_max_tokens(input.max_num_outputs)
-            .collect_text()
-            .await?;
+        let mut stream = ctx
+            .generate(sampler.clone())
+            .with_max_tokens(input.max_num_outputs);
+        if let Some(ref a) = adapter {
+            stream = stream.with_adapter(a).with_zo_seed(rollout.seed);
+        }
+        let text = stream.collect_text().await?;
 
         results.push(text);
     }
