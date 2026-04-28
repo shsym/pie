@@ -1,10 +1,10 @@
 """Test packed weight approach: allocate one big tensor per dtype, copy into it."""
 import sys, time, torch
 sys.path.insert(0, "/Users/ingim/Workspace/pie-mac/pie/src")
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
+from pie_driver.engine import Engine
+from pie_driver.config import RuntimeConfig
 import torch.nn.functional as fun
-import pie_backend.model.gpt_oss as gpt_oss
+import pie_driver.model.gpt_oss as gpt_oss
 
 def noop_compact(self):
     pass

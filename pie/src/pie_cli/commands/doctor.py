@@ -63,13 +63,13 @@ def _check_libraries() -> list[tuple[str, str, str]]:
     """Check library installations."""
     results = []
 
-    # pie_backend (merged into pie-server)
+    # pie_driver (merged into pie-server)
     try:
-        import pie_backend  # noqa: F401
+        import pie_driver  # noqa: F401
 
-        results.append(("pie_backend", "OK (part of pie-server)", "pass"))
+        results.append(("pie_driver", "OK (part of pie-server)", "pass"))
     except ImportError:
-        results.append(("pie_backend", "Not installed", "warn"))
+        results.append(("pie_driver", "Not installed", "warn"))
 
     # pie-client
     try:
@@ -104,7 +104,7 @@ def doctor() -> None:
     """Run environment health check.
 
     Checks platform, GPU availability, and required dependencies
-    to verify the system is ready for running the Pie backend.
+    to verify the system is ready for running the Pie driver.
     """
     console.print()
 

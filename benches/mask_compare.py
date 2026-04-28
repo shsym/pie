@@ -1,10 +1,10 @@
-"""Direct A/B harness for the custom-mask paths in pie_backend_vllm.
+"""Direct A/B harness for the custom-mask paths in pie_driver_vllm.
 
 Runs the same synthetic forward pass — identical token IDs, positions, KV
-pages, and BRLE attention mask — through both backends:
+pages, and BRLE attention mask — through both drivers:
 
-  * pie_backend       (FlashInfer reference, gold standard)
-  * pie_backend_vllm + _FlashInferStrategy (the production fast path)
+  * pie_driver       (FlashInfer reference, gold standard)
+  * pie_driver_vllm + _FlashInferStrategy (the production fast path)
 
 For each, we print:
   * the sampled (argmax) token at the last position
@@ -55,7 +55,7 @@ def make_inputs(
     device: torch.device,
     seed: int = 1234,
 ) -> dict[str, Any]:
-    """Construct a single-request batch dict matching `pie_backend.batching.Batch.get_model_inputs()`."""
+    """Construct a single-request batch dict matching `pie_driver.batching.Batch.get_model_inputs()`."""
     rng = np.random.default_rng(seed)
     token_ids = rng.integers(low=10, high=10000, size=prompt_len, dtype=np.int64)
 
@@ -82,7 +82,7 @@ def make_inputs(
     mask_indptr_u32 = np.array(indptr, dtype=np.uint32)
 
     # Decode BRLE to flat bool mask using pie's decoder for parity.
-    from pie_backend.batching import decode_brle_batch
+    from pie_driver.batching import decode_brle_batch
 
     valid_lens = positions + 1
     token_acc = np.zeros(prompt_len + 1, dtype=np.int32)
@@ -104,7 +104,7 @@ def make_inputs(
     sampler_seeds = np.array([0], dtype=np.uint32)
 
     return {
-        # Mirrors what RPC delivers; pie_backend.batching.Batch.__init__ consumes this.
+        # Mirrors what RPC delivers; pie_driver.batching.Batch.__init__ consumes this.
         "_rpc_args": {
             "token_ids": token_ids.astype(np.uint32).tobytes(),
             "position_ids": positions.astype(np.uint32).tobytes(),
@@ -145,8 +145,8 @@ def make_inputs(
 
 
 def load_native_engine(model_repo: str, device: str = "cuda:0"):
-    from pie_backend.config import NativeRuntimeConfig
-    from pie_backend.engine import Engine
+    from pie_driver.config import NativeRuntimeConfig
+    from pie_driver.engine import Engine
 
     cfg = NativeRuntimeConfig(
         hf_repo=model_repo,
@@ -178,9 +178,9 @@ def load_native_engine(model_repo: str, device: str = "cuda:0"):
 
 
 def load_vllm_engine(model_repo: str, device: str = "cuda:0", attention_backend: str = "FLASHINFER"):
-    from pie_backend.config import RuntimeConfig
-    from pie_backend_vllm.config import VllmDriverConfig
-    from pie_backend_vllm.engine import VllmEngine
+    from pie_driver.config import RuntimeConfig
+    from pie_driver_vllm.config import VllmDriverConfig
+    from pie_driver_vllm.engine import VllmEngine
 
     cfg = RuntimeConfig(
         hf_repo=model_repo,
@@ -215,7 +215,7 @@ def load_vllm_engine(model_repo: str, device: str = "cuda:0", attention_backend:
 
 def run_engine(engine, inputs_pkg: dict, *, with_mask: bool, kv_page_size: int) -> dict:
     """Run one fire_batch on the given engine. Returns the sampled token + last-pos hidden."""
-    from pie_backend.batching import Batch
+    from pie_driver.batching import Batch
 
     rpc = dict(inputs_pkg["_rpc_args"])
     if not with_mask:

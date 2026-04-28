@@ -15,8 +15,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
+from pie_driver.engine import Engine
+from pie_driver.config import RuntimeConfig
 
 
 # Default test model - use a small model for faster testing

@@ -1,7 +1,7 @@
 """Driver registry — maps `type = "..."` strings to driver implementations.
 
-Each inference driver (pie_backend_vllm, pie_backend, pie_backend_dummy,
-future siblings like pie_backend_sglang) registers a `DriverSpec` here on
+Each inference driver (pie_driver_vllm, pie_driver, pie_driver_dummy,
+future siblings like pie_driver_sgl) registers a `DriverSpec` here on
 package import. `pie/server.py` consults the registry to dispatch a model
 to the right worker module without hardcoding driver names.
 

@@ -122,7 +122,7 @@ app = typer.Typer(help="Manage models from HuggingFace")
 @app.command("list")
 def model_list() -> None:
     """List locally cached HuggingFace models."""
-    from pie_backend.hf_utils import (
+    from pie_driver.hf_utils import (
         get_hf_cache_dir,
         get_hf_snapshot_dir,
         load_hf_config,
@@ -249,7 +249,7 @@ def model_download(
         console.print(f"[green]✓[/green] Downloaded to {local_path}")
 
         # Check compatibility
-        from pie_backend.hf_utils import (
+        from pie_driver.hf_utils import (
             get_hf_snapshot_dir,
             load_hf_config,
             check_pie_compatibility,

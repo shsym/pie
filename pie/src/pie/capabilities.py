@@ -1,4 +1,4 @@
-"""Backend → runtime handshake contract.
+"""Driver → runtime handshake contract.
 
 Pie's configuration has two distinct concepts that this module separates:
 
@@ -7,15 +7,15 @@ Pie's configuration has two distinct concepts that this module separates:
     `default_token_budget`, etc. These flow from the user's config file into
     the worker and are consumed there. They never come back.
 
-  * **Capacities** (bottom-up, backend-computed in this dataclass): "given
+  * **Capacities** (bottom-up, driver-computed in this dataclass): "given
     that budget plus the kernel's real ceiling, here is what I actually
     have" — number of KV pages, page size the attention impl supports,
     clamped batch sizes, model-architecture facts read from HF config. These
     flow from the worker back to the server via the `ready_queue` handshake
     and are then forwarded to the Rust runtime when applicable.
 
-Each inference backend (`pie_backend`, `pie_backend_vllm`, future siblings)
-implements `Engine.capabilities() -> BackendCapabilities` and the worker
+Each inference driver (`pie_driver`, `pie_driver_vllm`, future siblings)
+implements `Engine.capabilities() -> DriverCapabilities` and the worker
 delivers that struct as the ready signal payload. The server uses it as the
 source of truth when constructing `pie_runtime.ModelConfig`.
 
@@ -30,8 +30,8 @@ from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
-class BackendCapabilities:
-    """Capacities the inference backend reports to pie's runtime.
+class DriverCapabilities:
+    """Capacities the inference driver reports to pie's runtime.
 
     Frozen so the value can't drift after the handshake — once the worker
     publishes it, both Python and Rust treat it as immutable truth for the
@@ -39,12 +39,12 @@ class BackendCapabilities:
     """
 
     # ── KV cache ────────────────────────────────────────────────────────
-    # Number of KV pages the backend allocated on this rank's GPU.
+    # Number of KV pages the driver allocated on this rank's GPU.
     # Forwarded to Rust as DeviceConfig.total_pages.
     total_pages: int
 
     # Block size in tokens that the chosen attention kernel actually uses.
-    # The user's `ModelConfig.kv_page_size` is a *preference*; the backend
+    # The user's `ModelConfig.kv_page_size` is a *preference*; the driver
     # may resolve to a different value (e.g., FlashInfer requires 16/32/64).
     # Forwarded to Rust as ModelConfig.kv_page_size.
     kv_page_size: int
@@ -54,7 +54,7 @@ class BackendCapabilities:
     swap_pool_size: int
 
     # ── Batching limits ────────────────────────────────────────────────
-    # Clamped to what the backend's kernel actually supports — not just an
+    # Clamped to what the driver's kernel actually supports — not just an
     # echo of the user's request. Forwarded to Rust as DeviceConfig fields.
     max_batch_tokens: int
     max_batch_size: int

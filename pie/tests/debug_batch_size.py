@@ -1,9 +1,9 @@
 """Find the maximum safe batch size for MPS clone operations."""
 import sys, torch
 sys.path.insert(0, "/Users/ingim/Workspace/pie-mac/pie/src")
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
-import pie_backend.model.gpt_oss as gpt_oss
+from pie_driver.engine import Engine
+from pie_driver.config import RuntimeConfig
+import pie_driver.model.gpt_oss as gpt_oss
 
 def noop_compact(self):
     pass

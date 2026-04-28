@@ -20,8 +20,8 @@ sys.path.insert(0, "src")
 import torch
 from transformers import AutoTokenizer
 
-from pie_backend.engine import Engine
-from pie_backend.config import RuntimeConfig
+from pie_driver.engine import Engine
+from pie_driver.config import RuntimeConfig
 
 
 # ---------------------------------------------------------------------------

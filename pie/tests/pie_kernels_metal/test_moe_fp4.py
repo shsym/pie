@@ -60,7 +60,7 @@ class TestFp4DomainOps:
 
     def test_deinterleave_gate_up_fp4(self):
         """Deinterleave should reorder rows: even→gate(second half), odd→linear(first half)."""
-        from pie_backend.model.gpt_oss_utils import deinterleave_gate_up_fp4
+        from pie_driver.model.gpt_oss_utils import deinterleave_gate_up_fp4
 
         E, I, H_half, H_scale = 2, 4, 16, 1
         blocks = torch.arange(E * 2 * I * H_half, dtype=torch.uint8).reshape(E, 2 * I, H_half)
@@ -80,7 +80,7 @@ class TestFp4DomainOps:
 
     def test_pad_gate_up_fp4_no_pad_needed(self):
         """When sizes already match, should return inputs unchanged."""
-        from pie_backend.model.gpt_oss_utils import pad_gate_up_fp4
+        from pie_driver.model.gpt_oss_utils import pad_gate_up_fp4
 
         E, I = 2, 4
         H = 32  # H_half=16, H_scale=1
@@ -93,7 +93,7 @@ class TestFp4DomainOps:
 
     def test_pad_gate_up_fp4_pads_correctly(self):
         """Padding should zero-fill blocks and 0x7F-fill scales in padded regions."""
-        from pie_backend.model.gpt_oss_utils import pad_gate_up_fp4
+        from pie_driver.model.gpt_oss_utils import pad_gate_up_fp4
 
         E, I = 1, 2
         H = 32
@@ -124,7 +124,7 @@ class TestFp4DomainOps:
 
     def test_pad_down_fp4(self):
         """Down projection padding should work for blocks and scales."""
-        from pie_backend.model.gpt_oss_utils import pad_down_fp4
+        from pie_driver.model.gpt_oss_utils import pad_down_fp4
 
         E, H, I = 1, 4, 64
         padded_H, padded_I = 8, 128
@@ -161,7 +161,7 @@ class TestMoeWithFp4Packed:
         This is a test-only reference quantizer that produces the same format
         as safetensors MXFP4 storage.
         """
-        from pie_backend.model.gpt_oss_utils import FP4_VALUES
+        from pie_driver.model.gpt_oss_utils import FP4_VALUES
 
         fp4_lut = torch.tensor(FP4_VALUES, dtype=torch.float32)
         shape = weights_bf16.shape
@@ -197,7 +197,7 @@ class TestMoeWithFp4Packed:
 
     def _dequant_fp4_to_bf16(self, blocks, scales):
         """Dequant packed FP4 back to bf16 using the existing reference implementation."""
-        from pie_backend.model.gpt_oss_utils import dequantize_from_mxfp4
+        from pie_driver.model.gpt_oss_utils import dequantize_from_mxfp4
 
         shape = blocks.shape
         # Reshape to [*prefix, groups_per_row, 16] and [*prefix, groups_per_row]

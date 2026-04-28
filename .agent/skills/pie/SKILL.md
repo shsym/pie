@@ -72,5 +72,5 @@ cd inferlets/text-completion && cargo check --target wasm32-wasip2
 | `sdk/rust/inferlet/wit/` | SDK-side WIT interfaces (must match runtime) |
 | `inferlets/` | Standard inferlets (text-completion, etc.) |
 | `pie/src/pie_cli/` | Python CLI (`pie run`, `pie serve`) |
-| `pie/src/pie_backend/` | Python GPU backend (model loading, inference engine) |
+| `pie/src/pie_driver/` | Python GPU driver (model loading, inference engine) |
 | `pie/pyproject.toml` | Build config (maturin + uv) |
