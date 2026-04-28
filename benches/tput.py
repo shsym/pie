@@ -67,18 +67,61 @@ async def run_benchmark(args):
     print(f"Prompt:      {args.prompt!r}")
     print()
 
+    from pie.config import (
+        ServerConfig, TelemetryConfig, DriverConfig,
+    )
+
+    # Build the [model.X.driver.<type>] subsection. Each driver expresses
+    # its budgets in its own vocabulary — translate CLI flags accordingly.
+    if args.driver == "vllm":
+        driver_subsection: dict = {
+            "gpu_memory_utilization": args.gpu_mem_util,
+            "max_num_seqs": args.max_batch_size,
+            "enforce_eager": not args.use_cuda_graphs,
+        }
+        if args.vllm_attention_backend is not None:
+            driver_subsection["attention_backend"] = args.vllm_attention_backend
+    elif args.driver == "native":
+        driver_subsection = {
+            "gpu_mem_utilization": args.gpu_mem_util,
+            "max_batch_size": args.max_batch_size,
+            "use_cuda_graphs": args.use_cuda_graphs,
+            "cpu_mem_budget_in_gb": args.cpu_mem_budget,
+        }
+    elif args.driver == "sglang":
+        # sglang's vocabulary differs: `mem_fraction_static` instead of
+        # `gpu_memory_utilization`, `disable_cuda_graph` (negation),
+        # `cpu_mem_budget_in_gb` is pie-universal (filtered out before
+        # ServerArgs splat in pie_backend_sglang/loader.py).
+        driver_subsection = {
+            "mem_fraction_static": args.gpu_mem_util,
+            "disable_cuda_graph": not args.use_cuda_graphs,
+            "cpu_mem_budget_in_gb": args.cpu_mem_budget,
+        }
+        if args.sglang_attention_backend is not None:
+            driver_subsection["attention_backend"] = args.sglang_attention_backend
+    else:  # dummy
+        driver_subsection = {}
+
     cfg = Config(
-        port=0,
+        server=ServerConfig(
+            port=0,
+            max_concurrent_processes=args.max_concurrent_processes,
+        ),
         auth=AuthConfig(enabled=False),
-        models=[ModelConfig(
-            hf_repo=args.model, device=device,
-            dummy_mode=args.dummy,
-            gpu_mem_utilization=args.gpu_mem_util,
-            cpu_mem_budget_in_gb=args.cpu_mem_budget,
-            default_token_budget=args.default_token_budget,
-            max_batch_size=args.max_batch_size,
-        )],
-        max_concurrent_processes=args.max_concurrent_processes,
+        telemetry=TelemetryConfig(),
+        models={
+            "default": ModelConfig(
+                name="default",
+                hf_repo=args.model,
+                default_token_budget=args.default_token_budget,
+                driver=DriverConfig(
+                    type=args.driver,
+                    device=device,
+                    options=driver_subsection,
+                ),
+            )
+        },
     )
     async with Server(cfg) as server:
         client = await server.connect()
@@ -193,7 +236,7 @@ def main():
     parser.add_argument("--prompt", default="Write a short story about a robot.", help="Prompt")
     parser.add_argument("--max-tokens", type=int, default=100, help="Max tokens per request")
     parser.add_argument("--temperature", type=float, default=0.6, help="Temperature")
-    parser.add_argument("--dummy", action="store_true", help="Use dummy mode (no GPU)")
+    # Dummy mode is now its own driver: pass --driver dummy (no separate flag needed)
     parser.add_argument("--gpu-mem-util", type=float, default=0.8, help="GPU memory utilization for KV cache (lower = fewer pages = more contention)")
     parser.add_argument("--cpu-mem-budget", type=int, default=0, help="CPU memory budget in GB for working page swap (0 = disabled)")
     parser.add_argument("--save-outputs", type=str, default=None, help="Save output samples to this file path")
@@ -202,6 +245,14 @@ def main():
     parser.add_argument("--default-token-budget", type=int, required=True, help="Default token budget per process (required)")
     parser.add_argument("--max-concurrent-processes", type=int, default=None, help="Maximum number of concurrent processes (default: None)")
     parser.add_argument("--max-batch-size", type=int, default=512, help="Maximum batch size for inference (default: 512)")
+    parser.add_argument("--driver", default="native", choices=["native", "vllm", "sglang", "dummy"],
+                        help="Inference driver: 'native', 'vllm', 'sglang', or 'dummy'")
+    parser.add_argument("--vllm-attention-backend", default=None,
+                        help="vLLM attention backend (FLASH_ATTN / FLASHINFER / etc.). Only used when --driver=vllm")
+    parser.add_argument("--sglang-attention-backend", default=None,
+                        help="SGLang attention backend (triton / flashinfer / flex_attention / fa3). Only used when --driver=sglang")
+    parser.add_argument("--use-cuda-graphs", action="store_true",
+                        help="Enable CUDA graphs (vllm: piecewise compile + graph capture; native: FlashInfer planning)")
 
     args = parser.parse_args()
 
