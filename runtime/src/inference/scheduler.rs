@@ -18,7 +18,7 @@ use crate::context::pagestore::PhysicalPageId;
 
 use crate::device;
 
-use super::adaptive_policy::AdaptiveThroughputPolicy;
+use super::adaptive_policy::{AdaptiveBatchPolicy, GreedyPolicy};
 use super::request::{
     BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassOutput, ForwardPassRequest,
     ForwardPassResponse, Sampler, SlotOutput,
@@ -105,20 +105,17 @@ fn build_slot_output(samplers: &[Sampler], resp: ForwardPassResponse) -> Forward
 /// the current batch.
 pub(super) trait SchedulingPolicy: Send {
     /// A request was added to the accumulator.
-    fn on_arrival(&mut self, arrival_time: Instant);
+    fn on_arrival(&mut self);
 
-    /// A batch finished executing.
-    fn on_complete(&mut self, stats: &BatchStats);
+    /// A batch finished executing. `latency` is the wall-clock time
+    /// the forward pass took on the device.
+    fn on_complete(&mut self, latency: Duration);
 
     /// The current batch was fired.
     fn on_fired(&mut self);
 
-    /// Decide whether to fire or wait.
-    fn decide(
-        &self,
-        current_batch_size: usize,
-        current_total_tokens: usize,
-    ) -> Decision;
+    /// Decide whether to fire or wait, given the current batch size.
+    fn decide(&self, current_batch_size: usize) -> Decision;
 }
 
 // =============================================================================
@@ -131,17 +128,6 @@ pub(super) enum Decision {
     Fire,
     /// Wait for more requests, up to the given duration.
     Wait(Duration),
-}
-
-// =============================================================================
-// BatchStats
-// =============================================================================
-
-/// Statistics from a completed batch execution, fed back to the policy.
-pub(super) struct BatchStats {
-    pub batch_size: usize,
-    pub total_tokens: usize,
-    pub latency: Duration,
 }
 
 // =============================================================================
@@ -248,8 +234,6 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
-        max_wait_ms: u64,
-        min_batch_for_optimization: usize,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let stats = Arc::new(SchedulerStats::default());
@@ -257,7 +241,7 @@ impl BatchScheduler {
             device_id, device_idx, rx,
             page_size,
             max_batch_size, max_batch_tokens,
-            request_timeout_secs, max_wait_ms, min_batch_for_optimization,
+            request_timeout_secs,
             stats.clone(),
         ));
 
@@ -299,31 +283,31 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
-        max_wait_ms: u64,
-        min_batch_for_optimization: usize,
         stats: Arc<SchedulerStats>,
     ) {
-        let max_wait_time = Duration::from_millis(max_wait_ms);
         let request_timeout = Duration::from_secs(request_timeout_secs);
 
         // Per-device state
         let mut batch = BatchAccumulator::new(max_batch_size, max_batch_tokens);
+        // Policy selection. The default `adaptive` is the production
+        // policy; `greedy` is a zero-state baseline retained mainly for
+        // debugging / sanity checks. See `adaptive_policy.rs` for the
+        // design rationale.
         let mut policy: Box<dyn SchedulingPolicy> =
-            Box::new(AdaptiveThroughputPolicy::new(
-                max_batch_size,
-                max_wait_time,
-                min_batch_for_optimization,
-            ));
+            match std::env::var("PIE_POLICY").as_deref().unwrap_or("adaptive") {
+                "greedy" => Box::new(GreedyPolicy::new()),
+                _ => Box::new(AdaptiveBatchPolicy::new(max_batch_size, device_idx)),
+            };
         // Only one in-flight batch at a time to prevent pipelined KV cache corruption.
         let in_flight = Arc::new(Semaphore::new(1));
 
-        // Channel for batch completion stats (latency feedback only)
-        let (stats_tx, mut stats_rx) = mpsc::unbounded_channel::<BatchStats>();
+        // Channel for batch completion latency feedback to the policy.
+        let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
 
         loop {
-            // Drain completed batch stats (non-blocking)
-            while let Ok(stats) = stats_rx.try_recv() {
-                policy.on_complete(&stats);
+            // Drain completed batch latencies (non-blocking)
+            while let Ok(latency) = latency_rx.try_recv() {
+                policy.on_complete(latency);
             }
 
             // Wait for first request if batch is empty
@@ -331,13 +315,13 @@ impl BatchScheduler {
                 let Some(pending) = req_rx.recv().await else {
                     break;
                 };
-                policy.on_arrival(pending.request.arrival_time.unwrap_or_else(Instant::now));
+                policy.on_arrival();
                 batch.push(pending);
             }
 
             // Accumulate more requests (non-blocking)
             while let Ok(pending) = req_rx.try_recv() {
-                policy.on_arrival(pending.request.arrival_time.unwrap_or_else(Instant::now));
+                policy.on_arrival();
                 batch.push(pending);
                 if batch.is_full() {
                     break;
@@ -345,7 +329,7 @@ impl BatchScheduler {
             }
 
             // Ask the policy what to do
-            match policy.decide(batch.len(), batch.total_tokens()) {
+            match policy.decide(batch.len()) {
                 Decision::Fire => {
                     // Acquire a permit (may wait if at in-flight limit)
                     // if in_flight.available_permits() == 0 {
@@ -357,7 +341,6 @@ impl BatchScheduler {
                         .await
                         .expect("semaphore closed");
 
-                    let batch_size = batch.len();
                     let total_tokens = batch.total_tokens();
                     let requests_to_fire = batch.take();
                     policy.on_fired();
@@ -368,11 +351,9 @@ impl BatchScheduler {
                         .collect();
 
                     // Spawn batch execution
-                    let stats_tx_clone = stats_tx.clone();
+                    let latency_tx_clone = latency_tx.clone();
                     let stats_clone = stats.clone();
                     let timeout = request_timeout;
-
-
 
                     tokio::spawn(async move {
                         let start = Instant::now();
@@ -391,21 +372,14 @@ impl BatchScheduler {
                         // that were in this batch (not stale pinned contexts).
                         crate::context::tick(device_idx, latency.as_secs_f64(), batch_ctx_ids);
 
-                        // Update cumulative atomic counters
+                        // Update cumulative atomic counters (consumed by external
+                        // monitoring; ignored by the policy).
                         stats_clone.total_batches.fetch_add(1, Relaxed);
                         stats_clone.total_tokens_processed.fetch_add(total_tokens as u64, Relaxed);
                         stats_clone.last_batch_latency_us.store(latency.as_micros() as u64, Relaxed);
                         stats_clone.cumulative_latency_us.fetch_add(latency.as_micros() as u64, Relaxed);
 
-
-
-                        stats_tx_clone
-                            .send(BatchStats {
-                                batch_size,
-                                total_tokens,
-                                latency,
-                            })
-                            .ok();
+                        latency_tx_clone.send(latency).ok();
                         drop(permit); // release in-flight slot
                     });
                 }
@@ -414,17 +388,15 @@ impl BatchScheduler {
                         _ = tokio::time::sleep(wait_duration) => {}
                         maybe_req = req_rx.recv() => {
                             if let Some(pending) = maybe_req {
-                                policy.on_arrival(
-                                    pending.request.arrival_time.unwrap_or_else(Instant::now),
-                                );
+                                policy.on_arrival();
                                 batch.push(pending);
                             } else {
                                 break; // channel closed
                             }
                         }
-                        stats = stats_rx.recv() => {
-                            if let Some(s) = stats {
-                                policy.on_complete(&s);
+                        latency = latency_rx.recv() => {
+                            if let Some(l) = latency {
+                                policy.on_complete(l);
                             }
                         }
                     }

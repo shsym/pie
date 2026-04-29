@@ -100,8 +100,6 @@ pub fn create_mock_env(
             devices,
             scheduler: SchedulerConfig {
                 request_timeout_secs: 30,
-                max_wait_ms: 10,
-                min_batch_for_optimization: 1,
             },
             default_token_budget: None,     // unlimited by default
             default_endowment_pages: 4,     // small endowment for small mock GPUs

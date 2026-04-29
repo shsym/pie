@@ -52,8 +52,6 @@ pub async fn spawn(
     device_indices: &[usize],
     page_size: u32,
     request_timeout_secs: u64,
-    max_wait_ms: u64,
-    min_batch_for_optimization: usize,
 ) -> usize {
     // Fetch device info before entering the sync closure.
     let device_ids: Vec<DeviceId> = device_indices.to_vec();
@@ -71,8 +69,6 @@ pub async fn spawn(
         device_batch_limits,
         page_size,
         request_timeout_secs,
-        max_wait_ms,
-        min_batch_for_optimization,
     )).expect("Failed to spawn inference service")
 }
 
@@ -133,8 +129,6 @@ impl InferenceService {
         device_batch_limits: Vec<(usize, usize)>,
         page_size: u32,
         request_timeout_secs: u64,
-        max_wait_ms: u64,
-        min_batch_for_optimization: usize,
     ) -> Self {
         let num_devices = device_ids.len();
         let schedulers: Vec<BatchScheduler> = device_ids.iter().enumerate().map(|(device_idx, &device_id)| {
@@ -146,8 +140,6 @@ impl InferenceService {
                 max_batch_size,
                 max_batch_tokens,
                 request_timeout_secs,
-                max_wait_ms,
-                min_batch_for_optimization,
             )
         }).collect();
 

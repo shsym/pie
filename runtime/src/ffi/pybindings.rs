@@ -105,30 +105,14 @@ impl RpcServer {
 pub struct SchedulerConfig {
     #[pyo3(get, set)]
     pub request_timeout_secs: u64,
-    #[pyo3(get, set)]
-    pub max_wait_ms: u64,
-    #[pyo3(get, set)]
-    pub min_batch_for_optimization: usize,
 }
 
 #[pymethods]
 impl SchedulerConfig {
     #[new]
-    #[pyo3(signature = (
-        request_timeout_secs = 120,
-        max_wait_ms = 50,
-        min_batch_for_optimization = 8,
-    ))]
-    fn new(
-        request_timeout_secs: u64,
-        max_wait_ms: u64,
-        min_batch_for_optimization: usize,
-    ) -> Self {
-        SchedulerConfig {
-            request_timeout_secs,
-            max_wait_ms,
-            min_batch_for_optimization,
-        }
+    #[pyo3(signature = (request_timeout_secs = 120))]
+    fn new(request_timeout_secs: u64) -> Self {
+        SchedulerConfig { request_timeout_secs }
     }
 }
 
@@ -224,7 +208,7 @@ impl ModelConfig {
             kv_page_size,
             tokenizer_path,
             devices,
-            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(120, 50, 8)),
+            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(120)),
             default_token_budget,
             default_endowment_pages,
             oversubscription_factor,
@@ -388,8 +372,6 @@ impl From<Config> for BootstrapConfig {
                         .collect(),
                     scheduler: BootstrapSchedulerConfig {
                         request_timeout_secs: m.scheduler.request_timeout_secs,
-                        max_wait_ms: m.scheduler.max_wait_ms,
-                        min_batch_for_optimization: m.scheduler.min_batch_for_optimization,
                     },
                     default_token_budget: m.default_token_budget,
                     default_endowment_pages: m.default_endowment_pages,

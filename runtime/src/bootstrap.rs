@@ -80,8 +80,6 @@ pub struct DeviceConfig {
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     pub request_timeout_secs: u64,
-    pub max_wait_ms: u64,
-    pub min_batch_for_optimization: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -157,8 +155,6 @@ pub async fn bootstrap(
             &devices,
             cfg.kv_page_size as u32,
             cfg.scheduler.request_timeout_secs,
-            cfg.scheduler.max_wait_ms,
-            cfg.scheduler.min_batch_for_optimization,
         ).await;
         adapter::spawn(&devices);
     }
