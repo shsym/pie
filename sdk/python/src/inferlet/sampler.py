@@ -9,6 +9,10 @@ The WIT sampler is a discriminated union:
   - top-k-top-p(temperature, k, p)
   - embedding
   - dist(temperature, top_k)
+  - raw-logits
+  - logprob(token_id)
+  - logprobs(token_ids)
+  - entropy
 """
 
 from __future__ import annotations
@@ -16,8 +20,12 @@ from __future__ import annotations
 from wit_world.imports.inference import (
     Sampler_Dist,
     Sampler_Embedding,
+    Sampler_Entropy,
+    Sampler_Logprob,
+    Sampler_Logprobs,
     Sampler_MinP,
     Sampler_Multinomial,
+    Sampler_RawLogits,
     Sampler_TopK,
     Sampler_TopKTopP,
     Sampler_TopP,
@@ -101,6 +109,46 @@ class Sampler:
         samplers. ``top_k=0`` returns the full distribution.
         """
         return cls(Sampler_Dist((temperature, top_k)))
+
+    @classmethod
+    def raw_logits(cls) -> Sampler:
+        """Raw logits output mode.
+
+        Returns the model's pre-softmax, untemperatured logits as a packed
+        little-endian f32 byte buffer (length = ``vocab_size * 4``) per
+        requested position. Decode in Python via
+        ``np.frombuffer(buf, dtype=np.float32)``.
+        """
+        return cls(Sampler_RawLogits())
+
+    @classmethod
+    def logprob(cls, token_id: int) -> Sampler:
+        """Single-label logprob.
+
+        Returns ``log p(token_id | context)`` at this position via
+        ``Output_Logprobs`` (a length-1 inner list per slot). Computed via
+        log-softmax with no temperature scaling.
+        """
+        return cls(Sampler_Logprob(token_id))
+
+    @classmethod
+    def logprobs(cls, token_ids: list[int]) -> Sampler:
+        """Multi-label logprobs at one position.
+
+        Returns ``log p(t | context)`` for each ``t`` in ``token_ids`` via
+        ``Output_Logprobs`` (a length-K inner list per slot, parallel to
+        ``token_ids``). Useful for yes/no, multiple-choice, and reranking.
+        """
+        return cls(Sampler_Logprobs(list(token_ids)))
+
+    @classmethod
+    def entropy(cls) -> Sampler:
+        """Shannon entropy of the unscaled distribution at this position.
+
+        Returns ``H(p) = -sum(p * log p)`` via ``Output_Entropies``.
+        Useful for uncertainty / confidence-based decisions.
+        """
+        return cls(Sampler_Entropy())
 
     def __repr__(self) -> str:
         return f"Sampler({self._variant})"

@@ -147,6 +147,18 @@ pub enum Sampler {
     TopKTopP { temperature: f32, k: u32, p: f32 },
     Embedding,
     Dist { temperature: f32, num_tokens: u32 },
+    /// Return raw (pre-softmax, untemperatured) logits for each requested
+    /// position. The host packs them as native-endian f32 bytes; length =
+    /// vocab_size * 4 per request slot.
+    RawLogits,
+    /// Return log p(token | context) at this position — one f32 per slot.
+    /// Computed via log_softmax(logits) with no temperature scaling.
+    Logprob { token_id: u32 },
+    /// Multi-candidate variant of Logprob — returns log p(t | context) for
+    /// each `t` in `token_ids` at this position. One inner list per slot.
+    Logprobs { token_ids: Vec<u32> },
+    /// Return Shannon entropy H(p) of the unscaled next-token distribution.
+    Entropy,
 }
 
 impl Sampler {
@@ -160,6 +172,10 @@ impl Sampler {
             Sampler::TopKTopP { .. } => 5,
             Sampler::Embedding => 6,
             Sampler::Dist { .. } => 0,
+            Sampler::RawLogits => 7,
+            Sampler::Logprob { .. } => 8,
+            Sampler::Logprobs { .. } => 9,
+            Sampler::Entropy => 10,
         }
     }
 
@@ -173,6 +189,10 @@ impl Sampler {
             Sampler::TopKTopP { temperature, .. } => *temperature,
             Sampler::Embedding => 0.0,
             Sampler::Dist { temperature, .. } => *temperature,
+            Sampler::RawLogits => 0.0,
+            Sampler::Logprob { .. } => 0.0,
+            Sampler::Logprobs { .. } => 0.0,
+            Sampler::Entropy => 0.0,
         }
     }
 
@@ -249,15 +269,27 @@ pub struct ForwardPassRequest {
     pub arrival_time: Option<Instant>,
 }
 
-/// Output from a forward pass.
+/// One typed result per `forward_pass.sampler(...)` slot, in slot order.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ForwardPassOutput {
-    None,
-    Tokens(Vec<u32>),
-    /// (accepted tokens, next speculative tokens, next speculative positions)
-    TokensWithSpeculation(Vec<u32>, Vec<u32>, Vec<u32>),
-    Embeddings(Vec<Vec<u8>>),
-    Distributions(Vec<(Vec<u32>, Vec<f32>)>),
+pub enum SlotOutput {
+    Token(u32),
+    Distribution(Vec<u32>, Vec<f32>),
+    /// Native-endian f32 bytes for `Sampler::RawLogits`.
+    Logits(Vec<u8>),
+    /// Length 1 for `Sampler::Logprob`, length K for `Sampler::Logprobs`.
+    Logprobs(Vec<f32>),
+    Entropy(f32),
+    /// Hidden-state embedding bytes (placeholder; not wired yet).
+    Embedding(Vec<u8>),
+}
+
+/// Output from a forward pass: per-slot results plus per-request spec channel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ForwardPassOutput {
+    pub slots: Vec<SlotOutput>,
+    /// Next iteration's speculative draft tokens (empty if non-spec).
+    pub spec_tokens: Vec<u32>,
+    pub spec_positions: Vec<u32>,
 }
 
 /// Response for a single forward pass request.
@@ -265,6 +297,17 @@ pub enum ForwardPassOutput {
 pub struct ForwardPassResponse {
     pub tokens: Vec<u32>,
     pub dists: Vec<(Vec<u32>, Vec<f32>)>,
+    /// Raw logits as native-endian f32 bytes, one buffer per RawLogits slot.
+    /// Empty unless the request used `Sampler::RawLogits` for some position.
+    #[serde(default)]
+    pub logits: Vec<Vec<u8>>,
+    /// Per-slot logprobs: length 1 for `Sampler::Logprob`, length K for
+    /// `Sampler::Logprobs`. Empty unless the request used either variant.
+    #[serde(default)]
+    pub logprobs: Vec<Vec<f32>>,
+    /// Per-slot entropies. Empty unless the request used `Sampler::Entropy`.
+    #[serde(default)]
+    pub entropies: Vec<f32>,
     /// Next speculative tokens (empty if non-speculative).
     pub spec_tokens: Vec<u32>,
     /// Next speculative positions (empty if non-speculative).
@@ -367,6 +410,14 @@ pub struct BatchedForwardPassRequest {
     pub sampler_seeds: ByteVec,
     pub request_num_samplers: ByteVec,
 
+    // === Per-sampler ragged label lists for Logprob/Logprobs ===
+    // For Logprob: 1 label per sampler. For Logprobs: K labels per sampler.
+    // For all other sampler types: empty range (0 labels).
+    #[serde(default)]
+    pub sampler_label_ids: ByteVec,
+    #[serde(default)]
+    pub sampler_label_indptr: ByteVec,
+
     // === Adapter (per request) ===
     pub adapter_indices: Vec<Option<AdapterId>>,
     pub adapter_seeds: Vec<Option<i64>>,
@@ -411,6 +462,8 @@ impl BatchedForwardPassRequest {
             sampler_types: ByteVec(Vec::new()),
             sampler_seeds: ByteVec(Vec::new()),
             request_num_samplers: ByteVec(Vec::new()),
+            sampler_label_ids: ByteVec(Vec::new()),
+            sampler_label_indptr: ByteVec(vec![0]),
             adapter_indices: Vec::new(),
             adapter_seeds: Vec::new(),
             spec_token_ids: ByteVec(Vec::new()),
@@ -519,6 +572,17 @@ impl BatchedForwardPassRequest {
             self.sampler_top_p.0.push(sampler.top_p());
             self.sampler_min_p.0.push(sampler.min_p());
             self.sampler_seeds.0.push(sampler.seed());
+            // Logprob/Logprobs label payload (empty range for other types).
+            match sampler {
+                Sampler::Logprob { token_id } => {
+                    self.sampler_label_ids.0.push(*token_id);
+                }
+                Sampler::Logprobs { token_ids } => {
+                    self.sampler_label_ids.0.extend_from_slice(token_ids);
+                }
+                _ => {}
+            }
+            self.sampler_label_indptr.0.push(self.sampler_label_ids.0.len() as u32);
         }
 
         // Adapter

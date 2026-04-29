@@ -6,7 +6,7 @@ use crate::api::model::Model;
 use crate::api::adapter::Adapter;
 use crate::instance::InstanceState;
 use crate::inference::brle::Brle;
-use crate::inference::request::{ForwardPassRequest, ForwardPassOutput};
+use crate::inference::request::{ForwardPassRequest, ForwardPassOutput, SlotOutput};
 use crate::inference::structured::grammar::Grammar as InternalGrammar;
 use crate::inference::structured::json_schema::{builtin_json_grammar, json_schema_to_grammar, JsonSchemaOptions};
 use crate::inference::structured::regex::regex_to_grammar;
@@ -62,7 +62,11 @@ impl Pollable for FutureOutput {
                     self.done = true;
                 }
                 Err(_) => {
-                    self.result = Some(pie::core::inference::Output::None);
+                    self.result = Some(pie::core::inference::Output {
+                        slots: Vec::new(),
+                        spec_tokens: Vec::new(),
+                        spec_positions: Vec::new(),
+                    });
                     self.done = true;
                 }
             }
@@ -72,16 +76,27 @@ impl Pollable for FutureOutput {
     }
 }
 
-/// Convert internal ForwardPassOutput to WIT Output variant.
+/// Convert internal ForwardPassOutput (per-slot results + spec channel) to
+/// the WIT `Output` record.
 fn convert_output(output: ForwardPassOutput) -> pie::core::inference::Output {
-    match output {
-        ForwardPassOutput::None => pie::core::inference::Output::None,
-        ForwardPassOutput::Tokens(tokens) => pie::core::inference::Output::Tokens(tokens),
-        ForwardPassOutput::TokensWithSpeculation(accepted, spec_tokens, spec_positions) => {
-            pie::core::inference::Output::TokensWithSpeculation((accepted, spec_tokens, spec_positions))
-        }
-        ForwardPassOutput::Embeddings(embeddings) => pie::core::inference::Output::Embeddings(embeddings),
-        ForwardPassOutput::Distributions(dists) => pie::core::inference::Output::Distributions(dists),
+    let slots = output
+        .slots
+        .into_iter()
+        .map(|s| match s {
+            SlotOutput::Token(t) => pie::core::inference::SlotOutput::Token(t),
+            SlotOutput::Distribution(ids, ps) => {
+                pie::core::inference::SlotOutput::Distribution((ids, ps))
+            }
+            SlotOutput::Logits(b) => pie::core::inference::SlotOutput::Logits(b),
+            SlotOutput::Logprobs(v) => pie::core::inference::SlotOutput::Logprobs(v),
+            SlotOutput::Entropy(h) => pie::core::inference::SlotOutput::Entropy(h),
+            SlotOutput::Embedding(b) => pie::core::inference::SlotOutput::Embedding(b),
+        })
+        .collect();
+    pie::core::inference::Output {
+        slots,
+        spec_tokens: output.spec_tokens,
+        spec_positions: output.spec_positions,
     }
 }
 
@@ -121,6 +136,20 @@ fn convert_sampler(map: &HashMap<String, rmpv::Value>) -> inference::Sampler {
             inference::Sampler::TopKTopP { temperature, k, p }
         }
         6 => inference::Sampler::Embedding,
+        7 => inference::Sampler::RawLogits,
+        8 => {
+            let token_id = map.get("token_id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            inference::Sampler::Logprob { token_id }
+        }
+        9 => {
+            let token_ids = map
+                .get("token_ids")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).map(|x| x as u32).collect())
+                .unwrap_or_default();
+            inference::Sampler::Logprobs { token_ids }
+        }
+        10 => inference::Sampler::Entropy,
         _ => inference::Sampler::Multinomial { temperature, seed: None },
     }
 }
@@ -133,6 +162,10 @@ enum SamplerType {
     MinP = 4,
     TopKTopP = 5,
     Embedding = 6,
+    RawLogits = 7,
+    Logprob = 8,
+    Logprobs = 9,
+    Entropy = 10,
 }
 
 impl pie::core::inference::Host for InstanceState {}
@@ -258,6 +291,21 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             }
             pie::core::inference::Sampler::Embedding => {
                 sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Embedding as u32));
+            }
+            pie::core::inference::Sampler::RawLogits => {
+                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::RawLogits as u32));
+            }
+            pie::core::inference::Sampler::Logprob(token_id) => {
+                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Logprob as u32));
+                sampler_map.insert("token_id".to_string(), rmpv::Value::from(token_id));
+            }
+            pie::core::inference::Sampler::Logprobs(token_ids) => {
+                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Logprobs as u32));
+                let arr: Vec<rmpv::Value> = token_ids.iter().map(|&x| rmpv::Value::from(x)).collect();
+                sampler_map.insert("token_ids".to_string(), rmpv::Value::Array(arr));
+            }
+            pie::core::inference::Sampler::Entropy => {
+                sampler_map.insert("sampler".to_string(), rmpv::Value::from(SamplerType::Entropy as u32));
             }
         }
 

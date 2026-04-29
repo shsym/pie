@@ -49,36 +49,77 @@ class Sampler_Dist:
     value: Tuple[float, int]
 
 
-Sampler = Union[Sampler_Multinomial, Sampler_TopK, Sampler_TopP, Sampler_MinP, Sampler_TopKTopP, Sampler_Embedding, Sampler_Dist]
-
-
-
 @dataclass
-class Output_None_:
+class Sampler_RawLogits:
     pass
 
 
 @dataclass
-class Output_Tokens:
+class Sampler_Logprob:
+    value: int
+
+
+@dataclass
+class Sampler_Logprobs:
     value: List[int]
 
 
 @dataclass
-class Output_TokensWithSpeculation:
-    value: Tuple[List[int], List[int], List[int]]
+class Sampler_Entropy:
+    pass
+
+
+Sampler = Union[Sampler_Multinomial, Sampler_TopK, Sampler_TopP, Sampler_MinP, Sampler_TopKTopP, Sampler_Embedding, Sampler_Dist, Sampler_RawLogits, Sampler_Logprob, Sampler_Logprobs, Sampler_Entropy]
+
 
 
 @dataclass
-class Output_Embeddings:
-    value: List[bytes]
+class SlotOutput_Token:
+    value: int
 
 
 @dataclass
-class Output_Distributions:
-    value: List[Tuple[List[int], List[float]]]
+class SlotOutput_Distribution:
+    value: Tuple[List[int], List[float]]
 
 
-Output = Union[Output_None_, Output_Tokens, Output_TokensWithSpeculation, Output_Embeddings, Output_Distributions]
+@dataclass
+class SlotOutput_Logits:
+    value: bytes
+
+
+@dataclass
+class SlotOutput_Logprobs:
+    value: List[float]
+
+
+@dataclass
+class SlotOutput_Entropy:
+    value: float
+
+
+@dataclass
+class SlotOutput_Embedding:
+    value: bytes
+
+
+SlotOutput = Union[
+    SlotOutput_Token,
+    SlotOutput_Distribution,
+    SlotOutput_Logits,
+    SlotOutput_Logprobs,
+    SlotOutput_Entropy,
+    SlotOutput_Embedding,
+]
+
+
+@dataclass
+class Output:
+    """Result of one forward-pass.execute(): per-slot results (in slot order)
+    plus a per-request side channel for next-iteration speculative drafts."""
+    slots: List[SlotOutput]
+    spec_tokens: List[int]
+    spec_positions: List[int]
 
 
 class FutureOutput:
