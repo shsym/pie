@@ -173,6 +173,7 @@ impl BatchScheduler {
     pub fn new(
         device_id: DeviceId,
         device_idx: usize,
+        page_size: u32,
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
@@ -183,6 +184,7 @@ impl BatchScheduler {
         let stats = Arc::new(SchedulerStats::default());
         tokio::spawn(Self::run(
             device_id, device_idx, rx,
+            page_size,
             max_batch_size, max_batch_tokens,
             request_timeout_secs, max_wait_ms, min_batch_for_optimization,
             stats.clone(),
@@ -222,6 +224,7 @@ impl BatchScheduler {
         device_id: DeviceId,
         device_idx: usize,
         mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
+        page_size: u32,
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
@@ -306,6 +309,7 @@ impl BatchScheduler {
                             device_idx,
                             requests_to_fire,
                             device_id,
+                            page_size,
                             timeout,
                         )
                         .await;
@@ -364,6 +368,7 @@ impl BatchScheduler {
                 device_idx,
                 requests,
                 device_id,
+                page_size,
                 request_timeout,
             )
             .await;
@@ -375,6 +380,7 @@ impl BatchScheduler {
         device_idx: usize,
         requests: Vec<PendingRequest>,
         device_id: DeviceId,
+        page_size: u32,
         timeout: Duration,
     ) {
         // Build batched request
@@ -382,11 +388,9 @@ impl BatchScheduler {
         for req in &requests {
             batch_req.add_request(
                 &req.request,
-                &req.physical_page_ids
-                    .iter()
-                    .map(|&p| p as u32)
-                    .collect::<Vec<_>>(),
+                &req.physical_page_ids,
                 req.last_page_len,
+                page_size,
             );
         }
 

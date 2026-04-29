@@ -288,6 +288,10 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let speculative_positions = take(&mut pass.speculative_positions);
         let output_speculative_tokens = pass.output_speculative_tokens;
         let masks = take(&mut pass.mask);
+        // Track whether the user actually supplied masks; the kernel-dispatch
+        // hint downstream needs to distinguish user masks from the runtime's
+        // synthesized causal default.
+        let has_user_mask = !masks.is_empty();
 
         // WIT spec: "if not provided, fallback to causal mask".
         // Each token at position `pos` must attend to all (pos + 1) preceding
@@ -383,6 +387,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             speculative_positions,
             output_speculative_tokens,
             masks,
+            has_user_mask,
             logit_mask,
             sampling_indices,
             samplers,

@@ -50,6 +50,7 @@ static SERVICES: std::sync::LazyLock<ServiceArray<Message>> = std::sync::LazyLoc
 /// Spawns a new inference service for a model.
 pub async fn spawn(
     device_indices: &[usize],
+    page_size: u32,
     request_timeout_secs: u64,
     max_wait_ms: u64,
     min_batch_for_optimization: usize,
@@ -68,6 +69,7 @@ pub async fn spawn(
         model_idx,
         device_ids,
         device_batch_limits,
+        page_size,
         request_timeout_secs,
         max_wait_ms,
         min_batch_for_optimization,
@@ -129,6 +131,7 @@ impl InferenceService {
         model_idx: usize,
         device_ids: Vec<DeviceId>,
         device_batch_limits: Vec<(usize, usize)>,
+        page_size: u32,
         request_timeout_secs: u64,
         max_wait_ms: u64,
         min_batch_for_optimization: usize,
@@ -139,6 +142,7 @@ impl InferenceService {
             BatchScheduler::new(
                 device_id,
                 device_idx,
+                page_size,
                 max_batch_size,
                 max_batch_tokens,
                 request_timeout_secs,

@@ -535,6 +535,175 @@ impl Brle {
         new_brle.extend(&tail);
         *self = new_brle;
     }
+
+    /// OR-set bits in `out` for pages whose entire `[p*page_size, (p+1)*page_size)`
+    /// range is False under this BRLE (including the implicit-False tail past
+    /// `total_size`). Used by the page-trim optimization in the wire-format
+    /// builder: a page is droppable iff every query row in the request marks
+    /// it droppable, computed by AND-reducing per-row bitmasks.
+    ///
+    /// # Arguments
+    /// * `page_size` — KV page size in tokens.
+    /// * `num_pages` — number of pages in the request's page list (only bits
+    ///   `[0, num_pages)` are considered).
+    /// * `total_seq_len` — request's full KV sequence length =
+    ///   `(num_pages - 1) * page_size + last_page_len`. Positions in
+    ///   `[self.total_size, total_seq_len)` are treated as implicit-False.
+    /// * `out` — bitmask of length `>= ceil(num_pages / 64)`. Caller is
+    ///   responsible for zeroing it before each row; this function only ORs.
+    pub fn droppable_page_bits(
+        &self,
+        page_size: u32,
+        num_pages: u32,
+        total_seq_len: u32,
+        out: &mut [u64],
+    ) {
+        if num_pages == 0 || page_size == 0 {
+            return;
+        }
+        let mut covered: u32 = 0;
+        for (value, start, end) in self.iter_runs() {
+            covered = end as u32;
+            if !value {
+                set_page_bits_in_range(start as u32, end as u32, page_size, num_pages, out);
+            }
+        }
+        // Implicit-False tail: positions [self.total_size, total_seq_len).
+        if covered < total_seq_len {
+            set_page_bits_in_range(covered, total_seq_len, page_size, num_pages, out);
+        }
+    }
+
+    /// Append a trimmed copy of this BRLE to `out`, with `skip_ranges` removed.
+    ///
+    /// Returns the new total size (number of bits in the appended BRLE).
+    ///
+    /// `skip_ranges` must be sorted by start, disjoint, and contained within
+    /// `[0, self.total_size]`. Each range is a half-open interval `[s, e)`.
+    /// Bits in skipped ranges are removed; surviving bits keep their relative
+    /// order. The appended BRLE is canonical: adjacent same-value runs are
+    /// merged and zero-length non-prefix runs are elided.
+    ///
+    /// Single pass over runs and skip ranges; allocations limited to growing
+    /// `out`. Used by the wire-format builder's page-trim optimization, where
+    /// the skip ranges are page-aligned ranges that fall fully inside False
+    /// runs — but the implementation handles the general case.
+    pub fn write_skipping(
+        &self,
+        skip_ranges: &[(u32, u32)],
+        out: &mut Vec<u32>,
+    ) -> u32 {
+        let mut last_value: Option<bool> = None;
+        let mut new_total: u32 = 0;
+        let mut skip_idx: usize = 0;
+
+        for (value, start, end) in self.iter_runs() {
+            let s = start as u32;
+            let e = end as u32;
+
+            // Sum of overlap of skip_ranges with [s, e). Skip ranges are sorted
+            // and disjoint, so we walk forward as runs advance. A range whose
+            // end exceeds this run's end stays in the queue for the next run.
+            let mut skipped: u32 = 0;
+            while skip_idx < skip_ranges.len() {
+                let (rs, re) = skip_ranges[skip_idx];
+                if rs >= e {
+                    break;
+                }
+                let overlap_s = rs.max(s);
+                let overlap_e = re.min(e);
+                if overlap_s < overlap_e {
+                    skipped += overlap_e - overlap_s;
+                }
+                if re <= e {
+                    skip_idx += 1;
+                } else {
+                    break;
+                }
+            }
+
+            let raw_len = e - s;
+            debug_assert!(skipped <= raw_len);
+            let eff_len = raw_len - skipped;
+            // A run that's entirely consumed by skips is elided. If it was a
+            // false run between two true runs, `last_value` stays Some(true)
+            // and the next run merges into the prior entry (canonicalization).
+            if eff_len == 0 {
+                continue;
+            }
+            new_total += eff_len;
+
+            match last_value {
+                None => {
+                    if value {
+                        out.push(0); // leading zero-length false prefix
+                    }
+                    out.push(eff_len);
+                    last_value = Some(value);
+                }
+                Some(lv) if lv == value => {
+                    // Merge with the run we just pushed (zero-length false in
+                    // the middle was elided, leaving same-value runs adjacent).
+                    *out.last_mut().unwrap() += eff_len;
+                }
+                Some(_) => {
+                    out.push(eff_len);
+                    last_value = Some(value);
+                }
+            }
+        }
+
+        new_total
+    }
+}
+
+/// OR-set bits in `out` for every page `p` in `[0, num_pages)` such that the
+/// entire range `[p*page_size, (p+1)*page_size)` lies inside `[s, e)`.
+#[inline]
+fn set_page_bits_in_range(
+    s: u32,
+    e: u32,
+    page_size: u32,
+    num_pages: u32,
+    out: &mut [u64],
+) {
+    if s >= e {
+        return;
+    }
+    // Ceiling division for the lower bound; floor for the upper bound.
+    let p_lo = s.div_ceil(page_size);
+    let p_hi = (e / page_size).min(num_pages);
+    if p_lo < p_hi {
+        set_bits(out, p_lo, p_hi);
+    }
+}
+
+/// OR-set bits `[lo, hi)` in `out` (treated as a packed u64 bitmask).
+///
+/// Shared with `inference::request::TrimPlan` — the bit-range stamping
+/// pattern recurs whenever we need to OR a contiguous range of page
+/// indices into a packed bitmap.
+#[inline]
+pub(super) fn set_bits(out: &mut [u64], lo: u32, hi: u32) {
+    if lo >= hi {
+        return;
+    }
+    let word_lo = (lo / 64) as usize;
+    let bit_lo = lo % 64;
+    let word_hi = (hi / 64) as usize;
+    let bit_hi = hi % 64;
+    if word_lo == word_hi {
+        let mask = ((1u64 << bit_hi).wrapping_sub(1)) & !((1u64 << bit_lo).wrapping_sub(1));
+        out[word_lo] |= mask;
+        return;
+    }
+    out[word_lo] |= !((1u64 << bit_lo).wrapping_sub(1));
+    for w in &mut out[word_lo + 1..word_hi] {
+        *w = u64::MAX;
+    }
+    if bit_hi > 0 {
+        out[word_hi] |= (1u64 << bit_hi).wrapping_sub(1);
+    }
 }
 
 // Internal implementation and iterators
@@ -986,6 +1155,222 @@ mod tests {
         // Buffer should be reused, not reallocated
         assert!(brle.buffer.capacity() >= cap_after_first);
         assert_eq!(brle.buffer, vec![128]); // all false
+    }
+
+    // -- droppable_page_bits ---------------------------------------------------
+
+    fn page_bits(b: &Brle, ps: u32, num_pages: u32, total_seq_len: u32) -> Vec<u64> {
+        let words = ((num_pages as usize) + 63) / 64;
+        let mut out = vec![0u64; words.max(1)];
+        b.droppable_page_bits(ps, num_pages, total_seq_len, &mut out);
+        out
+    }
+
+    fn bit_set(words: &[u64], i: u32) -> bool {
+        let w = (i / 64) as usize;
+        let b = i % 64;
+        (words[w] >> b) & 1 != 0
+    }
+
+    fn collect_set_bits(words: &[u64], num: u32) -> Vec<u32> {
+        (0..num).filter(|&i| bit_set(words, i)).collect()
+    }
+
+    #[test]
+    fn droppable_pages_causal_mask_yields_none() {
+        // Causal-style: all-true up to some position, BRLE total_size = pos+1.
+        // Used for the runtime's synthesized causal masks. seq_len = total_size,
+        // so no implicit-False tail. No false runs → no droppable pages.
+        let b = Brle::all_true(48);
+        let bits = page_bits(&b, 16, 3, 48);
+        assert_eq!(collect_set_bits(&bits, 3), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn droppable_pages_attention_sink_pattern() {
+        // sink=4, gap=252, window=64 over 320 KV tokens with page_size=16
+        // → 20 pages. False run = [4, 256). Pages 1..=15 fall fully inside it.
+        let b = Brle::from_vec(vec![0, 4, 252, 64]);
+        assert_eq!(b.len(), 320);
+        let bits = page_bits(&b, 16, 20, 320);
+        let expected: Vec<u32> = (1..=15).collect();
+        assert_eq!(collect_set_bits(&bits, 20), expected);
+    }
+
+    #[test]
+    fn droppable_pages_window_pattern() {
+        // gap=240, window=80, page_size=16 → 20 pages, false run = [0, 240).
+        // Pages 0..=14 fall fully inside [0, 240); page 15 covers [240, 256)
+        // which is in the true run, so not droppable.
+        let b = Brle::from_vec(vec![240, 80]);
+        assert_eq!(b.len(), 320);
+        let bits = page_bits(&b, 16, 20, 320);
+        let expected: Vec<u32> = (0..=14).collect();
+        assert_eq!(collect_set_bits(&bits, 20), expected);
+    }
+
+    #[test]
+    fn droppable_pages_partial_page_false_run_not_eligible() {
+        // False run = [5, 27), page_size = 16, num_pages = 2.
+        // Page 0 covers [0, 16): not fully inside [5, 27) (positions 0..4 missing).
+        // Page 1 covers [16, 32): not fully inside (positions 27..31 missing).
+        // No pages eligible.
+        let b = Brle::from_vec(vec![5, 22, 5]);
+        assert_eq!(b.len(), 32);
+        let bits = page_bits(&b, 16, 2, 32);
+        assert_eq!(collect_set_bits(&bits, 2), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn droppable_pages_aligned_false_run_eligible() {
+        // False run exactly aligned to a page: [16, 32), page_size = 16.
+        // Page 1 droppable, page 0 not (true), page 2 not (true).
+        let b = Brle::from_vec(vec![0, 16, 16, 16]);
+        assert_eq!(b.len(), 48);
+        let bits = page_bits(&b, 16, 3, 48);
+        assert_eq!(collect_set_bits(&bits, 3), vec![1]);
+    }
+
+    #[test]
+    fn droppable_pages_implicit_false_tail() {
+        // BRLE covers only [0, 32) with all-true, but seq_len = 64 (so positions
+        // 32..64 are implicit-False). Page 2 covers [32, 48), page 3 covers
+        // [48, 64) — both fall in the implicit tail → droppable.
+        let b = Brle::all_true(32);
+        let bits = page_bits(&b, 16, 4, 64);
+        assert_eq!(collect_set_bits(&bits, 4), vec![2, 3]);
+    }
+
+    #[test]
+    fn droppable_pages_or_accumulates_into_existing_bits() {
+        // Verify the function ORs into `out` rather than overwriting; callers
+        // that want fresh bits must zero the buffer first.
+        let b = Brle::from_vec(vec![0, 16, 16, 16]); // page 1 droppable
+        let mut out = vec![0u64; 1];
+        out[0] |= 1u64 << 5; // pre-existing unrelated bit
+        b.droppable_page_bits(16, 3, 48, &mut out);
+        assert!(bit_set(&out, 1));
+        assert!(bit_set(&out, 5));
+    }
+
+    #[test]
+    fn droppable_pages_cross_word_boundary() {
+        // num_pages = 100, false run covers positions [16, 16*99) = pages 1..=98.
+        // Crosses 64-bit word boundary at page 64.
+        let b = Brle::from_vec(vec![0, 16, 16 * 98, 16]);
+        let total = 16 * 100;
+        assert_eq!(b.len(), total);
+        let bits = page_bits(&b, 16, 100, total as u32);
+        let expected: Vec<u32> = (1..=98).collect();
+        assert_eq!(collect_set_bits(&bits, 100), expected);
+    }
+
+    // -- write_skipping --------------------------------------------------------
+
+    fn rebuild(buffer: Vec<u32>) -> Brle {
+        Brle::from_vec(buffer)
+    }
+
+    #[test]
+    fn write_skipping_no_skips_is_identity() {
+        let b = Brle::from_vec(vec![0, 4, 252, 64]);
+        let mut out = Vec::new();
+        let new_total = b.write_skipping(&[], &mut out);
+        assert_eq!(new_total, b.len() as u32);
+        assert_eq!(out, b.buffer);
+    }
+
+    #[test]
+    fn write_skipping_drops_middle_false_run_collapses_trues() {
+        // Original: false 4, true 16, false 16, true 4. Skip [20, 36) — exactly
+        // the middle false run. Surviving: false 4, true 16, true 4 → merged to
+        // false 4, true 20.
+        let b = Brle::from_vec(vec![4, 16, 16, 4]);
+        let mut out = Vec::new();
+        let new_total = b.write_skipping(&[(20, 36)], &mut out);
+        assert_eq!(new_total, 24);
+        let r = rebuild(out);
+        assert_eq!(r.buffer, vec![4, 20]);
+        assert_eq!(r.to_vec(), {
+            let mut v = vec![false; 4];
+            v.extend(vec![true; 20]);
+            v
+        });
+    }
+
+    #[test]
+    fn write_skipping_drops_partial_false_run() {
+        // False run [5, 27), skip [10, 26) → false run shortens by 16. Becomes
+        // false 5, ..., false 6 (5 bits before + 1 bit after). Original around:
+        // BRLE [5, 22, 5] (false 5, true 22, false 5) — wait, let me match a
+        // real layout. Let's use: false 32, true 8 → buffer [32, 8]. Skip
+        // [4, 20). Surviving: false 16 (32-16), true 8 → buffer [16, 8].
+        let b = Brle::from_vec(vec![32, 8]);
+        let mut out = Vec::new();
+        let new_total = b.write_skipping(&[(4, 20)], &mut out);
+        assert_eq!(new_total, 24);
+        assert_eq!(out, vec![16, 8]);
+    }
+
+    #[test]
+    fn write_skipping_multiple_skips_merge_trues() {
+        // Sink+window pattern with two pages dropped from the middle false run.
+        // Original: BRLE [0, 4, 252, 64] (sink 4, gap 252, window 64). Skip
+        // pages 1 and 2 — i.e., ranges [16, 32) and [32, 48). Combined effect:
+        // gap shortens from 252 to 220 (since the page-aligned range [16, 48)
+        // is fully inside the gap [4, 256)).
+        let b = Brle::from_vec(vec![0, 4, 252, 64]);
+        let mut out = Vec::new();
+        let new_total = b.write_skipping(&[(16, 32), (32, 48)], &mut out);
+        assert_eq!(new_total, 4 + 220 + 64);
+        assert_eq!(out, vec![0, 4, 220, 64]);
+    }
+
+    #[test]
+    fn write_skipping_drops_leading_false_run_keeps_zero_prefix() {
+        // BRLE [16, 16] (false 16, true 16). Skip [0, 16) → entire leading
+        // false run gone. Output should be [0, 16] (zero-length false prefix
+        // followed by 16 trues), preserving the canonical "starts-with-false"
+        // invariant.
+        let b = Brle::from_vec(vec![16, 16]);
+        let mut out = Vec::new();
+        let new_total = b.write_skipping(&[(0, 16)], &mut out);
+        assert_eq!(new_total, 16);
+        assert_eq!(out, vec![0, 16]);
+    }
+
+    #[test]
+    fn write_skipping_into_nonempty_buffer_appends() {
+        // Verify `out` is appended to, not overwritten — supports streaming
+        // multiple rows into a shared flattened-masks buffer.
+        let b = Brle::from_vec(vec![0, 4, 252, 64]);
+        let mut out = vec![99u32, 100, 101];
+        let _ = b.write_skipping(&[(16, 32)], &mut out);
+        assert_eq!(&out[..3], &[99, 100, 101]);
+        // Trimmed BRLE follows the prefix.
+        assert_eq!(&out[3..], &[0, 4, 236, 64]);
+    }
+
+    #[test]
+    fn write_skipping_skip_at_boundary_between_runs() {
+        // Skip range straddles a False/True run boundary — defensively handled
+        // by clamping to each run's intersection. Construction: false 16, true
+        // 16, skip [12, 24) removes 4 false bits and 8 true bits → remaining
+        // false 12, true 8.
+        let b = Brle::from_vec(vec![16, 16]);
+        let mut out = Vec::new();
+        let new_total = b.write_skipping(&[(12, 24)], &mut out);
+        assert_eq!(new_total, 20);
+        assert_eq!(out, vec![12, 8]);
+    }
+
+    #[test]
+    fn write_skipping_empty_brle_yields_empty_output() {
+        let b = Brle::new(0);
+        let mut out = vec![1u32, 2, 3];
+        let new_total = b.write_skipping(&[], &mut out);
+        assert_eq!(new_total, 0);
+        assert_eq!(out, vec![1, 2, 3]);
     }
 
     // -- benchmark ---------------------------------------------------------------

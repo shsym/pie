@@ -3,12 +3,139 @@
 //! Defines the wire format for forward pass batching.
 
 use serde::{Deserialize, Serialize};
+use smallvec::{smallvec, SmallVec};
 use std::time::Instant;
 
 use crate::adapter::AdapterId;
 use crate::context::ContextId;
-use crate::inference::brle::Brle;
+use crate::context::pagestore::PhysicalPageId;
+use crate::inference::brle::{self, Brle};
 use crate::device::DeviceId;
+
+/// Inline storage for the page-trim bitmap. Sized to cover up to 1024 pages
+/// (16 u64 words = 128 bytes, fits in one cache line per word) without ever
+/// touching the heap. Larger contexts spill to the heap transparently.
+const TRIM_INLINE_WORDS: usize = 16;
+type TrimBits = SmallVec<[u64; TRIM_INLINE_WORDS]>;
+
+// =============================================================================
+// Page-trim plan
+// =============================================================================
+//
+// When every query row of a request's attention mask agrees that an entire
+// page's worth of KV positions is False, that physical page can be excluded
+// from the wire-format `kv_page_indices` — the kernel reads fewer KV slots
+// and the BRLE rows get sliced down to match. This is a pure performance
+// optimization with no semantic change: position IDs of input tokens are
+// unaffected (RoPE is independent of page list shape) and the page-hash
+// chain used by the radix-trie dedup operates on `req.masks` upstream of
+// this point, so trimming the wire copy doesn't perturb caching.
+//
+// The eligibility window stops at `first_writeable_page` — pages that the
+// kernel will write new K/V into this pass cannot be dropped even if the
+// mask says all-False, because the kernel's write target is determined by
+// position-in-`kv_page_indices`.
+//
+// Eligibility math:
+//   total_kv = (num_pages - 1) * page_size + last_page_len   (post-pass)
+//   kv_before = total_kv - tokens.len()                       (pre-pass)
+//   first_writeable_page = kv_before / page_size
+
+/// A computed trim plan for a single request: which pages to drop and the
+/// corresponding bit ranges to slice out of every BRLE row.
+struct TrimPlan {
+    /// Bitmask over `[0, num_pages)`: bit p set ⇒ page p is dropped.
+    dropped_bits: TrimBits,
+    /// Sorted disjoint `[s, e)` ranges in original-coord space, one per
+    /// dropped page: `[p*page_size, (p+1)*page_size)`. Passed to
+    /// `Brle::write_skipping` for each row.
+    skip_ranges: Vec<(u32, u32)>,
+}
+
+impl TrimPlan {
+    /// Compute the trim plan, or return `None` if no pages can be dropped.
+    /// Returning `None` means the caller should take the fast path with
+    /// zero extra allocations.
+    fn compute(
+        masks: &[Brle],
+        num_pages: u32,
+        last_page_len: u32,
+        page_size: u32,
+        num_input_tokens: u32,
+    ) -> Option<Self> {
+        if num_pages == 0 || page_size == 0 || masks.is_empty() {
+            return None;
+        }
+
+        // Eligibility window: only pages strictly before the first page that
+        // receives new K/V writes are candidates. last_page_len reflects the
+        // post-pass state for non-spec input tokens; subtracting num_input_tokens
+        // yields the pre-pass kv length. Speculative tokens write past
+        // last_page_len into reserved pages, which are also writeable, but
+        // they live in pages >= first_writeable_page either way so they don't
+        // affect the cutoff.
+        let total_kv = (num_pages - 1) * page_size + last_page_len;
+        let kv_before = total_kv.saturating_sub(num_input_tokens);
+        let first_writeable_page = kv_before / page_size;
+        if first_writeable_page == 0 {
+            return None;
+        }
+
+        let total_seq_len = total_kv;
+        let num_words = ((num_pages as usize) + 63) / 64;
+
+        // Running eligibility: AND-reduction across rows, seeded with the
+        // writeable-window mask. SmallVec keeps both bitmaps inline on the
+        // stack for typical `num_pages <= TRIM_INLINE_WORDS * 64` (1024).
+        let mut eligible: TrimBits = smallvec![0u64; num_words];
+        brle::set_bits(&mut eligible, 0, first_writeable_page);
+
+        let mut row_bits: TrimBits = smallvec![0u64; num_words];
+        for mask in masks {
+            for w in row_bits.iter_mut() {
+                *w = 0;
+            }
+            mask.droppable_page_bits(page_size, num_pages, total_seq_len, &mut row_bits);
+            for (e, r) in eligible.iter_mut().zip(row_bits.iter()) {
+                *e &= *r;
+            }
+            // Early exit: once eligibility hits zero, no further rows can
+            // bring it back. Common case for non-causal masks where rows
+            // disagree on which pages are reachable.
+            if eligible.iter().all(|&w| w == 0) {
+                return None;
+            }
+        }
+
+        // Materialize skip_ranges in page order. Walk set bits LSB-first per
+        // word; each set bit p contributes [p*page_size, (p+1)*page_size).
+        let mut skip_ranges: Vec<(u32, u32)> = Vec::new();
+        for (w_idx, &word) in eligible.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let lsb = bits.trailing_zeros();
+                let p = (w_idx as u32) * 64 + lsb;
+                if p >= num_pages {
+                    break;
+                }
+                skip_ranges.push((p * page_size, (p + 1) * page_size));
+                bits &= bits.wrapping_sub(1);
+            }
+        }
+
+        Some(TrimPlan {
+            dropped_bits: eligible,
+            skip_ranges,
+        })
+    }
+
+    #[inline]
+    fn is_page_dropped(&self, p: u32) -> bool {
+        let w = (p / 64) as usize;
+        let b = p % 64;
+        self.dropped_bits.get(w).map(|word| (word >> b) & 1 != 0).unwrap_or(false)
+    }
+}
 
 /// Sampler configuration for token generation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +228,13 @@ pub struct ForwardPassRequest {
     pub output_speculative_tokens: bool,
     /// Attention masks (BRLE encoded, one per token).
     pub masks: Vec<Brle>,
+    /// Whether the user supplied custom masks via `attention_mask()`. False
+    /// means the runtime synthesized causal masks as the default. Drives
+    /// kernel dispatch: a single-token request with a user-supplied mask must
+    /// route to the prefill kernel (which honors `custom_mask`); a single-
+    /// token request with synthesized causal can use the cuda-graph decode
+    /// kernel which has no `custom_mask` argument.
+    pub has_user_mask: bool,
     /// Logit mask (BRLE encoded, applied to vocabulary).
     pub logit_mask: Option<Brle>,
     /// Indices of tokens to sample from.
@@ -289,25 +423,82 @@ impl BatchedForwardPassRequest {
         }
     }
 
+    /// Append the request's physical page IDs to `kv_page_indices`,
+    /// honoring the trim plan if present.
+    fn emit_kv_pages(
+        &mut self,
+        physical_page_ids: &[PhysicalPageId],
+        trim: Option<&TrimPlan>,
+    ) {
+        match trim {
+            None => self.kv_page_indices.0.extend(physical_page_ids),
+            Some(plan) => {
+                for (idx, &pid) in physical_page_ids.iter().enumerate() {
+                    if !plan.is_page_dropped(idx as u32) {
+                        self.kv_page_indices.0.push(pid);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flatten one BRLE buffer per row into `flattened_masks`, applying the
+    /// trim plan's skip ranges if present. Updates `mask_indptr` per row.
+    fn emit_attention_masks(&mut self, masks: &[Brle], trim: Option<&TrimPlan>) {
+        match trim {
+            None => {
+                for mask in masks {
+                    self.flattened_masks.0.extend(&mask.buffer);
+                    self.mask_indptr.0.push(self.flattened_masks.0.len() as u32);
+                }
+            }
+            Some(plan) => {
+                for mask in masks {
+                    mask.write_skipping(&plan.skip_ranges, &mut self.flattened_masks.0);
+                    self.mask_indptr.0.push(self.flattened_masks.0.len() as u32);
+                }
+            }
+        }
+    }
+
     /// Add a request to the batch.
-    pub fn add_request(&mut self, req: &ForwardPassRequest, physical_page_ids: &[u32], last_page_len: u32) {
+    ///
+    /// `page_size` is the model's KV page size in tokens. It's used by the
+    /// page-trim optimization: when every row of the request's attention mask
+    /// marks an entire page-sized range as False, that physical page is
+    /// excluded from `kv_page_indices` and the corresponding bits are sliced
+    /// out of every BRLE row before flattening. Pages that will receive new
+    /// K/V writes this pass are protected from trimming.
+    pub fn add_request(
+        &mut self,
+        req: &ForwardPassRequest,
+        physical_page_ids: &[PhysicalPageId],
+        last_page_len: u32,
+        page_size: u32,
+    ) {
         // Tokens and positions
         self.token_ids.0.extend(&req.tokens);
         self.position_ids.0.extend(&req.positions);
 
-        // KV cache layout
-        self.kv_page_indices.0.extend(physical_page_ids);
+        // Compute the page-trim plan. Returns None for the common case where
+        // no pages can be dropped (causal masks, decode steps, etc.) — the
+        // fast path below uses zero allocations.
+        let trim = TrimPlan::compute(
+            &req.masks,
+            physical_page_ids.len() as u32,
+            last_page_len,
+            page_size,
+            req.tokens.len() as u32,
+        );
+
+        // KV cache layout (page list + indptr) and query/output indirection.
+        self.emit_kv_pages(physical_page_ids, trim.as_ref());
         self.kv_page_indptr.0.push(self.kv_page_indices.0.len() as u32);
         self.kv_last_page_lens.0.push(last_page_len);
-
-        // Query/output indirection
         self.qo_indptr.0.push(self.token_ids.0.len() as u32);
 
-        // Attention masks (flatten BRLE)
-        for mask in &req.masks {
-            self.flattened_masks.0.extend(&mask.buffer);
-            self.mask_indptr.0.push(self.flattened_masks.0.len() as u32);
-        }
+        // Attention masks (flatten BRLE), trimmed if any pages were dropped.
+        self.emit_attention_masks(&req.masks, trim.as_ref());
 
         // Logit mask (flatten BRLE, per request)
         if let Some(ref mask) = req.logit_mask {
@@ -343,8 +534,15 @@ impl BatchedForwardPassRequest {
         // Context (stable id for per-context backend state)
         self.context_ids.push(req.context_id);
 
-        // Inference hint
-        if req.tokens.len() > 1 {
+        // Inference hint: route to the prefill kernel (`single_token_mode = false`)
+        // when ANY request needs `custom_mask` honored. Two cases qualify:
+        //   - multi-token requests (the cuda-graph decode path doesn't accept
+        //     more than one query token per request);
+        //   - single-token requests with user-supplied masks (the decode kernel
+        //     drops `custom_mask`, so honoring the mask requires prefill).
+        // Synthesized causal masks do NOT trigger this — the decode kernel's
+        // built-in causal already covers them.
+        if req.tokens.len() > 1 || req.has_user_mask {
             self.single_token_mode = false;
         }
     }
@@ -397,5 +595,197 @@ mod tests {
         let packed = rmp_serde::to_vec(&original).expect("serialize");
         let decoded: ByteVec = rmp_serde::from_slice(&packed).expect("deserialize");
         assert!(decoded.0.is_empty());
+    }
+
+    // -- Page-trim integration tests -----------------------------------------
+
+    fn make_request(
+        tokens: Vec<u32>,
+        positions: Vec<u32>,
+        masks: Vec<Brle>,
+    ) -> ForwardPassRequest {
+        let has_user_mask = !masks.is_empty();
+        ForwardPassRequest {
+            context_id: 0,
+            tokens,
+            positions,
+            speculative_tokens: vec![],
+            speculative_positions: vec![],
+            output_speculative_tokens: false,
+            masks,
+            has_user_mask,
+            logit_mask: None,
+            sampling_indices: vec![],
+            samplers: vec![],
+            adapter_id: None,
+            adapter_seed: None,
+            arrival_time: None,
+        }
+    }
+
+    #[test]
+    fn add_request_causal_decode_no_trim() {
+        // Single-token decode at position 47, page_size=16, num_pages=3,
+        // last_page_len=16. Causal mask (all-true [0,48]) → no false runs,
+        // no pages can be dropped. Wire format must match the pre-optimization
+        // layout exactly: all 3 pages present, mask buffer untouched.
+        let causal = Brle::all_true(48);
+        let req = make_request(vec![999], vec![47], vec![causal.clone()]);
+        let pages: Vec<PhysicalPageId> = vec![100, 101, 102];
+
+        let mut batch = BatchedForwardPassRequest::new(0);
+        batch.add_request(&req, &pages, 16, 16);
+
+        assert_eq!(batch.kv_page_indices.0, vec![100, 101, 102]);
+        assert_eq!(batch.kv_page_indptr.0, vec![0, 3]);
+        assert_eq!(batch.kv_last_page_lens.0, vec![16]);
+        // Mask buffer is the original BRLE (no rewrite).
+        assert_eq!(batch.flattened_masks.0, causal.buffer);
+    }
+
+    #[test]
+    fn add_request_attention_sink_trims_middle_pages() {
+        // Decode at position 319 with sink+window mask: sink=4, gap=252,
+        // window=64, total seq_len=320. page_size=16, num_pages=20,
+        // last_page_len=16. The single new token writes to page 19 (the last
+        // page), so first_writeable_page = 319/16 = 19 → eligible window is
+        // pages 0..=18.
+        //
+        // Per-row droppable: false run [4, 256) covers pages 1..=15 fully.
+        // After AND with eligibility window {0..=18}: pages 1..=15 dropped.
+        let mask = Brle::from_vec(vec![0, 4, 252, 64]); // sink+window
+        assert_eq!(mask.len(), 320);
+
+        let req = make_request(vec![999], vec![319], vec![mask]);
+        let pages: Vec<PhysicalPageId> =
+            (0..20).map(|i| 1000 + i as PhysicalPageId).collect();
+
+        let mut batch = BatchedForwardPassRequest::new(0);
+        batch.add_request(&req, &pages, 16, 16);
+
+        // Surviving pages: 0, 16, 17, 18, 19 (5 pages).
+        let expected_pages: Vec<u32> = vec![1000, 1016, 1017, 1018, 1019];
+        assert_eq!(batch.kv_page_indices.0, expected_pages);
+        assert_eq!(batch.kv_page_indptr.0, vec![0, 5]);
+        // last_page_len unchanged — last page is never dropped.
+        assert_eq!(batch.kv_last_page_lens.0, vec![16]);
+
+        // Trimmed BRLE: original false run [4, 256) shrinks by 15*16 = 240
+        // bits (15 dropped pages). Layout becomes:
+        //   sink(4) | gap'(12) | window(64)
+        // i.e., BRLE buffer = [0, 4, 12, 64], total_size = 80 = 5*16.
+        assert_eq!(batch.flattened_masks.0, vec![0, 4, 12, 64]);
+        assert_eq!(batch.mask_indptr.0, vec![0, 4]);
+    }
+
+    #[test]
+    fn add_request_window_only_trims_leading_pages() {
+        // Sliding-window mask: gap=240 (false), window=80 (true), seq_len=320.
+        // page_size=16, num_pages=20, last_page_len=16. Decode at position 319.
+        //   eligible window: pages 0..=18 (writeable = page 19).
+        //   row droppable: pages 0..=14 (false run [0, 240) covers them fully).
+        // Drop pages 0..=14 (15 pages); pages 15..=19 remain.
+        let mask = Brle::from_vec(vec![240, 80]);
+        assert_eq!(mask.len(), 320);
+
+        let req = make_request(vec![999], vec![319], vec![mask]);
+        let pages: Vec<PhysicalPageId> =
+            (0..20).map(|i| 2000 + i as PhysicalPageId).collect();
+
+        let mut batch = BatchedForwardPassRequest::new(0);
+        batch.add_request(&req, &pages, 16, 16);
+
+        let expected_pages: Vec<u32> = (15..20).map(|i| 2000 + i).collect();
+        assert_eq!(batch.kv_page_indices.0, expected_pages);
+        // After dropping 15 leading false pages, remaining mask is:
+        //   false: 240 - 15*16 = 0  →  zero-length false prefix preserved
+        //   true: 80
+        // Buffer: [0, 80], total_size = 80.
+        assert_eq!(batch.flattened_masks.0, vec![0, 80]);
+    }
+
+    #[test]
+    fn add_request_writeable_pages_are_protected() {
+        // Pathological: a request whose mask is all-False, but kv_before is
+        // entirely contained in a single non-final page. The writeable-window
+        // guard must protect that page even though the mask agrees it's
+        // droppable.
+        //
+        // page_size=16, kv_before=10 (one partial page), tokens.len()=6
+        // (filling the page). num_pages=1, last_page_len=16, total_kv=16.
+        // first_writeable_page = 10/16 = 0 → no eligible pages.
+        let mask = Brle::from_vec(vec![16]); // all false, total 16
+        let req = make_request(vec![1, 2, 3, 4, 5, 6], vec![10, 11, 12, 13, 14, 15], vec![mask.clone()]);
+        let pages: Vec<PhysicalPageId> = vec![777];
+
+        let mut batch = BatchedForwardPassRequest::new(0);
+        batch.add_request(&req, &pages, 16, 16);
+
+        // No pages dropped; original mask buffer preserved.
+        assert_eq!(batch.kv_page_indices.0, vec![777]);
+        assert_eq!(batch.flattened_masks.0, mask.buffer);
+    }
+
+    #[test]
+    fn add_request_rows_disagree_no_drops() {
+        // Two-token prefill, page_size=16, num_pages=4 (seq_len=64),
+        // last_page_len=16, kv_before=62 → first_writeable_page=3, eligible
+        // window {0,1,2}. Two rows whose droppable sets are disjoint within
+        // that window:
+        //   row 0: false [0, 32)  → pages 0,1 droppable
+        //   row 1: false [32, 48) → page 2 droppable
+        // AND-reduction collapses to ∅, so the trim path bails. Verify the
+        // wire format is byte-identical to the no-trim layout.
+        let row0 = Brle::from_vec(vec![32, 32]); // false 32, true 32
+        let row1 = Brle::from_vec(vec![0, 32, 16, 16]); // true 32, false 16, true 16
+        assert_eq!(row0.len(), 64);
+        assert_eq!(row1.len(), 64);
+
+        let req = make_request(vec![1, 2], vec![62, 63], vec![row0.clone(), row1.clone()]);
+        let pages: Vec<PhysicalPageId> = vec![10, 11, 12, 13];
+
+        let mut batch = BatchedForwardPassRequest::new(0);
+        batch.add_request(&req, &pages, 16, 16);
+
+        // Fast path: original pages and mask buffers byte-for-byte.
+        assert_eq!(batch.kv_page_indices.0, vec![10, 11, 12, 13]);
+        let mut expected_masks = row0.buffer.clone();
+        expected_masks.extend(&row1.buffer);
+        assert_eq!(batch.flattened_masks.0, expected_masks);
+        assert_eq!(batch.mask_indptr.0, vec![0, 2, 6]);
+    }
+
+    #[test]
+    fn add_request_multi_row_identical_sink_pattern() {
+        // Prefill with multiple input tokens, every row has the same
+        // sink+window mask (a common inferlet pattern). Verify that the trim
+        // applies uniformly across rows and the per-row mask offsets in
+        // `mask_indptr` track the trimmed buffer correctly.
+        let mask = Brle::from_vec(vec![0, 4, 252, 64]); // seq_len 320
+        let req = make_request(
+            vec![10, 20, 30],
+            vec![317, 318, 319],
+            vec![mask.clone(), mask.clone(), mask.clone()],
+        );
+        let pages: Vec<PhysicalPageId> =
+            (0..20).map(|i| 5000 + i as PhysicalPageId).collect();
+
+        let mut batch = BatchedForwardPassRequest::new(0);
+        // Three new tokens at positions 317..319, kv_before=317 →
+        // first_writeable_page=19. Pages 1..=15 still dropped by the mask.
+        batch.add_request(&req, &pages, 16, 16);
+
+        let expected_pages: Vec<u32> = vec![5000, 5016, 5017, 5018, 5019];
+        assert_eq!(batch.kv_page_indices.0, expected_pages);
+
+        // Three identical rows trimmed identically: each row's BRLE shrinks
+        // to [0, 4, 12, 64] (4 entries). Total flattened length = 12.
+        let trimmed_row: Vec<u32> = vec![0, 4, 12, 64];
+        let mut expected_flat: Vec<u32> = Vec::new();
+        for _ in 0..3 {
+            expected_flat.extend_from_slice(&trimmed_row);
+        }
+        assert_eq!(batch.flattened_masks.0, expected_flat);
+        assert_eq!(batch.mask_indptr.0, vec![0, 4, 8, 12]);
     }
 }

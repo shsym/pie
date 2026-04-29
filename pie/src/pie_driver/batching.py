@@ -98,14 +98,13 @@ class Batch:
         flattened_masks_u32 = _decode_u32(args["flattened_masks"]).astype(np.int32)
         mask_indptr = _decode_u32(args["mask_indptr"]).astype(np.int32)
 
-        # The decode kernel is a specialization of the prefill kernel that drops
-        # `custom_mask` for efficiency. Rust sets `single_token_mode` purely on
-        # qo_len==1 across the batch, so a 1-token request with a custom mask
-        # would silently route to the decode kernel and lose the mask. Any
-        # supplied mask forces the prefill path.
+        # The decode kernel is a specialization of the prefill kernel that
+        # drops `custom_mask` for efficiency. Rust now sets `single_token_mode`
+        # correctly: it forces the prefill path whenever any request supplied
+        # a user `attention_mask` (regardless of token count), so we trust the
+        # flag here. `has_custom_mask` is kept as a tensor-allocation gate
+        # downstream.
         self.has_custom_mask = len(flattened_masks_u32) > 0
-        if self.has_custom_mask:
-            self.single_token_mode = False
 
         num_requests = len(args["adapter_indices"])
 
