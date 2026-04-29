@@ -2,6 +2,10 @@
 # It is not intended for manual editing.
 """
 MCP client interface — lets inferlets discover and call MCP servers.
+
+All response payloads are returned as opaque JSON strings. SDKs are
+responsible for typing them. This keeps the WIT contract stable as the
+MCP spec evolves.
 """
 from typing import TypeVar, Generic, Union, Optional, Protocol, Tuple, List, Any, Self, Callable
 from types import TracebackType
@@ -11,54 +15,66 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import pie_mcp_types
+
 
 class Session:
     """
-    An active connection to an MCP server.
-    Dropping the resource closes the connection.
+    A typed handle to an MCP server registered on this client session.
+    
+    Cheap to construct — the underlying connection and `initialize`
+    handshake were performed when the host registered the server.
+    Dropping the resource releases this handle; the underlying
+    connection persists for the client session and is shared with
+    other inferlets in the same session.
     """
     
     def list_tools(self) -> str:
         """
         List tools exposed by this server.
+        Returns the raw `tools/list` JSON-RPC `result` field.
         
-        Raises: `wit_world.types.Err(wit_world.imports.pie_mcp_types.Error)`
+        Raises: `componentize_py_types.Err(wit_world.imports.pie_mcp_types.Error)`
         """
         raise NotImplementedError
-    def call_tool(self, name: str, args: str) -> List[pie_mcp_types.Content]:
+    def call_tool(self, name: str, args: str) -> str:
         """
-        Call a tool by name with JSON arguments.
+        Call a tool by name with JSON-encoded arguments.
+        Returns the raw `tools/call` JSON-RPC `result` field on
+        transport success, including any `isError` / `content` /
+        `structuredContent` fields the server returned. Tool-level
+        failures should be detected by inspecting `isError` in the
+        returned JSON.
         
-        Raises: `wit_world.types.Err(wit_world.imports.pie_mcp_types.Error)`
+        Raises: `componentize_py_types.Err(wit_world.imports.pie_mcp_types.Error)`
         """
         raise NotImplementedError
     def list_resources(self) -> str:
         """
         List resources exposed by this server.
         
-        Raises: `wit_world.types.Err(wit_world.imports.pie_mcp_types.Error)`
+        Raises: `componentize_py_types.Err(wit_world.imports.pie_mcp_types.Error)`
         """
         raise NotImplementedError
-    def read_resource(self, uri: str) -> List[pie_mcp_types.Content]:
+    def read_resource(self, uri: str) -> str:
         """
         Read a resource by URI.
+        Returns the raw `resources/read` JSON-RPC `result` field.
         
-        Raises: `wit_world.types.Err(wit_world.imports.pie_mcp_types.Error)`
+        Raises: `componentize_py_types.Err(wit_world.imports.pie_mcp_types.Error)`
         """
         raise NotImplementedError
     def list_prompts(self) -> str:
         """
         List prompts exposed by this server.
         
-        Raises: `wit_world.types.Err(wit_world.imports.pie_mcp_types.Error)`
+        Raises: `componentize_py_types.Err(wit_world.imports.pie_mcp_types.Error)`
         """
         raise NotImplementedError
     def get_prompt(self, name: str, args: str) -> str:
         """
         Render a prompt template with the given arguments.
         
-        Raises: `wit_world.types.Err(wit_world.imports.pie_mcp_types.Error)`
+        Raises: `componentize_py_types.Err(wit_world.imports.pie_mcp_types.Error)`
         """
         raise NotImplementedError
     def __enter__(self) -> Self:
@@ -75,13 +91,17 @@ class Session:
 
 def available_servers() -> List[str]:
     """
-    Discover available MCP servers.
+    Names of MCP servers the host has registered for this session.
     """
     raise NotImplementedError
 def connect(server_name: str) -> Session:
     """
-    Connect to a named MCP server, performing the MCP handshake.
+    Open a session to a registered MCP server.
     
-    Raises: `wit_world.types.Err(wit_world.imports.pie_mcp_types.Error)`
+    The MCP `initialize` handshake is performed by the host when it
+    registers the server, not here. This call validates that
+    `server-name` is registered and returns a typed handle.
+    
+    Raises: `componentize_py_types.Err(wit_world.imports.pie_mcp_types.Error)`
     """
     raise NotImplementedError

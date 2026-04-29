@@ -1,39 +1,17 @@
 /** @module Interface pie:mcp/types **/
 /**
- * Opaque JSON carried as a string.
+ * Opaque JSON carried as a string. Never inspected by the runtime.
  */
 export type Json = string;
 /**
- * MCP error, mirrors JSON-RPC error shape.
+ * Transport / JSON-RPC error. Mirrors the JSON-RPC 2.0 error shape.
+ * This represents protocol-level failures (server unreachable, method
+ * not found, etc.). Tool-level failures (`isError: true` in a
+ * `tools/call` response) arrive as a successful `json` payload that
+ * SDKs should inspect.
  */
 export interface Error {
   code: number,
   message: string,
   data?: Json,
-}
-export interface ImageContent {
-  mimeType: string,
-  data: Uint8Array,
-}
-export interface ResourceContent {
-  uri: string,
-  mimeType?: string,
-  text?: string,
-  blob?: Uint8Array,
-}
-/**
- * The fundamental unit of content in MCP responses.
- */
-export type Content = ContentText | ContentImage | ContentEmbeddedResource;
-export interface ContentText {
-  tag: 'text',
-  val: string,
-}
-export interface ContentImage {
-  tag: 'image',
-  val: ImageContent,
-}
-export interface ContentEmbeddedResource {
-  tag: 'embedded-resource',
-  val: ResourceContent,
 }
