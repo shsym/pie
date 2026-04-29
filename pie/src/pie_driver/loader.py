@@ -121,6 +121,20 @@ class ModelLoader:
                 # `*` patterns), so we pass num_layers=0 to avoid re-expansion.
                 num_layers = 0
 
+            case "phi3":
+                from .model import phi3
+
+                model_config = phi3.ModelConfig.from_dict(hf_config)
+                schema = phi3.create_schema(model_config)
+                num_layers = model_config.num_layers
+
+            case "mixtral":
+                from .model import mixtral
+
+                model_config = mixtral.ModelConfig.from_dict(hf_config)
+                schema = mixtral.create_schema(model_config)
+                num_layers = model_config.num_layers
+
             case "gptoss":
                 from .model import gpt_oss
 
