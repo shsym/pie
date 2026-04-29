@@ -473,24 +473,30 @@ class ForwardPass:
     ) -> torch.Tensor:
         """Build a cos/sin cache for Gemma 4 proportional RoPE.
 
-        Proportional RoPE rotates only the first ``rope_angles*2`` channels
-        but uses ``head_dim`` (not ``rotary_dim``) as the freq denominator,
-        which differs from the standard RoPE kernel. Cache shape matches
-        FlashInfer's ``apply_rope_with_cos_sin_cache_inplace`` expectation:
-        ``(max_seq, rotary_dim)`` with cos in the first half, sin in the
-        second half along the last dim.
+        Pairing convention: HF Gemma 4 uses standard rotate_half on the *full*
+        head_dim (so each pair is offset by head_dim/2), but only the first
+        ``rope_angles`` of those pairs carry non-trivial frequencies; the rest
+        get cos=1 / sin=0 (identity). To make FlashInfer's
+        ``apply_rope_with_cos_sin_cache_inplace`` follow the same pairing, we
+        build the cache at ``rotary_dim = head_dim`` and pad the upper
+        ``head_dim/2 - rope_angles`` cos/sin entries with the identity. The
+        frequency denominator is ``head_dim`` (not ``rope_angles*2``), which
+        is the "proportional" part.
         """
+        half = head_dim // 2
         rope_angles = int(partial_factor * head_dim) // 2  # e.g. 0.25*512//2 = 64
-        rotary_dim = rope_angles * 2  # e.g. 128
         # inv_freq[k] = 1 / theta^(2k / head_dim) for k in [0, rope_angles)
         ks = torch.arange(0, rope_angles, dtype=torch.float32, device=device)
-        inv_freq = 1.0 / (theta ** (2 * ks / head_dim))  # [rope_angles]
-        positions = torch.arange(max_seq, dtype=torch.float32, device=device)  # [max_seq]
-        freqs = positions[:, None] * inv_freq[None, :]  # [max_seq, rope_angles]
-        cache = torch.empty((max_seq, rotary_dim), dtype=torch.float32, device=device)
-        cache[:, :rope_angles] = freqs.cos()
-        cache[:, rope_angles:] = freqs.sin()
-        return cache
+        inv_freq_rot = 1.0 / (theta ** (2 * ks / head_dim))
+        positions = torch.arange(max_seq, dtype=torch.float32, device=device)
+        freqs_rot = positions[:, None] * inv_freq_rot[None, :]  # [max_seq, rope_angles]
+        cos = torch.ones((max_seq, half), dtype=torch.float32, device=device)
+        sin = torch.zeros((max_seq, half), dtype=torch.float32, device=device)
+        cos[:, :rope_angles] = freqs_rot.cos()
+        sin[:, :rope_angles] = freqs_rot.sin()
+        # FlashInfer's expected layout: cos in first half, sin in second half along
+        # the last dim — with rotary_dim = head_dim, "half" == head_dim // 2.
+        return torch.cat([cos, sin], dim=-1)
 
     # ------------------------------------------------------------------
     # Embedding + PLE
@@ -689,9 +695,9 @@ class ForwardPass:
             target_k = k
 
         if cfg.is_full_attention(layer_idx):
-            # Proportional RoPE: use precomputed cache. The kernel applies
-            # rotation to the leading ``rotary_dim`` channels (read from
-            # the cache shape) and leaves the trailing channels untouched.
+            # Proportional RoPE via cos/sin cache. See `_build_proportional_rope_cache`
+            # for the layout — pairs are at offset head_dim/2 (HF convention),
+            # with identity entries for non-rotated channels.
             n = q.size(0)
             num_q_heads = q.size(1)
             num_kv_heads = target_k.size(1)
@@ -1010,6 +1016,7 @@ class ForwardPass:
                 head_dim_qk=cfg.dim_head,
                 page_size=page_size,
                 custom_mask=custom_mask,
+                causal=(custom_mask is None),
                 sm_scale=1.0,
                 window_left=sliding_window_left,
                 q_data_type=input_embeds.dtype,

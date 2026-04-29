@@ -18,7 +18,6 @@ use std::collections::HashMap;
 use std::iter;
 use std::mem::take;
 use std::sync::Arc;
-use std::time::Instant;
 use tokio::sync::oneshot;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
@@ -441,7 +440,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
             samplers,
             adapter_id,
             adapter_seed,
-            arrival_time: Some(Instant::now()),
         };
 
         // Step 5: Submit to inference service (inference actor just dispatches — never blocks)

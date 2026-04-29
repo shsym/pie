@@ -19,5 +19,4 @@ export * as messaging from './messaging.js';
 export { Subscription } from './messaging.js';
 export * as mcp from './mcp.js';
 export { McpSession } from './mcp.js';
-export type { Content } from './mcp.js';
 export * as zo from './zo.js';

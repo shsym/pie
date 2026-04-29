@@ -8,14 +8,15 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 from pathlib import Path
-from typing import Optional
 
 from rich.panel import Panel
 from .console import console
 from . import path as path_utils
+from . import py_runtime
 import typer
 
 
@@ -75,9 +76,29 @@ def to_python_ident(name: str) -> str:
     return name.replace("-", "_")
 
 
+def find_command(cmd: str) -> str | None:
+    """Locate ``cmd`` on PATH or alongside the running interpreter.
+
+    The interpreter-bin fallback matters when bakery is invoked through
+    ``pie build`` via the venv's absolute path from outside the venv's
+    activation: PATH won't include the venv's bin/, but tools like
+    ``componentize-py`` (installed by ``factored-componentize-py``) live
+    there.
+    """
+    if found := shutil.which(cmd):
+        return found
+    candidate = Path(sys.executable).parent / cmd
+    return str(candidate) if candidate.exists() else None
+
+
 def command_exists(cmd: str) -> bool:
-    """Check if a command is available in PATH."""
-    return shutil.which(cmd) is not None
+    return find_command(cmd) is not None
+
+
+def resolve_command(cmd: str) -> str:
+    """Resolved path for ``cmd``, or the bare name as a fallback so the
+    OS surfaces the usual "command not found" error."""
+    return find_command(cmd) or cmd
 
 
 def detect_platform(input_path: Path) -> str:
@@ -213,6 +234,12 @@ import asyncio
 from wit_world import exports
 from wit_world.imports.poll import poll as _wasi_poll
 
+# `componentize_py_types.Err` is the exception class that componentize-py
+# uses to encode the Err arm of a `result<T, E>` return. We catch any
+# uncaught Python exception from the user's main() and re-raise it as
+# this so the host receives a clean WIT Err instead of a wasm trap.
+from componentize_py_types import Err as _WitErr
+
 # Import inferlet at top level so componentize-py bundles it
 import inferlet as _inferlet
 
@@ -328,27 +355,34 @@ class Run(exports.Run):
         except json.JSONDecodeError:
             input_data = {{"input": input}}
 
-        # Call the user's main function, passing parsed input
-        if hasattr(_user_module, 'main'):
-            result = _user_module.main(input_data)
-            # Support both sync and async main()
-            if asyncio.iscoroutine(result):
-                result = loop.run_until_complete(result)
-            # Pass through strings; JSON-stringify everything else (dict,
-            # list, primitives, pydantic v2 models, dataclasses).
-            if result is None:
-                return _inferlet.get_return_value() or ""
-            if isinstance(result, str):
-                return result
-            # Pydantic v2 BaseModel — use canonical JSON dump.
-            if hasattr(result, "model_dump_json") and callable(result.model_dump_json):
-                return result.model_dump_json()
-            return json.dumps(result, default=str)
-        else:
-            # Module execution happens at import time for scripts without main()
-            pass
+        # Call the user's main function, passing parsed input. Translate
+        # any Python exception into the WIT Err variant so the host sees
+        # a clean error string rather than a wasm trap.
+        try:
+            if hasattr(_user_module, 'main'):
+                result = _user_module.main(input_data)
+                # Support both sync and async main()
+                if asyncio.iscoroutine(result):
+                    result = loop.run_until_complete(result)
+                # Pass through strings; JSON-stringify everything else (dict,
+                # list, primitives, pydantic v2 models, dataclasses).
+                if result is None:
+                    return _inferlet.get_return_value() or ""
+                if isinstance(result, str):
+                    return result
+                # Pydantic v2 BaseModel — use canonical JSON dump.
+                if hasattr(result, "model_dump_json") and callable(result.model_dump_json):
+                    return result.model_dump_json()
+                return json.dumps(result, default=str)
+            else:
+                # Module execution happens at import time for scripts without main()
+                pass
 
-        return _inferlet.get_return_value() or ""
+            return _inferlet.get_return_value() or ""
+        except _WitErr:
+            raise  # already shaped for componentize-py
+        except BaseException as e:
+            raise _WitErr(str(e))
 """
 
     output_path.write_text(wrapper_content)
@@ -457,7 +491,7 @@ def run_componentize_py(
     )
 
     cmd = [
-        "componentize-py",
+        resolve_command("componentize-py"),
         "-d",
         str(temp_wit_dir),
         "-w",
@@ -487,28 +521,13 @@ def run_componentize_py(
 
 
 def get_inferlet_wit_path() -> Path:
-    """Get the path to the inferlet WIT directory.
+    """Get the path to the inferlet WIT directory (sdk/rust/inferlet/wit).
 
-    This is sdk/rust/inferlet/wit/ which contains all WIT definitions
-    with properly structured deps/.
-
-    Raises:
-        FileNotFoundError: If the WIT directory cannot be found.
+    Delegates to ``path.get_wit_path`` so the resolution order (env
+    override → cwd walk → bakery install location walk) stays consistent
+    across modules.
     """
-    if pie_sdk := os.environ.get("PIE_SDK"):
-        path = Path(pie_sdk) / "rust" / "inferlet" / "wit"
-        if path.exists():
-            return path
-
-    current_dir = Path.cwd()
-    for parent in [current_dir] + list(current_dir.parents):
-        wit_path = parent / "sdk" / "rust" / "inferlet" / "wit"
-        if wit_path.exists():
-            return wit_path
-
-    raise FileNotFoundError(
-        "Could not find sdk/rust/inferlet/wit directory. Please set PIE_SDK environment variable."
-    )
+    return path_utils.get_wit_path()
 
 
 def handle_python_build(input_path: Path, output: Path, debug: bool = False) -> None:
@@ -535,6 +554,24 @@ def handle_python_build(input_path: Path, output: Path, debug: bool = False) -> 
     # Read package name from Pie.toml
     project_dir = input_path if input_path.is_dir() else input_path.parent
     package_name = read_package_name(project_dir)
+
+    # The built WASM imports `componentize-py-runtime` from the host at
+    # run time — fetch that runtime now if it's missing so the user
+    # doesn't get a cryptic linker error later. Best-effort: a network
+    # failure here doesn't block the build, it just means `pie run`
+    # will need to retry.
+    if not py_runtime.is_installed():
+        console.print(
+            "[dim]Python WASM runtime not installed; fetching for first use…[/dim]"
+        )
+        try:
+            py_runtime.ensure_installed()
+        except Exception as exc:
+            console.print(
+                f"[yellow]⚠[/yellow]  Could not fetch Python WASM runtime ({exc}). "
+                "The build will continue but `pie run` will need it before "
+                "the inferlet can execute."
+            )
 
     # Resolve paths
     with console.status("[bold green]Resolving paths...[/bold green]"):
@@ -1006,7 +1043,16 @@ export const run = {{
           inputData = {{ input }};
         }}
       }}
-      const result = await userMain(inputData);
+      let result;
+      try {{
+        result = await userMain(inputData);
+      }} catch (e) {{
+        // componentize-js maps a thrown *string* to the WIT
+        // `result<_, string>::Err` variant; throwing an Error object
+        // would trap. Coerce so users can `throw new Error(...)` idiomatically.
+        if (typeof e === 'string') throw e;
+        throw String(e?.message ?? e);
+      }}
       // Pass strings through; JSON-stringify everything else (objects,
       // arrays, primitives). null/undefined become empty string.
       if (result == null) return '';

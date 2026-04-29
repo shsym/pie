@@ -2,6 +2,11 @@
 # It is not intended for manual editing.
 """
 Shared MCP data types.
+
+This interface is intentionally minimal: MCP responses are returned as
+opaque JSON strings so the WIT contract doesn't need to track every
+addition to the MCP spec. SDKs in each language layer typed wrappers
+on top.
 """
 from typing import TypeVar, Generic, Union, Optional, Protocol, Tuple, List, Any, Self, Callable
 from types import TracebackType
@@ -16,44 +21,14 @@ from componentize_py_types import Result, Ok, Err, Some
 @dataclass
 class Error:
     """
-    MCP error, mirrors JSON-RPC error shape.
+    Transport / JSON-RPC error. Mirrors the JSON-RPC 2.0 error shape.
+    This represents protocol-level failures (server unreachable, method
+    not found, etc.). Tool-level failures (`isError: true` in a
+    `tools/call` response) arrive as a successful `json` payload that
+    SDKs should inspect.
     """
     code: int
     message: str
     data: Optional[str]
-
-@dataclass
-class ImageContent:
-    mime_type: str
-    data: bytes
-
-@dataclass
-class ResourceContent:
-    uri: str
-    mime_type: Optional[str]
-    text: Optional[str]
-    blob: Optional[bytes]
-
-
-@dataclass
-class Content_Text:
-    value: str
-
-
-@dataclass
-class Content_Image:
-    value: ImageContent
-
-
-@dataclass
-class Content_EmbeddedResource:
-    value: ResourceContent
-
-
-Content = Union[Content_Text, Content_Image, Content_EmbeddedResource]
-"""
-The fundamental unit of content in MCP responses.
-"""
-
 
 

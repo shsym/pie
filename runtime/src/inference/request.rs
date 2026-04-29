@@ -4,7 +4,6 @@
 
 use serde::{Deserialize, Serialize};
 use smallvec::{smallvec, SmallVec};
-use std::time::Instant;
 
 use crate::adapter::AdapterId;
 use crate::context::ContextId;
@@ -265,8 +264,6 @@ pub struct ForwardPassRequest {
     pub adapter_id: Option<AdapterId>,
     /// Optional adapter seed (for ZO optimization).
     pub adapter_seed: Option<i64>,
-    /// Arrival time for scheduler estimation.
-    pub arrival_time: Option<Instant>,
 }
 
 /// One typed result per `forward_pass.sampler(...)` slot, in slot order.
@@ -683,7 +680,6 @@ mod tests {
             samplers: vec![],
             adapter_id: None,
             adapter_seed: None,
-            arrival_time: None,
         }
     }
 
