@@ -165,6 +165,21 @@ class Batch:
             np.int32
         )
 
+        # Per-sampler ragged label lists (Logprob/Logprobs).
+        # `sampler_label_indptr` has length num_samplers + 1; for sampler i,
+        # labels are sampler_label_ids[indptr[i] : indptr[i+1]] (empty for
+        # samplers that don't carry labels).
+        if "sampler_label_ids" in args:
+            self.sampler_label_ids = _decode_u32(args["sampler_label_ids"]).astype(
+                np.int32
+            )
+            self.sampler_label_indptr = _decode_u32(
+                args["sampler_label_indptr"]
+            ).astype(np.int32)
+        else:
+            self.sampler_label_ids = np.zeros(0, dtype=np.int32)
+            self.sampler_label_indptr = np.zeros(1, dtype=np.int32)
+
         # Load flattened output token indices
         flat_output_indices = _decode_u32(args["sampling_indices"]).astype(
             np.int32
@@ -243,6 +258,10 @@ class Batch:
         self.spec_indptr = _decode_u32(args["spec_indptr"]).astype(np.int32)
         self.output_spec_flags = args["output_spec_flags"]
         self.sampler_seeds_arr = _decode_u32(args["sampler_seeds"])
+        # Host-side check: if every sampler's seed is 0 (the "user did not
+        # ask for determinism" sentinel), we can short-circuit the device-
+        # side seed plumbing entirely and skip a per-group GPU sync.
+        self.has_user_seeds: bool = bool(self.sampler_seeds_arr.any())
 
         # ===== CONTEXT IDS (per request) =====
         # Stable per-context identifier. Used by drivers that maintain
@@ -565,6 +584,20 @@ class Batch:
                 sampler_groups[sampler_idx] = []
             sampler_groups[sampler_idx].append(i)
 
+        # Per-sampler RNG seeds (u32 values from Rust; 0 means "no seed").
+        # Only build the tensor if at least one sampler asked for a seed —
+        # the all-zeros case is the common one and we want to skip the
+        # device transfer + the kernel-side seed plumbing.
+        seeds_tensor = (
+            torch.as_tensor(
+                self.sampler_seeds_arr.astype(np.int64),
+                device=device,
+                dtype=torch.long,
+            )
+            if self.has_user_seeds
+            else None
+        )
+
         return {
             "indices_for_logits": indices_for_logits,
             "temperatures": temperatures,
@@ -572,6 +605,11 @@ class Batch:
             "top_k": top_k_tensor,
             "top_p": top_p_tensor,
             "min_p": min_p_tensor,
+            "seeds": seeds_tensor,
+            # Per-sampler label lists for Logprob/Logprobs paths. Indexed by
+            # the sampler slot (i.e. the i in sampler_groups[type] = [i, ...]).
+            "sampler_label_ids": self.sampler_label_ids,
+            "sampler_label_indptr": self.sampler_label_indptr,
             # `sampling_masks` is the effective logit mask at each logit
             # position. Prefer whichever source populated it (historically two
             # names coexisted; `logit_masks` came from grammar constraints via
@@ -689,6 +727,7 @@ class Batch:
         top_k_arr = _extend_with_clones(self.top_k_values)
         top_p_arr = _extend_with_clones(self.top_p_values)
         min_p_arr = _extend_with_clones(self.min_p_values)
+        seeds_arr = _extend_with_clones(self.sampler_seeds_arr)
 
         # sampler_types is a Python list, not a numpy array.
         sampler_types_ext = list(self.sampler_types)
@@ -706,6 +745,15 @@ class Batch:
                     f"Request {i}: first sampler is Distribution-mode, "
                     "which can't be used for spec verification."
                 )
+            if stype in (7, 8, 9, 10):
+                # Same constraint as Distribution: RawLogits/Logprob/
+                # Logprobs/Entropy don't yield a sampled token for the
+                # verifier to compare against.
+                raise ValueError(
+                    f"Request {i}: first sampler is type {stype} "
+                    "(RawLogits/Logprob/Logprobs/Entropy), which can't be "
+                    "used for spec verification."
+                )
             sampler_types_ext.extend([stype] * count)
 
         # Group samplers (now spans inferlet + verification slots).
@@ -722,6 +770,11 @@ class Batch:
         top_k_t = torch.tensor(top_k_arr, device=device, dtype=torch.long)
         top_p_t = torch.tensor(top_p_arr, device=device, dtype=dtype)
         min_p_t = torch.tensor(min_p_arr, device=device, dtype=dtype)
+        seeds_t = (
+            torch.as_tensor(seeds_arr.astype(np.int64), device=device, dtype=torch.long)
+            if self.has_user_seeds
+            else None
+        )
 
         # Logit/sampling masks: extend in lock-step with the verification
         # block (same mask as the inferlet's first sampler for that request).
@@ -763,6 +816,7 @@ class Batch:
             "top_k": top_k_t,
             "top_p": top_p_t,
             "min_p": min_p_t,
+            "seeds": seeds_t,
             "sampling_masks": sampling_masks_t,
         }
 
@@ -834,6 +888,9 @@ class Batch:
             ]
 
         final_dists = sampling_results["dists"]
+        final_logits = sampling_results.get("logits") or []
+        final_logprobs = sampling_results.get("logprobs") or []
+        final_entropies = sampling_results.get("entropies") or []
         final_tokens_list = sampling_results["tokens"]
         spec_tokens_all = sampling_results.get("spec_tokens", None)
         spec_positions_all = sampling_results.get("spec_positions", None)
@@ -847,6 +904,9 @@ class Batch:
             num_outputs = int(self.request_output_counts[req_idx])
             request_dists = []
             request_tokens = []
+            request_logits: list[bytes] = []
+            request_logprobs: list[list[float]] = []
+            request_entropies: list[float] = []
 
             spec_accepted = (
                 spec_accepted_all[req_idx] if spec_accepted_all is not None else None
@@ -859,16 +919,30 @@ class Batch:
                 request_tokens = list(spec_accepted)
             else:
                 for i in range(cursor, cursor + num_outputs):
-                    if self.sampler_types[i] == 0:
-                        # Distribution request
+                    stype = self.sampler_types[i]
+                    if stype == 0:
                         if final_dists[i] is not None:
                             request_dists.append(final_dists[i])
+                    elif stype == 7:
+                        if i < len(final_logits) and final_logits[i] is not None:
+                            request_logits.append(final_logits[i])
+                    elif stype in (8, 9):
+                        if i < len(final_logprobs) and final_logprobs[i] is not None:
+                            request_logprobs.append(final_logprobs[i])
+                    elif stype == 10:
+                        if i < len(final_entropies) and final_entropies[i] is not None:
+                            request_entropies.append(final_entropies[i])
                     else:
-                        # Sampling request
                         request_tokens.append(final_tokens_list[i])
 
             # Build response with optional speculation
-            resp = message.ForwardPassResponse(dists=request_dists, tokens=request_tokens)
+            resp = message.ForwardPassResponse(
+                dists=request_dists,
+                tokens=request_tokens,
+                logits=request_logits,
+                logprobs=request_logprobs,
+                entropies=request_entropies,
+            )
             if (
                 spec_tokens_all is not None
                 and self.output_spec_flags[req_idx]

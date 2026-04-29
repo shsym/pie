@@ -59,6 +59,38 @@ export const Sampler = {
   distribution(temperature: number, topK: number): WitSampler {
     return { tag: 'dist', val: [temperature, topK] };
   },
+
+  /** Raw logits output mode.
+   *
+   * Returns the model's pre-softmax, untemperatured logits as a packed
+   * little-endian f32 byte buffer (length = `vocab_size * 4`) per requested
+   * position. Decode via `new Float32Array(buf.buffer, buf.byteOffset,
+   * buf.byteLength / 4)` (or similar). */
+  rawLogits(): WitSampler {
+    return { tag: 'raw-logits' };
+  },
+
+  /** Single-label logprob at this position.
+   *
+   * Returns `log p(tokenId | context)` via `Output.logprobs` (length-1 inner
+   * list per slot). Computed via log-softmax with no temperature scaling. */
+  logprob(tokenId: number): WitSampler {
+    return { tag: 'logprob', val: tokenId };
+  },
+
+  /** Multi-label logprobs at one position.
+   *
+   * Returns `log p(t | context)` for each `t` in `tokenIds`, in order, via
+   * `Output.logprobs` (length-K inner list per slot). */
+  logprobs(tokenIds: number[]): WitSampler {
+    return { tag: 'logprobs', val: tokenIds };
+  },
+
+  /** Shannon entropy `H(p) = -sum(p log p)` of the unscaled distribution at
+   * this position, via `Output.entropies`. */
+  entropy(): WitSampler {
+    return { tag: 'entropy' };
+  },
 } as const;
 
 /** Re-export the WIT sampler type for external use. */

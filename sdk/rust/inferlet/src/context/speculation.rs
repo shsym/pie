@@ -64,27 +64,22 @@ impl Speculation {
     }
 
     pub(crate) fn accept(&mut self, output: Output) -> Vec<u32> {
+        // The new Output shape always carries the next-iter spec channel as
+        // separate fields; accepted tokens are whatever Token slots came back
+        // (in spec mode the verifier produces a sequence of them).
+        let accepted: Vec<u32> = output.tokens().collect();
         match self {
             Speculation::Default {
                 spec_tokens,
                 spec_positions,
-            } => match output {
-                Output::TokensWithSpeculation((accepted, next_spec, next_pos)) => {
-                    *spec_tokens = next_spec;
-                    *spec_positions = next_pos;
-                    accepted
-                }
-                Output::Tokens(tokens) => tokens,
-                _ => vec![],
-            },
+            } => {
+                *spec_tokens = output.spec_tokens;
+                *spec_positions = output.spec_positions;
+                accepted
+            }
             Speculation::Custom(s) => {
-                let tokens = match output {
-                    Output::Tokens(tokens) => tokens,
-                    Output::TokensWithSpeculation((accepted, _, _)) => accepted,
-                    _ => vec![],
-                };
-                s.accept(&tokens);
-                tokens
+                s.accept(&accepted);
+                accepted
             }
         }
     }

@@ -52,6 +52,14 @@ class ForwardPassResponse(msgspec.Struct, gc=False):
     dists: list[tuple[list[int], list[float]]]
     spec_tokens: list[int] = msgspec.field(default_factory=list)
     spec_positions: list[int] = msgspec.field(default_factory=list)
+    # Raw logits as native-endian f32 bytes, one buffer per RawLogits slot.
+    # Empty unless the request used Sampler::RawLogits for some position.
+    logits: list[bytes] = msgspec.field(default_factory=list)
+    # One inner list per Logprob/Logprobs slot. Length 1 for Logprob, length K
+    # for Logprobs. Empty unless the request used either variant.
+    logprobs: list[list[float]] = msgspec.field(default_factory=list)
+    # One float per Entropy slot. Empty unless the request used Entropy.
+    entropies: list[float] = msgspec.field(default_factory=list)
 
 
 class EmbedImageRequest(msgspec.Struct, gc=False):

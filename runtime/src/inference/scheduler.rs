@@ -21,7 +21,78 @@ use crate::device;
 use super::adaptive_policy::AdaptiveThroughputPolicy;
 use super::request::{
     BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassOutput, ForwardPassRequest,
+    ForwardPassResponse, Sampler, SlotOutput,
 };
+
+/// Build the per-slot output list from the worker's parallel-fields response.
+///
+/// Walks the request's samplers in slot order, pulling one item from the
+/// matching response field per slot. This preserves the 1:1 mapping between
+/// `pass.sampler(...)` calls and returned slots — even when sampler types
+/// are mixed (e.g. multinomial + entropy on the same position).
+///
+/// Spec-mode requests are detected via a token-count mismatch (the verifier
+/// produces a token sequence whose length is unrelated to the inferlet's
+/// sampler count); in that case all slots collapse to `Token` entries.
+fn build_slot_output(samplers: &[Sampler], resp: ForwardPassResponse) -> ForwardPassOutput {
+    let spec_tokens = resp.spec_tokens;
+    let spec_positions = resp.spec_positions;
+
+    let expected_token_slots = samplers
+        .iter()
+        .filter(|s| {
+            matches!(
+                s,
+                Sampler::Multinomial { .. }
+                    | Sampler::TopK { .. }
+                    | Sampler::TopP { .. }
+                    | Sampler::MinP { .. }
+                    | Sampler::TopKTopP { .. }
+            )
+        })
+        .count();
+
+    let is_spec_walk = !resp.tokens.is_empty()
+        && resp.tokens.len() != expected_token_slots
+        && resp.dists.is_empty()
+        && resp.logits.is_empty()
+        && resp.logprobs.is_empty()
+        && resp.entropies.is_empty();
+
+    if is_spec_walk {
+        let slots = resp.tokens.into_iter().map(SlotOutput::Token).collect();
+        return ForwardPassOutput { slots, spec_tokens, spec_positions };
+    }
+
+    let mut tok_iter = resp.tokens.into_iter();
+    let mut dist_iter = resp.dists.into_iter();
+    let mut logit_iter = resp.logits.into_iter();
+    let mut lp_iter = resp.logprobs.into_iter();
+    let mut ent_iter = resp.entropies.into_iter();
+
+    let slots: Vec<SlotOutput> = samplers
+        .iter()
+        .filter_map(|s| match s {
+            Sampler::Multinomial { .. }
+            | Sampler::TopK { .. }
+            | Sampler::TopP { .. }
+            | Sampler::MinP { .. }
+            | Sampler::TopKTopP { .. } => tok_iter.next().map(SlotOutput::Token),
+            Sampler::Dist { .. } => dist_iter
+                .next()
+                .map(|(ids, ps)| SlotOutput::Distribution(ids, ps)),
+            Sampler::RawLogits => logit_iter.next().map(SlotOutput::Logits),
+            Sampler::Logprob { .. } | Sampler::Logprobs { .. } => {
+                lp_iter.next().map(SlotOutput::Logprobs)
+            }
+            Sampler::Entropy => ent_iter.next().map(SlotOutput::Entropy),
+            // Embedding is reserved but not currently produced by the worker.
+            Sampler::Embedding => None,
+        })
+        .collect();
+
+    ForwardPassOutput { slots, spec_tokens, spec_positions }
+}
 
 // =============================================================================
 // Scheduling Policy Trait
@@ -407,42 +478,36 @@ impl BatchScheduler {
                 let mut resp_iter = batch_resp.results.into_iter();
                 for req in requests {
                     if let Some(resp) = resp_iter.next() {
-                        let output = if !resp.tokens.is_empty() {
-                            if !resp.spec_tokens.is_empty() {
-                                ForwardPassOutput::TokensWithSpeculation(
-                                    resp.tokens,
-                                    resp.spec_tokens,
-                                    resp.spec_positions,
-                                )
-                            } else {
-                                ForwardPassOutput::Tokens(resp.tokens)
-                            }
-                        } else if !resp.dists.is_empty() {
-                            ForwardPassOutput::Distributions(resp.dists)
-                        } else {
-                            if !req.request.sampling_indices.is_empty() {
-                                eprintln!(
-                                    "FP_NONE_FOR_DECODE ctx={} samplers={} tokens={} pages={} lpl={}",
-                                    req.request.context_id,
-                                    req.request.sampling_indices.len(),
-                                    req.request.tokens.len(),
-                                    req.physical_page_ids.len(),
-                                    req.last_page_len,
-                                );
-                            }
-                            ForwardPassOutput::None
-                        };
+                        // Build the per-slot output list by walking the
+                        // request's sampler types in order and pulling from
+                        // the matching response field. This preserves the
+                        // 1:1 mapping between `pass.sampler(...)` calls and
+                        // returned slots — even when types are mixed.
+                        let output = build_slot_output(&req.request.samplers, resp);
+                        if output.slots.is_empty()
+                            && output.spec_tokens.is_empty()
+                            && !req.request.sampling_indices.is_empty()
+                        {
+                            eprintln!(
+                                "FP_NONE_FOR_DECODE ctx={} samplers={} tokens={} pages={} lpl={}",
+                                req.request.context_id,
+                                req.request.sampling_indices.len(),
+                                req.request.tokens.len(),
+                                req.physical_page_ids.len(),
+                                req.last_page_len,
+                            );
+                        }
                         req.response_tx.send(output).ok();
                     } else {
                         tracing::warn!(device = device_id, "Fewer results than requests — sending None");
-                        req.response_tx.send(ForwardPassOutput::None).ok();
+                        req.response_tx.send(ForwardPassOutput::default()).ok();
                     }
                 }
             }
             Err(e) => {
                 tracing::error!("fire_batch failed for device {}: {:?}", device_id, e);
                 for req in requests {
-                    req.response_tx.send(ForwardPassOutput::None).ok();
+                    req.response_tx.send(ForwardPassOutput::default()).ok();
                 }
             }
         }
