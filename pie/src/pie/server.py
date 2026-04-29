@@ -28,6 +28,33 @@ from pie.config import Config
 log = logging.getLogger(__name__)
 
 
+def _ensure_py_runtime_quiet() -> None:
+    """Make sure ~/.pie/py-runtime/ is populated before the engine starts.
+
+    Best-effort: any failure (network, missing dep, partial extract) is
+    logged and swallowed. The engine will still try to start; if a
+    Python inferlet is then loaded, instantiation will fail with the
+    original linker error and at least the user has a clear log line.
+    """
+    try:
+        from bakery import py_runtime
+    except ImportError:
+        log.debug("bakery not installed; skipping py-runtime auto-install")
+        return
+    if py_runtime.is_installed():
+        return
+    try:
+        py_runtime.ensure_installed(quiet=True)
+        log.info("Installed Python WASM runtime at %s", py_runtime.get_runtime_dir())
+    except Exception as exc:
+        log.warning(
+            "Could not auto-install Python WASM runtime (%s); "
+            "Python inferlets will fail to instantiate until you run "
+            "`pie config init` manually.",
+            exc,
+        )
+
+
 # -- Public API ---------------------------------------------------------------
 
 
@@ -69,6 +96,14 @@ class Server:
 
     async def __aenter__(self) -> Server:
         console = Console(quiet=True)
+
+        # Make sure the Python WASM runtime is on disk before the engine
+        # spins up. The runtime tarball provides the `componentize-py-runtime`
+        # core module that Python inferlets link against; without it,
+        # instantiation fails with a cryptic linker error. Best-effort —
+        # if the network is unavailable, defer the failure to the moment
+        # the engine actually tries to load a Python inferlet.
+        await asyncio.to_thread(_ensure_py_runtime_quiet)
 
         # _bootstrap is synchronous (mp.spawn + queue.get), run on thread
         self._handle, self._workers = await asyncio.to_thread(
