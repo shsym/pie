@@ -378,7 +378,8 @@ def _bootstrap(
         tokenizer_path=str(Path(group0_caps.snapshot_dir) / "tokenizer.json"),
         devices=py_devices,
         scheduler=pie_runtime.SchedulerConfig(
-            request_timeout_secs=120,
+            request_timeout_secs=model.scheduler.request_timeout_secs,
+            policy=model.scheduler.policy,
         ),
         default_token_budget=model.default_token_budget,
         default_endowment_pages=model.default_endowment_pages,

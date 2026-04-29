@@ -18,7 +18,7 @@ use crate::context::pagestore::PhysicalPageId;
 
 use crate::device;
 
-use super::adaptive_policy::{AdaptiveBatchPolicy, GreedyPolicy};
+use super::adaptive_policy::{AdaptivePolicy, EagerPolicy, GreedyPolicy};
 use super::request::{
     BatchedForwardPassRequest, BatchedForwardPassResponse, ForwardPassOutput, ForwardPassRequest,
     ForwardPassResponse, Sampler, SlotOutput,
@@ -234,6 +234,7 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
+        policy: Option<String>,
     ) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let stats = Arc::new(SchedulerStats::default());
@@ -242,6 +243,7 @@ impl BatchScheduler {
             page_size,
             max_batch_size, max_batch_tokens,
             request_timeout_secs,
+            policy,
             stats.clone(),
         ));
 
@@ -283,21 +285,26 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_batch_tokens: usize,
         request_timeout_secs: u64,
+        policy_from_config: Option<String>,
         stats: Arc<SchedulerStats>,
     ) {
         let request_timeout = Duration::from_secs(request_timeout_secs);
 
         // Per-device state
         let mut batch = BatchAccumulator::new(max_batch_size, max_batch_tokens);
-        // Policy selection. The default `adaptive` is the production
-        // policy; `greedy` is a zero-state baseline retained mainly for
-        // debugging / sanity checks. See `adaptive_policy.rs` for the
-        // design rationale.
-        let mut policy: Box<dyn SchedulingPolicy> =
-            match std::env::var("PIE_POLICY").as_deref().unwrap_or("adaptive") {
-                "greedy" => Box::new(GreedyPolicy::new()),
-                _ => Box::new(AdaptiveBatchPolicy::new(max_batch_size, device_idx)),
-            };
+        // Policy selection from config — see `adaptive_policy.rs` for the
+        // design rationale. The per-model `[model.X.scheduler.policy]`
+        // setting picks one of "adaptive" (default), "eager", "greedy".
+        let policy_name = policy_from_config.unwrap_or_else(|| "adaptive".to_string());
+        let mut policy: Box<dyn SchedulingPolicy> = match policy_name.as_str() {
+            "greedy" => Box::new(GreedyPolicy::new()),
+            "eager" => Box::new(EagerPolicy::new(max_batch_size, device_idx)),
+            "adaptive" => Box::new(AdaptivePolicy::new(max_batch_size, device_idx)),
+            other => panic!(
+                "Unknown scheduler.policy {other:?}; expected one of \
+                'adaptive' | 'eager' | 'greedy'"
+            ),
+        };
         // Only one in-flight batch at a time to prevent pipelined KV cache corruption.
         let in_flight = Arc::new(Semaphore::new(1));
 

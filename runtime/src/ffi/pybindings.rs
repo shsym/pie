@@ -105,14 +105,18 @@ impl RpcServer {
 pub struct SchedulerConfig {
     #[pyo3(get, set)]
     pub request_timeout_secs: u64,
+    /// Batch-firing policy: `"adaptive"` (default), `"eager"`, or
+    /// `"greedy"`. `None` = use built-in default.
+    #[pyo3(get, set)]
+    pub policy: Option<String>,
 }
 
 #[pymethods]
 impl SchedulerConfig {
     #[new]
-    #[pyo3(signature = (request_timeout_secs = 120))]
-    fn new(request_timeout_secs: u64) -> Self {
-        SchedulerConfig { request_timeout_secs }
+    #[pyo3(signature = (request_timeout_secs = 120, policy = None))]
+    fn new(request_timeout_secs: u64, policy: Option<String>) -> Self {
+        SchedulerConfig { request_timeout_secs, policy }
     }
 }
 
@@ -208,7 +212,7 @@ impl ModelConfig {
             kv_page_size,
             tokenizer_path,
             devices,
-            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(120)),
+            scheduler: scheduler.unwrap_or_else(|| SchedulerConfig::new(120, None)),
             default_token_budget,
             default_endowment_pages,
             oversubscription_factor,
@@ -372,6 +376,7 @@ impl From<Config> for BootstrapConfig {
                         .collect(),
                     scheduler: BootstrapSchedulerConfig {
                         request_timeout_secs: m.scheduler.request_timeout_secs,
+                        policy: m.scheduler.policy.clone(),
                     },
                     default_token_budget: m.default_token_budget,
                     default_endowment_pages: m.default_endowment_pages,

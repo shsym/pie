@@ -80,6 +80,9 @@ pub struct DeviceConfig {
 #[derive(Debug, Clone)]
 pub struct SchedulerConfig {
     pub request_timeout_secs: u64,
+    /// Optional batch-firing policy. `None` = use built-in default.
+    /// Recognized values: `"adaptive"`, `"eager"`, `"greedy"`.
+    pub policy: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -155,6 +158,7 @@ pub async fn bootstrap(
             &devices,
             cfg.kv_page_size as u32,
             cfg.scheduler.request_timeout_secs,
+            cfg.scheduler.policy.clone(),
         ).await;
         adapter::spawn(&devices);
     }

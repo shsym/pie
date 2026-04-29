@@ -259,7 +259,7 @@ async def run_benchmark(args):
     from pie.server import Server
     from pie.config import (
         Config, ModelConfig, AuthConfig,
-        ServerConfig, TelemetryConfig, DriverConfig,
+        ServerConfig, TelemetryConfig, DriverConfig, SchedulerConfig,
     )
 
     script_dir = Path(__file__).parent.resolve()
@@ -314,6 +314,7 @@ async def run_benchmark(args):
                 name="default",
                 hf_repo=args.model,
                 default_token_budget=args.default_token_budget,
+                scheduler=SchedulerConfig(policy=args.policy),
                 driver=DriverConfig(type=args.driver, device=device, options=driver_subsection),
             )
         },
@@ -432,6 +433,9 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--churn", type=str, default=None,
                         help="Phase-alternating workload, e.g. '32:6,1:6,32:6,1:6'.")
+    parser.add_argument("--policy", type=str, default=None,
+                        choices=[None, "adaptive", "eager", "greedy"],
+                        help="Scheduler policy via config (None = use built-in default).")
 
     args = parser.parse_args()
     try:
