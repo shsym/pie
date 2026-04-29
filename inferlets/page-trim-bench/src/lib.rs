@@ -13,7 +13,7 @@
 
 use inferlet::{
     Context, ForwardPassExt, RawContext, Result,
-    inference::{ForwardPass, Output, Sampler},
+    inference::{ForwardPass, Sampler},
     model::Model,
     runtime,
 };
@@ -99,11 +99,9 @@ async fn main(input: Input) -> Result<String> {
             .collect();
         pass.attention_mask(&masks);
     }
-    pass.sampler(&[input.prompt_tokens - 1], Sampler::ARGMAX);
-    let mut next_token = match pass.execute_async().await? {
-        Output::Tokens(tokens) => *tokens.first().ok_or("empty prefill output")?,
-        _ => return Err("prefill: unexpected output variant".into()),
-    };
+    pass.sampler(&[input.prompt_tokens - 1], &Sampler::ARGMAX);
+    let output = pass.execute_async().await?;
+    let mut next_token = output.tokens().next().ok_or("empty prefill output")?;
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
     // Commit complete pages so subsequent decode steps see them as committed.
@@ -131,11 +129,9 @@ async fn main(input: Input) -> Result<String> {
             let mask = build_sink_mask(total_seq, input.sink_size, input.window_size);
             pass.attention_mask(&[mask]);
         }
-        pass.sampler(&[0], Sampler::ARGMAX);
-        next_token = match pass.execute_async().await? {
-            Output::Tokens(tokens) => *tokens.first().ok_or("empty decode output")?,
-            _ => return Err("decode: unexpected output variant".into()),
-        };
+        pass.sampler(&[0], &Sampler::ARGMAX);
+        let output = pass.execute_async().await?;
+        next_token = output.tokens().next().ok_or("empty decode output")?;
 
         let new_wpt = wpt + 1;
         let to_commit = new_wpt / page_size;

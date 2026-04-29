@@ -41,6 +41,22 @@ class SGLangDriverConfig:
     # Mirrors sglang's `disable_cuda_graph`.
     disable_cuda_graph: bool = False
 
+    # Override the largest CUDA-graph batch-size bin sglang captures. None
+    # = sglang's auto-pick, which on a 4090 caps around 24. Bumping this
+    # to match `max_batch_size` lets the scheduler use captured graphs at
+    # high concurrency instead of falling back to eager kernel launches.
+    cuda_graph_max_bs: int | None = None
+
+    # Cap on simultaneously-running requests. None = sglang's auto-pick
+    # based on max_total_tokens. Raise to allow wider batches at high
+    # concurrency.
+    max_running_requests: int | None = None
+    # Cap on total tokens (across requests) the scheduler tries to pack
+    # into one fire_batch.
+    max_total_tokens: int | None = None
+    # Chunked-prefill size override.
+    chunked_prefill_size: int | None = None
+
     # KV cache element dtype. "auto" inherits the model's activation dtype.
     kv_cache_dtype: str = "auto"
 
