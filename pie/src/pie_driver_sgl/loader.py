@@ -13,6 +13,7 @@ fields mirror `ServerArgs` so values splat verbatim.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,26 @@ class LoadedModel:
     sglang_model_config: Any   # sglang.srt.configs.model_config.ModelConfig
     arch_type: str             # HF architecture string, e.g. "Qwen3ForCausalLM"
     snapshot_dir: str | None
+    # If True, the loader skipped `runner.init_device_graphs()` and the
+    # engine must call it after installing pie's hooks (see engine.py).
+    graph_capture_deferred: bool = False
+
+
+@contextlib.contextmanager
+def _defer_graph_capture(should_defer: bool):
+    """Suppress `ModelRunner.init_device_graphs` for the duration of
+    `ModelRunner.__init__` so pie's `_HiddenCapture` hook can be installed
+    before graph capture binds the original LogitsProcessor."""
+    from sglang.srt.model_executor.model_runner import ModelRunner
+    if not should_defer:
+        yield
+        return
+    original = ModelRunner.init_device_graphs
+    ModelRunner.init_device_graphs = lambda self: None  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        ModelRunner.init_device_graphs = original  # type: ignore[assignment]
 
 
 def _build_sglang_server_args(config: RuntimeConfig, driver_config: SGLangDriverConfig) -> Any:
@@ -165,19 +186,24 @@ def load_sglang_model(
 
     from sglang.srt.model_executor.model_runner import ModelRunner
 
-    runner = ModelRunner(
-        model_config=sglang_model_config,
-        mem_fraction_static=server_args.mem_fraction_static,
-        gpu_id=gpu_id,
-        tp_rank=config.rank,
-        tp_size=config.tensor_parallel_size,
-        moe_ep_rank=0,
-        moe_ep_size=1,
-        pp_rank=0,
-        pp_size=1,
-        nccl_port=int(os.environ["MASTER_PORT"]) + 1,
-        server_args=server_args,
-    )
+    # Skip ModelRunner's in-construction graph capture so the engine can
+    # install pie's `_HiddenCapture` hook first. Adapter mode runs eager
+    # anyway, so deferring there is pointless.
+    want_graph = not server_args.disable_cuda_graph and not driver_config.enable_adapter
+    with _defer_graph_capture(want_graph):
+        runner = ModelRunner(
+            model_config=sglang_model_config,
+            mem_fraction_static=server_args.mem_fraction_static,
+            gpu_id=gpu_id,
+            tp_rank=config.rank,
+            tp_size=config.tensor_parallel_size,
+            moe_ep_rank=0,
+            moe_ep_size=1,
+            pp_rank=0,
+            pp_size=1,
+            nccl_port=int(os.environ["MASTER_PORT"]) + 1,
+            server_args=server_args,
+        )
     _log("Model loaded via SGLang", "INFO")
 
     arches = list(sglang_model_config.hf_config.architectures)
@@ -192,4 +218,5 @@ def load_sglang_model(
         sglang_model_config=sglang_model_config,
         arch_type=arch_type,
         snapshot_dir=snapshot_dir,
+        graph_capture_deferred=want_graph,
     )
