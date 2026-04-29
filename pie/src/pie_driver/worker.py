@@ -589,6 +589,9 @@ def _leader_loop(
             {
                 "tokens": resp.tokens,
                 "dists": resp.dists,
+                "logits": getattr(resp, "logits", []) or [],
+                "logprobs": getattr(resp, "logprobs", []) or [],
+                "entropies": getattr(resp, "entropies", []) or [],
                 "spec_tokens": getattr(resp, "spec_tokens", []) or [],
                 "spec_positions": getattr(resp, "spec_positions", []) or [],
             }

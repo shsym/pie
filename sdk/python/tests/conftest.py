@@ -178,28 +178,50 @@ class Sampler_Embedding:
 @dataclass
 class Sampler_Dist:
     value: tuple
-
-# --- Output variants ---
 @dataclass
-class Output_None_:
+class Sampler_RawLogits:
     pass
 @dataclass
-class Output_Tokens:
+class Sampler_Logprob:
+    value: int
+@dataclass
+class Sampler_Logprobs:
     value: list
 @dataclass
-class Output_TokensWithSpeculation:
+class Sampler_Entropy:
+    pass
+
+# --- Slot output variants ---
+@dataclass
+class SlotOutput_Token:
+    value: int
+@dataclass
+class SlotOutput_Distribution:
     value: tuple
 @dataclass
-class Output_Embeddings:
+class SlotOutput_Logits:
+    value: bytes
+@dataclass
+class SlotOutput_Logprobs:
     value: list
 @dataclass
-class Output_Distributions:
-    value: list
+class SlotOutput_Entropy:
+    value: float
+@dataclass
+class SlotOutput_Embedding:
+    value: bytes
+
+# --- Output (record) ---
+@dataclass
+class Output:
+    slots: list
+    spec_tokens: list
+    spec_positions: list
 
 
 class FakeFutureOutput:
     def __init__(self, output=None):
-        self._output = output or Output_Tokens([42])
+        self._output = output or Output(slots=[SlotOutput_Token(42)], spec_tokens=[], spec_positions=[])
     def pollable(self):
         return FakePollable()
     def get(self):
@@ -228,7 +250,7 @@ class FakeForwardPass:
     def execute(self):
         if FakeForwardPass._next_output is not None:
             return FakeFutureOutput(FakeForwardPass._next_output)
-        return FakeFutureOutput(Output_Tokens([2]))  # EOS
+        return FakeFutureOutput(Output(slots=[SlotOutput_Token(2)], spec_tokens=[], spec_positions=[]))  # EOS
 
     def __enter__(self):
         return self
@@ -423,14 +445,22 @@ def _build_mock_modules():
     inf_mod = types.ModuleType("wit_world.imports.inference")
     for cls in [
         Sampler_Multinomial, Sampler_TopK, Sampler_TopP, Sampler_MinP,
-        Sampler_TopKTopP, Sampler_Embedding, Sampler_Dist,
-        Output_None_, Output_Tokens, Output_TokensWithSpeculation,
-        Output_Embeddings, Output_Distributions,
+        Sampler_TopKTopP, Sampler_Embedding, Sampler_Dist, Sampler_RawLogits,
+        Sampler_Logprob, Sampler_Logprobs, Sampler_Entropy,
+        SlotOutput_Token, SlotOutput_Distribution, SlotOutput_Logits,
+        SlotOutput_Logprobs, SlotOutput_Entropy, SlotOutput_Embedding,
+        Output,
     ]:
         setattr(inf_mod, cls.__name__, cls)
     inf_mod.Sampler = (
         Sampler_Multinomial | Sampler_TopK | Sampler_TopP | Sampler_MinP
         | Sampler_TopKTopP | Sampler_Embedding | Sampler_Dist
+        | Sampler_RawLogits | Sampler_Logprob | Sampler_Logprobs
+        | Sampler_Entropy
+    )
+    inf_mod.SlotOutput = (
+        SlotOutput_Token | SlotOutput_Distribution | SlotOutput_Logits
+        | SlotOutput_Logprobs | SlotOutput_Entropy | SlotOutput_Embedding
     )
     inf_mod.FutureOutput = FakeFutureOutput
     inf_mod.ForwardPass = FakeForwardPass

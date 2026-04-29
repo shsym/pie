@@ -124,15 +124,11 @@ async fn main(input: Input) -> Result<String> {
         }
 
         let last_token_idx = (pending_tokens.len() - 1) as u32;
-        pass.sampler(&[last_token_idx], sampler.clone());
+        pass.sampler(&[last_token_idx], &sampler);
 
         let output = pass.execute_async().await?;
 
-        let new_tokens = match output {
-            Output::Tokens(tokens) => tokens,
-            _ => break,
-        };
-
+        let new_tokens: Vec<u32> = output.tokens().collect();
         if new_tokens.is_empty() {
             break;
         }

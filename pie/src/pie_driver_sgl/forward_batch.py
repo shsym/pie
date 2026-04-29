@@ -163,6 +163,13 @@ def build_sglang_forward_batch(
     # We always use EXTEND. SGLang's decode kernel doesn't accept custom_mask
     # nor pie's caller-supplied positions; the extend kernel handles
     # query_len=1 fine via per-request `extend_seq_lens=1, prefix_lens=N`.
+    #
+    # NOTE: this means sglang's CUDA graphs (captured for the DECODE kernel)
+    # can't be used at high concurrency — pie throughput on sglang plateaus
+    # around 100 req/s on c=256 workloads on a 4090 because every step runs
+    # the prefill kernel. Proper fix requires routing single-token-no-mask
+    # batches through ForwardMode.DECODE plus the missing graph-runner
+    # plumbing (`capture_hidden_mode`, etc.) — out of scope for now.
     fb = ForwardBatch(
         forward_mode=ForwardMode.EXTEND,
         batch_size=batch_size,

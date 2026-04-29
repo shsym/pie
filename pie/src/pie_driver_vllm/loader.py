@@ -206,7 +206,12 @@ def load_vllm_model(
 
     # Architecture string (first arch in the HF config). Used for telemetry
     # and as the `arch_type` reported back through pie's ready handshake.
-    arches = list(vllm_config.model_config.hf_text_config.architectures)
+    # Multimodal HF configs (e.g. Qwen3.5) carry `architectures` only on the
+    # top-level config; the inner `text_config` is None there. Fall back to
+    # the outer `hf_config` so multimodal text-only loads still report a name.
+    text_arches = vllm_config.model_config.hf_text_config.architectures
+    outer_arches = getattr(vllm_config.model_config.hf_config, "architectures", None)
+    arches = list(text_arches or outer_arches or [])
     if not arches:
         raise RuntimeError(
             f"vllm's HF config for {config.hf_repo} has no `architectures` field. "

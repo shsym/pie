@@ -82,14 +82,12 @@ async fn main(input: Input) -> Result<String> {
         let pass = ForwardPass::new(&model);
         pass.context(ctx.inner());
         pass.input_tokens(&[trigger], &[seq_len]);
-        pass.sampler(&[0], sampler.clone());
+        pass.sampler(&[0], &sampler);
         let output = pass.execute_async().await
             .map_err(|e| format!("Bootstrap forward pass failed: {}", e))?;
-        match output {
-            Output::Tokens(t) if !t.is_empty() => {
-                all_generated.push(t[0]);
-            }
-            _ => return Err("Bootstrap sampling produced no token".to_string()),
+        match output.first_token() {
+            Some(t) => all_generated.push(t),
+            None => return Err("Bootstrap sampling produced no token".to_string()),
         }
     }
     let mut anchor = all_generated[0];
@@ -127,16 +125,12 @@ async fn main(input: Input) -> Result<String> {
 
         // Request sampling at all positions
         let sample_indices: Vec<u32> = (0..input_count as u32).collect();
-        pass.sampler(&sample_indices, sampler.clone());
+        pass.sampler(&sample_indices, &sampler);
 
         let output = pass.execute_async().await
             .map_err(|e| format!("Forward pass failed: {}", e))?;
 
-        let predicted_tokens = match output {
-            Output::Tokens(tokens) => tokens,
-            _ => break,
-        };
-
+        let predicted_tokens: Vec<u32> = output.tokens().collect();
         if predicted_tokens.is_empty() {
             break;
         }

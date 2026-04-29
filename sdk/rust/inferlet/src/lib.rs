@@ -131,12 +131,107 @@ impl crate::pie::core::inference::Sampler {
     pub const fn distribution(temperature: f32, k: u32) -> Self {
         Self::Dist((temperature, k))
     }
+
+    /// Raw logits output: returns the model's pre-softmax, untemperatured
+    /// logits as a packed little-endian f32 byte buffer (length =
+    /// `vocab_size * 4`) per requested position. Decode via
+    /// `bytemuck::cast_slice::<u8, f32>(&buf)` or equivalent. Useful for
+    /// custom sampling or beam search where the full distribution matters.
+    pub const fn raw_logits() -> Self {
+        Self::RawLogits
+    }
+
+    /// Per-position log p(token | context). Returned as `Output::Logprobs`
+    /// with a length-1 inner list per slot. Computed via log_softmax with
+    /// no temperature scaling — the value reflects the model's native
+    /// distribution. Use for perplexity / cross-entropy / scoring.
+    pub const fn logprob(token_id: u32) -> Self {
+        Self::Logprob(token_id)
+    }
+
+    /// Per-position log p(t | context) for each `t` in `token_ids`. Returned
+    /// as `Output::Logprobs` with a length-K inner list per slot, in the
+    /// same order. Use for multi-candidate scoring (yes/no, multiple choice,
+    /// reranking).
+    pub fn logprobs(token_ids: Vec<u32>) -> Self {
+        Self::Logprobs(token_ids)
+    }
+
+    /// Shannon entropy `H(p) = -sum(p log p)` of the unscaled distribution
+    /// at this position. Returned as `Output::Entropies`. Useful for
+    /// uncertainty / confidence-based decisions.
+    pub const fn entropy() -> Self {
+        Self::Entropy
+    }
 }
 
 impl Default for crate::pie::core::inference::Sampler {
     /// Argmax. The most predictable default — switch to `top_p` for creative
     /// tasks.
     fn default() -> Self { Self::ARGMAX }
+}
+
+// =============================================================================
+// Output helpers
+//
+// `Output` is now a `record { slots, spec-tokens, spec-positions }` and each
+// slot is a typed `SlotOutput` variant. Inferlets that attach exactly one
+// sampler want a single-line accessor; these helpers cover the common cases
+// without forcing a `match` on every call site.
+// =============================================================================
+
+impl crate::pie::core::inference::Output {
+    /// First slot's sampled token, if it's a Token slot.
+    pub fn first_token(&self) -> Option<u32> {
+        self.slots.first().and_then(|s| match s {
+            crate::pie::core::inference::SlotOutput::Token(t) => Some(*t),
+            _ => None,
+        })
+    }
+
+    /// Iterator over every Token slot, in slot order. In spec-decode mode,
+    /// these are the verifier-accepted tokens.
+    pub fn tokens(&self) -> impl Iterator<Item = u32> + '_ {
+        self.slots.iter().filter_map(|s| match s {
+            crate::pie::core::inference::SlotOutput::Token(t) => Some(*t),
+            _ => None,
+        })
+    }
+
+    /// First slot's distribution `(token_ids, probs)`, if it's a Distribution slot.
+    pub fn first_distribution(&self) -> Option<(&[u32], &[f32])> {
+        self.slots.first().and_then(|s| match s {
+            crate::pie::core::inference::SlotOutput::Distribution((ids, ps)) => {
+                Some((ids.as_slice(), ps.as_slice()))
+            }
+            _ => None,
+        })
+    }
+
+    /// First slot's raw logits buffer (native-endian f32 bytes), if any.
+    pub fn first_logits(&self) -> Option<&[u8]> {
+        self.slots.first().and_then(|s| match s {
+            crate::pie::core::inference::SlotOutput::Logits(b) => Some(b.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// First slot's logprob list. Length 1 for `Sampler::logprob`, length K
+    /// for `Sampler::logprobs`.
+    pub fn first_logprobs(&self) -> Option<&[f32]> {
+        self.slots.first().and_then(|s| match s {
+            crate::pie::core::inference::SlotOutput::Logprobs(v) => Some(v.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// First slot's entropy.
+    pub fn first_entropy(&self) -> Option<f32> {
+        self.slots.first().and_then(|s| match s {
+            crate::pie::core::inference::SlotOutput::Entropy(h) => Some(*h),
+            _ => None,
+        })
+    }
 }
 
 pub mod instruct {

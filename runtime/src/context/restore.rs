@@ -296,6 +296,13 @@ impl ContextManager {
                         speculative_positions: Vec::new(),
                         output_speculative_tokens: false,
                         masks: suffix_masks[..aligned_len].to_vec(),
+                        // Replay reproduces a previously-executed prefix whose
+                        // masks were already in the lineage. We can't
+                        // distinguish user-supplied from synthesized in the
+                        // lineage, so we conservatively force the prefill
+                        // kernel (which honors `custom_mask`) to preserve the
+                        // original semantics regardless.
+                        has_user_mask: true,
                         logit_mask: None,
                         sampling_indices: Vec::new(),
                         samplers: Vec::new(),
@@ -368,6 +375,10 @@ impl ContextManager {
                         speculative_positions: Vec::new(),
                         output_speculative_tokens: false,
                         masks,
+                        // See restore.rs head: replay forces prefill kernel
+                        // because the lineage doesn't tell us whether masks
+                        // were originally user-supplied or synthesized.
+                        has_user_mask: true,
                         logit_mask: None,
                         sampling_indices: Vec::new(),
                         samplers: Vec::new(),

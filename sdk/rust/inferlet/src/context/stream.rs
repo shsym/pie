@@ -346,7 +346,7 @@ impl<'a> TokenStream<'a> {
 
         // Sample at the last input token position (or last cached position if no input).
         let sample_idx = if n_pending > 0 { n_pending - 1 } else { 0 };
-        pass.sampler(&[sample_idx], self.sampler.clone());
+        pass.sampler(&[sample_idx], &self.sampler);
 
         // Compose constraint masks: each constraint advances on tokens
         // accepted in the previous step and returns its next-position mask.

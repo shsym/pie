@@ -178,7 +178,7 @@ async fn main(input: Input) -> Result<String> {
 
         // Use Dist sampler to get the probability distribution
         let last_idx = (pending_tokens.len() - 1) as u32;
-        pass.sampler(&[last_idx], Sampler::distribution(0.0, 0));
+        pass.sampler(&[last_idx], &Sampler::distribution(0.0, 0));
 
         let output = pass.execute_async().await
             .map_err(|e| format!("Forward pass failed at step {}: {}", step, e))?;
@@ -192,15 +192,9 @@ async fn main(input: Input) -> Result<String> {
         }
 
         // Extract distribution and apply watermark sampling
-        let chosen_token = match output {
-            Output::Distributions(dists) => {
-                if let Some((ids, probs)) = dists.first() {
-                    watermark.sample(ids, probs)
-                } else {
-                    break;
-                }
-            }
-            _ => break,
+        let chosen_token = match output.first_distribution() {
+            Some((ids, probs)) => watermark.sample(ids, probs),
+            None => break,
         };
 
         // Check for stop tokens

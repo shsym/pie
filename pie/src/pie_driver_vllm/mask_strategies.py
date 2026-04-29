@@ -329,6 +329,10 @@ def install_mask_strategies(vllm_config) -> None:
     for _name, layer in fc.items():
         if not isinstance(layer, AttentionLayerBase):
             continue
+        # Hybrid models register linear-attention / SSM layers in the same
+        # forward context but they don't expose a vLLM attention impl.
+        if not hasattr(layer, "impl"):
+            continue
 
         impl = layer.impl
         if getattr(impl, "_pie_proxy_marker", False):

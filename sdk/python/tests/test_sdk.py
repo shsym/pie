@@ -53,6 +53,39 @@ class TestSampler:
         s = Sampler.embedding()
         assert isinstance(s._variant, Sampler_Embedding)
 
+    def test_distribution(self):
+        from inferlet.sampler import Sampler
+        from wit_world.imports.inference import Sampler_Dist
+        s = Sampler.distribution(temperature=1.0, top_k=8)
+        assert isinstance(s._variant, Sampler_Dist)
+        assert s._variant.value == (1.0, 8)
+
+    def test_raw_logits(self):
+        from inferlet.sampler import Sampler
+        from wit_world.imports.inference import Sampler_RawLogits
+        s = Sampler.raw_logits()
+        assert isinstance(s._variant, Sampler_RawLogits)
+
+    def test_logprob(self):
+        from inferlet.sampler import Sampler
+        from wit_world.imports.inference import Sampler_Logprob
+        s = Sampler.logprob(token_id=42)
+        assert isinstance(s._variant, Sampler_Logprob)
+        assert s._variant.value == 42
+
+    def test_logprobs(self):
+        from inferlet.sampler import Sampler
+        from wit_world.imports.inference import Sampler_Logprobs
+        s = Sampler.logprobs([7, 11, 13])
+        assert isinstance(s._variant, Sampler_Logprobs)
+        assert s._variant.value == [7, 11, 13]
+
+    def test_entropy(self):
+        from inferlet.sampler import Sampler
+        from wit_world.imports.inference import Sampler_Entropy
+        s = Sampler.entropy()
+        assert isinstance(s._variant, Sampler_Entropy)
+
 
 class TestContext:
     def test_create(self):

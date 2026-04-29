@@ -60,7 +60,7 @@ pub async fn validate_outputs(
 
             // Sample distributions at the last token position
             let last_idx = (pending.len() - 1) as u32;
-            pass.sampler(&[last_idx], Sampler::distribution(0.0, 0));
+            pass.sampler(&[last_idx], &Sampler::distribution(0.0, 0));
 
             let output = pass.execute_async().await
                 .map_err(|e| format!("Forward pass failed: {}", e))?;
@@ -74,20 +74,18 @@ pub async fn validate_outputs(
             }
 
             // Extract distribution and find the probability of the target token
-            if let Output::Distributions(dists) = output {
-                if let Some((ids, probs)) = dists.first() {
-                    if let Some(index) = ids.iter().position(|&id| id == token_id) {
-                        let prob = probs[index];
-                        if prob > 0.0 {
-                            current_log_prob += prob.ln();
-                        } else {
-                            current_log_prob = -1000.0;
-                            break;
-                        }
+            if let Some((ids, probs)) = output.first_distribution() {
+                if let Some(index) = ids.iter().position(|&id| id == token_id) {
+                    let prob = probs[index];
+                    if prob > 0.0 {
+                        current_log_prob += prob.ln();
                     } else {
                         current_log_prob = -1000.0;
                         break;
                     }
+                } else {
+                    current_log_prob = -1000.0;
+                    break;
                 }
             }
 

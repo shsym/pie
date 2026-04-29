@@ -155,6 +155,7 @@ pub async fn bootstrap(
         );
         inference::spawn(
             &devices,
+            cfg.kv_page_size as u32,
             cfg.scheduler.request_timeout_secs,
             cfg.scheduler.max_wait_ms,
             cfg.scheduler.min_batch_for_optimization,
