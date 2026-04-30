@@ -6,94 +6,92 @@ sidebar_position: 2
 
 # Quickstart
 
-From zero to generated text in under five minutes.
+Get from zero to generating text in under 5 minutes.
 
 ## Prerequisites
 
-- Pie installed ([Installation](./index.mdx))
+Make sure you have:
+- Pie installed ([Installation Guide](./index.mdx))
 - A model downloaded (`pie model download Qwen/Qwen3-0.6B`)
-- A config in place (`pie config init`)
+- Configuration initialized (`pie config init`)
 
-## Your first prompt
+## Run Your First Prompt
 
-```bash
-pie run text-completion --prompt "The capital of France is"
-```
-
-You'll see something like:
-
-```
-╭─ Pie Run ───────────────────────────────────────╮
-│ Inferlet     text-completion@0.1.0              │
-│ Model        default (Qwen/Qwen3-0.6B)          │
-│ Driver       native                             │
-│ Device       cuda:0                             │
-╰─────────────────────────────────────────────────╯
-
-The capital of France is Paris, which is located in…
-```
-
-## What the command does
+The simplest way to use Pie is with the `run` command:
 
 ```bash
-pie run text-completion --prompt "The capital of France is"
+pie run text-completion -- --prompt "The capital of France is"
+```
+
+You should see output like:
+
+```
+╭─ Pie Run ─────────────────────────────────────╮
+│ Inferlet       text-completion                │
+│ Model          Qwen/Qwen3-0.6B                  │
+│ Device         cuda:0                         │
+╰───────────────────────────────────────────────╯
+
+The capital of France is Paris, which is located in...
+```
+
+## Understanding the Command
+
+Let's break down what happened:
+
+```bash
+pie run text-completion -- --prompt "The capital of France is"
 ```
 
 | Part | Meaning |
 |------|---------|
-| `pie run` | Boot a one-shot engine, run an inferlet, exit. |
-| `text-completion` | The inferlet to run. Resolved to `text-completion@<latest>` via the registry. |
-| `--prompt "…"` | Becomes `{"prompt": "…"}` in the inferlet's input JSON. |
+| `pie run` | Run an inferlet one-shot (engine starts, runs, shuts down) |
+| `text-completion` | The inferlet to run (from the standard registry) |
+| `--` | Separator between Pie args and inferlet args |
+| `--prompt "..."` | Argument passed to the inferlet |
 
-`pie run` flags after the inferlet name are folded into the input dict
-(int/float/bool inference happens automatically). Add a few:
+## Configuration
+
+Your configuration lives at `~/.pie/config.toml`. View it:
 
 ```bash
-pie run text-completion \
-  --prompt "Write a haiku about pie" \
-  --max-tokens 64 \
-  --temperature 0.7
+pie config show
 ```
 
-## Inspect or edit the config
+Key settings:
 
-```bash
-pie config show              # pretty-print ~/.pie/config.toml
-pie config set server.port 9090
-pie config set model.default.hf_repo Qwen/Qwen2.5-3B-Instruct
+```toml
+[engine]
+host = "127.0.0.1"      # Server bind address
+port = 8080             # Server port
+enable_auth = true      # Require authentication
+
+[[model]]
+hf_repo = "Qwen/Qwen3-0.6B"
+device = ["cuda:0"]     # GPU(s) to use
 ```
 
-The config schema is documented in the [CLI reference](../cli#configuration-file).
+## Change the Model
 
-## Change the model
+Update your config to use a different model:
 
 ```bash
+# Download a new model
 pie model download Qwen/Qwen2.5-3B-Instruct
-pie config set model.default.hf_repo Qwen/Qwen2.5-3B-Instruct
+
+# Update config
+pie config update --hf-repo "Qwen/Qwen2.5-3B-Instruct"
 ```
 
-## Run a local build
+## Run with a Local Inferlet
 
-If you've built a custom inferlet, point `pie run` at the `.wasm` and its
-manifest:
+If you have a custom `.wasm` inferlet:
 
 ```bash
-pie run \
-  --path ./target/wasm32-wasip2/release/my_inferlet.wasm \
-  --manifest ./Pie.toml \
-  --prompt "hello"
+pie run --path ./my_inferlet.wasm -- --arg1 value1
 ```
 
-## Pin a version
+## Next Steps
 
-```bash
-pie run text-completion@0.1.0 --prompt "hi"
-```
-
-Without `@`, Pie asks the registry for the latest version.
-
-## Next steps
-
-- [Server mode](./server-mode) — keep an engine running and connect to it.
-- [Client basics](./client-basics) — drive Pie from Python / JS / Rust.
-- [Writing inferlets](../writing-inferlets) — build your own.
+- Learn about [Server Mode](./server-mode) for persistent serving
+- Connect from code with [Client Basics](./client-basics)

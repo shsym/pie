@@ -6,142 +6,143 @@ sidebar_position: 2
 
 # Model & Context
 
-Every inferlet starts with two objects:
+The `Model` and `Context` are the two foundational types in every inferlet. A **Model** represents a loaded LLM with its weights and tokenizer. A **Context** represents a sequence of tokens with associated KV cache state.
 
-- **`Model`** — a loaded LLM (weights + tokenizer), shared across inferlets.
-- **`Context`** — a token sequence with an attached KV cache.
-
-## Loading a model
+## Loading a Model
 
 ```rust
 use inferlet::{model::Model, runtime};
 
-// Names of every model the engine has loaded
-let names = runtime::models();
+// List available models
+let model_names = runtime::models();
 
-// Load by name (matches the [model.<name>] key in ~/.pie/config.toml)
-let model = Model::load(names.first().ok_or("No models available")?)?;
+// Load a model by name
+let model = Model::load(&model_names[0])?;
 ```
 
-The runtime owns model lifetimes — multiple inferlets can `Model::load`
-the same name simultaneously without re-loading weights.
+The runtime manages model lifecycle — multiple inferlets can share the same model.
 
-## Tokenizer
+## The Tokenizer
+
+Every model has a tokenizer for converting between text and token IDs:
 
 ```rust
-let tok = model.tokenizer();
+let tokenizer = model.tokenizer();
 
-// text → tokens
-let ids: Vec<u32> = tok.encode("What is the capital of France?");
+// Encode text → tokens
+let tokens = tokenizer.encode("What is the capital of France?");
 
-// tokens → text
-let text: String = tok.decode(&ids)?;
+// Decode tokens → text
+let text = tokenizer.decode(&tokens)?;
 
-// Vocabulary: (token_ids, raw_byte_sequences)
-let (ids, bytes) = tok.vocabs();
-
-// Special tokens (BOS, EOS, etc.)
-let (sp_ids, sp_bytes) = tok.special_tokens();
-
-// The split regex used during BPE pre-tokenization
-let regex = tok.split_regex();
+// Access vocabulary
+let vocab_size = tokenizer.vocabs().len();
+let special_tokens = tokenizer.special_tokens();
 ```
 
-## Creating a context
+## Creating a Context
+
+A `Context` holds the token sequence and its KV cache. Contexts are **anonymous by default** — they are automatically cleaned up when the inferlet exits:
 
 ```rust
-use inferlet::Context;
+use inferlet::{context::Context, ContextExt};
 
-let mut ctx = Context::new(&model)?;
+// Create a new anonymous context
+let ctx = Context::new(&model)?;
 ```
 
-A fresh `Context` is **anonymous** — its KV pages are released when the
-inferlet exits.
-
-### Persistent contexts
-
-Save a context under a name to keep its KV pages alive across runs:
+To make a context **persistent** (survives process exit), save it with a name:
 
 ```rust
-ctx.save("my-session")?;       // copy this context to a named slot
-let snap = ctx.snapshot()?;    // serialize → string for offline storage
+ctx.save("my-session")?;
 ```
 
-Later, reattach:
+## Filling a Context
+
+Before generating, you need to fill the context with tokens. The simplest way is through [InstructExt](./chat-instruct), but you can also work with raw tokens:
 
 ```rust
-let ctx = Context::open(&model, "my-session")?;   // shared (still owned by registry)
-let ctx = Context::take(&model, "my-session")?;   // move ownership to this inferlet
-Context::delete(&model, "my-session")?;            // drop the named slot
+// Append raw token IDs
+ctx.fill_tokens(&token_ids);
+
+// Flush: runs the forward pass on buffered tokens to populate the KV cache
+ctx.flush().await?;
 ```
 
-`open` clones (copy-on-write). `take` removes the slot from the registry
-and hands ownership to the caller.
+**`flush()`** processes all buffered tokens except the last one (which is kept as the "seed" for generation). This is a prefill step — it populates the KV cache without sampling.
 
-## Filling a context
+```
+  fill_tokens()       flush()            generate()
+  ┌──────────┐   ┌──────────────┐   ┌──────────────────┐
+  │ Append   │──►│ Prefill:     │──►│ Autoregressive:  │
+  │ tokens   │   │ KV computed, │   │ sample one token │
+  │ to buffer│   │ pages filled │   │ per step         │
+  └──────────┘   └──────────────┘   └──────────────────┘
+       ▼                ▼                    ▼
+  [buffered_tokens]  [committed pages]   [new tokens emitted]
+```
 
-The instruct API (`system / user / assistant / cue`) is the high-level
-way to add tokens — see [Chat & Instruct](./chat-instruct).
+## Forking a Context
 
-For raw input:
+Fork creates a copy-on-write clone of an existing context's KV cache. The fork is anonymous by default:
 
 ```rust
-ctx.append(&token_ids);     // queue tokens in the SDK-side buffer
-ctx.flush().await?;         // run a forward pass to commit pages
+// Fork shares all committed KV pages with the original
+let forked = ctx.fork()?;
+
+// Changes to forked don't affect the original
+forked.fill_tokens(&new_tokens);
 ```
 
-`flush()` drains the buffer, runs prefill, and commits new KV pages. It
-does **not** sample — use [`generate()`](./generation) for that.
+Forking is O(1) — it references the same KV cache pages until new tokens are committed.
 
-```
-  ctx.append(t)        ctx.flush().await?         ctx.generate(s)
-  ┌──────────┐   ┌──────────────────────┐   ┌──────────────────┐
-  │ Buffer   │──►│ Prefill: KV computed,│──►│ Autoregressive   │
-  │ tokens   │   │ pages committed      │   │ generation       │
-  └──────────┘   └──────────────────────┘   └──────────────────┘
-```
+## Opening a Saved Context
 
-## Forking
-
-`fork()` is a copy-on-write clone. Both contexts share committed KV pages
-until the fork writes new tokens.
+Saved (named) contexts persist across inferlet instances. Open one by name:
 
 ```rust
-let mut child = ctx.fork()?;
-child.user("…");
-child.cue();
+if let Some(ctx) = Context::open(&model, "my-session") {
+    // Resume from existing KV state
+}
 ```
 
-Fork is O(1) — no page copies. Useful for branching exploration (tree of
-thought, best-of-N, etc.).
+## Context State
 
-## Inspecting state
+Track the current state of a context:
+
+```
+                   committed pages                     active page
+ ┌──────────┬──────────┬──────────┬──────────┬──────────────────────┐
+ │  Page 0  │  Page 1  │  Page 2  │  Page 3  │       Page 4        │
+ │ ████████ │ ████████ │ ████████ │ ████████ │ █████░░░░░░░░░░░░░░ │
+ └──────────┴──────────┴──────────┴──────────┴───────↑─────────────┘
+                                                   cursor
+ ◄──────── committed_page_count = 4 ────────►
+                                              ◄── tokens_per_page ──►
+
+ Buffered tokens: [t1, t2, t3]     (queued, not yet in KV cache)
+ Last position:   4 × page_size + cursor
+```
 
 ```rust
-ctx.model();              // &Model
-ctx.page_size();          // u32 — tokens per KV page
-ctx.seq_len();            // u32 — total committed + working tokens
-ctx.buffer();             // &[u32] — SDK-side buffered tokens (not yet flushed)
-ctx.inner();              // &RawContext — escape hatch to the WIT resource
+// The model this context belongs to
+let model = ctx.model();
+
+// Current cursor position within the active page
+let cursor = ctx.cursor();
+
+// Last committed position (None if empty)
+let last_pos = ctx.last_position();
+
+// Tokens waiting to be processed
+let buffered = ctx.buffered_tokens();
+
+// Page size (tokens per KV page)
+let page_size = ctx.tokens_per_page();
 ```
 
-## Suspending and bidding
+## Next Steps
 
-Every running context places a *bid* in the engine's market for KV pages.
-The SDK manages this automatically (`generate()` sets a budget-exhausting
-bid for you), but you can override:
-
-```rust
-ctx.bid(0.0);                                 // step out of contention
-let _g = ctx.yield_bid(Duration::from_secs(2)); // RAII low-bid window
-ctx.suspend()?;                               // return all pages to the pool
-```
-
-See `compute_bid` in `inferlet::context` for the formula behind the
-default bid.
-
-## Next
-
-- [Generation](./generation) — sample from a filled context.
-- [Chat & Instruct](./chat-instruct) — high-level template API.
-- [KV Cache Control](./kv-cache) — page-level operations.
+- **[Generation](./generation)** — Generate tokens from a filled context
+- **[KV Cache Control](./kv-cache)** — Page-level cache operations
+- **[Chat & Instruct](./chat-instruct)** — High-level chat template API

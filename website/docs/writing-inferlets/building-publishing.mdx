@@ -6,159 +6,112 @@ sidebar_position: 14
 
 # Building & Publishing
 
-Source → WASM → Pie registry. The toolchain is `bakery` (a Python CLI in
-`sdk/tools/bakery`); for raw `cargo` users it's a thin wrapper.
-
-## Anatomy of an inferlet project
-
-```
-my-inferlet/
-├── Cargo.toml          # Rust crate manifest
-├── Pie.toml            # inferlet manifest (read at compile time + by `pie run`)
-└── src/
-    └── lib.rs          # contains #[inferlet::main]
-```
-
-`Cargo.toml`:
-
-```toml
-[package]
-name = "my-inferlet"
-version = "0.1.0"
-edition = "2024"
-
-[lib]
-crate-type = ["cdylib"]      # required: produces a WASM component
-
-[dependencies]
-inferlet = "0.2"
-serde = { version = "1.0", features = ["derive"] }
-
-[profile.release]
-lto = true
-```
-
-`Pie.toml`:
-
-```toml
-[package]
-name = "my-inferlet"
-version = "0.1.0"
-description = "A helpful chat assistant"
-authors = ["You <you@example.com>"]
-
-[runtime]
-core = "^0.2.0"
-mcp  = "^0.2.0"            # only if you use inferlet::mcp::*
-
-[parameters]
-prompt     = { type = "string", description = "User prompt" }
-max_tokens = { type = "int", optional = true }
-```
-
-The `inferlet::main` macro reads `Pie.toml` for the package name during
-the build (`CARGO_MANIFEST_DIR/Pie.toml`).
+This page covers the complete lifecycle from source code to a published inferlet available in the Pie registry.
 
 ## Building
 
-### With cargo
+Inferlets compile to WebAssembly (WASI Preview 2):
 
 ```bash
-rustup target add wasm32-wasip2     # one-time
+# Install the target (one-time)
+rustup target add wasm32-wasip2
+
+# Build
 cargo build --target wasm32-wasip2 --release
-# output: target/wasm32-wasip2/release/my_inferlet.wasm
 ```
 
-### With bakery
+The output is at `target/wasm32-wasip2/release/your_inferlet.wasm`.
+
+### Cargo.toml Requirements
+
+```toml
+[package]
+name = "your-inferlet"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]  # Required for Wasm component
+
+[dependencies]
+inferlet = "0.1"
+```
+
+The `cdylib` crate type is required — it produces a Wasm component rather than a Rust library.
+
+## Running Locally
+
+Test your inferlet directly:
 
 ```bash
-pip install -e sdk/tools/bakery     # one-time, from a Pie checkout
+# Run with a prompt
+pie run --path target/wasm32-wasip2/release/your_inferlet.wasm \
+    -- --prompt "What is the capital of France?"
 
-# Rust (auto-detects Cargo.toml)
-bakery build ./my-inferlet -o my-inferlet.wasm
-
-# TypeScript / JavaScript
-bakery build ./my-ts-inferlet -o my-inferlet.wasm
-bakery build ./index.ts -o single-file.wasm
+# Run from registry (after publishing)
+pie run your-inferlet -- --prompt "Hello!"
 ```
 
-| Flag | Description |
-|---|---|
-| `-o, --output <FILE>` | Output `.wasm` path. Required. |
-| `--debug` | Debug build (JS/TS only — includes source maps). |
+## Packaging with Bakery
 
-When developing inside a Pie checkout, set `PIE_SDK=/path/to/pie/sdk` so
-bakery can find the SDK libraries.
-
-### Scaffolding from scratch
+The `pie bakery` tool packages your inferlet for the registry:
 
 ```bash
-bakery create my-inferlet            # Rust template (default)
-bakery create my-inferlet --ts       # TypeScript template
+# Build and package
+pie bakery build
+
+# This creates a distributable package with metadata
 ```
 
-The templates lay down `Cargo.toml` (or `package.json`), `Pie.toml`, and
-a working `lib.rs` / `index.ts` against the current SDK.
+### Manifest
 
-## Running locally
+A `pie.toml` manifest describes your inferlet:
+
+```toml
+[inferlet]
+name = "my-inferlet"
+version = "0.1.0"
+description = "A helpful chat assistant"
+
+[build]
+target = "wasm32-wasip2"
+```
+
+## Publishing to Registry
+
+Publish your packaged inferlet to the Pie registry:
 
 ```bash
-# Local build — both files are required
-pie run \
-  --path  target/wasm32-wasip2/release/my_inferlet.wasm \
-  --manifest ./Pie.toml \
-  --prompt "Hello"
+# Authenticate
+pie auth login
 
-# After publishing, run from the registry
-pie run my-inferlet --prompt "Hello"
-pie run my-inferlet@0.1.0 --prompt "Hello"     # pinned
+# Publish
+pie bakery publish
 ```
 
-CLI flags after the manifest become the JSON `Input` (with int/float/bool
-inference). See [`pie run`](../cli#run) for the full grammar.
-
-## Publishing
+Once published, anyone with access can run your inferlet:
 
 ```bash
-# 1) Authenticate (GitHub OAuth)
-bakery login
-
-# 2) Publish — uploads the wasm + manifest to the registry
-bakery inferlet publish ./my-inferlet
+pie run my-inferlet@0.1.0 -- --prompt "Hello!"
 ```
 
-| Subcommand | Description |
-|---|---|
-| `bakery inferlet search <query>` | Search published inferlets. |
-| `bakery inferlet info <name>` | Show metadata for a published inferlet. |
-| `bakery inferlet publish <path>` | Build and publish. |
+## Version Resolution
 
-Once published, the inferlet is launchable from any Pie engine connected
-to the same registry:
-
-```bash
-pie run my-inferlet --prompt "Hello"
-```
+Clients automatically resolve the latest version:
 
 ```python
-proc = await client.launch_process("my-inferlet@0.1.0",
-                                    input={"prompt": "Hello"})
+# Python client
+client = PieClient()
+instance = client.launch("my-inferlet")  # Resolves to latest version
 ```
 
-## Version resolution
-
-If a name has no `@version`, the client (Python / JS / Rust) calls the
-registry's `resolve_version` to pick the latest. Pin a version when you
-need reproducibility:
+You can also pin to a specific version:
 
 ```python
-await client.launch_process("my-inferlet@0.1.0", input=...)
+instance = client.launch("my-inferlet@0.1.0")
 ```
 
-Or pre-resolve and reuse the result.
+## Next Steps
 
-## Next
-
-- [Your First Inferlet](./first-inferlet) — the canonical Rust template.
-- [I/O](./io) — for HTTP-server inferlets and the alternate
-  `#[wstd::http_server]` entry point.
+- **[Your First Inferlet](./first-inferlet)** — Start from scratch
+- **[I/O](./io)** — Build HTTP server inferlets
