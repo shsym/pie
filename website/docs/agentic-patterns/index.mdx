@@ -47,7 +47,7 @@ Patterns for human oversight, reasoning transparency, and user interaction.
 | Pattern | Category | Pie Advantage |
 |---------|----------|---------------|
 | [Context-Minimization](./context-memory#context-minimization) | Context & Memory | Purge tainted tokens via KV cache ops |
-| [Dynamic Context Injection](./context-memory#dynamic-context-injection) | Context & Memory | I/O fetch + `fill_tokens()` on demand |
+| [Dynamic Context Injection](./context-memory#dynamic-context-injection) | Context & Memory | I/O fetch + `ctx.append()` on demand |
 | [Curated Code Context](./context-memory#curated-code-context) | Context & Memory | Search + selective token injection |
 | [Curated File Context](./context-memory#curated-file-context) | Context & Memory | Ranked file loading into context |
 | [Episodic Memory](./context-memory#episodic-memory) | Context & Memory | I/O to vector DB + context injection |

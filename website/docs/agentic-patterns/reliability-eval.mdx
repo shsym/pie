@@ -29,29 +29,24 @@ Force the model's output to conform to a grammar (JSON schema, regex, EBNF) usin
 ```
 
 ```rust
-use inferlet::InstructExt;
+use inferlet::Schema;
 
-// JSON schema constraint
-let schema = serde_json::json!({
+// JSON Schema as a string (passed to the constrained-decoder)
+let schema = r#"{
     "type": "object",
     "properties": {
-        "name": { "type": "string" },
-        "age": { "type": "integer" },
-        "interests": {
-            "type": "array",
-            "items": { "type": "string" }
-        }
+        "name":      { "type": "string" },
+        "age":       { "type": "integer" },
+        "interests": { "type": "array", "items": { "type": "string" } }
     },
     "required": ["name", "age"]
-});
-
-let matcher = create_json_schema_matcher(&model, &schema);
+}"#.to_string();
 
 ctx.user("Extract person info: John is 30, likes hiking and chess.");
 ctx.cue();
 
 let json = ctx.generate(sampler)
-    .with_constraint(matcher)
+    .with_schema(Schema::JsonSchema(schema))?
     .with_max_tokens(256)
     .collect_text().await?;
 // Guaranteed valid JSON matching the schema

@@ -28,7 +28,7 @@ let text = ctx
 Implement the `Speculate` trait for custom draft strategies:
 
 ```rust
-use inferlet::context_ext::Speculate;
+use inferlet::Speculate;
 
 pub trait Speculate {
     /// Generate draft tokens and their positions
@@ -101,11 +101,13 @@ let text = ctx
 
 ## How It Works
 
-1. Before each forward pass, `Speculate::draft()` provides draft tokens
-2. These are sent as `ForwardPass::input_speculative_tokens()`
-3. The model verifies all tokens in a single forward pass
-4. `Speculate::accept()` is called with the accepted prefix
-5. Rejected tokens are discarded — no rollback of committed KV state needed
+1. Before each forward pass, `Speculate::draft()` provides `(tokens, positions)`.
+2. These are sent as `ForwardPass::input_speculative_tokens(...)`.
+3. The model verifies all tokens in a single forward pass.
+4. `Speculate::accept()` is called with the accepted prefix (extracted
+   from `Output.tokens()` — the verifier-accepted Token slots).
+5. Rejected drafts are discarded; the runtime trims any speculative
+   working-page tokens that didn't make it.
 
 ```
  Standard autoregressive (4 forward passes for 4 tokens):
@@ -120,7 +122,12 @@ let text = ctx
  Pipeline: draft() → speculative_tokens() → execute → accept()
 ```
 
-When using `Speculation::system()`, the runtime also requests new draft tokens via `output_speculative_tokens(true)`, creating a pipeline where each step both verifies the current draft and produces the next one.
+When using `Speculation::system()` (the default — also returned from
+`Speculation::default()`), the runtime drafts on its own. Each pass both
+verifies the current draft batch and feeds new drafts into
+`Output.spec_tokens` / `spec_positions`, which the SDK plumbs into the
+next pass automatically. See the SGLang spec-decoding work in recent
+runtime commits for the pipeline details.
 
 ## Combining with Constraints
 

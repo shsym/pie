@@ -299,7 +299,7 @@ Interleave reasoning and tool calls in a loop: think → act → observe → thi
 ```
 
 ```rust
-use inferlet::{Event, InstructExt};
+use inferlet::Event;
 
 ctx.system("You are a helpful assistant with access to tools.");
 ctx.equip_tools(&tool_schemas)?;
@@ -362,8 +362,6 @@ Split into two phases: the model produces a frozen plan (structured output), the
 ```
 
 ```rust
-use inferlet::InstructExt;
-
 // Phase 1: Generate a structured plan
 ctx.system("Output a JSON array of tool calls to execute.");
 ctx.user(&task);

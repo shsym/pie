@@ -170,6 +170,12 @@ impl Server {
     async fn listener_loop(addr: String, state: Arc<ServerState>) {
         let listener = TcpListener::bind(addr).await.unwrap();
         while let Ok((stream, _addr)) = listener.accept().await {
+            // Disable Nagle's algorithm so small RPC messages don't sit waiting
+            // for delayed-ACKs — without this, concurrent client requests see
+            // ~40 ms tail latency on Linux (one outlier per batch).
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!("set_nodelay failed: {}", e);
+            }
             let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
 
             match spawn_session(id, stream, state.clone()).await {

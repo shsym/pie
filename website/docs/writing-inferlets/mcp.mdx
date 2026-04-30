@@ -6,95 +6,114 @@ sidebar_position: 12
 
 # MCP Integration
 
-The [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) is an open standard for connecting LLM applications to external tools, resources, and prompts. Pie's MCP client lets inferlets discover and interact with MCP servers.
+The [Model Context Protocol](https://modelcontextprotocol.io/) is an open
+standard for exposing tools, resources, and prompt templates to LLM
+applications. Pie ships with an MCP client so inferlets can discover and
+call MCP servers without writing transport code.
 
-## Connecting to an MCP Server
+## Connecting
 
 ```rust
-use inferlet::pie::mcp::client;
+use inferlet::mcp::client;
 
-// List available MCP servers
+// Names of all servers the host has registered for this session.
 let servers = client::available_servers();
 
-// Connect to a server
+// Open a session — the resource closes when dropped.
 let session = client::connect(&servers[0])?;
 ```
 
+The host (your `pie serve`, or a client that registered an MCP server via
+`Client::register_mcp_server`) is responsible for spawning the actual MCP
+servers; the inferlet just sees their names.
+
 ## Tools
 
-Discover and call tools provided by the MCP server:
-
 ```rust
-// List available tools
-let tools = session.list_tools();
+// list_tools / list_resources / list_prompts return a JSON string
+// (the raw MCP `tools/list` response). Parse it with serde_json.
+let tools_json: String = session.list_tools()?;
+let tools: serde_json::Value = serde_json::from_str(&tools_json)?;
 
-for tool in &tools {
-    println!("{}: {}", tool.name, tool.description);
+for tool in tools["tools"].as_array().unwrap() {
+    eprintln!("{}: {}", tool["name"], tool["description"]);
 }
 
-// Call a tool
-let result = session.call_tool("search", &serde_json::json!({
-    "query": "Rust programming"
-}).to_string())?;
+// Call a tool by name with JSON arguments. Returns a list of `content`.
+use inferlet::mcp::types::Content;
 
-match result {
-    Content::Text(text) => println!("Result: {}", text),
-    Content::Image(data) => { /* handle image */ }
-    Content::Resource(r) => { /* handle resource */ }
+let args = serde_json::json!({"query": "Rust release"}).to_string();
+let result: Vec<Content> = session.call_tool("search", &args)?;
+
+for chunk in result {
+    match chunk {
+        Content::Text(s)               => print!("{s}"),
+        Content::Image(img)            => save_image(&img.data, &img.mime_type),
+        Content::EmbeddedResource(r)   => handle_resource(&r),
+    }
 }
 ```
 
 ## Resources
 
-Read resources exposed by the server:
-
 ```rust
-// List available resources
-let resources = session.list_resources();
+let resources_json = session.list_resources()?;
+let parsed: serde_json::Value = serde_json::from_str(&resources_json)?;
 
-// Read a resource
-let content = session.read_resource(&resources[0].uri)?;
+let uri = parsed["resources"][0]["uri"].as_str().unwrap();
+let content: Vec<Content> = session.read_resource(uri)?;
 ```
 
 ## Prompts
 
-Use prompt templates provided by the server:
-
 ```rust
-// List available prompts
-let prompts = session.list_prompts();
+let prompts_json = session.list_prompts()?;
+let parsed: serde_json::Value = serde_json::from_str(&prompts_json)?;
 
-// Render a prompt with arguments
-let rendered = session.render_prompt(
-    &prompts[0].name,
-    &serde_json::json!({ "topic": "Rust" }).to_string()
-)?;
+let name = parsed["prompts"][0]["name"].as_str().unwrap();
+let args = serde_json::json!({"topic": "Rust"}).to_string();
+let rendered_json = session.get_prompt(name, &args)?;
 ```
 
-## Combining with Tool Calling
+`get_prompt` returns the raw MCP `prompts/get` JSON — the messages array is
+under `result.messages`.
 
-Use MCP tools alongside Pie's tool-calling API for a complete agent:
+## Bridging MCP tools into the chat decoder
+
+Wire MCP tools into Pie's [tool-calling](./tool-calling) flow by parsing
+the MCP tool list, equipping the model with the schemas, and dispatching
+`Event::ToolCall` to the session:
 
 ```rust
-// Discover tools from MCP
-let tools = session.list_tools();
+// 1) Build the equip_tools input from the MCP tool list.
+let tools_json: serde_json::Value =
+    serde_json::from_str(&session.list_tools()?)?;
 
-// Convert to tool definitions for equip_tools
-let tool_defs: Vec<String> = tools.iter()
-    .map(|t| t.schema.clone())
+let equip: Vec<String> = tools_json["tools"]
+    .as_array().unwrap()
+    .iter()
+    .map(|t| t.to_string())
     .collect();
+ctx.equip_tools(&equip)?;
 
-ctx.equip_tools(&tool_defs);
-ctx.user("Search for the latest Rust release");
-ctx.cue();
+ctx.user("Search for the latest Rust release").cue();
 
-// When the model calls a tool, dispatch to MCP
-let event = /* ... get ToolCall event ... */;
-let result = session.call_tool(&event.name, &event.arguments)?;
-ctx.answer_tool(&event.id, &result.to_string());
+// 2) Stream events, dispatch ToolCall to MCP.
+let mut events = ctx.generate(sampler).decode().with_tool_use();
+
+while let Some(ev) = events.next().await? {
+    if let inferlet::Event::ToolCall(name, args) = ev {
+        let result = session.call_tool(&name, &args)?;
+        let answer = render_content(&result);
+        events.stream_mut().ctx().answer_tool(&name, &answer).cue();
+    }
+}
 ```
 
-## Next Steps
+`render_content` is up to you — concatenate `Content::Text`, encode
+images, etc.
 
-- **[Tool Calling](./tool-calling)** — The tool-calling API that drives MCP tool dispatch
-- **[I/O](./io)** — HTTP and file I/O for other external integrations
+## Next
+
+- [Tool Calling](./tool-calling) — how `equip_tools` and the decoder fit together.
+- [I/O & messaging](./io) — HTTP/file I/O for non-MCP integrations.
