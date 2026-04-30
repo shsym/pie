@@ -228,10 +228,10 @@ fn init_wasmtime() -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
     wasm_config.async_support(true);
 
-    // TODO: Adjust settings later: https://docs.wasmtime.dev/api/wasmtime/struct.PoolingAllocationConfig.html
-    // let mut pooling_config = PoolingAllocationConfig::default();
-    // wasm_config.allocation_strategy(InstanceAllocationStrategy::Pooling(pooling_config));
-    
+    let pooling_config = wasmtime::PoolingAllocationConfig::default();
+    wasm_config
+        .allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling_config));
+
     wasmtime::Engine::new(&wasm_config).unwrap()
 }
 
