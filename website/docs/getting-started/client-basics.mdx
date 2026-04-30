@@ -1,187 +1,196 @@
 ---
 title: Client Basics
-description: Connect to Pie from Python and JavaScript
+description: Connect to Pie from Python, JavaScript, or Rust
 sidebar_position: 4
 ---
 
 # Client Basics
 
-Learn how to connect to a running Pie server and interact with inferlets.
+How to connect to a running Pie server and drive inferlets from your code.
 
 ## Prerequisites
 
-- Pie server running (`pie serve`)
-- Client library installed
+- A Pie server running (`pie serve`).
+- A client library: `pie-client` (Python), `@pie/client` (JS), or
+  `pie-client` (Rust crate).
 
-## Python Client
+## The lifecycle
 
-### Installation
+Every client follows the same pattern:
+
+1. Connect to `ws://host:port`.
+2. Authenticate.
+3. Launch a *process* (a running inferlet) by `name@version`, passing JSON input.
+4. Receive a stream of events until `Return` (success) or `Error` (abort).
+
+The terminal events for a process are `Return` and `Error`. After either,
+the server closes the per-process event stream.
+
+## Python
 
 ```bash
 pip install pie-client
 ```
 
-### Basic Usage
-
 ```python
 import asyncio
-from pie import PieClient
+from pie_client import PieClient, ParsedPrivateKey, Event
 
 async def main():
     async with PieClient("ws://127.0.0.1:8080") as client:
-        # Authenticate (required even if auth is disabled)
-        await client.authenticate("username")
-        
-        # Launch an inferlet from the registry
-        instance = await client.launch_instance_from_registry(
-            "text-completion",
-            ["--prompt", "What is the capital of France?"]
+        # If [auth].enabled = false on the server, you can pass key=None.
+        key = ParsedPrivateKey.from_file("~/.ssh/id_ed25519")
+        await client.authenticate("alice", key)
+
+        proc = await client.launch_process(
+            "text-completion@0.1.0",
+            input={"prompt": "What is the capital of France?",
+                   "max_tokens": 64},
         )
-        
-        # Receive output
+
         while True:
-            event, message = await instance.recv()
-            
-            if event.name == "Stdout":
-                print(message, end="", flush=True)
-            elif event.name == "Completed":
+            event, value = await proc.recv()
+            if event == Event.Stdout:
+                print(value, end="", flush=True)
+            elif event == Event.Return:
+                # value is the inferlet's JSON-encoded Output
+                print("\n[done]", value)
                 break
-            elif event.name == "Exception":
-                print(f"Error: {message}")
+            elif event == Event.Error:
+                print("\n[error]", value)
                 break
 
 asyncio.run(main())
 ```
 
-### Sending Messages
-
-For interactive inferlets:
+### Signaling a running process
 
 ```python
-async with PieClient("ws://127.0.0.1:8080") as client:
-    await client.authenticate("username")
-    
-    instance = await client.launch_instance_from_registry("chat")
-    
-    # Send a message
-    await instance.send("What is the capital of France?")
-    
-    # Receive response
-    event, response = await instance.recv()
-    print(response)
+proc = await client.launch_process("chat-loop@0.1.0")
+await proc.signal("hello")          # → inferlet receives a string signal
+await proc.transfer_file(b"...")    # → inferlet receives a binary blob
 ```
 
-### Upload Custom Inferlet
+### Uploading a local build
 
 ```python
-async with PieClient("ws://127.0.0.1:8080") as client:
-    await client.authenticate("username")
-    
-    # Upload the Wasm binary
-    with open("my_inferlet.wasm", "rb") as f:
-        await client.upload_program(f.read())
-    
-    # Get the program hash (blake3)
-    import hashlib
-    program_hash = "..."  # Compute blake3 hash
-    
-    # Launch
-    instance = await client.launch_instance(program_hash, ["--arg", "value"])
+await client.install_program("./build.wasm", "./Pie.toml")
+proc = await client.launch_process("my-inferlet@0.1.0", input={...})
 ```
 
-## JavaScript Client
-
-### Installation
+## JavaScript
 
 ```bash
-npm install @pie-project/client
+npm install @pie/client
 ```
 
-### Basic Usage
-
 ```javascript
-import { PieClient } from '@pie-project/client';
+import { PieClient } from '@pie/client';
 
-const client = new PieClient('ws://127.0.0.1:8080');
+const client = new PieClient("ws://127.0.0.1:8080");
+await client.connect();
 
-async function main() {
-    await client.connect();
-    await client.authenticate('username');
-    
-    const instance = await client.launchInstanceFromRegistry(
-        'text-completion',
-        ['--prompt', 'What is the capital of France?']
-    );
-    
-    while (true) {
-        const { event, msg } = await instance.recv();
-        
-        if (event === 'Stdout') {
-            process.stdout.write(msg);
-        } else if (event === 'Completed') {
-            break;
-        } else if (event === 'Exception') {
-            console.error('Error:', msg);
-            break;
-        }
-    }
-    
-    await client.close();
+// The JS client only exposes token-based auth today.
+// For public-key auth, use the Python or Rust client.
+await client.authByToken(process.env.PIE_TOKEN);
+
+const proc = await client.launchProcess(
+  "text-completion@0.1.0",
+  { prompt: "Hello", max_tokens: 64 },
+);
+
+while (true) {
+  const { event, value } = await proc.recv();
+  if (event === "stdout") process.stdout.write(value);
+  else if (event === "return") { console.log("\n[done]", value); break; }
+  else if (event === "error")  { console.error("\n[error]", value); break; }
 }
 
-main();
+client.close();
 ```
 
-### Sending Messages
+## Rust
 
-```javascript
-const instance = await client.launchInstanceFromRegistry('chat');
-
-// Send a message
-await instance.send('What is 2 + 2?');
-
-// Receive response
-const { event, msg } = await instance.recv();
-console.log(msg);
+```toml
+[dependencies]
+pie-client = "*"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
 ```
 
-## Event Types
+```rust
+use pie_client::{Client, ParsedPrivateKey, ProcessEvent};
 
-Both clients receive events from inferlets:
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = Client::connect("ws://127.0.0.1:8080").await?;
+    let key = ParsedPrivateKey::from_file("~/.ssh/id_ed25519")?;
+    client.authenticate("alice", &Some(key)).await?;
 
-| Event | Description |
-|-------|-------------|
-| `Message` | Text message from the inferlet |
-| `Stdout` | Streaming stdout output |
-| `Stderr` | Streaming stderr output |
-| `Blob` | Binary data |
-| `Completed` | Inferlet finished successfully |
-| `Aborted` | Inferlet was aborted |
-| `Exception` | Inferlet raised an exception |
-| `ServerError` | Server-side error |
-| `OutOfResources` | Resource limit reached |
+    let mut proc = client
+        .launch_process(
+            "text-completion@0.1.0".into(),
+            r#"{"prompt":"Hello","max_tokens":64}"#.into(),
+            true,
+            None,
+        )
+        .await?;
 
-## Authentication
+    loop {
+        match proc.recv().await? {
+            ProcessEvent::Stdout(s) => print!("{s}"),
+            ProcessEvent::Return(v) => { println!("\n[done] {v}"); break; }
+            ProcessEvent::Error(e)  => { eprintln!("\n[error] {e}"); break; }
+            _ => {}
+        }
+    }
 
-Pie supports public key authentication:
+    client.close().await?;
+    Ok(())
+}
+```
+
+## Events
+
+Every client surfaces the same six event kinds:
+
+| Event | Payload | Meaning |
+|-------|---------|---------|
+| `Stdout` / `"stdout"` | text | Streamed stdout from the inferlet. |
+| `Stderr` / `"stderr"` | text | Streamed stderr. |
+| `Message` / `"message"` | text | A user-defined message from the inferlet. |
+| `File` / `"file"` | bytes | A file the inferlet sent back (chunked, reassembled by the client). |
+| `Return` / `"return"` | JSON text | Final `Output` — the process exited cleanly. |
+| `Error` / `"error"` | text | The process aborted. |
+
+Both `Return` and `Error` are terminal: don't call `recv()` again on the
+same process after either one fires.
+
+## Detached / reattach
+
+`launch_process` returns a handle. Drop it, reconnect, call
+`attach_process(process_id)`, and resume reading. While disconnected, the
+server buffers events for you.
 
 ```python
-from pie import PieClient, ParsedPrivateKey
-
-key = ParsedPrivateKey.from_file("~/.ssh/id_ed25519")
-
-async with PieClient("ws://127.0.0.1:8080") as client:
-    await client.authenticate("username", key)
+pid = proc.process_id
+# … later, possibly from a different host …
+async with PieClient(uri) as c:
+    await c.authenticate("alice", key)
+    proc = await c.attach_process(pid)
+    event, value = await proc.recv()
 ```
 
-For development with `--no-auth`:
+## Authentication notes
 
-```python
-await client.authenticate("any_username")  # No key needed
-```
+- `[auth].enabled = false`: Python/Rust can pass `private_key=None`/`&None`,
+  JS skips auth entirely.
+- `[auth].enabled = true`: register a key with
+  `cat key.pub | pie auth add <user> <key_name>`, then sign in with the
+  matching private key.
 
-## Next Steps
+## Next steps
 
-- See the full [Python Client API](../client-api/python)
-- See the full [JavaScript Client API](../client-api/javascript)
-- Explore the [Rust Client API](../client-api/rust)
+- [Python client reference](../client-api/python)
+- [JavaScript client reference](../client-api/javascript)
+- [Rust client reference](../client-api/rust)

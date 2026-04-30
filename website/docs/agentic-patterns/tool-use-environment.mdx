@@ -114,25 +114,8 @@ Incorporate visual inputs (screenshots, diagrams, photos) into the agent's reaso
  Image ──▶ Model (vision) ──▶ Analysis ──▶ Follow-up (free, cached)
 ```
 
-```rust
-// Load image through I/O
-let screenshot = io::fs::read_bytes("screenshot.png").await?;
-
-// Models with vision capability can process images
-ctx.system("You are a UI testing assistant.");
-ctx.user_with_image(
-    "Analyze this screenshot. Are there any visual bugs?",
-    &screenshot,
-);
-ctx.cue();
-
-let analysis = ctx.generate(sampler)
-    .with_max_tokens(512)
-    .collect_text().await?;
-```
-
-:::tip[Why Pie]
-Multimodal processing runs inside the inferlet with full access to the model's attention — no external vision API needed. The KV cache retains the processed image, so follow-up questions about the same image are free.
+:::caution[Roadmap]
+Image inputs are **not yet exposed** through the Rust SDK's chat fillers. Vision-capable models (e.g. `gemma3`, `gemma4`) load and run, but the public `Context::user(...)` API currently accepts only text. Multimodal context filling is on the roadmap; track progress in the Pie repo.
 :::
 
 ---

@@ -6,7 +6,8 @@ sidebar_position: 1
 
 # Python Client
 
-A Python client for interacting with the Pie server.
+`pie-client` is the async Python library for talking to a running Pie server
+over WebSocket.
 
 ## Installation
 
@@ -14,40 +15,45 @@ A Python client for interacting with the Pie server.
 pip install pie-client
 ```
 
-## Quick Start
+## Quick start
 
 ```python
 import asyncio
-from pie import PieClient, ParsedPrivateKey
+from pie_client import PieClient, ParsedPrivateKey, Event
 
 async def main():
     async with PieClient("ws://127.0.0.1:8080") as client:
-        # Authentication is always required
-        # If server auth is enabled, provide a valid private key:
+        # Auth: keyless if the server has [auth].enabled = false,
+        # otherwise sign a challenge with your private key.
         key = ParsedPrivateKey.from_file("~/.ssh/id_ed25519")
-        await client.authenticate("username", key)
-        
-        # If server auth is disabled, any username works without a key:
-        # await client.authenticate("any_username")
-        
-        # Upload and launch a program
-        with open("my_program.wasm", "rb") as f:
-            await client.upload_program(f.read())
-        
-        program_hash = "..."  # blake3 hash of the wasm binary
-        instance = await client.launch_instance(program_hash)
-        
-        # Interact with the instance
-        await instance.send("hello")
-        event, message = await instance.recv()
-        print(f"Received: {event.name} - {message}")
+        await client.authenticate("alice", key)
+
+        # Launch an inferlet from the registry. JSON input becomes the
+        # inferlet's typed `Input` struct.
+        process = await client.launch_process(
+            "text-completion@0.1.0",
+            input={"prompt": "Hello world", "max_tokens": 64},
+        )
+
+        # Stream events until the process returns or errors.
+        while True:
+            event, value = await process.recv()
+            if event == Event.Stdout:
+                print(value, end="", flush=True)
+            elif event == Event.Return:
+                print("\n[done]", value)
+                break
+            elif event == Event.Error:
+                print("\n[error]", value)
+                break
 
 asyncio.run(main())
 ```
 
 ## PieClient
 
-The main client class for connecting to a Pie server.
+The main client object. Use it as an async context manager so the WebSocket
+is closed cleanly on exit.
 
 ### Constructor
 
@@ -57,145 +63,168 @@ PieClient(server_uri: str)
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `server_uri` | `str` | WebSocket URI (e.g., `"ws://127.0.0.1:8080"`) |
+| `server_uri` | `str` | WebSocket URI, e.g. `"ws://127.0.0.1:8080"`. |
 
-### Methods
+### Authentication
 
 | Method | Description |
 |--------|-------------|
-| `authenticate(username, private_key=None)` | Public key authentication (challenge-response) |
-| `internal_authenticate(token)` | Token-based internal authentication |
-| `upload_program(bytes)` | Upload a WASM program |
-| `program_exists(hash)` | Check if program is uploaded |
-| `launch_instance(hash, args=[], detached=False)` | Launch a program instance by hash |
-| `launch_instance_from_registry(name, args=[], detached=False)` | Launch from registry |
-| `attach_instance(instance_id)` | Attach to a detached instance |
-| `list_instances()` | List running instances |
-| `terminate_instance(instance_id)` | Terminate an instance |
-| `ping()` | Check server connectivity |
-| `query(subject, record)` | Generic server query |
-
-### Context Manager
-
-Use as an async context manager for automatic cleanup:
+| `authenticate(username, private_key=None)` | Public-key auth (challenge → signature). `private_key` may be `None` only if the server has auth disabled. |
+| `auth_by_token(token)` | Token-based auth used for backend ↔ engine connections. |
 
 ```python
-async with PieClient("ws://127.0.0.1:8080") as client:
-    # client is connected
-    await client.authenticate("username")
-    # ...
-# client is automatically closed
+key = ParsedPrivateKey.from_file("~/.ssh/id_ed25519")
+await client.authenticate("alice", key)
 ```
 
-## Instance
+### Programs
 
-Represents a running program instance on the server.
-
-### Methods
+A *program* is a published `(name, version)` plus its WASM and `Pie.toml`
+manifest.
 
 | Method | Description |
 |--------|-------------|
-| `send(message)` | Send a string message to the instance |
-| `upload_blob(bytes)` | Upload binary data to the instance |
-| `recv()` | Receive next event (returns `(Event, data)`) |
-| `terminate()` | Request termination |
-
-### Example
+| `resolve_version(name, registry_url)` | Resolve a bare name to `name@version` via the registry. Returns the input unchanged if it already contains `@`. |
+| `check_program(inferlet, wasm_path=None, manifest_path=None)` | Returns `True` if the server already has this `name@version`. If you pass `wasm_path` and `manifest_path`, the hashes are checked too. |
+| `install_program(wasm_path, manifest_path, force_overwrite=False)` | Upload a local build (chunked). |
 
 ```python
-instance = await client.launch_instance_from_registry(
-    "text-completion",
-    ["--prompt", "Hello"]
-)
+await client.install_program("./build.wasm", "./Pie.toml")
+```
 
-# Send additional input
-await instance.send("Continue the story...")
+### Processes
 
-# Receive streaming output
+A *process* is a running instance of a program.
+
+| Method | Description |
+|--------|-------------|
+| `launch_process(inferlet, input=None, capture_outputs=True, token_budget=None)` | Launch a `name@version`. `input` is JSON-serialized into the inferlet's `Input` struct. |
+| `attach_process(process_id)` | Reattach to a process you previously launched. |
+| `list_processes()` | List running processes (id, username, program, arguments, elapsed_secs). |
+| `signal_process(process_id, message)` | Fire-and-forget string message to a process. |
+| `terminate_process(process_id)` | Ask the server to stop a process. |
+| `launch_daemon(inferlet, port, input=None)` | Start a long-running daemon inferlet bound to `port`. |
+
+`launch_process` and `attach_process` return a [`Process`](#process).
+
+### Other
+
+| Method | Description |
+|--------|-------------|
+| `ping()` | Round-trip a ping. Useful for health checks. |
+| `query(subject, record)` | Generic key-value query passthrough. |
+
+## Process
+
+The handle returned by `launch_process` / `attach_process`.
+
+```python
+class Process:
+    process_id: str
+
+    async def recv(self) -> tuple[Event, str | bytes]: ...
+    async def signal(self, message: str): ...
+    async def transfer_file(self, file_bytes: bytes): ...
+    async def terminate(self): ...
+```
+
+| Method | Description |
+|--------|-------------|
+| `recv()` | Await the next event from the process. Returns `(Event, value)`. |
+| `signal(message)` | Send a string signal to the running inferlet. |
+| `transfer_file(bytes)` | Send a binary file (chunked). |
+| `terminate()` | Request termination. |
+
+### Receive loop pattern
+
+```python
+process = await client.launch_process("my-inferlet@0.1.0",
+                                       input={"prompt": "..."})
+
 while True:
-    event, data = await instance.recv()
-    
-    if event.name == "Stdout":
-        print(data, end="")
-    elif event.name == "Completed":
+    event, value = await process.recv()
+    if event == Event.Stdout:
+        print(value, end="", flush=True)
+    elif event == Event.Stderr:
+        print(value, end="", file=sys.stderr, flush=True)
+    elif event == Event.Message:
+        handle_message(value)
+    elif event == Event.File:
+        save_blob(value)            # value is bytes
+    elif event == Event.Return:
+        result = value              # JSON string of the inferlet's Output
         break
+    elif event == Event.Error:
+        raise RuntimeError(value)
 ```
 
-## Event Types
+## Event
 
-Events returned by `instance.recv()`:
+Events received from `Process.recv()`:
 
-| Event | Description |
-|-------|-------------|
-| `Message` | Text message from instance |
-| `Stdout` | Streaming stdout output |
-| `Stderr` | Streaming stderr output |
-| `Blob` | Binary data received |
-| `Completed` | Instance finished successfully |
-| `Aborted` | Instance was aborted |
-| `Exception` | Instance raised an exception |
-| `ServerError` | Server-side error |
-| `OutOfResources` | Resource limit reached |
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `Event.Stdout` | `str` | Streamed stdout. |
+| `Event.Stderr` | `str` | Streamed stderr. |
+| `Event.Message` | `str` | A user-defined message emitted by the inferlet. |
+| `Event.File` | `bytes` | A file the inferlet sent back. |
+| `Event.Return` | `str` | Final JSON-encoded `Output`. The process exits cleanly after this. |
+| `Event.Error` | `str` | The process aborted. |
+
+`Event` is a normal `enum.Enum`. Compare with the constants
+(`if event == Event.Stdout`) or by name (`event.name == "Stdout"`).
 
 ## ParsedPrivateKey
 
-Handles SSH private keys for authentication.
+Loads SSH/PEM private keys for `authenticate`.
 
-### Supported Key Types
+Supported formats:
 
-- RSA (≥2048 bits)
-- ED25519
-- ECDSA (P-256, P-384)
-
-### Methods
-
-```python
-# From file
-key = ParsedPrivateKey.from_file("~/.ssh/id_ed25519")
-
-# From string
-key = ParsedPrivateKey.parse(key_content)
-```
-
-### Example
+- OpenSSH (RSA / Ed25519 / ECDSA)
+- PKCS#8 PEM
+- PKCS#1 PEM
+- ECDSA curves: P-256, P-384
+- RSA keys must be ≥ 2048 bits
 
 ```python
-from pie import PieClient, ParsedPrivateKey
+from pie_client import ParsedPrivateKey
 
 key = ParsedPrivateKey.from_file("~/.ssh/id_ed25519")
-
-async with PieClient("ws://127.0.0.1:8080") as client:
-    await client.authenticate("username", key)
+# or
+with open("~/.ssh/id_ed25519") as f:
+    key = ParsedPrivateKey.parse(f.read())
 ```
 
-## Detached Instances
+## Detached processes
 
-Launch instances that persist after disconnection:
+`launch_process` always returns a `Process` you can drop and reattach later
+via `attach_process(process_id)`. There is no separate "detached" flag —
+just disconnect, reconnect, and reattach. While disconnected, the server
+buffers events for you (see *orphan events* in the source).
 
 ```python
-# Launch detached
-instance = await client.launch_instance_from_registry(
-    "long-running-task",
-    detached=True
-)
-instance_id = instance.id
+async with PieClient(uri) as c:
+    p = await c.launch_process("long-task@0.1.0", input={...})
+    pid = p.process_id
 
-# Later, reattach
-instance = await client.attach_instance(instance_id)
-event, data = await instance.recv()
+# … later, possibly from a different process …
+async with PieClient(uri) as c:
+    await c.authenticate("alice", key)
+    p = await c.attach_process(pid)
+    event, value = await p.recv()
 ```
 
-## Error Handling
+## Error handling
 
 ```python
-from pie import PieClient, PieError
-
 try:
     async with PieClient("ws://127.0.0.1:8080") as client:
-        await client.authenticate("username")
-        instance = await client.launch_instance("invalid_hash")
-except PieError as e:
-    print(f"Pie error: {e}")
+        await client.authenticate("alice", key)
+        process = await client.launch_process("does-not-exist@0.1.0")
 except ConnectionError as e:
-    print(f"Connection failed: {e}")
+    print("Connection failed:", e)
+except Exception as e:
+    # The client raises plain Exceptions for protocol-level failures
+    # (auth rejected, launch failed, upload failed, etc.)
+    print("Pie error:", e)
 ```

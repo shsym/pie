@@ -6,123 +6,125 @@ sidebar_position: 3
 
 # Server Mode
 
-While `pie run` is great for quick tests, production use cases need a persistent server.
+`pie run` is one-shot. For everything else — drives multiple clients, keeps
+state across requests, gets monitored — start a long-lived server.
 
-## Start the Server
-
-Launch Pie in server mode:
+## Start the server
 
 ```bash
 pie serve
 ```
 
 Output:
+
 ```
-╭─ Pie Engine (server) ────────────────────────╮
-│ Host           127.0.0.1:8080                │
-│ Model          Qwen/Qwen3-0.6B                  │
-│ Device         cuda:0                        │
+╭─ Pie Engine ─────────────────────────────────╮
+│ Host         127.0.0.1:8080                  │
+│ Model        default (Qwen/Qwen3-0.6B)       │
+│ Driver       native                          │
+│ Device       cuda:0                          │
 ╰──────────────────────────────────────────────╯
 
-✓ Backend started on cuda:0
-✓ Engine listening on ws://127.0.0.1:8080
+✓ Server ready at ws://127.0.0.1:8080
 ```
 
-The server is now ready to accept client connections.
+The server is now accepting WebSocket clients.
 
-## Interactive Mode
+## Monitor mode
 
-For development and testing, use interactive mode:
-
-```bash
-pie serve -i
-```
-
-This gives you a shell to run inferlets directly:
-
-```
-Type 'help' for commands, ↑/↓ for history
-
-pie> run text-completion --prompt "Hello world"
-Hello world! How are you today?
-
-pie> help
-Available commands:
-  run <inferlet> [args]  - Run an inferlet
-  list                   - List running instances
-  exit                   - Shutdown and exit
-```
-
-## Monitor Mode
-
-For real-time performance monitoring:
+A real-time TUI dashboard:
 
 ```bash
 pie serve -m
 ```
 
-This launches a TUI dashboard showing:
-- Active requests
-- Throughput (tokens/sec)
-- Memory usage
-- Batch statistics
+It shows the running model, batch utilization, throughput, and per-process
+status. Press `q` to exit the TUI; the server keeps running in the
+background until you `Ctrl-C`.
 
-## Command-Line Options
+## Common flags
 
 | Option | Description |
 |--------|-------------|
-| `--config`, `-c` | Path to config file |
-| `--host` | Override host address |
-| `--port` | Override port |
-| `--no-auth` | Disable authentication |
-| `--verbose`, `-v` | Enable verbose logging |
-| `--interactive`, `-i` | Interactive shell mode |
-| `--monitor`, `-m` | TUI monitor mode |
-
-Examples:
+| `-c`, `--config <PATH>` | Use a non-default config file. |
+| `--host <HOST>` | Override `[server].host`. |
+| `--port <PORT>` | Override `[server].port`. |
+| `--no-auth` | Disable authentication for this run. |
+| `-v`, `--verbose` | Verbose logging. |
+| `-m`, `--monitor` | Launch the TUI alongside the server. |
+| `--no-snapshot` | Disable the host-side Python snapshot optimization. |
 
 ```bash
-# Custom port, no auth
-pie serve --port 9000 --no-auth
+# Custom port, no auth (dev)
+pie serve --port 9000 --no-auth -v
 
-# Verbose logging
-pie serve -v
-
-# Custom config file
-pie serve -c /path/to/config.toml
+# Alternate config
+pie serve -c ./dev.toml
 ```
 
-## Connecting Clients
+See the [CLI reference](../cli#serve) for the full list.
 
-Once the server is running, connect with a client:
+## Connecting clients
 
 ```python
-from pie import PieClient
+from pie_client import PieClient, ParsedPrivateKey, Event
 
 async with PieClient("ws://127.0.0.1:8080") as client:
-    await client.authenticate("username")
-    # ... use the client
+    # Skip the key arg if [auth].enabled = false
+    key = ParsedPrivateKey.from_file("~/.ssh/id_ed25519")
+    await client.authenticate("alice", key)
+
+    proc = await client.launch_process(
+        "text-completion@0.1.0",
+        input={"prompt": "hello"},
+    )
+    while True:
+        event, value = await proc.recv()
+        if event == Event.Stdout: print(value, end="")
+        elif event == Event.Return: break
 ```
 
-See [Client Basics](./client-basics) for more.
+The full client API is in [Client basics](./client-basics) and the
+[Python](../client-api/python) / [JS](../client-api/javascript) /
+[Rust](../client-api/rust) references.
 
-## Graceful Shutdown
+## Authorizing clients
 
-Press `Ctrl+C` to shut down:
+When `[auth].enabled = true`, only registered users can connect. Add a
+public key:
+
+```bash
+cat ~/.ssh/id_ed25519.pub | pie auth add alice laptop
+pie auth list
+```
+
+`pie auth remove alice [key_name]` revokes a single key or the whole user.
+
+## Dummy backend (no GPU)
+
+For protocol-level testing without loading real weights, set the driver to
+`dummy`:
+
+```bash
+pie config set model.default.driver.type dummy
+pie serve
+```
+
+The engine returns random tokens but every other code path runs.
+
+## Graceful shutdown
+
+`Ctrl-C`:
 
 ```
 ^C
-Shutting down...
 ✓ Shutdown complete
 ```
 
-Pie will:
-1. Stop accepting new connections
-2. Wait for running inferlets to complete
-3. Terminate backends
-4. Clean up resources
+Pie stops accepting new connections, lets running processes finish, tears
+down driver workers, and exits.
 
-## Next Steps
+## Next steps
 
-- Learn to [connect from code](./client-basics)
-- Explore the [CLI Reference](../cli)
+- [Client basics](./client-basics) — drive the server from your code.
+- [CLI reference](../cli) — all `pie serve` options and config schema.

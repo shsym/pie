@@ -1,16 +1,16 @@
 ---
 title: I/O & Messaging
-description: HTTP client/server, file I/O, client messaging, broadcast/subscribe, and spawning inferlets
-sidebar_position: 10
+description: HTTP client/server, file I/O, broadcast/subscribe, and queues
+sidebar_position: 11
 ---
 
 # I/O & Messaging
 
-Inferlets run inside a WASI (WebAssembly System Interface) sandbox. WASI provides capability-based access to the outside world — HTTP networking, filesystem, and timers. Pie extends this with a messaging interface for inter-inferlet and client communication.
+Inferlets run inside a WASI sandbox. WASI gives them HTTP, filesystem,
+timers, and `wstd::task` — Pie layers a `messaging` interface on top for
+inter-inferlet and host coordination.
 
-## HTTP Client
-
-Fetch data from external services using `wstd::http::Client`:
+## HTTP client
 
 ```rust
 use inferlet::wstd::http::{Client, Method, Request};
@@ -18,208 +18,156 @@ use inferlet::wstd::io::{AsyncRead, empty};
 
 async fn fetch(url: &str) -> Result<Vec<u8>> {
     let client = Client::new();
-
-    let request = Request::builder()
+    let req = Request::builder()
         .uri(url)
         .method(Method::GET)
         .body(empty())?;
+    let resp = client.send(req).await?;
 
-    let response = client.send(request).await?;
-
-    let mut body = response.into_body();
+    let mut body = resp.into_body();
     let mut buf = Vec::new();
     body.read_to_end(&mut buf).await?;
-
     Ok(buf)
 }
 ```
 
-This enables inferlets to:
-- Fetch documents, images, or data for context
-- Call external APIs (e.g., search engines, databases)
-- Download resources on demand
+Use it for fetching documents, calling external APIs, or downloading
+resources at request time.
 
-## HTTP Server
+## HTTP server inferlets
 
-Inferlets can also serve HTTP requests using the `wasi:http/incoming-handler` interface. This is a different entry point from `#[inferlet::main]`:
+A separate entry-point macro turns an inferlet into an HTTP server. Used
+e.g. by `inferlets/http-server/`:
 
 ```rust
-use wstd::http::body::{BodyForthcoming, IncomingBody};
+use wstd::http::body::IncomingBody;
 use wstd::http::server::{Finished, Responder};
 use wstd::http::{IntoBody, Request, Response, StatusCode};
-use wstd::io::AsyncWrite;
 
 #[wstd::http_server]
 async fn main(req: Request<IncomingBody>, res: Responder) -> Finished {
-    let path = req.uri().path();
-
-    match path {
-        "/" => {
-            res.respond(Response::new("Hello!".into_body())).await
-        }
-        _ => {
-            let response = Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body("404".into_body())
-                .unwrap();
-            res.respond(response).await
-        }
+    match req.uri().path() {
+        "/" => res.respond(Response::new("hello".into_body())).await,
+        _   => res.respond(
+                  Response::builder().status(StatusCode::NOT_FOUND)
+                      .body("404".into_body()).unwrap(),
+              ).await,
     }
 }
 ```
 
-Run an HTTP server inferlet:
+Run it with the `pie http` command (currently exposed by the runtime, not
+the top-level `pie` CLI — see the inferlet's README).
 
-```bash
-pie http --path ./my-server.wasm --port 8080
-```
-
-### SSE Streaming
-
-For streaming responses (e.g., Server-Sent Events), use `BodyForthcoming`:
+### SSE / streaming responses
 
 ```rust
-let sse_response = Response::builder()
+use wstd::http::body::BodyForthcoming;
+use wstd::io::AsyncWrite;
+
+let stream = Response::builder()
     .header("Content-Type", "text/event-stream")
-    .header("Cache-Control", "no-cache")
-    .body(BodyForthcoming)
-    .unwrap();
+    .body(BodyForthcoming).unwrap();
+let mut body = res.start_response(stream);
 
-let mut body = res.start_response(sse_response);
-
-for i in 1..=5 {
-    let event = format!("event: message\ndata: {{\"count\": {}}}\n\n", i);
-    body.write_all(event.as_bytes()).await?;
-    body.flush().await?;  // Push data to client immediately
+for i in 0..5 {
+    let frame = format!("data: {{\"i\":{i}}}\n\n");
+    body.write_all(frame.as_bytes()).await?;
+    body.flush().await?;
     wstd::task::sleep(Duration::from_millis(100)).await;
 }
-
 Finished::finish(body, Ok(()), None)
 ```
 
 ## File I/O
 
-WASI provides standard filesystem access:
+Standard `std::fs` works inside the WASI sandbox:
 
 ```rust
-use std::fs;
-
-// Read a file
-let contents = fs::read_to_string("/data/input.txt")?;
-
-// Write a file
-fs::write("/data/output.json", &json_bytes)?;
+let s = std::fs::read_to_string("/data/in.txt")?;
+std::fs::write("/data/out.json", &json)?;
 ```
 
-:::note
-File access is sandboxed — inferlets can only access directories explicitly granted by the runtime.
-:::
+Filesystem access is gated by the runtime — only directories the host
+has explicitly granted are visible.
 
-## Timers and Sleep
+## Time
 
 ```rust
 use wstd::time::{Duration, Instant};
 
-// Sleep
 wstd::task::sleep(Duration::from_secs(1)).await;
-
-// Timing
-let start = Instant::now();
-// ... work ...
-let elapsed = start.elapsed();
+let t0 = Instant::now();
+// …work…
+let dt = t0.elapsed();
 ```
 
-## Client Communication
+## Broadcast / subscribe
 
-Send and receive text messages with the connected client:
-
-```rust
-use inferlet::{messaging, FutureStringExt};
-
-// Send a message to the client
-messaging::send("Processing your request...");
-
-// Receive a message from the client (async)
-let future = messaging::receive();
-let msg = future.wait_async().await;  // Option<String>
-```
-
-:::note
-`receive()` returns a `FutureString` — a pollable async handle. Use the `FutureStringExt::wait_async()` extension trait to await it.
-:::
-
-The client SDK's `send()`/`recv()` methods correspond to these functions.
-
-## Broadcast / Subscribe
-
-One-to-many messaging where all subscribers receive every message:
+Topic-based fan-out: every subscriber sees every broadcast.
 
 ```rust
 use inferlet::{messaging, SubscriptionExt};
 
-// Publisher: broadcast to all subscribers on a topic
-messaging::broadcast("events", "new-data-available");
+// Publisher
+messaging::broadcast("events", "new-data");
 
-// Subscriber: subscribe to a topic
-let subscription = messaging::subscribe("events");
-
-// Poll for messages asynchronously
+// Subscriber
+let sub = messaging::subscribe("events");
 loop {
-    if let Some(msg) = subscription.get_async().await {
-        println!("Got event: {}", msg);
+    if let Some(msg) = sub.get_async().await {
+        eprintln!("got {msg}");
     }
 }
-
-// When done
-subscription.unsubscribe();
+sub.unsubscribe();
 ```
 
-Broadcast/subscribe enables event-driven coordination between inferlets — for example, notifying workers that new data is available.
+`SubscriptionExt::get_async()` is the async polled receive. The raw
+`subscription.get()` is non-blocking and returns `Option<String>`.
 
-## Spawning Inferlets
+Used by `inferlets/agent-swarm/` to coordinate worker generations.
 
-Launch child inferlets from within a running inferlet:
+## Queues (push / pull)
+
+Work-queue style: each `pull` consumes one message; topic order is
+preserved.
 
 ```rust
-use inferlet::{runtime, FutureStringExt};
+use inferlet::{messaging, FutureStringExt};
 
-// Spawn a child inferlet by package name
-let result = runtime::spawn("my-tool@0.1.0", &["--arg", "value"])?;
+// Producer
+messaging::push("jobs", &job_payload);
 
-// Wait for its output
-let output = result.wait_async().await;  // Option<String>
+// Consumer
+let fut = messaging::pull("jobs");
+let msg: Option<String> = fut.wait_async().await;
 ```
 
-This enables pipelines where one inferlet delegates subtasks to others.
+`FutureStringExt::wait_async()` resolves the WIT `future-string` handle.
 
 ## Concurrency
 
-Use `wstd::task::spawn` for concurrent operations within an inferlet:
+`wstd::task::spawn` runs tasks concurrently within an inferlet (e.g.,
+parallel HTTP fetches alongside generation):
 
 ```rust
-use wstd::task;
-
-// Spawn concurrent tasks
-let handle = task::spawn(async {
-    // ... concurrent work ...
-    "result"
-});
+let h1 = wstd::task::spawn(async { fetch("https://a").await });
+let h2 = wstd::task::spawn(async { fetch("https://b").await });
+let (a, b) = (h1.await?, h2.await?);
 ```
 
-This is useful for parallel HTTP requests, concurrent generation streams, or background processing.
+## At a glance
 
-## Summary
+| Pattern | Purpose |
+|---|---|
+| `wstd::http::Client` | Fetch external HTTP resources. |
+| `#[wstd::http_server]` | Expose an HTTP/SSE endpoint from an inferlet. |
+| `std::fs` | Read/write within the sandbox. |
+| `messaging::broadcast / subscribe` | Topic fan-out — every subscriber sees every msg. |
+| `messaging::push / pull` | Work-queue, single-consumer-per-message. |
+| `wstd::task::spawn` | Concurrent tasks inside one inferlet. |
 
-| Pattern | When to use |
-|---------|-------------|
-| **HTTP Client** | Fetch external data, call APIs |
-| **HTTP Server** | Serve HTTP/SSE endpoints from an inferlet |
-| **File I/O** | Read/write sandboxed files |
-| **Send / Receive** | Interactive client-inferlet communication |
-| **Broadcast / Subscribe** | Event notifications, state sync across inferlets |
-| **Spawn** | Delegate subtasks to other inferlets |
+## Next
 
-## Next Steps
-
-- **[MCP Integration](./mcp)** — Connect to external tool servers
-- **[Building & Publishing](./building-publishing)** — Package your inferlet
+- [MCP integration](./mcp) — connect to external tool servers.
+- [Building & publishing](./building-publishing) — package an inferlet.
