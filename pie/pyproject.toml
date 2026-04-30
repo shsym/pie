@@ -28,6 +28,7 @@ dependencies = [
     "opentelemetry-api>=1.20.0",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20.0",
     "opentelemetry-sdk>=1.20.0",
+    "pie-bakery",
     "pie-client",
     "platformdirs>=4.3",
     "psutil>=7.1.3",
@@ -110,6 +111,11 @@ name = "pytorch-cu126"
 url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
 # cu130 channel — used by the sglang extra. Upstream sglang's pyproject
 # pins torch/torchvision/torchaudio through its own `torch-cu130` index
 # (see ../../sglang/python/pyproject.toml [tool.uv.sources]); we mirror that
@@ -126,25 +132,28 @@ explicit = true
 
 [tool.uv.sources]
 
-# Local workspace member
+# Local workspace members
 pie-client = { path = "../client/python", editable = true }
+pie-bakery = { path = "../sdk/tools/bakery", editable = true }
 
 # Track upstream vllm via the sibling checkout. Pin behavior is "whatever is
 # checked out" — bump via `git -C ../../vllm pull` then re-sync.
-vllm = { path = "../../vllm", editable = true }
+# vllm = { path = "../../vllm", editable = true }
 
 # Track upstream sglang via the sibling checkout. Same convention as vllm.
 # The sglang Python package lives at ../../sglang/python.
-sglang = { path = "../../sglang/python", editable = true }
+# sglang = { path = "../../sglang/python", editable = true }
 
 # Torch: cu126 from cu126 index, sglang's pinned 2.9.1 from the cu130 index
 # (sglang upstream pins it that way). The vllm path's loose `torch>=2.7.1`
 # (in the cu128 base extra) keeps using PyPI's default channel as before.
 torch = [
     { index = "pytorch-cu126", extra = "cu126" },
+    { index = "pytorch-cu128", extra = "cu128" },
     { index = "torch-cu130", extra = "sglang" },
 ]
 torchao = [
+    { index = "pytorch-cu128", extra = "cu128" },
     { index = "torch-cu130", extra = "sglang" },
 ]
 torchaudio = [

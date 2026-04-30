@@ -80,6 +80,32 @@ class TelemetryConfig:
 
 
 @dataclass
+class SchedulerConfig:
+    """The `[model.X.scheduler]` block.
+
+    `policy` selects the batch-firing policy (see
+    `runtime/src/inference/adaptive_policy.rs` for the choices and their
+    tradeoffs). Recognized values: `"adaptive"` (default), `"eager"`,
+    `"greedy"`.
+    """
+
+    request_timeout_secs: int = 120
+    policy: str | None = None
+
+    def __post_init__(self):
+        if self.request_timeout_secs <= 0:
+            raise ValueError(
+                f"scheduler.request_timeout_secs must be > 0 "
+                f"(got {self.request_timeout_secs!r})"
+            )
+        if self.policy is not None and self.policy not in ("adaptive", "eager", "greedy"):
+            raise ValueError(
+                f"scheduler.policy must be one of "
+                f"'adaptive' | 'eager' | 'greedy' (got {self.policy!r})"
+            )
+
+
+@dataclass
 class DriverConfig:
     """The `[model.X.driver]` block.
 
@@ -109,6 +135,7 @@ class ModelConfig:
     name: str
     hf_repo: str
     driver: DriverConfig
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     # Admission policy (pie's market mechanism)
     default_token_budget: int | None = None
     default_endowment_pages: int = 64
@@ -291,11 +318,22 @@ def _parse_model(name: str, raw: dict) -> ModelConfig:
         )
 
     driver = _parse_driver(name, raw["driver"])
+    sched_raw = raw.get("scheduler", {})
+    if not isinstance(sched_raw, dict):
+        raise ValueError(
+            f"[model.{name}.scheduler] must be a TOML table, "
+            f"got {type(sched_raw).__name__}."
+        )
+    scheduler = SchedulerConfig(
+        request_timeout_secs=int(sched_raw.get("request_timeout_secs", 120)),
+        policy=sched_raw.get("policy"),
+    )
 
     return ModelConfig(
         name=name,
         hf_repo=str(raw["hf_repo"]),
         driver=driver,
+        scheduler=scheduler,
         default_token_budget=raw.get("default_token_budget"),
         default_endowment_pages=int(raw.get("default_endowment_pages", 64)),
         oversubscription_factor=float(raw.get("oversubscription_factor", 4.0)),

@@ -308,7 +308,6 @@ impl ContextManager {
                         samplers: Vec::new(),
                         adapter_id: *adapter,
                         adapter_seed: *adapter_seed,
-                        arrival_time: None,
                     };
 
                     requests.push((fwd_req, phys_ids, last_page_len));
@@ -384,7 +383,6 @@ impl ContextManager {
                         samplers: Vec::new(),
                         adapter_id: adapter,
                         adapter_seed,
-                        arrival_time: None,
                     };
 
                     requests.push((fwd_req, phys_ids, last_page_len));

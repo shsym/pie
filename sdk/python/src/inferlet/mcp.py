@@ -1,13 +1,15 @@
 """
 MCP client wrapping ``pie:mcp/client``.
 
-Lets inferlets discover and call MCP servers.
+Lets inferlets discover and call MCP servers. All response payloads are
+returned as raw JSON strings — the WIT contract stays stable as MCP
+evolves; you parse the JSON yourself with whatever shape your inferlet
+needs.
 """
 
 from __future__ import annotations
 
 from wit_world.imports import client as _client
-from wit_world.imports.pie_mcp_types import Content
 
 
 def available_servers() -> list[str]:
@@ -16,9 +18,10 @@ def available_servers() -> list[str]:
 
 
 def connect(server_name: str) -> McpSession:
-    """Connect to a named MCP server.
+    """Open a session to a registered MCP server.
 
-    Performs the MCP handshake and returns a session handle.
+    The MCP `initialize` handshake is performed by the host at
+    registration time; this is just a typed-handle constructor.
     """
     handle = _client.connect(server_name)
     return McpSession(handle)
@@ -27,11 +30,18 @@ def connect(server_name: str) -> McpSession:
 class McpSession:
     """An active connection to an MCP server.
 
+    All methods return the raw JSON-RPC ``result`` field as a string. Use
+    ``json.loads(...)`` to inspect — particularly the ``isError`` /
+    ``content`` / ``structuredContent`` fields of a ``call_tool`` response.
+
     Usage::
 
+        import json
         session = mcp.connect("my-mcp-server")
-        tools = session.list_tools()
-        result = session.call_tool("search", '{"query": "hello"}')
+        tools = json.loads(session.list_tools())["tools"]
+        result = json.loads(session.call_tool("search", '{"query": "hi"}'))
+        if result.get("isError"):
+            ...
     """
 
     __slots__ = ("_handle",)
@@ -40,33 +50,27 @@ class McpSession:
         self._handle = handle
 
     def list_tools(self) -> str:
-        """List tools exposed by this server (JSON)."""
+        """Raw `tools/list` JSON-RPC result."""
         return self._handle.list_tools()
 
-    def call_tool(self, name: str, args: str) -> list[Content]:
-        """Call a tool by name with JSON arguments.
-
-        Returns a list of Content items (Text, Image, or EmbeddedResource).
-        """
+    def call_tool(self, name: str, args: str) -> str:
+        """Raw `tools/call` JSON-RPC result. Includes `isError` / `content`."""
         return self._handle.call_tool(name, args)
 
     def list_resources(self) -> str:
-        """List resources exposed by this server (JSON)."""
+        """Raw `resources/list` JSON-RPC result."""
         return self._handle.list_resources()
 
-    def read_resource(self, uri: str) -> list[Content]:
-        """Read a resource by URI.
-
-        Returns a list of Content items.
-        """
+    def read_resource(self, uri: str) -> str:
+        """Raw `resources/read` JSON-RPC result."""
         return self._handle.read_resource(uri)
 
     def list_prompts(self) -> str:
-        """List prompts exposed by this server (JSON)."""
+        """Raw `prompts/list` JSON-RPC result."""
         return self._handle.list_prompts()
 
     def get_prompt(self, name: str, args: str) -> str:
-        """Render a prompt template with the given arguments (JSON)."""
+        """Raw `prompts/get` JSON-RPC result."""
         return self._handle.get_prompt(name, args)
 
     def __enter__(self) -> McpSession:

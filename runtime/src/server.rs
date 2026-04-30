@@ -98,13 +98,18 @@ pub fn get_mcp_servers(client_id: ClientId) -> Vec<String> {
 }
 
 /// Sends an MCP relay request to a client and awaits the response.
+///
+/// Returns `Ok(Ok(payload))` on application success (`payload` is the
+/// JSON-encoded JSON-RPC `result` field), `Ok(Err(payload))` on application
+/// error (`payload` is the JSON-encoded JSON-RPC `error` object), or `Err`
+/// on transport / channel failure.
 pub async fn send_mcp_request(
     client_id: ClientId,
     process_id: ProcessId,
     server_name: String,
     method: String,
     params: String,
-) -> Result<String> {
+) -> Result<std::result::Result<String, String>> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     CLIENT_SERVICES.send(&client_id, SessionMessage::McpRelay {
         process_id,
@@ -114,11 +119,7 @@ pub async fn send_mcp_request(
         response: tx,
     })?;
     let (ok, result) = rx.await?;
-    if ok {
-        Ok(result)
-    } else {
-        bail!("MCP request failed: {}", result)
-    }
+    Ok(if ok { Ok(result) } else { Err(result) })
 }
 
 /// Spawns a new session actor for the given TCP connection.
@@ -169,6 +170,12 @@ impl Server {
     async fn listener_loop(addr: String, state: Arc<ServerState>) {
         let listener = TcpListener::bind(addr).await.unwrap();
         while let Ok((stream, _addr)) = listener.accept().await {
+            // Disable Nagle's algorithm so small RPC messages don't sit waiting
+            // for delayed-ACKs — without this, concurrent client requests see
+            // ~40 ms tail latency on Linux (one outlier per batch).
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!("set_nodelay failed: {}", e);
+            }
             let id = state.next_client_id.fetch_add(1, Ordering::Relaxed);
 
             match spawn_session(id, stream, state.clone()).await {

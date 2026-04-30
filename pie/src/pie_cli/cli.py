@@ -7,6 +7,8 @@ import typer
 
 from pie_cli import config
 from pie_cli.commands import serve, run
+from pie_cli.commands.build import build
+from pie_cli.commands.new import new
 from pie_cli.commands.model import app as model_app
 from pie_cli.commands.auth import app as auth_app
 from pie_cli.commands.doctor import doctor
@@ -20,6 +22,8 @@ app = typer.Typer(
 # Register top-level commands
 app.command()(serve)
 app.command()(run)
+app.command()(build)
+app.command()(new)
 app.command()(doctor)
 
 # Register subcommand groups

@@ -112,6 +112,29 @@ class ModelLoader:
                 schema = qwen3.create_schema(model_config)
                 num_layers = model_config.num_layers
 
+            case "qwen3_5":
+                from .model import qwen3_5
+
+                model_config = qwen3_5.ModelConfig.from_dict(hf_config)
+                schema = qwen3_5.create_schema(model_config)
+                # Schema for qwen3_5 already enumerates layers explicitly (no
+                # `*` patterns), so we pass num_layers=0 to avoid re-expansion.
+                num_layers = 0
+
+            case "phi3":
+                from .model import phi3
+
+                model_config = phi3.ModelConfig.from_dict(hf_config)
+                schema = phi3.create_schema(model_config)
+                num_layers = model_config.num_layers
+
+            case "mixtral":
+                from .model import mixtral
+
+                model_config = mixtral.ModelConfig.from_dict(hf_config)
+                schema = mixtral.create_schema(model_config)
+                num_layers = model_config.num_layers
+
             case "gptoss":
                 from .model import gpt_oss
 
