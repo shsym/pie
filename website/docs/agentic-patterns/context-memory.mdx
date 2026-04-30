@@ -29,22 +29,23 @@ After processing untrusted input, purge the raw tokens from context and retain o
 
 ```rust
 // Process untrusted content
-let untrusted_page_count = ctx.committed_page_count();
+let untrusted_page_count = ctx.inner().committed_page_count();
 
 ctx.user(&format!("Extract sender, subject, and action items:\n{email}"));
 ctx.cue();
 
 let extraction = ctx.generate(sampler.clone())
-    .with_constraint(extraction_schema.clone())
+    .with_schema(Schema::Json)?
     .with_max_tokens(128)
     .collect_text().await?;
 
 // Purge the untrusted input from KV cache
-// Release all pages that contained the raw email
-ctx.release_pages(ctx.committed_page_count() - untrusted_page_count);
+// Release all working pages that contained the raw email
+let to_release = ctx.inner().committed_page_count() - untrusted_page_count;
+ctx.inner().release_working_pages(to_release);
 
 // Continue with only the safe extraction
-let safe_ctx = Context::new(&model)?;
+let mut safe_ctx = Context::new(&model)?;
 safe_ctx.system("You are a task manager.");
 safe_ctx.user(&format!("Process this extracted data:\n{extraction}"));
 safe_ctx.cue();

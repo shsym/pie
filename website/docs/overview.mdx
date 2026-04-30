@@ -53,22 +53,25 @@ Modern LLM apps demand LLM usage beyond simple text completion. They're interact
 **1) Write inferlets** with Pie APIs to control LLM resources (KV, embeddings), run inference (embed, forward, sample), and do lightweight I/O (HTTP, message bus).
 
 ```rust
-use inferlet::{Args, Result, ContextExt, InstructExt};
-use inferlet::model::Model;
-use inferlet::context::Context;
-use inferlet::inference::Sampler;
+use inferlet::{Context, Result, inference::Sampler, model::Model, runtime};
+use serde::Deserialize;
+
+#[derive(Deserialize)]
+struct Input {
+    prompt: String,
+}
 
 #[inferlet::main]
-async fn main(args: Args) -> Result<String> {
-    let model = Model::load(&inferlet::runtime::models()[0])?;
-    let ctx = Context::new(&model)?;
+async fn main(input: Input) -> Result<String> {
+    let model = Model::load(&runtime::models()[0])?;
+    let mut ctx = Context::new(&model)?;
 
     ctx.system("You are a helpful, respectful and honest assistant.");
-    ctx.user("How are you?");
+    ctx.user(&input.prompt);
     ctx.cue();
 
     let response = ctx
-        .generate(Sampler::TopP((0.6, 0.95)))
+        .generate(Sampler::top_p(0.6, 0.95))
         .collect_text()
         .await?;
 
@@ -100,27 +103,22 @@ Pie is a three-layered system where each layer separates concerns.
 
 Pie provides client libraries for:
 - **Python** — `pip install pie-client`
-- **JavaScript** — `npm install @pie-project/client`
+- **JavaScript** — `npm install pie-client`
 - **Rust** — `cargo add pie-client`
 
 See the [Client API](./client-api/python) documentation for details.
 
 ---
 
-## Standard Inferlets
+## Bundled Inferlets
 
-Pie includes standard inferlets for common use cases:
+The Pie repo ships ~35 example inferlets under `inferlets/` covering chat, structured generation, speculative decoding, agents, and concurrency benchmarks. The canonical entry point is `text-completion`:
 
-| Inferlet | Description |
-|----------|-------------|
-| `std/text-completion` | Simple text completion |
-| `std/chat` | Multi-turn chat with system prompts |
-
-Run them directly:
 ```bash
-pie run text-completion -- --prompt "Once upon a time"
-pie run chat
+pie run text-completion --prompt "Once upon a time"
 ```
+
+Browse the full catalog in [Examples](./examples).
 
 ---
 

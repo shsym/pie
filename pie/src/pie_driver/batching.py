@@ -352,6 +352,7 @@ class Batch:
                 if self.adapter_subpass_needed
                 else None
             ),
+            "total_pages_cpu": self.kv_page_indptr[-1],
             "spec_token_ids": (
                 torch.as_tensor(self.spec_token_ids, device=device, dtype=torch.long)
                 if len(self.spec_token_ids) > 0
@@ -567,6 +568,7 @@ class Batch:
                 if self.adapter_subpass_needed
                 else None
             ),
+            "total_pages_cpu": self.kv_page_indptr[-1],
         }
 
     def get_sampling_metadata(

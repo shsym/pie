@@ -115,6 +115,11 @@ class SGLangEngine:
             page_size=int(loaded.runner.page_size),
         )
 
+        # The loader deferred `init_device_graphs()` so pie's hook could be
+        # installed first; capture now that the hook is in place.
+        if loaded.graph_capture_deferred:
+            loaded.runner.init_device_graphs()
+
         # Pinned host KV pool — sized from `cpu_mem_budget_in_gb`. Indexing
         # contract matches native: `host_kv[layer][slot]` is one block worth
         # of (K, V) data, ready for `index_copy_` in the swap RPC handlers.
@@ -313,6 +318,7 @@ class SGLangEngine:
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
             single_token_inference_mode=inputs["single_token_inference_mode"],
+            total_pages_cpu=inputs.get("total_pages_cpu", 0),
             custom_mask=inputs.get("custom_mask"),
             adapter_subpass=adapter_subpass,
         )

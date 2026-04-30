@@ -167,6 +167,7 @@ class VllmEngine:
             # so we gate on the explicit `has_custom_mask` flag instead.
             custom_mask=inputs["custom_mask"] if inputs.get("has_custom_mask") else None,
             single_token_inference_mode=inputs["single_token_inference_mode"],
+            total_pages_cpu=inputs.get("total_pages_cpu", 0),
         )
 
         return self.forward_pass.sample(hidden_states, sampling_metadata)

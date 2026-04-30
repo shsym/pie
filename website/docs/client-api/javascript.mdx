@@ -1,223 +1,170 @@
 ---
 title: JavaScript Client
-description: JavaScript client library reference
+description: JavaScript / TypeScript client library reference
 sidebar_position: 2
 ---
 
 # JavaScript Client
 
-A JavaScript client for interacting with the Pie server.
+The JavaScript client (Node.js or modern browsers) talks to the Pie server
+over WebSocket. It mirrors the Python client surface, with `camelCase` method
+names.
 
 ## Installation
 
 ```bash
-npm install @pie-project/client
+npm install @pie/client
 ```
 
-## Quick Start
+## Quick start
 
 ```javascript
-import { PieClient } from '@pie-project/client';
+import { PieClient } from '@pie/client';
 
-async function main() {
-    const client = new PieClient('ws://127.0.0.1:8080');
-    
-    try {
-        await client.connect();
-        await client.authenticate('username');
-        
-        const instance = await client.launchInstanceFromRegistry(
-            'text-completion',
-            ['--prompt', 'What is the capital of France?']
-        );
-        
-        while (true) {
-            const { event, msg } = await instance.recv();
-            
-            if (event === 'Stdout') {
-                process.stdout.write(msg);
-            } else if (event === 'Completed') {
-                break;
-            }
-        }
-    } finally {
-        await client.close();
-    }
+const client = new PieClient("ws://127.0.0.1:8080");
+await client.connect();
+
+// Internal-token auth (used between backend processes).
+// For public-key auth, use the Python or Rust client today.
+await client.authByToken(process.env.PIE_TOKEN);
+
+const proc = await client.launchProcess(
+  "text-completion@0.1.0",
+  { prompt: "Hello", max_tokens: 64 },
+);
+
+while (true) {
+  const { event, value } = await proc.recv();
+  if (event === "stdout")  process.stdout.write(value);
+  else if (event === "return") { console.log("\n[done]", value); break; }
+  else if (event === "error")  { console.error("\n[error]", value); break; }
 }
 
-main();
+client.close();
 ```
 
 ## PieClient
 
-The main client class for connecting to a Pie server.
-
-### Constructor
-
 ```javascript
-new PieClient(serverUri)
-```
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `serverUri` | `string` | WebSocket URI (e.g., `"ws://127.0.0.1:8080"`) |
-
-### Methods
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `connect()` | `Promise<void>` | Establish WebSocket connection |
-| `close()` | `Promise<void>` | Close the connection |
-| `authenticate(username)` | `Promise<void>` | Authenticate with server |
-| `uploadProgram(bytes)` | `Promise<void>` | Upload a WASM program |
-| `programExists(hash)` | `Promise<boolean>` | Check if program exists |
-| `launchInstance(hash, args, detached)` | `Promise<Instance>` | Launch by hash |
-| `launchInstanceFromRegistry(name, args, detached)` | `Promise<Instance>` | Launch from registry |
-| `attachInstance(instanceId)` | `Promise<Instance>` | Attach to existing instance |
-| `listInstances()` | `Promise<Array>` | List running instances |
-| `terminateInstance(instanceId)` | `Promise<void>` | Terminate an instance |
-| `ping()` | `Promise<void>` | Check connectivity |
-
-### Example
-
-```javascript
-const client = new PieClient('ws://127.0.0.1:8080');
-
+const client = new PieClient(serverUri);
 await client.connect();
-await client.authenticate('username');
-
-// Upload a custom inferlet
-const wasmBytes = await fs.promises.readFile('my_inferlet.wasm');
-await client.uploadProgram(wasmBytes);
-
-// Check if already uploaded
-const exists = await client.programExists(programHash);
+// …
+client.close();
 ```
 
-## Instance
+| Method | Description |
+|--------|-------------|
+| `connect()` | Open the WebSocket connection. Resolves once the socket is open. |
+| `close()` | Close the connection. |
 
-Represents a running program instance.
+### Authentication
 
-### Properties
+| Method | Description |
+|--------|-------------|
+| `authByToken(token)` | Authenticate with an internal token. The only auth mechanism currently exposed by the JS client. |
 
-| Property | Type | Description |
-|----------|------|-------------|
-| `instanceId` | `string` | Unique instance identifier |
+If the server has `[auth].enabled = false`, you can skip authentication
+entirely.
 
-### Methods
+### Programs
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `send(message)` | `Promise<void>` | Send a string message |
-| `recv()` | `Promise<{event, msg}>` | Receive next event |
-| `terminate()` | `Promise<void>` | Request termination |
+| Method | Description |
+|--------|-------------|
+| `resolveVersion(name, registryUrl)` | Returns `name@version`; passes through if `name` already includes `@`. |
+| `checkProgram(inferlet)` | Returns `true` if the server already has this `name@version`. (`programExists` is an alias.) |
+| `installProgram(wasmPath, manifestPath, forceOverwrite=false)` | **Node.js only.** Reads the WASM and `Pie.toml` from disk and uploads them in chunks. |
 
-### Example
+### Processes
+
+| Method | Description |
+|--------|-------------|
+| `launchProcess(inferlet, input={}, captureOutputs=true, { tokenBudget=null }={})` | Launch a `name@version`. `input` is JSON-stringified into the inferlet's typed input. (`launchInstance` is an alias.) |
+| `attachProcess(processId)` | Reattach to an existing process by id. |
+| `signalProcess(processId, message)` | Fire-and-forget string signal. |
+| `terminateProcess(processId)` | Stop a process. |
+| `listProcesses()` | Return active process ids. |
+| `launchDaemon(inferlet, port, input={})` | Start a long-running daemon inferlet bound to `port`. |
+| `ping()` | Round-trip a ping. |
+| `query(subject, record)` | Generic key-value query passthrough. |
+
+`launchProcess` and `attachProcess` resolve to a [`Process`](#process).
+
+## Process
 
 ```javascript
-const instance = await client.launchInstanceFromRegistry('chat');
+class Process {
+  processId: string;
 
-// Send a message
-await instance.send('What is the meaning of life?');
-
-// Receive response
-const { event, msg } = await instance.recv();
-console.log(msg);
-
-// Terminate when done
-await instance.terminate();
+  async signal(message);
+  async transferFile(fileBytes);   // Uint8Array | Buffer
+  async recv();                    // → { event, value }
+  async terminate();
+}
 ```
 
-## Event Types
+| Method | Description |
+|--------|-------------|
+| `recv()` | Await the next event. Returns `{ event, value }`. |
+| `signal(message)` | Send a string signal to the running inferlet. |
+| `transferFile(bytes)` | Send a binary file (chunked). |
+| `terminate()` | Request termination. |
 
-Events returned by `instance.recv()`:
+`Instance` is exported as a backwards-compatible alias for `Process`.
 
-| Event | Description |
-|-------|-------------|
-| `Message` | Text message from instance |
-| `Stdout` | Streaming stdout output |
-| `Stderr` | Streaming stderr output |
-| `Blob` | Binary data received |
-| `Completed` | Instance finished successfully |
-| `Aborted` | Instance was aborted |
-| `Exception` | Instance raised an exception |
-| `ServerError` | Server-side error |
-| `OutOfResources` | Resource limit reached |
-
-### Handling Events
+### Receive loop pattern
 
 ```javascript
+const proc = await client.launchProcess("my-inferlet@0.1.0", { prompt });
+
 while (true) {
-    const { event, msg } = await instance.recv();
-    
-    switch (event) {
-        case 'Stdout':
-            process.stdout.write(msg);
-            break;
-        case 'Stderr':
-            console.error(msg);
-            break;
-        case 'Completed':
-            console.log('\nDone!');
-            return;
-        case 'Exception':
-            throw new Error(`Inferlet error: ${msg}`);
-        case 'ServerError':
-            throw new Error(`Server error: ${msg}`);
-    }
+  const { event, value } = await proc.recv();
+  switch (event) {
+    case "stdout":  process.stdout.write(value); break;
+    case "stderr":  process.stderr.write(value); break;
+    case "message": handleMessage(value);        break;
+    case "file":    saveBlob(value);             break;   // Uint8Array
+    case "return":  return JSON.parse(value);              // typed Output
+    case "error":   throw new Error(value);
+  }
 }
 ```
 
-## Detached Instances
+## Events
 
-Launch instances that persist after disconnection:
+Events are passed as plain strings (no enum):
 
-```javascript
-// Launch detached
-const instance = await client.launchInstanceFromRegistry(
-    'long-task',
-    [],
-    true  // detached
-);
-const instanceId = instance.instanceId;
+| Event | Payload | Description |
+|-------|---------|-------------|
+| `"stdout"` | `string` | Streamed stdout. |
+| `"stderr"` | `string` | Streamed stderr. |
+| `"message"` | `string` | Inferlet-emitted message. |
+| `"file"` | `Uint8Array` | Inferlet-emitted file (reassembled from chunks). |
+| `"return"` | `string` | Final JSON-encoded `Output`; the process exits cleanly after this. |
+| `"error"` | `string` | The process aborted. |
 
-// Disconnect
-await client.close();
+The event queue for a process is cleaned up automatically once `return` or
+`error` is delivered.
 
-// Later, reconnect and attach
-const client2 = new PieClient('ws://127.0.0.1:8080');
-await client2.connect();
-await client2.authenticate('username');
+## Detached / reattach
 
-const attached = await client2.attachInstance(instanceId);
-const { event, msg } = await attached.recv();
-```
-
-## Browser Usage
-
-The client works in browsers with WebSocket support:
-
-```html
-<script type="module">
-import { PieClient } from '@pie-project/client';
-
-const client = new PieClient('ws://localhost:8080');
-await client.connect();
-// ...
-</script>
-```
-
-## Error Handling
+`launchProcess` returns a handle you can drop. Reconnect later, call
+`attachProcess(processId)`, and resume reading. While disconnected, the
+server buffers events for you.
 
 ```javascript
-try {
-    await client.connect();
-    await client.authenticate('username');
-} catch (error) {
-    if (error.message.includes('ECONNREFUSED')) {
-        console.error('Server not running');
-    } else {
-        console.error('Connection error:', error);
-    }
-}
+const c1 = new PieClient(uri); await c1.connect();
+const proc = await c1.launchProcess("long-task@0.1.0", { /* … */ });
+const pid = proc.processId;
+c1.close();
+
+// … later …
+const c2 = new PieClient(uri); await c2.connect();
+const resumed = await c2.attachProcess(pid);
+const { event, value } = await resumed.recv();
 ```
+
+## Browser vs. Node.js
+
+- `installProgram` requires `fs` and is Node.js-only.
+- Everything else (`authByToken`, `launchProcess`, `recv`, file transfer with
+  in-memory `Uint8Array`) works in modern browsers.

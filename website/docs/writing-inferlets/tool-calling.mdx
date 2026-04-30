@@ -13,12 +13,11 @@ Pie's tool-calling API lets inferlets equip the model with tools, detect when th
 Define tools and make them available to the model:
 
 ```rust
-use inferlet::InstructExt;
-
 ctx.system("You are a helpful assistant with access to tools.");
 
-// Equip tools with JSON schema definitions
-ctx.equip_tools(&[
+// Equip tools with JSON schema definitions. Each entry is a JSON string
+// in OpenAI tool-call format.
+let tools = vec![
     serde_json::json!({
         "name": "calculator",
         "description": "Evaluate a mathematical expression",
@@ -33,7 +32,8 @@ ctx.equip_tools(&[
             "required": ["expression"]
         }
     }).to_string(),
-])?;
+];
+ctx.equip_tools(&tools)?;
 
 ctx.user("What is 15 * 37?");
 ctx.cue();
@@ -124,22 +124,13 @@ for _ in 0..max_iterations {
 }
 ```
 
-## Tool Matcher
+## Forcing valid tool calls
 
-For structured generation that forces the model to produce a valid tool call, use `create_tool_matcher`:
-
-```rust
-use inferlet::InstructExt;
-
-// Create a grammar matcher constrained to valid tool calls
-let matcher = Context::create_tool_matcher(&model, &tool_schemas);
-
-// Use as a constraint during generation
-let output = ctx.generate(sampler)
-    .with_constraint(matcher)
-    .collect_text()
-    .await?;
-```
+To guarantee that the model produces a syntactically valid tool call, attach
+a [grammar constraint](./structured-generation) over the JSON shape of your
+tool schema. Combined with `with_tool_use()`, this masks invalid tokens
+during sampling and the decoder still emits `Event::ToolCall(name, args)`
+when the call completes.
 
 ## Next Steps
 

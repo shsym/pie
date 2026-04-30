@@ -478,7 +478,7 @@ def estimate_flashinfer_workspace_size(
             padded_batch_size = batch_size
         else:
             split_kv = True
-            # Worst-case: pad to max grid capacity.
+            # In worst case (or CUDA graph), it pads to max capacity
             padded_batch_size = max_grid_size // max(1, gqa_group_size)
 
         # -- Int Buffer Allocations --
