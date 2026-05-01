@@ -61,7 +61,6 @@ class ServerConfig:
     port: int = 8080
     verbose: bool = False
     registry: str = "https://registry.pie-project.org/"
-    allow_filesystem: bool = False
     max_concurrent_processes: int | None = None
     python_snapshot: bool = True
     primary_model: str | None = None     # which model is "primary"; default = first
@@ -77,6 +76,118 @@ class TelemetryConfig:
     enabled: bool = False
     endpoint: str = "http://localhost:4317"
     service_name: str = "pie"
+
+
+@dataclass
+class RuntimeConfig:
+    """The `[runtime]` block: tokio worker pool + wasmtime engine pool
+    + per-instance security policies (filesystem / network).
+
+    All fields are opt-in. Leaving the section out yields stock tokio,
+    stock wasmtime, no filesystem, and unrestricted network — the
+    legacy hardcoded behavior.
+
+    Tokio:
+      * `worker_threads` — number of tokio worker threads. `None`
+        (default) lets tokio pick `num_cpus`. On boxes with high
+        logical-core counts and many in-flight tasks (e.g. 96 cores at
+        high request concurrency), the default can cause heavy
+        migration / context-switch overhead; lowering this (commonly
+        to 8) substantially improves throughput. For real GPU backends
+        where Python compute dominates, the default is fine — leave
+        this unset unless a profile shows benefit.
+
+    Wasmtime engine pool:
+      * `wasm_max_instances` — concurrent-inferlet cap. Bumps
+        wasmtime's `total_core_instances`, `total_component_instances`,
+        `total_memories`, and `total_tables` together; pie uses one of
+        each per inferlet. `None` = wasmtime default of 1000.
+      * `wasm_max_memory_mb` — per-inferlet linear-memory cap, in MiB.
+        `None` = wasmtime default of 10.
+      * `wasm_warm_memory_mb` — RAM kept warm per slot to skip
+        remapping on respawn, in MiB. RSS-vs-spawn-latency tradeoff.
+        `None` = wasmtime default of 0.
+      * `wasm_warm_slots` — prepared-but-idle inferlet slots kept
+        ready for fast respawn. `None` = wasmtime default of 100.
+
+    Filesystem:
+      * `allow_fs` — when True, mount a per-process scratch dir at
+        `/scratch` with full RW. When False (default), no
+        ``wasi:filesystem`` access at all.
+      * `fs_scratch_dir` — base directory for per-process scratch
+        dirs. ``None`` (default) = ``${TMPDIR}/pie``.
+
+    Network:
+      * `allow_network` — when True (default), inferlets can use both
+        ``wasi:sockets`` and ``wasi:http``. When False, all socket
+        operations are denied and the ``wasi:http`` linker binding is
+        dropped entirely.
+      * `network_allowed_hosts` — list of ``cidr[:port]`` /
+        ``cidr:lo-hi`` strings. ``["*"]`` (default) means "no
+        restriction". Empty list ≡ ``allow_network = false``.
+        IMPORTANT: only filters ``wasi:sockets``; ``wasi:http``
+        bypasses the per-socket hook (its host stack does its own DNS
+        and connects directly). For tight IP-level control over
+        outbound HTTP, set ``allow_network = false`` and have your
+        inferlet use ``wasi:sockets`` directly.
+
+    Uploads:
+      * `max_upload_mb` — per-upload cap on cumulative bytes across
+        chunks (program installs and ``session.send_file`` blob
+        transfers). Checked on every chunk so a malicious sender
+        can't grow the in-flight buffer without bound. ``None``
+        (default) = use the runtime's built-in default of 256 MiB.
+    """
+
+    worker_threads: int | None = None
+    wasm_max_instances: int | None = None
+    wasm_max_memory_mb: int | None = None
+    wasm_warm_memory_mb: int | None = None
+    wasm_warm_slots: int | None = None
+    allow_fs: bool = False
+    fs_scratch_dir: str | None = None
+    allow_network: bool = True
+    network_allowed_hosts: list[str] = field(default_factory=lambda: ["*"])
+    max_upload_mb: int | None = None
+
+    def __post_init__(self):
+        if self.worker_threads is not None and self.worker_threads <= 0:
+            raise ValueError(
+                f"runtime.worker_threads must be > 0 if set "
+                f"(got {self.worker_threads!r})"
+            )
+        if self.wasm_max_instances is not None and self.wasm_max_instances <= 0:
+            raise ValueError(
+                f"runtime.wasm_max_instances must be > 0 if set "
+                f"(got {self.wasm_max_instances!r})"
+            )
+        if self.wasm_max_memory_mb is not None and self.wasm_max_memory_mb <= 0:
+            raise ValueError(
+                f"runtime.wasm_max_memory_mb must be > 0 if set "
+                f"(got {self.wasm_max_memory_mb!r})"
+            )
+        if self.wasm_warm_memory_mb is not None and self.wasm_warm_memory_mb < 0:
+            raise ValueError(
+                f"runtime.wasm_warm_memory_mb must be >= 0 if set "
+                f"(got {self.wasm_warm_memory_mb!r})"
+            )
+        if self.wasm_warm_slots is not None and self.wasm_warm_slots < 0:
+            raise ValueError(
+                f"runtime.wasm_warm_slots must be >= 0 if set "
+                f"(got {self.wasm_warm_slots!r})"
+            )
+        if not isinstance(self.network_allowed_hosts, list) or not all(
+            isinstance(h, str) for h in self.network_allowed_hosts
+        ):
+            raise ValueError(
+                f"runtime.network_allowed_hosts must be a list of strings "
+                f"(got {self.network_allowed_hosts!r})"
+            )
+        if self.max_upload_mb is not None and self.max_upload_mb <= 0:
+            raise ValueError(
+                f"runtime.max_upload_mb must be > 0 if set "
+                f"(got {self.max_upload_mb!r})"
+            )
 
 
 @dataclass
@@ -166,6 +277,7 @@ class Config:
     server: ServerConfig = field(default_factory=ServerConfig)
     auth: AuthConfig = field(default_factory=AuthConfig)
     telemetry: TelemetryConfig = field(default_factory=TelemetryConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     models: dict[str, ModelConfig] = field(default_factory=dict)
 
     @property
@@ -220,6 +332,33 @@ enabled = false
 enabled = false
 endpoint = "http://localhost:4317"
 service_name = "pie"
+
+# [runtime]
+# Tokio + wasmtime tuning + per-instance security policies.
+# Leave the section out for stock defaults.
+#
+# Tokio + wasmtime
+# worker_threads = 8        # tokio worker count; lower on many-core boxes
+# wasm_max_instances = 4096 # concurrent-inferlet cap (default 1000)
+# wasm_max_memory_mb = 64   # per-inferlet memory cap, MiB (default 10)
+# wasm_warm_memory_mb = 0   # RAM kept warm for fast respawn, MiB (default 0)
+# wasm_warm_slots = 100     # prepared-but-idle slots (default 100)
+#
+# Filesystem
+# allow_fs = false                        # mount /scratch RW; default false
+# fs_scratch_dir = "/var/lib/pie/scratch" # base dir; default ${{TMPDIR}}/pie
+#
+# Network. Filtering is by IP post-DNS — hostnames don't survive DNS,
+# so use IP / CIDR allowlists, or front the inferlet with a proxy.
+# allow_network = true                    # default: true
+# network_allowed_hosts = ["*"]           # ["*"] = unrestricted (default).
+                                          # Examples:
+                                          #   ["10.0.0.0/8", "127.0.0.1"]
+                                          #   ["10.0.0.0/8:443"]
+                                          #   ["10.0.0.0/8:1024-65535"]
+#
+# Uploads
+# max_upload_mb = 256                     # per-upload cumulative cap; default 256
 
 [model.default]
 hf_repo = "{DEFAULT_MODEL}"
@@ -359,6 +498,7 @@ def load_config(
     server_raw = raw.get("server", {})
     auth_raw = raw.get("auth", {})
     telemetry_raw = raw.get("telemetry", {})
+    runtime_raw = raw.get("runtime", {})
     model_raw = raw.get("model", {})
 
     if not isinstance(model_raw, dict) or not model_raw:
@@ -370,19 +510,56 @@ def load_config(
     for name, m in model_raw.items():
         models[name] = _parse_model(name, m)
 
+    if "allow_filesystem" in server_raw:
+        raise ValueError(
+            "[server].allow_filesystem has moved to [runtime].allow_fs. "
+            "Update your config: remove `allow_filesystem` from [server] and "
+            "add `allow_fs = true` to [runtime] (or omit it for the default "
+            "of false)."
+        )
+
     server = ServerConfig(
         host=host if host is not None else server_raw.get("host", "127.0.0.1"),
         port=port if port is not None else int(server_raw.get("port", 8080)),
         verbose=verbose or bool(server_raw.get("verbose", False)),
         registry=registry if registry is not None
                  else str(server_raw.get("registry", "https://registry.pie-project.org/")),
-        allow_filesystem=bool(server_raw.get("allow_filesystem", False)),
         max_concurrent_processes=server_raw.get("max_concurrent_processes"),
         python_snapshot=bool(server_raw.get("python_snapshot", True)),
         primary_model=server_raw.get("primary_model"),
     )
 
     auth_enabled = (not no_auth) and bool(auth_raw.get("enabled", True))
+
+    if not isinstance(runtime_raw, dict):
+        raise ValueError(
+            f"[runtime] must be a TOML table, got {type(runtime_raw).__name__}."
+        )
+
+    def _opt_int(key: str) -> int | None:
+        v = runtime_raw.get(key)
+        return None if v is None else int(v)
+
+    network_allowed_hosts_raw = runtime_raw.get("network_allowed_hosts", ["*"])
+    if not isinstance(network_allowed_hosts_raw, list):
+        raise ValueError(
+            f"[runtime].network_allowed_hosts must be a list of strings, "
+            f"got {type(network_allowed_hosts_raw).__name__}."
+        )
+
+    fs_scratch_dir_raw = runtime_raw.get("fs_scratch_dir")
+    runtime_cfg = RuntimeConfig(
+        worker_threads=_opt_int("worker_threads"),
+        wasm_max_instances=_opt_int("wasm_max_instances"),
+        wasm_max_memory_mb=_opt_int("wasm_max_memory_mb"),
+        wasm_warm_memory_mb=_opt_int("wasm_warm_memory_mb"),
+        wasm_warm_slots=_opt_int("wasm_warm_slots"),
+        allow_fs=bool(runtime_raw.get("allow_fs", False)),
+        fs_scratch_dir=str(fs_scratch_dir_raw) if fs_scratch_dir_raw is not None else None,
+        allow_network=bool(runtime_raw.get("allow_network", True)),
+        network_allowed_hosts=[str(h) for h in network_allowed_hosts_raw],
+        max_upload_mb=_opt_int("max_upload_mb"),
+    )
 
     return Config(
         server=server,
@@ -392,5 +569,6 @@ def load_config(
             endpoint=str(telemetry_raw.get("endpoint", "http://localhost:4317")),
             service_name=str(telemetry_raw.get("service_name", "pie")),
         ),
+        runtime=runtime_cfg,
         models=models,
     )

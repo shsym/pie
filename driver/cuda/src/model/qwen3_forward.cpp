@@ -10,7 +10,6 @@
 #include "kernels/swiglu.hpp"
 #include "ops/attention_flashinfer.hpp"
 #include "ops/attention_naive.hpp"
-#include "ops/attention_paged.hpp"
 #include "ops/gemm.hpp"
 
 namespace pie_cuda_driver::model {
@@ -77,15 +76,20 @@ void qwen3_forward_prefill(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
 
-        // 4. Per-head q_norm / k_norm. Reshape Q from [N, h_q*d] to
-        //    [N*h_q, d] — same memory, just a different per-row interpretation.
-        //    The RMSNorm kernel takes (num_rows, hidden) so this is free.
-        kernels::launch_rmsnorm_bf16(
-            ws.q.data(), layer.q_norm->data(), ws.q.data(),
-            N * cfg.num_attention_heads, d, eps, stream);
-        kernels::launch_rmsnorm_bf16(
-            ws.k.data(), layer.k_norm->data(), ws.k.data(),
-            N * cfg.num_key_value_heads, d, eps, stream);
+        // 4. Per-head q_norm / k_norm. Qwen3-only — Llama 3 / Mistral /
+        //    Qwen 2 leave these null and skip the extra RMSNorm. Reshape Q
+        //    from [N, h_q*d] to [N*h_q, d] (same memory, different per-row
+        //    interpretation); the RMSNorm kernel takes (num_rows, hidden).
+        if (layer.q_norm) {
+            kernels::launch_rmsnorm_bf16(
+                ws.q.data(), layer.q_norm->data(), ws.q.data(),
+                N * cfg.num_attention_heads, d, eps, stream);
+        }
+        if (layer.k_norm) {
+            kernels::launch_rmsnorm_bf16(
+                ws.k.data(), layer.k_norm->data(), ws.k.data(),
+                N * cfg.num_key_value_heads, d, eps, stream);
+        }
 
         // 5. RoPE (in place on Q and K).
         kernels::launch_rope_bf16(
@@ -153,8 +157,9 @@ void qwen3_forward_paged(
     const std::uint32_t* kv_page_indptr_h,
     int N,
     int R,
-    int max_kv_len,
-    bool is_pure_decode)
+    bool is_pure_decode,
+    const std::uint8_t*  custom_mask_d,
+    const std::int32_t*  custom_mask_indptr_d)
 {
     const int H  = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
@@ -169,6 +174,26 @@ void qwen3_forward_paged(
     kernels::launch_embed_bf16(
         token_ids, w.embed->data(), ws.y.data(),
         N, H, cfg.vocab_size, stream);
+
+    // Hoist the flashinfer decode plan out of the per-layer loop. The
+    // plan depends only on (kv_page_indptr_h, num_requests, num_q_heads,
+    // num_kv_heads, head_dim, page_size) — all stable across layers.
+    // Doing it once here saves 27 redundant DecodePlan calls per fire
+    // (each ~25 µs of host work + a small device kernel).
+    ops::DecodePlanCachePtr decode_plan;
+    if (is_pure_decode) {
+        decode_plan = ops::make_decode_plan();
+        ops::plan_attention_flashinfer_decode_bf16(
+            *decode_plan,
+            kv_page_indptr_h,
+            R,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            d,
+            cache.page_size(),
+            attn_ws,
+            stream);
+    }
 
     for (int L = 0; L < cfg.num_hidden_layers; ++L) {
         const auto& layer = w.layers[L];
@@ -186,13 +211,17 @@ void qwen3_forward_paged(
         ops::gemm_act_x_wt_bf16(cublas.handle(),
             ws.norm_x.data(), layer.v_proj->data(), ws.v.data(), N, Hk, H);
 
-        // 4. q/k norm
-        kernels::launch_rmsnorm_bf16(
-            ws.q.data(), layer.q_norm->data(), ws.q.data(),
-            N * cfg.num_attention_heads, d, eps, stream);
-        kernels::launch_rmsnorm_bf16(
-            ws.k.data(), layer.k_norm->data(), ws.k.data(),
-            N * cfg.num_key_value_heads, d, eps, stream);
+        // 4. q/k norm (Qwen3 only — null on Llama-likes).
+        if (layer.q_norm) {
+            kernels::launch_rmsnorm_bf16(
+                ws.q.data(), layer.q_norm->data(), ws.q.data(),
+                N * cfg.num_attention_heads, d, eps, stream);
+        }
+        if (layer.k_norm) {
+            kernels::launch_rmsnorm_bf16(
+                ws.k.data(), layer.k_norm->data(), ws.k.data(),
+                N * cfg.num_key_value_heads, d, eps, stream);
+        }
 
         // 5. RoPE
         kernels::launch_rope_bf16(
@@ -211,11 +240,24 @@ void qwen3_forward_paged(
         // flashinfer prefill (causal) otherwise. The naive paged kernel is
         // retained as a debug fallback but is no longer on the hot path.
         if (is_pure_decode) {
-            ops::launch_attention_flashinfer_decode_bf16(
+            // flashinfer decode kernel doesn't support custom masks (its
+            // single-query-per-request shape can't express arbitrary
+            // patterns). Custom-mask decode workloads would need to route
+            // through prefill instead — TODO if any inferlet hits that.
+            // Plan is hoisted (computed once before the loop); each layer
+            // only does the dispatch.
+            ops::dispatch_attention_flashinfer_decode_bf16(
+                *decode_plan,
                 ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                kv_page_indptr_h,
-                R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
+                attn_ws, stream);
+        } else if (custom_mask_d) {
+            ops::launch_attention_flashinfer_prefill_custom_bf16(
+                ws.q.data(), cache.k(L), cache.v(L), ws.attn_out.data(),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                custom_mask_d, custom_mask_indptr_d,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, cfg.num_attention_heads, cfg.num_key_value_heads, d,
                 cache.page_size(), attn_ws, stream);
         } else {
             ops::launch_attention_flashinfer_prefill_bf16(

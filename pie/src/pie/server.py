@@ -355,7 +355,8 @@ def _bootstrap(
         f"swap_pool={group0_caps.swap_pool_size}, "
         f"vocab={group0_caps.vocab_size}, "
         f"max_model_len={group0_caps.max_model_len}, "
-        f"dtype={group0_caps.activation_dtype}[/dim]"
+        f"dtype={group0_caps.activation_dtype}, "
+        f"user_mask={'yes' if group0_caps.supports_user_attention_mask else 'no'}[/dim]"
     )
 
     # Build Rust config from the per-group capabilities.
@@ -399,8 +400,19 @@ def _bootstrap(
         telemetry_enabled=config.telemetry.enabled,
         telemetry_endpoint=config.telemetry.endpoint,
         telemetry_service_name=config.telemetry.service_name,
+        runtime=pie_runtime.RuntimeConfig(
+            worker_threads=config.runtime.worker_threads,
+            wasm_max_instances=config.runtime.wasm_max_instances,
+            wasm_max_memory_mb=config.runtime.wasm_max_memory_mb,
+            wasm_warm_memory_mb=config.runtime.wasm_warm_memory_mb,
+            wasm_warm_slots=config.runtime.wasm_warm_slots,
+            allow_fs=config.runtime.allow_fs,
+            fs_scratch_dir=config.runtime.fs_scratch_dir,
+            allow_network=config.runtime.allow_network,
+            network_allowed_hosts=config.runtime.network_allowed_hosts,
+            max_upload_mb=config.runtime.max_upload_mb,
+        ),
         models=[py_model],
-        allow_filesystem=config.server.allow_filesystem,
         max_concurrent_processes=config.server.max_concurrent_processes,
         python_snapshot=config.server.python_snapshot,
     )

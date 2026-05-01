@@ -748,7 +748,11 @@ def _leader_loop(
     SHMEM_NAME = "/pie_shmem"
     SHMEM_SLOTS = 8
     SHMEM_REQ_BUF = 4 * 1024 * 1024
-    SHMEM_RESP_BUF = 1 * 1024 * 1024
+    # Sized to hold a full-vocab `Distribution` probe / `Sampler::Dist`
+    # payload (vocab × 8 bytes ≈ 2.6 MiB on 150K-vocab models) plus
+    # per-request overhead and the spec-mode multi-slot tail. Must
+    # match SHMEM_RESP_BUF in runtime/src/device.rs.
+    SHMEM_RESP_BUF = 8 * 1024 * 1024
     SHMEM_BUSY_US = 10_000
 
     from pie_driver import shmem_ipc as _shm
@@ -799,13 +803,26 @@ def _leader_loop(
     _shmem_thread = _threading.Thread(target=_shmem_loop, name="shmem-fire-batch", daemon=True)
     _shmem_thread.start()
 
-    # Best-effort cleanup on signal-induced exit (mp.spawn daemon=True sends
-    # SIGTERM on parent exit, which bypasses atexit).
-    def _shmem_signal_cleanup(signum, frame):
+    def _stop_shmem():
+        # Quiesce the busy-poll thread, THEN unmap the region. Closing the
+        # mmap before the thread exits leaves it dereferencing freed memory
+        # inside _u64_at_slot.
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+        try:
+            _shmem_thread.join(timeout=1.0)
+        except Exception:
+            pass
         try:
             _shmem_server.close()
         except Exception:
             pass
+
+    # mp.spawn daemon=True sends SIGTERM on parent exit, which bypasses atexit.
+    def _shmem_signal_cleanup(signum, frame):
+        _stop_shmem()
         _os._exit(0)
     for _sig in (_signal.SIGTERM, _signal.SIGINT):
         try:
@@ -848,15 +865,7 @@ def _leader_loop(
                 response = msgpack.packb(str(e))
                 server.respond(request_id, response)
     finally:
-        # Shutdown: stop shmem thread and broadcast STOP to followers
-        try:
-            _shmem_thread.join(timeout=1.0)
-        except Exception:
-            pass
-        try:
-            _shmem_server.close()
-        except Exception:
-            pass
+        _stop_shmem()
         print("[RPC Worker] Shutting down...")
         if config.world_size > 1 and config.rank == 0 and compute_pg is not None:
             try:

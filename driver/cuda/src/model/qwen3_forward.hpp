@@ -78,7 +78,10 @@ void qwen3_forward_paged(
     const std::uint32_t* kv_page_indptr_h,   // host pointer, [num_requests + 1]
     int total_tokens,
     int num_requests,
-    int max_kv_len,
-    bool is_pure_decode);
+    bool is_pure_decode,
+    // Optional custom mask. When non-null, the prefill path uses
+    // flashinfer's MaskMode::kCustom; ignored on the decode path.
+    const std::uint8_t*  custom_mask_d = nullptr,
+    const std::int32_t*  custom_mask_indptr_d = nullptr);
 
 }  // namespace pie_cuda_driver::model

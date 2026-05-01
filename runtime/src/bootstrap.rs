@@ -29,9 +29,8 @@ pub struct Config {
     pub log_dir: Option<PathBuf>,
     pub registry_url: String,
     pub telemetry: TelemetryConfig,
+    pub runtime: RuntimeConfig,
     pub models: Vec<ModelConfig>,
-    /// Allow inferlets to access a sandboxed scratch filesystem.
-    pub allow_filesystem: bool,
     /// Skip tracing initialization (for tests — can only init once per process).
     pub skip_tracing: bool,
     /// Hard cap on the number of concurrent processes.
@@ -42,6 +41,108 @@ pub struct Config {
     /// `--no-snapshot` CLI flag.
     pub python_snapshot: bool,
 }
+
+/// Runtime tuning — tokio worker pool + wasmtime engine pool +
+/// per-instance security policies (filesystem / network). All fields
+/// are opt-in; leaving them at their defaults yields stock tokio,
+/// stock wasmtime, no filesystem, and unrestricted network (matching
+/// the legacy hardcoded behavior).
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    /// Number of tokio worker threads. `None` = let tokio default to
+    /// `num_cpus`. On boxes with high logical-core counts and many
+    /// in-flight tasks, lowering this (e.g. to 8) cuts migration /
+    /// context-switch overhead and can give a substantial throughput
+    /// win — see comments in `RuntimeConfig` on the Python side.
+    pub worker_threads: Option<usize>,
+
+    // ── wasmtime engine pool ────────────────────────────────────────
+    //
+    // The pooling allocator caps four resource classes at 1000 each by
+    // default. In pie every inferlet uses one of each, so we expose
+    // them as a single `wasm_max_instances` knob and bump them in
+    // lockstep.
+
+    /// Concurrent-inferlet cap. Bumps wasmtime's
+    /// `total_core_instances`, `total_component_instances`,
+    /// `total_memories`, and `total_tables` together. `None` = use
+    /// wasmtime's default of 1000.
+    pub wasm_max_instances: Option<u32>,
+
+    /// Per-inferlet linear-memory cap, in MiB. `None` = use wasmtime's
+    /// default of 10 MiB.
+    pub wasm_max_memory_mb: Option<usize>,
+
+    /// RAM kept warm per slot to skip remapping on inferlet respawn,
+    /// in MiB. RSS-vs-spawn-latency tradeoff. `None` = wasmtime
+    /// default of 0 (don't keep memory warm).
+    pub wasm_warm_memory_mb: Option<usize>,
+
+    /// Prepared-but-idle inferlet slots kept ready for fast respawn.
+    /// `None` = wasmtime default of 100.
+    pub wasm_warm_slots: Option<u32>,
+
+    // ── filesystem ───────────────────────────────────────────────────
+
+    /// If true, mount a per-process scratch directory at `/scratch`
+    /// with full read+write. If false, no `wasi:filesystem` access.
+    /// Default: false.
+    pub allow_fs: bool,
+
+    /// Base directory under which per-process scratch dirs are
+    /// created. Each instance gets `<base>/<process_id>`. `None` =
+    /// `${TMPDIR}/pie`.
+    pub fs_scratch_dir: Option<PathBuf>,
+
+    // ── network ──────────────────────────────────────────────────────
+
+    /// If true, expose the host network to inferlets (both
+    /// `wasi:sockets` and `wasi:http`). If false, deny all socket
+    /// operations and drop the `wasi:http` linker binding entirely.
+    /// Default: true (matches legacy `inherit_network()`).
+    pub allow_network: bool,
+
+    /// Allowlist of `cidr[:port]` / `cidr:lo-hi` strings. `["*"]` (the
+    /// default) means "no restriction". Empty list ≡ `allow_network =
+    /// false`. NOTE: only filters `wasi:sockets`; `wasi:http` is
+    /// gated by `allow_network` alone (its host stack does its own
+    /// DNS resolution and bypasses the per-socket hook). For tight
+    /// IP-level control over outbound HTTP, set `allow_network =
+    /// false` and have inferlets use `wasi:sockets` directly.
+    pub network_allowed_hosts: Vec<String>,
+
+    // ── upload cap ───────────────────────────────────────────────────
+
+    /// Per-upload cap on total bytes accumulated across chunks, in
+    /// MiB. Applies to inferlet program installs and
+    /// `session.send_file` blob transfers. Checked on every chunk so
+    /// a malicious sender can't grow the in-flight buffer without
+    /// bound. `None` = use the built-in default of 256 MiB.
+    pub max_upload_mb: Option<usize>,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        RuntimeConfig {
+            worker_threads: None,
+            wasm_max_instances: None,
+            wasm_max_memory_mb: None,
+            wasm_warm_memory_mb: None,
+            wasm_warm_slots: None,
+            allow_fs: false,
+            fs_scratch_dir: None,
+            allow_network: true,
+            network_allowed_hosts: vec!["*".to_string()],
+            max_upload_mb: None,
+        }
+    }
+}
+
+/// Built-in default for `max_upload_mb` when the field is `None`.
+/// 256 MiB is large enough for any current inferlet (12 MiB JS bundles
+/// are the biggest we ship) plus headroom, and small enough that a
+/// runaway upload doesn't exhaust host RAM before failing.
+pub const DEFAULT_MAX_UPLOAD_MB: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -107,7 +208,7 @@ pub async fn bootstrap(
     if !config.skip_tracing {
         init_tracing(&config.log_dir, config.verbose, &config.telemetry)?;
     }
-    let wasm_engine = init_wasmtime();
+    let wasm_engine = init_wasmtime(&config.runtime);
 
     // Load the Python runtime shared modules (full + stripped variants) before
     // the linker and program services spawn, so both can read from the shared
@@ -125,8 +226,29 @@ pub async fn bootstrap(
         config.cache_dir.clone(),
     );
 
-    linker::spawn(&wasm_engine, config.allow_filesystem);
-    server::spawn(&config.host, config.port);
+    // Compile per-instance security policies once. Network policy
+    // parsing fails fast on bad config (typo'd CIDRs, `"*"` mixed with
+    // rules, etc.) — better here than on the first inferlet launch.
+    let fs_policy = crate::policy::FsPolicy {
+        allow: config.runtime.allow_fs,
+        base_dir: config
+            .runtime
+            .fs_scratch_dir
+            .clone()
+            .unwrap_or_else(crate::policy::FsPolicy::default_base_dir),
+    };
+    let network_policy = crate::policy::NetworkPolicy::parse(
+        config.runtime.allow_network,
+        &config.runtime.network_allowed_hosts,
+    )?;
+
+    linker::spawn(&wasm_engine, fs_policy, network_policy);
+    let max_upload_bytes = config
+        .runtime
+        .max_upload_mb
+        .unwrap_or(DEFAULT_MAX_UPLOAD_MB)
+        .saturating_mul(1024 * 1024);
+    server::spawn(&config.host, config.port, max_upload_bytes);
     messaging::spawn();
     process::init_admission(config.max_concurrent_processes);
     
@@ -224,11 +346,32 @@ fn verify_config(config: &Config) -> Result<()> {
 }
 
 
-fn init_wasmtime() -> wasmtime::Engine {
+fn init_wasmtime(runtime: &RuntimeConfig) -> wasmtime::Engine {
     let mut wasm_config = wasmtime::Config::default();
     wasm_config.async_support(true);
 
-    let pooling_config = wasmtime::PoolingAllocationConfig::default();
+    let mut pooling_config = wasmtime::PoolingAllocationConfig::default();
+
+    // Lockstep bump on the four "total_*" caps. wasmtime defaults all
+    // of them to 1000; we bump them together because every pie
+    // inferlet uses exactly one of each (one core instance, one
+    // component instance, one memory, one table).
+    if let Some(n) = runtime.wasm_max_instances {
+        pooling_config.total_core_instances(n);
+        pooling_config.total_component_instances(n);
+        pooling_config.total_memories(n);
+        pooling_config.total_tables(n);
+    }
+    if let Some(mb) = runtime.wasm_max_memory_mb {
+        pooling_config.max_memory_size(mb.saturating_mul(1024 * 1024));
+    }
+    if let Some(mb) = runtime.wasm_warm_memory_mb {
+        pooling_config.linear_memory_keep_resident(mb.saturating_mul(1024 * 1024));
+    }
+    if let Some(n) = runtime.wasm_warm_slots {
+        pooling_config.max_unused_warm_slots(n);
+    }
+
     wasm_config
         .allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(pooling_config));
 
