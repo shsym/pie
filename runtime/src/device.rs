@@ -22,10 +22,18 @@ use tokio::sync::oneshot;
 
 use crate::service::{ServiceArray, ServiceHandler};
 
-/// Default shmem region name (one worker per host). Geometry of the region
-/// — slot count, request/response buffer sizes — is owned by the driver
-/// and read out of the header at attach time; see `shmem_ipc::ShmemClient`.
-const SHMEM_NAME: &str = "/pie_shmem";
+/// Per-device shmem region name. Each DP replica's worker creates its own
+/// POSIX shmem region (`/pie_shmem_g{device_idx}`); the runtime connects to
+/// the matching one based on which device a request is routed to.
+/// Hardcoding a single name silently mixes requests across replicas (the
+/// second replica attaches to the first's backing store or fails to
+/// create), which causes both perf collapse and correctness faults under
+/// DP > 1. Region geometry (slots, request/response buffer sizes) is owned
+/// by the driver and read out of the header at attach time; see
+/// `shmem_ipc::ShmemClient`.
+fn shmem_name(device_idx: usize) -> String {
+    format!("/pie_shmem_g{device_idx}")
+}
 /// Busy-spin window (µs) before yielding while waiting on resp_seq.
 const SHMEM_SPIN_US: u64 = 10_000;
 
@@ -128,20 +136,22 @@ pub async fn fire_batch(
     crate::shmem_schema::read_response(&resp_bytes)
 }
 
-/// Lazy-initialized shmem clients keyed by device index. All devices share
-/// one client today (one shmem region per worker).
+/// Lazy-initialized shmem clients keyed by device index. Each DP replica
+/// has its own shmem region (`/pie_shmem_g{idx}`) so requests routed to
+/// device i talk only to replica i's worker.
 static SHMEM_CLIENTS: LazyLock<DashMap<usize, Arc<crate::shmem_ipc::ShmemClient>>> =
     LazyLock::new(DashMap::new);
 
 static SHMEM_REQ_ID: AtomicU64 = AtomicU64::new(1);
 
-fn get_or_init_shmem_client(_device_idx: usize) -> Result<Arc<crate::shmem_ipc::ShmemClient>> {
-    if let Some(c) = SHMEM_CLIENTS.get(&0) {
+fn get_or_init_shmem_client(device_idx: usize) -> Result<Arc<crate::shmem_ipc::ShmemClient>> {
+    if let Some(c) = SHMEM_CLIENTS.get(&device_idx) {
         return Ok(c.clone());
     }
-    let client = crate::shmem_ipc::ShmemClient::open(SHMEM_NAME, SHMEM_SPIN_US)?;
+    let name = shmem_name(device_idx);
+    let client = crate::shmem_ipc::ShmemClient::open(&name, SHMEM_SPIN_US)?;
     let arc = Arc::new(client);
-    SHMEM_CLIENTS.insert(0, arc.clone());
+    SHMEM_CLIENTS.insert(device_idx, arc.clone());
     Ok(arc)
 }
 

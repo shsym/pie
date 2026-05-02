@@ -13,16 +13,34 @@ use crate::model::tokenizer::Tokenizer;
 
 // ─── GenericChatDecoder ──────────────────────────────────────
 
-/// Chat decoder that accumulates text and stops on any of the given token IDs.
+/// Chat decoder that accumulates tokens, emits incremental text deltas,
+/// and stops on any of the given token IDs.
+///
+/// Decoding strategy: SentencePiece-based tokenizers (Phi-3, Llama-1/2,
+/// some Mistral variants) encode word-leading whitespace as a `▁`
+/// prefix that gets re-stripped by the tokenizer's `Strip(start=1)`
+/// rule. Calling `decode([single_token])` on each new token therefore
+/// loses every inter-token space — output looks like
+/// `Onceuponatime`. Avoid that by accumulating *tokens*, decoding the
+/// full sequence each fire, and emitting only the suffix not yet seen.
+/// Byte-level BPE tokenizers (Qwen, Llama-3, Gemma) already encode
+/// spaces in-token, so this code path is a no-op cost on them but
+/// keeps the contract uniform.
 pub struct GenericChatDecoder {
     tokenizer: Arc<Tokenizer>,
     stop_ids: Vec<u32>,
-    accumulated: String,
+    token_buf: Vec<u32>,
+    text_emitted: usize,
 }
 
 impl GenericChatDecoder {
     pub fn new(tokenizer: Arc<Tokenizer>, stop_ids: Vec<u32>) -> Self {
-        Self { tokenizer, stop_ids, accumulated: String::new() }
+        Self {
+            tokenizer,
+            stop_ids,
+            token_buf: Vec::new(),
+            text_emitted: 0,
+        }
     }
 }
 
@@ -30,17 +48,48 @@ impl ChatDecoder for GenericChatDecoder {
     fn feed(&mut self, tokens: &[u32]) -> ChatEvent {
         for &t in tokens {
             if self.stop_ids.contains(&t) {
-                return ChatEvent::Done(std::mem::take(&mut self.accumulated));
+                let full = self.tokenizer.decode(&self.token_buf, false);
+                self.token_buf.clear();
+                self.text_emitted = 0;
+                return ChatEvent::Done(full);
             }
+            self.token_buf.push(t);
         }
-        let delta = self.tokenizer.decode(tokens, false);
-        self.accumulated.push_str(&delta);
+        let full = self.tokenizer.decode(&self.token_buf, false);
+        // Byte-level BPE tokenizers (Qwen, Llama-3, Gemma) split multi-byte
+        // characters across tokens. When only part of a character has
+        // arrived, HF's decode emits trailing U+FFFD replacements; the
+        // *next* fire will re-decode the same prefix into the real char,
+        // shifting byte offsets. Slicing by raw byte length therefore
+        // lands inside a multi-byte char and panics. Hold back any
+        // trailing replacements (and stop on the last safe char boundary)
+        // until later fires complete them.
+        let safe_end = safe_emit_end(&full);
+        let delta = if safe_end > self.text_emitted {
+            full[self.text_emitted..safe_end].to_string()
+        } else {
+            String::new()
+        };
+        self.text_emitted = safe_end;
         ChatEvent::Delta(delta)
     }
 
     fn reset(&mut self) {
-        self.accumulated.clear();
+        self.token_buf.clear();
+        self.text_emitted = 0;
     }
+}
+
+/// Byte length of the longest prefix of `s` that is safe to emit now —
+/// i.e., does not end in a U+FFFD replacement char. Returns 0 if every
+/// char in `s` is U+FFFD.
+fn safe_emit_end(s: &str) -> usize {
+    for (i, c) in s.char_indices().rev() {
+        if c != '\u{FFFD}' {
+            return i + c.len_utf8();
+        }
+    }
+    0
 }
 
 // ─── ThinkingDecoder ─────────────────────────────────────────
@@ -57,7 +106,13 @@ pub struct ThinkingDecoder {
     start_ids: Vec<u32>,
     end_ids: Vec<u32>,
     inside: bool,
-    accumulated: String,
+    /// Tokens accumulated while Inside (excluding the closing match).
+    /// Re-decoded in full each fire so partial multi-byte chars from a
+    /// previous fire resolve when their trailing bytes arrive.
+    token_buf: Vec<u32>,
+    /// Byte offset into `decode(token_buf)` of text already emitted as
+    /// Delta. Maintained at a U+FFFD-free boundary.
+    text_emitted: usize,
     match_pos: usize,
     starts_inside: bool,
 }
@@ -70,7 +125,8 @@ impl ThinkingDecoder {
             start_ids,
             end_ids,
             inside: starts_inside,
-            accumulated: String::new(),
+            token_buf: Vec::new(),
+            text_emitted: 0,
             match_pos: 0,
             starts_inside,
         }
@@ -88,6 +144,8 @@ impl ReasoningDecoder for ThinkingDecoder {
                     if self.match_pos == self.start_ids.len() {
                         self.inside = true;
                         self.match_pos = 0;
+                        self.token_buf.clear();
+                        self.text_emitted = 0;
                         return ReasoningEvent::Start;
                     }
                 } else {
@@ -102,25 +160,40 @@ impl ReasoningDecoder for ThinkingDecoder {
                 {
                     self.match_pos += 1;
                     if self.match_pos == self.end_ids.len() {
+                        // Closing match — flush the full accumulated decode
+                        // (mirrors GenericChatDecoder::Done; any trailing
+                        // U+FFFD that never resolved are surfaced here, the
+                        // standard outcome on truncated multi-byte input).
+                        let full = self.tokenizer.decode(&self.token_buf, false);
                         self.inside = false;
                         self.match_pos = 0;
-                        return ReasoningEvent::Complete(
-                            std::mem::take(&mut self.accumulated),
-                        );
+                        self.token_buf.clear();
+                        self.text_emitted = 0;
+                        return ReasoningEvent::Complete(full);
                     }
                 } else {
                     self.match_pos = 0;
                 }
+                // Tokens that don't complete the end match — including the
+                // ones that started a partial match and reset — are content.
+                self.token_buf.push(t);
             }
-            let delta = self.tokenizer.decode(tokens, false);
-            self.accumulated.push_str(&delta);
+            let full = self.tokenizer.decode(&self.token_buf, false);
+            let safe_end = safe_emit_end(&full);
+            let delta = if safe_end > self.text_emitted {
+                full[self.text_emitted..safe_end].to_string()
+            } else {
+                String::new()
+            };
+            self.text_emitted = safe_end;
             ReasoningEvent::Delta(delta)
         }
     }
 
     fn reset(&mut self) {
         self.inside = self.starts_inside;
-        self.accumulated.clear();
+        self.token_buf.clear();
+        self.text_emitted = 0;
         self.match_pos = 0;
     }
 }
@@ -291,6 +364,48 @@ mod tests {
             ReasoningEvent::Delta(s) => assert_eq!(s, "reason"),
             other => panic!("expected Delta, got {:?}", other),
         }
+    }
+
+    // ─── safe_emit_end ───────────────────────────────────────
+
+    #[test]
+    fn safe_end_no_replacements() {
+        assert_eq!(safe_emit_end("hello"), 5);
+        assert_eq!(safe_emit_end(""), 0);
+    }
+
+    #[test]
+    fn safe_end_holds_back_trailing_replacement() {
+        // 'abc' (3 bytes) + U+FFFD (3 bytes) = 6 bytes total; safe end = 3
+        let s = "abc\u{FFFD}";
+        assert_eq!(s.len(), 6);
+        assert_eq!(safe_emit_end(s), 3);
+    }
+
+    #[test]
+    fn safe_end_holds_back_multiple_trailing_replacements() {
+        let s = "x\u{FFFD}\u{FFFD}\u{FFFD}";
+        assert_eq!(safe_emit_end(s), 1);
+    }
+
+    #[test]
+    fn safe_end_keeps_internal_replacement() {
+        // Replacement in the middle is committed; only trailing ones held.
+        let s = "a\u{FFFD}b";
+        assert_eq!(safe_emit_end(s), s.len());
+    }
+
+    #[test]
+    fn safe_end_all_replacements_returns_zero() {
+        let s = "\u{FFFD}\u{FFFD}";
+        assert_eq!(safe_emit_end(s), 0);
+    }
+
+    #[test]
+    fn safe_end_with_multibyte_char_at_end() {
+        let s = "ab\u{1F9E0}"; // 🧠 — 4 bytes
+        assert_eq!(s.len(), 6);
+        assert_eq!(safe_emit_end(s), 6);
     }
 
     // ─── No-op Decoders ──────────────────────────────────────

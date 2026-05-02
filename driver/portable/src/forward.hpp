@@ -1,19 +1,21 @@
 #pragma once
 
-// Forward engine: builds a per-call ggml graph for Qwen3 (multi-request,
-// page-table-aware), computes it on the model's backend, samples one token
-// per sampler slot (greedy/argmax for now), and writes a `BPIS` flat
-// response.
+// Forward engine. Builds a per-batch ggml graph from the BPIQ wire
+// payload, runs it on the model's backend, samples per-request, and
+// writes the BPIS response. Per-arch graph builders live in
+// graph_qwen3.cpp (covers 11 archs via ArchSpec flags) and
+// graph_gemma4.cpp.
 //
-// M2 status:
-//   - multiple requests per batch (each with its own context_id)
-//   - paged KV pool honoring `kv_page_indices` / `kv_page_indptr` /
-//     `kv_last_page_lens` from the BPIQ wire format
-//   - one greedy sampler slot per request (full sampler suite lands in M4)
-//   - no logit masks, no spec decode, no LoRA, no custom attention masks
+// Honors the runtime's paged KV state (kv_page_indices / kv_page_indptr
+// / kv_last_page_lens) and supports the full feature surface:
+// speculative-decode verification (M8), LoRA deltas (M9), special
+// samplers + msgpack responses (M10), GPU greedy + uniform top-K fast
+// paths (M11), per-token custom attention masks (M6), per-request logit
+// masks (M5).
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -22,6 +24,7 @@
 #include "model.hpp"
 #include "sampler.hpp"
 #include "shmem_schema.hpp"
+#include "state_cache.hpp"
 
 namespace pie_portable_driver {
 
@@ -81,6 +84,10 @@ public:
         std::vector<std::int32_t> sampling_positions;
         // Draft tokens for verification (length = n_drafts; empty = no spec).
         std::vector<std::uint32_t> draft_tokens;
+        // Qwen 3.5 / 3.6: index into the StateCache slot pool. -1 if the
+        // arch doesn't carry recurrent state. The runtime is expected to
+        // assign a stable slot per context for the duration of generation.
+        std::int32_t state_slot = -1;
     };
 
     struct BatchPlan {
@@ -101,7 +108,12 @@ public:
         bool                        pure_decode = false;
         std::int32_t                max_n_kv = 0;
         std::vector<std::int32_t>   packed_gather_idxs;  // [n_req * max_n_kv]
-        std::vector<std::uint16_t>  packed_mask_f16;     // [max_n_kv, 64, 1, n_req]
+        std::vector<std::uint16_t>  packed_mask_f16;     // [max_n_kv, 64, 1, n_req] — SWA-clipped
+        // Optional companion "no-SWA" mask for archs with mixed
+        // sliding+full attention patterns (Gemma 4): full-attention
+        // layers attend the entire context, so they need a different
+        // packed mask. Empty unless the engine builds it.
+        std::vector<std::uint16_t>  packed_mask_full_f16;
 
         // M9 LoRA: active adapter for this whole batch (single-adapter-
         // per-batch v1 restriction). nullptr = no adapter.
@@ -161,9 +173,22 @@ private:
 
     Model&         model_;
     KvCachePaged   kv_;
+    // Qwen 3.5 / 3.6 recurrent-state cache. Null on archs without
+    // gated-delta-rule layers.
+    std::unique_ptr<StateCache> state_;
     ggml_gallocr_t galloc_ = nullptr;
     AdapterPool*   adapters_ = nullptr;
     mutable PhaseTimings timings_;
+
+    // Graph cache (P7). Most consecutive compute_() calls in decode-
+    // heavy serving have identical graph topology after max_n_kv is
+    // rounded to a kv_page_size boundary in plan_(). Cached entry holds
+    // the previously-built ggml_context + graph + gallocr allocation;
+    // a hit skips ggml_init / graph build / gallocr_alloc entirely.
+    // Implementation lives in forward.cpp; struct is opaque here so
+    // graph_common.hpp can keep depending on this header.
+    struct GraphCache;
+    std::unique_ptr<GraphCache> cache_;
 };
 
 }  // namespace pie_portable_driver

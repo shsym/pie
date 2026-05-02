@@ -235,16 +235,21 @@ impl Market {
 /// Spawns a new context manager for a model.
 ///
 /// - `default_endowment_pages`: market weight assigned to processes that
-///   don't declare an explicit `token_budget` at admission.
-/// - `default_tokens_remaining`: compute-wallet cap for the same;
+///   don't declare an explicit token limit at admission.
+/// - `default_token_limit`: compute-wallet cap for the same;
 ///   `None` means unlimited (the system-wide default).
+/// - `admission_oversubscription_factor`: admission gate — `Σ endowment` must not
+///   exceed `total_pages × factor`.
+/// - `restore_pause_at_utilization`: the restore loop pauses when any
+///   device's GPU page utilization exceeds this fraction.
 pub fn spawn(
     page_size: usize,
     num_gpu_pages: Vec<usize>,
     num_cpu_pages: Vec<usize>,
     default_endowment_pages: usize,
-    default_tokens_remaining: Option<usize>,
-    oversubscription_factor: f64,
+    default_token_limit: Option<usize>,
+    admission_oversubscription_factor: f64,
+    restore_pause_at_utilization: f64,
 ) -> usize {
     PAGE_SIZES.push(page_size);
     MARKET.push(Market::new(default_endowment_pages));
@@ -254,8 +259,9 @@ pub fn spawn(
         &num_gpu_pages,
         &num_cpu_pages,
         default_endowment_pages,
-        default_tokens_remaining,
-        oversubscription_factor,
+        default_token_limit,
+        admission_oversubscription_factor,
+        restore_pause_at_utilization,
     )).expect("Failed to spawn context manager")
 }
 
@@ -303,7 +309,7 @@ pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
 /// Called from `InstanceState::new` before any context operations.
 ///
 /// Fails fast if any model's admission gate would refuse the request (the
-/// `Σ endowment ≤ capacity × oversubscription_factor` invariant).
+/// `Σ endowment ≤ capacity × admission_oversubscription_factor` invariant).
 /// On partial failure — e.g., model 0 admits but model 1 refuses — the
 /// successful registrations are rolled back so no orphan state remains.
 pub async fn register_process(pid: ProcessId, token_budget: Option<usize>) -> Result<()> {
@@ -781,28 +787,34 @@ pub(crate) struct ContextManager {
     /// Default compute-wallet cap for new processes that do not declare
     /// an explicit token_budget at admission.
     /// `None` = unlimited (the system-wide default); `Some(n)` = cap at `n`.
-    pub(crate) default_tokens_remaining: Option<usize>,
-    /// Admission cap: `Σ endowment ≤ total_gpu_capacity × oversubscription_factor`.
+    pub(crate) default_token_limit: Option<usize>,
+    /// Admission cap: `Σ endowment ≤ total_gpu_capacity × admission_oversubscription_factor`.
     /// At 1.0 strictly bound by physical capacity; > 1.0 allows overbook.
-    pub(crate) oversubscription_factor: f64,
+    pub(crate) admission_oversubscription_factor: f64,
+    /// Hard admission gate for the restore loop: pause restoring suspended
+    /// contexts when any device's page utilization exceeds this fraction.
+    /// Prevents the evict→restore→re-evict thrash cascade.
+    pub(crate) restore_pause_at_utilization: f64,
     /// Diagnostic counters for scheduler health.
     pub(crate) sched_counters: SchedCounters,
+    /// Round-robin counter for new-context device assignment. Used when
+    /// `least_loaded_device()` would otherwise tie (which it does for
+    /// every burst-arriving context until at least one of them allocates
+    /// pages — `available()` doesn't reflect in-flight allocations). Without
+    /// this, every burst pins to the same device and DP collapses to DP=1.
+    next_device_rr: usize,
 }
 
 impl ContextManager {
-    /// Hard admission control threshold: don't restore when any device
-    /// exceeds this page utilization fraction. Prevents the
-    /// evict→restore→re-evict thrashing cascade.
-    const RESTORE_UTILIZATION_CAP: f64 = 0.85;
-
     pub(crate) fn new(
         model_idx: usize,
         page_size: usize,
         num_gpu_pages: &[usize],
         num_cpu_pages: &[usize],
         default_endowment_pages: usize,
-        default_tokens_remaining: Option<usize>,
-        oversubscription_factor: f64,
+        default_token_limit: Option<usize>,
+        admission_oversubscription_factor: f64,
+        restore_pause_at_utilization: f64,
     ) -> Self {
         let gpu_stores: Vec<_> = num_gpu_pages.iter()
             .map(|&n| PageStore::new(page_size, n))
@@ -819,9 +831,11 @@ impl ContextManager {
             restore_queue: BinaryHeap::new(),
             auction_results: vec![AuctionResult::default(); num_gpu_pages.len()],
             default_endowment: default_endowment_pages as f64,
-            default_tokens_remaining,
-            oversubscription_factor,
+            default_token_limit,
+            admission_oversubscription_factor,
+            restore_pause_at_utilization,
             sched_counters: SchedCounters::default(),
+            next_device_rr: 0,
         }
     }
 
@@ -901,10 +915,32 @@ impl ContextManager {
         let id = self.next_id; self.next_id += 1; id
     }
 
-    fn least_loaded_device(&self) -> usize {
-        self.gpu_stores.iter().enumerate()
-            .max_by_key(|(_, d)| d.available())
-            .map(|(i, _)| i).unwrap_or(0)
+    /// Pick a device for a brand-new context.
+    ///
+    /// `available()` reflects only *allocated* pages, not pages claimed by
+    /// concurrently-arriving contexts that haven't allocated yet. For a
+    /// burst of N contexts admitted back-to-back (e.g. a benchmark firing
+    /// `launch_process` async tasks in parallel), every call sees the same
+    /// `available()` and `max_by_key` deterministically returns the same
+    /// device — collapsing DP to a single GPU. We tiebreak with a
+    /// round-robin counter so bursty arrivals spread across devices.
+    fn least_loaded_device(&mut self) -> usize {
+        // Find the maximum `available()` and tally how many devices share it.
+        let max_avail = self.gpu_stores.iter().map(|d| d.available()).max().unwrap_or(0);
+        let tied: Vec<usize> = self.gpu_stores.iter().enumerate()
+            .filter(|(_, d)| d.available() == max_avail)
+            .map(|(i, _)| i)
+            .collect();
+        if tied.is_empty() {
+            return 0;
+        }
+        if tied.len() == 1 {
+            return tied[0];
+        }
+        // On ties, round-robin among the tied devices.
+        let pick = tied[self.next_device_rr % tied.len()];
+        self.next_device_rr = self.next_device_rr.wrapping_add(1);
+        pick
     }
 
     // ==================== Core Operations ====================
@@ -1260,7 +1296,7 @@ impl ContextManager {
         let over_capacity = self.gpu_stores.iter().any(|d| {
             let (used, total) = d.stats();
             let utilization = used as f64 / total.max(1) as f64;
-            utilization > Self::RESTORE_UTILIZATION_CAP
+            utilization > self.restore_pause_at_utilization
         });
         if over_capacity {
             return;

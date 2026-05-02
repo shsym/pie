@@ -22,7 +22,7 @@ from pie_client import Event
 
 async def run_benchmark(args):
     from pie.server import Server
-    from pie.config import Config, ModelConfig, AuthConfig, RuntimeConfig
+    from pie.config import Config, ModelConfig, AuthConfig, RuntimeConfig, SchedulerConfig
 
     if args.driver == "native" and args.use_cuda_graphs:
         print("ERROR: --use-cuda-graphs is not supported on the native driver.",
@@ -73,10 +73,10 @@ async def run_benchmark(args):
     print()
 
     from pie.config import (
-        ServerConfig, TelemetryConfig, DriverConfig,
+        ServerConfig, TelemetryConfig, DriverConfig, SchedulerConfig,
     )
 
-    # Build the [model.X.driver.<type>] subsection. Each driver expresses
+    # Build the [model.driver.options] subsection. Each driver expresses
     # its budgets in its own vocabulary — translate CLI flags accordingly.
     if args.driver == "vllm":
         driver_subsection: dict = {
@@ -125,21 +125,35 @@ async def run_benchmark(args):
         ),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        runtime=RuntimeConfig(worker_threads=args.worker_threads),
-        models={
-            "default": ModelConfig(
+        runtime=RuntimeConfig(
+            # Size the wasm instance pool for the workload. Default wasmtime
+            # cap is 1000; each pie inferlet allocates ~3 core instances, so
+            # bump well above num_requests*3 to avoid "maximum concurrent
+            # limit reached" at high concurrency.
+            wasm_max_instances=max(
+                4096, (args.num_requests + args.warmup_requests) * 4
+            ),
+            **({"worker_threads": args.worker_threads}
+               if args.worker_threads is not None else {}),
+        ),
+        models=[
+            ModelConfig(
                 name="default",
                 hf_repo=args.model,
-                default_token_budget=args.default_token_budget,
-                default_endowment_pages=args.default_endowment_pages,
-                oversubscription_factor=args.oversubscription_factor,
+                scheduler=SchedulerConfig(
+                    batch_policy=args.policy,
+                    default_token_limit=args.default_token_limit,
+                    default_endowment_pages=args.default_endowment_pages,
+                    admission_oversubscription_factor=args.admission_oversubscription_factor,
+                ),
                 driver=DriverConfig(
                     type=args.driver,
                     device=device,
+                    tensor_parallel_size=args.tp_size,
                     options=driver_subsection,
                 ),
-            )
-        },
+            ),
+        ],
     )
     async with Server(cfg) as server:
         client = await server.connect()
@@ -280,7 +294,7 @@ def main():
     parser.add_argument("--save-outputs", type=str, default=None, help="Save output samples to this file path")
     parser.add_argument("--num-samples", type=int, default=10, help="Number of output samples to save (default: 10)")
     parser.add_argument("--unique-prompts", action="store_true", help="Make each request's prompt unique (append request #N)")
-    parser.add_argument("--default-token-budget", type=int, required=True, help="Default token budget per process (required)")
+    parser.add_argument("--default-token-limit", type=int, required=True, help="Default per-process token limit (required)")
     parser.add_argument("--max-concurrent-processes", type=int, default=None,
                         help="Maximum number of concurrent processes (default: None — uncapped, saturate the GPU)")
     parser.add_argument("--max-batch-size", type=int, default=2048,
@@ -288,6 +302,11 @@ def main():
     parser.add_argument("--driver", default="native",
                         choices=["native", "vllm", "sglang", "dummy", "cuda_native", "portable"],
                         help="Inference driver: 'native', 'vllm', 'sglang', 'dummy', 'cuda_native', or 'portable'")
+    parser.add_argument("--tp-size", type=int, default=1,
+                        help="Tensor-parallel size; DP = len(--device) // --tp-size")
+    parser.add_argument("--policy", default="adaptive",
+                        choices=["adaptive", "eager", "greedy"],
+                        help="Scheduler policy")
     parser.add_argument("--cuda-native-kv-pages", dest="cuda_native_kv_pages",
                         type=int, default=2048,
                         help="KV pages for the cuda_native driver. Each page = kv_page_size tokens.")
@@ -299,7 +318,7 @@ def main():
                         help="Enable CUDA graphs (vllm/sglang only — native driver does not support this).")
     parser.add_argument("--default-endowment-pages", type=int, default=64,
                         help="Per-process KV-page endowment used by the admission gate (lower = more concurrent processes admitted)")
-    parser.add_argument("--oversubscription-factor", type=float, default=1000.0,
+    parser.add_argument("--admission-oversubscription-factor", type=float, default=1000.0,
                         help="Admission overbook factor (Σ endowment ≤ capacity × factor). "
                              "Default 1000.0 effectively disables the gate; lower it to study admission behavior.")
     parser.add_argument("--warmup-requests", type=int, default=0,

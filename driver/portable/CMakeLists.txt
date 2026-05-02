@@ -27,7 +27,7 @@ include(cmake/CPM.cmake)
 cpmaddpackage(
   NAME llama
   GITHUB_REPOSITORY ggerganov/llama.cpp
-  GIT_TAG b6993
+  GIT_TAG b8994
   EXCLUDE_FROM_ALL YES
   OPTIONS
     "LLAMA_BUILD_TESTS OFF"
@@ -52,8 +52,18 @@ add_executable(pie_driver_portable
   src/shmem_schema.cpp
   src/safetensors.cpp
   src/hf_config.cpp
+  src/gguf_archive.cpp
+  src/gguf_hparams.cpp
   src/model.cpp
   src/kv_cache.cpp
+  src/state_cache.cpp
+  src/arch_spec.cpp
+  src/plan.cpp
+  src/graph_common.cpp
+  src/graph_qwen3.cpp
+  src/graph_gemma4.cpp
+  src/graph_qwen3_5.cpp
+  src/response.cpp
   src/forward.cpp
   src/sampler.cpp
   src/aux_server.cpp
