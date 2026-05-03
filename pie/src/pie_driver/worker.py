@@ -502,6 +502,22 @@ def _leader_loop(
         Used by both the dict-returning `_handle_fire_batch` (cold-path
         compatibility) and the shmem fast path that encodes directly.
         """
+        # KV-bleed test (ticket #70 / #83 / project_pie_kv_bleed_d2d_fork_race):
+        # cold-path copy_d2d (snapshot.fork's working-page copy) runs on the
+        # main RPC thread while fire_batch runs on this shmem thread. Without
+        # cross-thread sync, fire_batch can launch forward-pass kernels
+        # before the main thread has even enqueued the d2d kernel, causing
+        # the new context to read stale page contents (recently-freed KV
+        # from another slot — produces structured cross-contamination).
+        # Synchronizing here forces this thread to wait for ANY pending GPU
+        # work, including any d2d kernels already enqueued by the main
+        # thread. NOTE this only closes the race when the d2d kernel has
+        # been launched first; it does not fix the case where the main
+        # thread hasn't yet processed the cold-path IPC. That stronger fix
+        # requires Rust-side notify→call serialization. See
+        # project_pie_kv_bleed_d2d_fork_race.md.
+        import torch as _torch
+        _torch.cuda.synchronize()
         t_start = time.perf_counter()
 
         t0 = time.perf_counter()
