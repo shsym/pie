@@ -92,7 +92,11 @@ int run_parity(const pie_cuda_driver::Config& cfg,
     const bool is_gpt_oss  = (mt_for_parity == "gpt_oss");
     const bool is_gemma3n  = (mt_for_parity == "gemma3n" || mt_for_parity == "gemma3n_text");
     const bool is_qwen3_5  = (mt_for_parity == "qwen3_5" || mt_for_parity == "qwen3_5_text");
-    const bool is_qwen3_5_moe = (mt_for_parity == "qwen3_5_moe" || mt_for_parity == "qwen3_5_moe_text");
+    const bool is_qwen3_5_moe = (mt_for_parity == "qwen3_5_moe" || mt_for_parity == "qwen3_5_moe_text"
+                                  || mt_for_parity == "qwen3_moe");
+    const bool parity_has_linear_attn =
+        (mt_for_parity == "qwen3_5" || mt_for_parity == "qwen3_5_text" ||
+         mt_for_parity == "qwen3_5_moe" || mt_for_parity == "qwen3_5_moe_text");
     const bool is_gemma2_arch = (mt_for_parity == "gemma2");
     const bool is_gemma3_arch = (mt_for_parity == "gemma3" || mt_for_parity == "gemma3_text");
     const bool is_gemma_arch = is_gemma2_arch || is_gemma3_arch;
@@ -103,6 +107,8 @@ int run_parity(const pie_cuda_driver::Config& cfg,
          || mt_for_parity == "qwen2"
          || mt_for_parity == "llama" || mt_for_parity == "llama3"
          || mt_for_parity == "mistral" || mt_for_parity == "mistral3"
+         || mt_for_parity == "olmo2" || mt_for_parity == "olmo3"
+         || mt_for_parity == "phi3"
          || is_gpt_oss
          || is_gemma3n
          || is_gemma_arch
@@ -137,6 +143,10 @@ int run_parity(const pie_cuda_driver::Config& cfg,
         weights_gemma2 = pie_cuda_driver::model::bind_gemma2(engine);
     } else if (is_gemma3_arch) {
         weights_gemma2 = pie_cuda_driver::model::bind_gemma3(engine);
+    } else if (mt_for_parity == "olmo2" || mt_for_parity == "olmo3") {
+        weights = pie_cuda_driver::model::bind_olmo3(engine);
+    } else if (mt_for_parity == "phi3") {
+        weights = pie_cuda_driver::model::bind_phi3(engine);
     } else {
         weights = pie_cuda_driver::model::bind_llama_like(engine);
     }
@@ -236,30 +246,32 @@ int run_parity(const pie_cuda_driver::Config& cfg,
         pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace q35_moe_ws;
         if (is_qwen3_5 || is_qwen3_5_moe) {
             const auto& cfg_q = engine.hf_config();
-            const int K_dim = cfg_q.linear_num_key_heads * cfg_q.linear_key_head_dim;
-            const int V_dim = cfg_q.linear_num_value_heads * cfg_q.linear_value_head_dim;
-            const int conv_dim = 2 * K_dim + V_dim;
-            q35_la_ws = pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace::allocate(
-                N, conv_dim, cfg_q.linear_num_value_heads,
-                cfg_q.linear_num_key_heads,
-                cfg_q.linear_key_head_dim, cfg_q.linear_value_head_dim,
-                /*hq=*/cfg_q.num_attention_heads * cfg_q.head_dim);
-            const std::size_t num_layers = is_qwen3_5
-                ? weights_qwen3_5.layers.size()
-                : weights_qwen3_5_moe.layers.size();
-            std::vector<bool> layer_is_linear(num_layers);
-            for (std::size_t L = 0; L < num_layers; ++L) {
-                const bool is_linear = is_qwen3_5
-                    ? (weights_qwen3_5.layers[L].kind ==
-                       pie_cuda_driver::model::Qwen3_5LayerWeights::Kind::LinearAttn)
-                    : (weights_qwen3_5_moe.layers[L].kind ==
-                       pie_cuda_driver::model::Qwen3_5MoeLayerWeights::Kind::LinearAttn);
-                layer_is_linear[L] = is_linear;
+            if (parity_has_linear_attn) {
+                const int K_dim = cfg_q.linear_num_key_heads * cfg_q.linear_key_head_dim;
+                const int V_dim = cfg_q.linear_num_value_heads * cfg_q.linear_value_head_dim;
+                const int conv_dim = 2 * K_dim + V_dim;
+                q35_la_ws = pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace::allocate(
+                    N, conv_dim, cfg_q.linear_num_value_heads,
+                    cfg_q.linear_num_key_heads,
+                    cfg_q.linear_key_head_dim, cfg_q.linear_value_head_dim,
+                    /*hq=*/cfg_q.num_attention_heads * cfg_q.head_dim);
+                const std::size_t num_layers = is_qwen3_5
+                    ? weights_qwen3_5.layers.size()
+                    : weights_qwen3_5_moe.layers.size();
+                std::vector<bool> layer_is_linear(num_layers);
+                for (std::size_t L = 0; L < num_layers; ++L) {
+                    const bool is_linear = is_qwen3_5
+                        ? (weights_qwen3_5.layers[L].kind ==
+                           pie_cuda_driver::model::Qwen3_5LayerWeights::Kind::LinearAttn)
+                        : (weights_qwen3_5_moe.layers[L].kind ==
+                           pie_cuda_driver::model::Qwen3_5MoeLayerWeights::Kind::LinearAttn);
+                    layer_is_linear[L] = is_linear;
+                }
+                q35_state_cache = pie_cuda_driver::Qwen3_5StateCache::allocate(
+                    layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
+                    cfg_q.linear_num_value_heads,
+                    cfg_q.linear_key_head_dim, cfg_q.linear_value_head_dim);
             }
-            q35_state_cache = pie_cuda_driver::Qwen3_5StateCache::allocate(
-                layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
-                cfg_q.linear_num_value_heads,
-                cfg_q.linear_key_head_dim, cfg_q.linear_value_head_dim);
             if (is_qwen3_5_moe) {
                 q35_moe_ws = pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace::allocate(
                     N, cfg_q.hidden_size,
@@ -298,6 +310,36 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             // the attention knobs.
             fwd_cfg.use_qkv_bias    = false;
             fwd_cfg.rope_kind       = pie_cuda_driver::model::RopeKind::Standard;
+            fwd_cfg.force_prefill_path = !decode_after_prefill;
+        } else if (mt_for_parity == "olmo2" || mt_for_parity == "olmo3") {
+            // OLMo-2/3: post-norm + q/k-norm. OLMo-3 also has YaRN +
+            // per-layer sliding window.
+            const auto& hf = engine.hf_config();
+            fwd_cfg.use_qk_norm    = true;
+            fwd_cfg.norm_placement = pie_cuda_driver::model::NormPlacement::Post;
+            switch (hf.rope_scaling_kind) {
+                case pie_cuda_driver::HfConfig::RopeScaling::Llama3:
+                    fwd_cfg.rope_kind = pie_cuda_driver::model::RopeKind::YaRN;
+                    break;
+                case pie_cuda_driver::HfConfig::RopeScaling::OriginalYaRN:
+                    fwd_cfg.rope_kind = pie_cuda_driver::model::RopeKind::YaRNOriginal;
+                    break;
+                default:
+                    fwd_cfg.rope_kind = pie_cuda_driver::model::RopeKind::Standard;
+                    break;
+            }
+            fwd_cfg.yarn_factor                = hf.rope_factor;
+            fwd_cfg.yarn_low_freq_factor       = hf.rope_low_freq_factor;
+            fwd_cfg.yarn_high_freq_factor      = hf.rope_high_freq_factor;
+            fwd_cfg.yarn_beta_fast             = hf.rope_beta_fast;
+            fwd_cfg.yarn_beta_slow             = hf.rope_beta_slow;
+            fwd_cfg.yarn_attention_factor      = hf.rope_attention_factor;
+            fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
+            fwd_cfg.sliding_window             = hf.sliding_window;
+            for (const auto& t : hf.layer_types) {
+                fwd_cfg.per_layer_window_left.push_back(
+                    (t == "sliding_attention") ? hf.sliding_window : -1);
+            }
             fwd_cfg.force_prefill_path = !decode_after_prefill;
         }
         // TP knobs apply to every llama_like-shaped fwd_cfg user
@@ -439,11 +481,17 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             } else {
                 // Route the parity path through `llama_like_forward_paged`
                 // so it shares the TP-aware forward used by the runtime
-                // serve path. Single-GPU behaviour matches the legacy
-                // `qwen3_forward_paged` (verified by parity_qwen3.py).
-                pie_cuda_driver::model::LlamaLikeForwardCfg parity_fwd{};
-                parity_fwd.use_qk_norm  = engine.hf_config().use_qk_norm;
-                parity_fwd.use_qkv_bias = engine.hf_config().attention_bias;
+                // serve path. The outer `fwd_cfg` was already specialised
+                // per-arch above (OLMo-2/3 sets post-norm + use_qk_norm +
+                // YaRN params; default falls through with attention_bias
+                // / use_qk_norm read from HfConfig). For the legacy llama
+                // path we just patch in the bits the parity helper used to
+                // set itself.
+                pie_cuda_driver::model::LlamaLikeForwardCfg parity_fwd = fwd_cfg;
+                if (mt_for_parity != "olmo2" && mt_for_parity != "olmo3") {
+                    parity_fwd.use_qk_norm  = engine.hf_config().use_qk_norm;
+                    parity_fwd.use_qkv_bias = engine.hf_config().attention_bias;
+                }
                 parity_fwd.tp_size = cfg.distributed.tp_size;
                 parity_fwd.tp_comm = tp_comm;
                 pie_cuda_driver::model::LlamaLikePlanState parity_plan;
@@ -738,9 +786,10 @@ int main(int argc, char** argv) {
             mt == "qwen3"
          || mt == "qwen3_5" || mt == "qwen3_5_text"
          || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
+         || mt == "qwen3_moe"
          || mt == "qwen2"
          || mt == "llama" || mt == "llama3"
-         || mt == "mistral" || mt == "mistral3"
+         || mt == "mistral" || mt == "mistral3" || mt == "ministral3"
          || mt == "mixtral"
          || mt == "gpt_oss"
          || mt == "phi3"
@@ -786,13 +835,21 @@ int main(int argc, char** argv) {
     const bool is_qwen3_5_arch =
         (mt_for_bind == "qwen3_5" || mt_for_bind == "qwen3_5_text");
     const bool is_qwen3_5_moe_arch =
+        (mt_for_bind == "qwen3_5_moe" || mt_for_bind == "qwen3_5_moe_text" ||
+         mt_for_bind == "qwen3_moe");
+    // Qwen3-MoE is full-attention only; the Qwen3.5/3.6 family adds a
+    // hybrid linear-attn schedule and an always-on shared expert. The
+    // bind / forward share the same struct, so we only need to gate the
+    // linear-attn workspace + state cache and the shared-expert
+    // workspace allocations.
+    const bool qwen3_5_moe_has_linear_attn =
         (mt_for_bind == "qwen3_5_moe" || mt_for_bind == "qwen3_5_moe_text");
 
     if (mt_for_bind == "phi3") {
         weights_llama = pie_cuda_driver::model::bind_phi3(engine);
     } else if (mt_for_bind == "olmo2" || mt_for_bind == "olmo3") {
         weights_llama = pie_cuda_driver::model::bind_olmo3(engine);
-    } else if (mt_for_bind == "mistral3") {
+    } else if (mt_for_bind == "mistral3" || mt_for_bind == "ministral3") {
         weights_llama = pie_cuda_driver::model::bind_mistral3(engine);
     } else if (mt_for_bind == "gemma2") {
         weights_gemma = pie_cuda_driver::model::bind_gemma2(engine);
@@ -891,7 +948,19 @@ int main(int argc, char** argv) {
                   static_cast<int>(cfg.batching.kv_page_size),
                   kv_heads_local,
                   weights_gemma4.per_layer_head_dim,
-                  weights_gemma4.kv_source_layer)
+                  weights_gemma4.kv_source_layer,
+                  // Per-layer kv_heads — only meaningful for the
+                  // 26B-A4B variant where full layers ship 2 KV heads
+                  // and sliding ones ship 8. Pass through TP-divided
+                  // values to match the forward's `Hk` calculation.
+                  [&]() {
+                      std::vector<int> r;
+                      r.reserve(weights_gemma4.per_layer_num_kv_heads.size());
+                      for (int v : weights_gemma4.per_layer_num_kv_heads) {
+                          r.push_back(v / std::max(1, cfg.distributed.tp_size));
+                      }
+                      return r;
+                  }())
             : pie_cuda_driver::KvCache::allocate(
                   engine.hf_config().num_hidden_layers,
                   static_cast<int>(cfg.batching.max_num_kv_pages),
@@ -936,48 +1005,53 @@ int main(int argc, char** argv) {
     pie_cuda_driver::model::Qwen3_5PlanState qwen3_5_plan_state;
     if (is_qwen3_5_arch || is_qwen3_5_moe_arch) {
         const auto& cfg_q = engine.hf_config();
-        // Per-rank head shares: linear-attn K/V heads, full-attn Q/KV
-        // heads, and intermediate all divide tp_size — checked at engine
-        // load. Workspace dims shrink accordingly so each rank only
-        // allocates its slice.
         const int T_q35 = std::max(1, cfg.distributed.tp_size);
-        const int K_h_local = cfg_q.linear_num_key_heads / T_q35;
-        const int V_h_local = cfg_q.linear_num_value_heads / T_q35;
-        const int K_dim = K_h_local * cfg_q.linear_key_head_dim;
-        const int V_dim = V_h_local * cfg_q.linear_value_head_dim;
-        const int conv_dim = 2 * K_dim + V_dim;
-        const int hq_local =
-            (cfg_q.num_attention_heads / T_q35) * cfg_q.head_dim;
-        qwen3_5_la_ws = pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace::allocate(
-            max_workspace_tokens, conv_dim,
-            V_h_local,
-            K_h_local,
-            cfg_q.linear_key_head_dim,
-            cfg_q.linear_value_head_dim,
-            /*hq=*/hq_local);
-        const std::size_t num_layers = is_qwen3_5_arch
-            ? weights_qwen3_5.layers.size()
-            : weights_qwen3_5_moe.layers.size();
-        std::vector<bool> layer_is_linear(num_layers);
-        for (std::size_t L = 0; L < num_layers; ++L) {
-            const bool is_linear = is_qwen3_5_arch
-                ? (weights_qwen3_5.layers[L].kind ==
-                   pie_cuda_driver::model::Qwen3_5LayerWeights::Kind::LinearAttn)
-                : (weights_qwen3_5_moe.layers[L].kind ==
-                   pie_cuda_driver::model::Qwen3_5MoeLayerWeights::Kind::LinearAttn);
-            layer_is_linear[L] = is_linear;
+        const bool has_linear_attn =
+            is_qwen3_5_arch || qwen3_5_moe_has_linear_attn;
+        if (has_linear_attn) {
+            // Per-rank head shares: linear-attn K/V heads, full-attn Q/KV
+            // heads, and intermediate all divide tp_size — checked at
+            // engine load. Workspace dims shrink accordingly so each rank
+            // only allocates its slice.
+            const int K_h_local = cfg_q.linear_num_key_heads / T_q35;
+            const int V_h_local = cfg_q.linear_num_value_heads / T_q35;
+            const int K_dim = K_h_local * cfg_q.linear_key_head_dim;
+            const int V_dim = V_h_local * cfg_q.linear_value_head_dim;
+            const int conv_dim = 2 * K_dim + V_dim;
+            const int hq_local =
+                (cfg_q.num_attention_heads / T_q35) * cfg_q.head_dim;
+            qwen3_5_la_ws = pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace::allocate(
+                max_workspace_tokens, conv_dim,
+                V_h_local,
+                K_h_local,
+                cfg_q.linear_key_head_dim,
+                cfg_q.linear_value_head_dim,
+                /*hq=*/hq_local);
+            const std::size_t num_layers = is_qwen3_5_arch
+                ? weights_qwen3_5.layers.size()
+                : weights_qwen3_5_moe.layers.size();
+            std::vector<bool> layer_is_linear(num_layers);
+            for (std::size_t L = 0; L < num_layers; ++L) {
+                const bool is_linear = is_qwen3_5_arch
+                    ? (weights_qwen3_5.layers[L].kind ==
+                       pie_cuda_driver::model::Qwen3_5LayerWeights::Kind::LinearAttn)
+                    : (weights_qwen3_5_moe.layers[L].kind ==
+                       pie_cuda_driver::model::Qwen3_5MoeLayerWeights::Kind::LinearAttn);
+                layer_is_linear[L] = is_linear;
+            }
+            qwen3_5_state_cache = pie_cuda_driver::Qwen3_5StateCache::allocate(
+                layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
+                V_h_local,
+                cfg_q.linear_key_head_dim,
+                cfg_q.linear_value_head_dim);
         }
-        qwen3_5_state_cache = pie_cuda_driver::Qwen3_5StateCache::allocate(
-            layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
-            V_h_local,
-            cfg_q.linear_key_head_dim,
-            cfg_q.linear_value_head_dim);
 
         if (is_qwen3_5_moe_arch) {
-            // Both routed and shared experts shard along the intermediate
-            // axis under TP — the engine streams per-rank slices straight
-            // from the safetensors mmap, so the workspace tracks the local
-            // Im_local for both.
+            // Routed experts shard along the intermediate axis under TP —
+            // the engine streams per-rank slices straight from the
+            // safetensors mmap. Shared-expert width is 0 on Qwen3-MoE
+            // (no shared expert); the workspace allocator handles 0-width
+            // by skipping those buffers.
             qwen3_5_moe_ws = pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace::allocate(
                 max_workspace_tokens,
                 cfg_q.hidden_size,
@@ -1135,12 +1209,23 @@ int main(int argc, char** argv) {
         if (is_olmo_post_norm) {
             fwd_cfg.use_qk_norm = true;
         }
-        fwd_cfg.rope_kind = hf.has_rope_scaling
-            ? pie_cuda_driver::model::RopeKind::YaRN
-            : pie_cuda_driver::model::RopeKind::Standard;
+        switch (hf.rope_scaling_kind) {
+            case pie_cuda_driver::HfConfig::RopeScaling::Llama3:
+                fwd_cfg.rope_kind = pie_cuda_driver::model::RopeKind::YaRN;
+                break;
+            case pie_cuda_driver::HfConfig::RopeScaling::OriginalYaRN:
+                fwd_cfg.rope_kind = pie_cuda_driver::model::RopeKind::YaRNOriginal;
+                break;
+            default:
+                fwd_cfg.rope_kind = pie_cuda_driver::model::RopeKind::Standard;
+                break;
+        }
         fwd_cfg.yarn_factor               = hf.rope_factor;
         fwd_cfg.yarn_low_freq_factor      = hf.rope_low_freq_factor;
         fwd_cfg.yarn_high_freq_factor     = hf.rope_high_freq_factor;
+        fwd_cfg.yarn_beta_fast            = hf.rope_beta_fast;
+        fwd_cfg.yarn_beta_slow            = hf.rope_beta_slow;
+        fwd_cfg.yarn_attention_factor     = hf.rope_attention_factor;
         fwd_cfg.yarn_original_max_position = hf.rope_original_max_position;
         fwd_cfg.sliding_window            = hf.sliding_window;
         // flashinfer's decode kernel only instantiates GQA group sizes
@@ -1196,8 +1281,12 @@ int main(int argc, char** argv) {
         std::cerr << "[pie-driver-cuda] model_type=" << mt
                   << " use_qk_norm=" << fwd_cfg.use_qk_norm
                   << " use_qkv_bias=" << fwd_cfg.use_qkv_bias
-                  << " rope=" << (fwd_cfg.rope_kind ==
-                       pie_cuda_driver::model::RopeKind::YaRN ? "yarn" : "standard")
+                  << " rope="
+                  << (fwd_cfg.rope_kind == pie_cuda_driver::model::RopeKind::YaRN
+                          ? "yarn-llama3"
+                      : fwd_cfg.rope_kind == pie_cuda_driver::model::RopeKind::YaRNOriginal
+                          ? "yarn-original"
+                          : "standard")
                   << "\n";
     }
 
@@ -1217,8 +1306,23 @@ int main(int argc, char** argv) {
     // `main`'s scope (weights_*, fwd_cfg, gemma_fwd_cfg) and persist for
     // the lifetime of the server.
     pie_cuda_driver::ForwardFn forward_fn;
+    // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
+    // alongside the dense forward state. Inert (zero-byte) on dense
+    // E2B / E4B / 31B variants.
+    pie_cuda_driver::model::Gemma4MoeMlpWorkspace gemma4_moe_ws;
+    if (is_gemma4_arch && engine.hf_config().gemma4_enable_moe) {
+        const auto& hf_cfg = engine.hf_config();
+        gemma4_moe_ws = pie_cuda_driver::model::Gemma4MoeMlpWorkspace::allocate(
+            max_workspace_tokens,
+            hf_cfg.hidden_size,
+            hf_cfg.num_experts,
+            hf_cfg.num_experts_per_tok,
+            hf_cfg.moe_intermediate_size /
+                std::max(1, cfg.distributed.tp_size));
+    }
     if (is_gemma4_arch) {
-        forward_fn.body = [&engine, &weights_gemma4, gemma4_fwd_cfg](
+        forward_fn.body = [&engine, &weights_gemma4, &gemma4_moe_ws,
+                           gemma4_fwd_cfg](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
             pie_cuda_driver::AttentionWorkspace& attn_ws,
@@ -1234,7 +1338,7 @@ int main(int argc, char** argv) {
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
             pie_cuda_driver::model::gemma4_forward_paged(
                 weights_gemma4, engine.hf_config(), gemma4_fwd_cfg,
-                ws, cache, attn_ws, cublas,
+                ws, gemma4_moe_ws, cache, attn_ws, cublas,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
                 qo_indptr_h, kv_page_indptr_h,
@@ -1340,7 +1444,18 @@ int main(int argc, char** argv) {
             const std::uint32_t* kv_page_indptr_h,
             int R, bool is_pure_decode) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-            q35_fwd.force_prefill_path = false;
+            // flashinfer's decode kernel only instantiates GQA group
+            // sizes {1, 2, 3, 4, 8}. Qwen3.6-27B (q=24, kv=4 → gqa=6)
+            // and similar GQA-6 / GQA-7 ckpts must force the prefill
+            // kernel even on decode fires.
+            {
+                const auto& hf_q = engine.hf_config();
+                const int gqa_q = hf_q.num_attention_heads /
+                                  std::max(1, hf_q.num_key_value_heads);
+                q35_fwd.force_prefill_path =
+                    !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                      gqa_q == 4 || gqa_q == 8);
+            }
             q35_fwd.tp_size = q35_tp_size;
             q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
@@ -1364,7 +1479,18 @@ int main(int argc, char** argv) {
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-            q35_fwd.force_prefill_path = false;
+            // flashinfer's decode kernel only instantiates GQA group
+            // sizes {1, 2, 3, 4, 8}. Qwen3.6-27B (q=24, kv=4 → gqa=6)
+            // and similar GQA-6 / GQA-7 ckpts must force the prefill
+            // kernel even on decode fires.
+            {
+                const auto& hf_q = engine.hf_config();
+                const int gqa_q = hf_q.num_attention_heads /
+                                  std::max(1, hf_q.num_key_value_heads);
+                q35_fwd.force_prefill_path =
+                    !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                      gqa_q == 4 || gqa_q == 8);
+            }
             q35_fwd.tp_size = q35_tp_size;
             q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::qwen3_5_forward_paged(
@@ -1386,7 +1512,18 @@ int main(int argc, char** argv) {
             const std::uint32_t* kv_page_indptr_h,
             int R, bool is_pure_decode) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-            q35_fwd.force_prefill_path = false;
+            // flashinfer's decode kernel only instantiates GQA group
+            // sizes {1, 2, 3, 4, 8}. Qwen3.6-27B (q=24, kv=4 → gqa=6)
+            // and similar GQA-6 / GQA-7 ckpts must force the prefill
+            // kernel even on decode fires.
+            {
+                const auto& hf_q = engine.hf_config();
+                const int gqa_q = hf_q.num_attention_heads /
+                                  std::max(1, hf_q.num_key_value_heads);
+                q35_fwd.force_prefill_path =
+                    !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                      gqa_q == 4 || gqa_q == 8);
+            }
             q35_fwd.tp_size = q35moe_tp_size;
             q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
@@ -1411,7 +1548,18 @@ int main(int argc, char** argv) {
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d) {
             pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-            q35_fwd.force_prefill_path = false;
+            // flashinfer's decode kernel only instantiates GQA group
+            // sizes {1, 2, 3, 4, 8}. Qwen3.6-27B (q=24, kv=4 → gqa=6)
+            // and similar GQA-6 / GQA-7 ckpts must force the prefill
+            // kernel even on decode fires.
+            {
+                const auto& hf_q = engine.hf_config();
+                const int gqa_q = hf_q.num_attention_heads /
+                                  std::max(1, hf_q.num_key_value_heads);
+                q35_fwd.force_prefill_path =
+                    !(gqa_q == 1 || gqa_q == 2 || gqa_q == 3 ||
+                      gqa_q == 4 || gqa_q == 8);
+            }
             q35_fwd.tp_size = q35moe_tp_size;
             q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::qwen3_5_moe_forward_paged(

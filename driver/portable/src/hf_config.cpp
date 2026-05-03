@@ -16,6 +16,7 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::Gemma2:   return "gemma2";
         case PieArch::Gemma3:   return "gemma3";
         case PieArch::Gemma4:   return "gemma4";
+        case PieArch::Gemma3n:  return "gemma3n";
         case PieArch::Mistral3: return "mistral3";
         case PieArch::Olmo3:    return "olmo3";
         case PieArch::GptOss:   return "gptoss";
@@ -38,6 +39,8 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
         hf_model_type == "gemma3_text")   return PieArch::Gemma3;
     if (hf_model_type == "gemma4" ||
         hf_model_type == "gemma4_text")   return PieArch::Gemma4;
+    if (hf_model_type == "gemma3n" ||
+        hf_model_type == "gemma3n_text")  return PieArch::Gemma3n;
     if (hf_model_type == "mistral")     return PieArch::Mistral3;
     if (hf_model_type == "mistral3")    return PieArch::Mistral3;
     if (hf_model_type == "olmo3")       return PieArch::Olmo3;
@@ -130,17 +133,62 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     //     likewise unsupported. We ignore `quantization_config` here; the
     //     safetensors loader throws on the first unsupported dtype.
 
+    // Per-arch defaults for fields HF's PretrainedConfig fills implicitly.
+    // Gemma 3 4B+ multimodal checkpoints ship with a minimal text_config
+    // (only hidden_size / intermediate_size / num_hidden_layers / etc.),
+    // relying on Gemma3TextConfig class defaults. Inject those here.
+    if (h.arch == PieArch::Gemma3) {
+        auto fill = [&](const char* k, double v) {
+            if (!text.contains(k) || text[k].is_null()) text[k] = v;
+        };
+        fill("num_attention_heads", 8);
+        fill("num_key_value_heads", 4);
+        fill("head_dim", 256);
+        fill("vocab_size", 262208);
+        fill("rms_norm_eps", 1e-6);
+        fill("rope_theta", 1e6);
+        fill("max_position_embeddings", 131072);
+        fill("sliding_window", 4096);
+        fill("rope_local_base_freq", 10000.0);
+        fill("query_pre_attn_scalar", 256);
+    }
+
     h.num_hidden_layers = text.at("num_hidden_layers").get<std::int32_t>();
     h.num_attention_heads = text.at("num_attention_heads").get<std::int32_t>();
     // Some configs default num_key_value_heads to num_attention_heads.
     h.num_key_value_heads =
         get_or<std::int32_t>(text, "num_key_value_heads", h.num_attention_heads);
+    // Gemma 4 alternative-attention only.
+    h.num_global_key_value_heads =
+        get_or<std::int32_t>(text, "num_global_key_value_heads", 0);
     h.hidden_size = text.at("hidden_size").get<std::int32_t>();
     // Pure-MoE checkpoints (Qwen 3.6) omit `intermediate_size` because
     // every layer's FFN is the routed-expert path; the per-expert width
     // lives in `moe_intermediate_size`. Fall back to 0 there.
-    h.intermediate_size =
-        get_or<std::int32_t>(text, "intermediate_size", 0);
+    //
+    // Gemma 3n stores `intermediate_size` as a per-layer array (e.g.
+    // [8192, 8192, …]). v1 supports the constant-across-layers case by
+    // taking the first element; reject heterogeneous values until the
+    // graph builder can route per-layer FFN widths.
+    if (auto it = text.find("intermediate_size");
+        it != text.end() && it->is_array()) {
+        if (it->empty()) {
+            h.intermediate_size = 0;
+        } else {
+            const auto first = (*it)[0].get<std::int32_t>();
+            for (const auto& v : *it) {
+                if (v.get<std::int32_t>() != first) {
+                    throw std::runtime_error(
+                        "hf_config: per-layer intermediate_size with mixed "
+                        "values is not yet supported");
+                }
+            }
+            h.intermediate_size = first;
+        }
+    } else {
+        h.intermediate_size =
+            get_or<std::int32_t>(text, "intermediate_size", 0);
+    }
     h.vocab_size = text.at("vocab_size").get<std::int32_t>();
     h.max_position_embeddings =
         get_or<std::int32_t>(text, "max_position_embeddings", 4096);
@@ -219,15 +267,35 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     }
 
     // ── Gemma 4 specifics ──
-    if (h.arch == PieArch::Gemma4) {
-        h.gemma4_head_dim_global =
-            get_or<std::int32_t>(text, "global_head_dim", h.head_dim);
+    // Gemma 3n shares the PLE dimensions and num_kv_shared_layers fields
+    // (same HF config keys), so reuse the same hparams. The Gemma4-only
+    // bits (proportional RoPE, layer_scalar, double-wide MLP, dual head_dim)
+    // are gated below on arch == Gemma4.
+    if (h.arch == PieArch::Gemma4 || h.arch == PieArch::Gemma3n) {
         h.gemma4_num_kv_shared_layers =
             get_or<std::int32_t>(text, "num_kv_shared_layers", 0);
         h.gemma4_ple_dim =
             get_or<std::int32_t>(text, "hidden_size_per_layer_input", 0);
         h.gemma4_ple_vocab =
             get_or<std::int32_t>(text, "vocab_size_per_layer_input", 0);
+    }
+    if (h.arch == PieArch::Gemma3n) {
+        h.altup_num_inputs    = get_or<std::int32_t>(text, "altup_num_inputs", 4);
+        h.altup_active_idx    = get_or<std::int32_t>(text, "altup_active_idx", 0);
+        h.altup_correct_scale = get_or<bool>(text, "altup_correct_scale", true);
+        h.laurel_rank         = get_or<std::int32_t>(text, "laurel_rank", 0);
+        if (auto it = text.find("activation_sparsity_pattern");
+            it != text.end() && it->is_array()) {
+            for (const auto& v : *it) {
+                if (v.is_number()) {
+                    h.activation_sparsity_pattern.push_back(v.get<float>());
+                }
+            }
+        }
+    }
+    if (h.arch == PieArch::Gemma4) {
+        h.gemma4_head_dim_global =
+            get_or<std::int32_t>(text, "global_head_dim", h.head_dim);
         h.gemma4_use_double_wide_mlp =
             get_or<bool>(text, "use_double_wide_mlp", false);
         // rope_parameters in gemma4 is a dict keyed by attention type.

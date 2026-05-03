@@ -135,6 +135,31 @@ ArchSpec arch_spec_for(PieArch a, const Hparams& h) {
             }
             apply_swa_pattern_(s, h, SwaPattern::Every6Gemma3);
             break;
+        case PieArch::Gemma3n:
+            // Gemma 3-style pre/post norm sandwich + GeGLU + per-head
+            // qk_norm + per-layer-type SWA pattern (`layer_types`). Unlike
+            // Gemma 2/3, Gemma 3n's RMSNorm stores weights centered at 1
+            // (init=ones) and applies a direct `x * w` (NOT `x * (1+w)`),
+            // so `norm_weight_plus_one` stays FALSE here even though the
+            // overall norm-sandwich layout matches Gemma 3.
+            // Attention scale is 1.0 (Q is pre-normalized via q_norm — the
+            // 1/sqrt(head_dim) factor is absorbed into the q_norm weights).
+            // Final softcap (30.0) preserved. AltUp / PLE / Laurel /
+            // activation sparsity are layered on top inside the graph builder.
+            apply_gemma_norms_(s);
+            s.has_qk_norm = true;
+            s.gemma4_unit_sm_scale = true;  // attention scale = 1.0
+            s.gemma4_v_norm        = true;  // pure RMS-norm on V (no scale)
+            // KV-share: last `num_kv_shared_layers` (=10 on E2B/E4B) reuse
+            // upstream non-shared layer's K/V matched by attention type.
+            // The graph builder reads `gemma4_first_shared` to know where
+            // the cutoff is (mirrors gemma4 wiring; same field name reused).
+            s.gemma4_first_shared = h.gemma4_num_kv_shared_layers > 0
+                ? h.num_hidden_layers - h.gemma4_num_kv_shared_layers
+                : h.num_hidden_layers;
+            apply_swa_pattern_(s, h, SwaPattern::FromLayerTypes);
+            if (h.final_logit_softcapping) s.final_softcap = *h.final_logit_softcapping;
+            break;
         case PieArch::Mixtral:
         case PieArch::GptOss:
         case PieArch::Qwen3Moe:

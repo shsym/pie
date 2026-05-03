@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <iostream>
+#include <set>
 #include <stdexcept>
 #include <vector>
 
@@ -113,7 +115,7 @@ bool supports_tp(const std::string& mt) {
     return mt == "qwen3"
         || mt == "qwen2"
         || mt == "llama" || mt == "llama3"
-        || mt == "mistral" || mt == "mistral3"
+        || mt == "mistral" || mt == "mistral3" || mt == "ministral3"
         || mt == "phi3"
         || mt == "olmo2" || mt == "olmo3"
         || mt == "gemma2"
@@ -123,7 +125,17 @@ bool supports_tp(const std::string& mt) {
         || mt == "gemma3n" || mt == "gemma3n_text"
         || mt == "gpt_oss"
         || mt == "qwen3_5" || mt == "qwen3_5_text"
-        || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text";
+        || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
+        || mt == "qwen3_moe";
+}
+
+// True for any MoE model whose forward path lives in qwen3_5_moe_forward.
+// All members share an all-MoE MLP layout (no dense `intermediate_size`),
+// so the engine's TP divisibility checks on `intermediate_size` should
+// be skipped for them.
+bool is_qwen3_5_moe_arch(const std::string& mt) {
+    return mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
+        || mt == "qwen3_moe";
 }
 
 // Slice a 2-D bf16 weight `[N, K]` per-rank along the given axis. Used
@@ -244,24 +256,33 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
         };
         require_divisible(hf.num_attention_heads, "num_attention_heads");
         require_divisible(hf.num_key_value_heads, "num_key_value_heads");
-        // Qwen3.5-MoE has no dense `intermediate_size`; the MLP lives
-        // entirely in `moe_intermediate_size` + `shared_expert_intermediate_size`.
-        const bool is_q35_moe =
-            (hf.model_type == "qwen3_5_moe" ||
-             hf.model_type == "qwen3_5_moe_text");
+        // Qwen3.5-MoE / Qwen3-MoE have no dense `intermediate_size`; the
+        // MLP lives entirely in `moe_intermediate_size` (+ `shared_expert_
+        // intermediate_size` for the 3.5/3.6 family — Qwen3-MoE has no
+        // shared expert).
+        const bool is_q35_moe = is_qwen3_5_moe_arch(hf.model_type);
         if (!is_q35_moe) {
             require_divisible(hf.intermediate_size, "intermediate_size");
         }
         // Qwen3.5 / 3.6-MoE: linear-attention head counts must shard too.
-        if (hf.model_type == "qwen3_5" || hf.model_type == "qwen3_5_text" ||
-            is_q35_moe) {
+        // Qwen3-MoE has no linear-attn layers, so this check is skipped.
+        const bool has_linear_attn =
+            (hf.model_type == "qwen3_5" || hf.model_type == "qwen3_5_text" ||
+             hf.model_type == "qwen3_5_moe" ||
+             hf.model_type == "qwen3_5_moe_text");
+        if (has_linear_attn) {
             require_divisible(hf.linear_num_key_heads, "linear_num_key_heads");
             require_divisible(hf.linear_num_value_heads, "linear_num_value_heads");
         }
         if (is_q35_moe) {
             require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
-            require_divisible(hf.shared_expert_intermediate_size,
-                              "shared_expert_intermediate_size");
+            // shared_expert_intermediate_size is 0 for Qwen3-MoE (no shared
+            // expert); only enforce divisibility when the family actually
+            // has one.
+            if (hf.shared_expert_intermediate_size > 0) {
+                require_divisible(hf.shared_expert_intermediate_size,
+                                  "shared_expert_intermediate_size");
+            }
         }
     }
 
@@ -408,16 +429,20 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 " is supported (got bits=" +
                 std::to_string(e.hf_.quant_bits) + ")");
         }
-        if (e.hf_.quant_desc_act) {
-            throw std::runtime_error(
-                "engine: GPTQ desc_act=true is not yet supported (would "
-                "require g_idx + activation permutation).");
-        }
-        if (!is_awq && (e.hf_.quant_zero_point || !e.hf_.quant_sym)) {
-            throw std::runtime_error(
-                "engine: GPTQ asymmetric (zero_point) is not yet supported; "
-                "only sym=true gptq INT4 maps cleanly to marlin's u4b8.");
-        }
+        // GPTQ goes through eager dequant when:
+        //   * desc_act=true (act-order; would need permuted marlin repack)
+        //   * sym=false / zero_point=true (asymmetric; marlin's kU4B8
+        //     dispatch only handles sym; kU4 + has_zp would work but
+        //     we hit the same issue as AWQ).
+        // The launch_gptq_dequant_to_bf16 kernel handles both cases via
+        // (qweight - (qzeros+1)) * scales — same autogptq convention
+        // for sym (qzeros all 7 → +1 = 8 = kU4B8 bias) and asym (qzeros
+        // stores zp-1 → +1 = actual zp). desc_act=true also drives the
+        // optional g_idx lookup.
+        const bool gptq_eager_dequant = !is_awq && (
+            e.hf_.quant_desc_act ||
+            e.hf_.quant_zero_point ||
+            !e.hf_.quant_sym);
         // TP slicing strategy: the safetensors loader leaves GPTQ tensors
         // (`.qweight`, `.qzeros`, `.scales`, `.g_idx`) replicated on every
         // rank — the standard `llama_like_shard_axis` doesn't recognise
@@ -529,6 +554,110 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
                       << (awq_allocated / (1024 * 1024)) << " MiB bf16\n";
             loaded_bytes = loaded_bytes - awq_freed + awq_allocated;
             break;  // Skip the marlin pass entirely.
+        }
+
+        // GPTQ eager dequant via launch_gptq_dequant_to_bf16. g_idx is
+        // optional (only present for desc_act=true ckpts). Shape +
+        // per-rank slice semantics mirror the AWQ path.
+        if (gptq_eager_dequant) {
+            if (e.hf_.quant_group_size <= 0) {
+                throw std::runtime_error(
+                    "engine: GPTQ eager dequant with group_size<=0 is not "
+                    "supported (per-channel has no clean fallback yet)");
+            }
+            std::vector<std::string> qw_names;
+            for (const auto& [n, _] : e.weights_) {
+                if (ends_with_str(n, ".qweight")) qw_names.push_back(n);
+            }
+            std::uint64_t freed = 0, allocated = 0;
+            for (const auto& qw_name : qw_names) {
+                const std::string prefix = qw_name.substr(
+                    0, qw_name.size() - 8);
+                const std::string qz_name = prefix + ".qzeros";
+                const std::string sc_name = prefix + ".scales";
+                const std::string gi_name = prefix + ".g_idx";
+                const std::string canonical_w = prefix + ".weight";
+                auto qw_it = e.weights_.find(qw_name);
+                auto qz_it = e.weights_.find(qz_name);
+                auto sc_it = e.weights_.find(sc_name);
+                if (qw_it == e.weights_.end() || qz_it == e.weights_.end() ||
+                    sc_it == e.weights_.end()) {
+                    throw std::runtime_error(
+                        "engine: GPTQ '" + qw_name + "' missing qzeros/scales");
+                }
+                const DeviceTensor& qw = qw_it->second;
+                const DeviceTensor& sc = sc_it->second;
+                if (qw.shape().size() != 2) {
+                    throw std::runtime_error(
+                        "engine: GPTQ qweight '" + qw_name + "' must be 2-D");
+                }
+                // GPTQ qweight: [K/8, N] int32; logical dims:
+                const int Kdim = static_cast<int>(qw.shape()[0]) * 8;
+                const int Ndim = static_cast<int>(qw.shape()[1]);
+                // Cast scales to bf16 if fp16 (small tensor; same as AWQ).
+                DeviceTensor sc_bf16 = sc.dtype() == DType::BF16
+                    ? DeviceTensor()
+                    : DeviceTensor::allocate(DType::BF16, sc.shape());
+                const void* sc_ptr = sc.data();
+                if (sc.dtype() == DType::FP16) {
+                    kernels::launch_cast_fp16_to_bf16(
+                        sc.data(), sc_bf16.data(), sc.numel(), /*stream=*/0);
+                    sc_ptr = sc_bf16.data();
+                } else if (sc.dtype() == DType::FP32) {
+                    kernels::launch_cast_fp32_to_bf16(
+                        sc.data(), sc_bf16.data(), sc.numel(), /*stream=*/0);
+                    sc_ptr = sc_bf16.data();
+                } else if (sc.dtype() != DType::BF16) {
+                    throw std::runtime_error(
+                        "engine: GPTQ scales '" + sc_name +
+                        "' has unexpected dtype " +
+                        std::string(dtype_name(sc.dtype())));
+                }
+                // g_idx is optional — only desc_act=true ckpts ship it.
+                // For sym=false / desc_act=false ckpts, the kernel uses
+                // the implicit `g = k / group_size` mapping.
+                auto gi_it = e.weights_.find(gi_name);
+                const void* gi_ptr = (gi_it != e.weights_.end())
+                    ? gi_it->second.data() : nullptr;
+                if (e.hf_.quant_desc_act && !gi_ptr) {
+                    throw std::runtime_error(
+                        "engine: GPTQ desc_act=true ckpt missing g_idx for '" +
+                        qw_name + "'");
+                }
+                DeviceTensor bf16_full = DeviceTensor::allocate(
+                    DType::BF16,
+                    {static_cast<std::int64_t>(Ndim),
+                     static_cast<std::int64_t>(Kdim)});
+                kernels::launch_gptq_dequant_to_bf16(
+                    qw.data(), qz_it->second.data(), sc_ptr, gi_ptr,
+                    bf16_full.data(), Kdim, Ndim, e.hf_.quant_group_size,
+                    /*stream=*/0);
+                freed += qw.nbytes() + qz_it->second.nbytes() + sc.nbytes()
+                       + (gi_it != e.weights_.end() ? gi_it->second.nbytes() : 0);
+
+                DeviceTensor bf16_w = (tp_size <= 1)
+                    ? std::move(bf16_full)
+                    : slice_bf16_per_rank(
+                          bf16_full,
+                          llama_like_shard_axis(canonical_w),
+                          tp_rank, tp_size, canonical_w);
+                allocated += bf16_w.nbytes();
+                e.weights_.erase(qw_it);
+                e.weights_.erase(qz_name);
+                e.weights_.erase(sc_name);
+                if (gi_it != e.weights_.end()) e.weights_.erase(gi_name);
+                e.weights_.emplace(canonical_w, std::move(bf16_w));
+            }
+            CUDA_CHECK(cudaDeviceSynchronize());
+            std::cerr << "[pie-driver-cuda] GPTQ -> bf16 eager dequant ("
+                      << (e.hf_.quant_desc_act ? "desc_act=true" : "")
+                      << (e.hf_.quant_desc_act && (!e.hf_.quant_sym || e.hf_.quant_zero_point) ? "+" : "")
+                      << ((!e.hf_.quant_sym || e.hf_.quant_zero_point) ? "asym" : "")
+                      << "): " << qw_names.size() << " projections, "
+                      << (freed / (1024 * 1024)) << " MiB int4 -> "
+                      << (allocated / (1024 * 1024)) << " MiB bf16\n";
+            loaded_bytes = loaded_bytes - freed + allocated;
+            break;  // Skip the marlin pass.
         }
 
         std::vector<std::string> qw_names;
@@ -866,8 +995,13 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
             const std::string canonical_s = wname + "_scale_inv";
             e.weights_.erase(scale_name);
             e.weights_.emplace(canonical_s, std::move(fp32_scale));
+            // Per-tensor (scalar scale) vs per-channel ([N] scale).
+            // RedHatAI/Meta-Llama-3.1-8B-FP8 ships static per-tensor;
+            // mistral3-FP8-dynamic ships per-channel.
             QuantMeta meta;
-            meta.kind         = QuantMeta::Kind::PerChannel;
+            meta.kind         = (nelems == 1)
+                                   ? QuantMeta::Kind::PerTensor
+                                   : QuantMeta::Kind::PerChannel;
             meta.scale        = &e.weights_.at(canonical_s);
             meta.zero_point   = nullptr;
             meta.group_size   = 0;
@@ -879,7 +1013,7 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
             CUDA_CHECK(cudaDeviceSynchronize());
             std::cerr << "[pie-driver-cuda] compressed-tensors FP8: "
                       << "registered " << ct_count
-                      << " per-channel-scaled weights\n";
+                      << " quantised weights\n";
         } else {
             // compressed-tensors covers FP8 / INT8 / W4A16 / etc. We
             // only handle the FP8 sub-mode (weights stored as FP8_E4M3
@@ -1149,6 +1283,16 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
         }
         if (!fp8_weights.empty()) {
             std::uint64_t freed = 0, allocated = 0;
+            // Track which `_scale_inv` companions we actually consumed so
+            // we only erase those. Non-compressed-tensors FP8 ckpts
+            // (Ministral-3-Instruct-2512: quant_method="fp8" with
+            // bf16 scalar `weight_scale_inv` per projection) leave their
+            // FP8 weights without QuantMeta — the per-arch bind dequants
+            // them later using the still-resident scale tensor. Blanket-
+            // erasing every `_scale_inv` here would strip those scales
+            // before the bind runs.
+            std::vector<std::string> consumed_scales;
+            consumed_scales.reserve(fp8_weights.size());
             for (const auto& wname : fp8_weights) {
                 auto qmeta_it = e.quant_meta_.find(wname);
                 if (qmeta_it == e.quant_meta_.end() ||
@@ -1178,16 +1322,12 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 freed     += src.nbytes();
                 allocated += bf16.nbytes();
                 w_it->second = std::move(bf16);
+                consumed_scales.push_back(wname + "_scale_inv");
                 e.quant_meta_.erase(qmeta_it);
             }
-            // Drop the orphaned `_scale_inv` companions — no QuantMeta
-            // points at them anymore.
-            for (auto it = e.weights_.begin(); it != e.weights_.end(); ) {
-                if (ends_with_str(it->first, "_scale_inv")) {
-                    it = e.weights_.erase(it);
-                } else {
-                    ++it;
-                }
+            // Drop only the `_scale_inv` companions we actually consumed.
+            for (const auto& s : consumed_scales) {
+                e.weights_.erase(s);
             }
             CUDA_CHECK(cudaDeviceSynchronize());
             std::cerr << "[pie-driver-cuda] eager FP8 -> bf16 dequant "
@@ -1197,6 +1337,113 @@ Engine Engine::load(const Config& boot_cfg, NcclComm* tp_comm) {
                       << " MiB FP8 -> " << (allocated / (1024 * 1024))
                       << " MiB bf16\n";
             loaded_bytes = loaded_bytes - freed + allocated;
+        }
+    }
+
+    // ── MoE per-expert → fused 3-D synthesis ──────────────────────────
+    // Some compressed-tensors MoE ckpts (e.g. RedHatAI/Qwen3.6-35B-A3B-
+    // FP8-dynamic) ship per-expert 2-D weights:
+    //   experts.{i}.gate_proj.weight  [Im, H]
+    //   experts.{i}.up_proj.weight    [Im, H]
+    //   experts.{i}.down_proj.weight  [H, Im]
+    // The qwen3_5_moe forward expects fused 3-D tensors:
+    //   experts.gate_up_proj  [E, 2*Im, H]   (gate stacked above up)
+    //   experts.down_proj     [E, H, Im]
+    // Synthesize them after eager-dequant so we can keep the existing
+    // forward path unchanged. Each per-expert tensor is already TP-
+    // sharded along Im (via llama_like_shard_axis matching .gate_proj/
+    // .up_proj/.down_proj.weight) so the fused result lands per-rank-
+    // shaped without further slicing.
+    if (is_qwen3_5_moe_arch(e.hf_.model_type)) {
+        // Discover layer prefixes that have per-expert tensors.
+        std::vector<std::string> layer_prefixes;
+        {
+            std::set<std::string> uniq;
+            const char* suffix = ".experts.0.gate_proj.weight";
+            const std::size_t suffix_len = std::strlen(suffix);
+            for (const auto& [n, _] : e.weights_) {
+                if (ends_with_str(n, suffix)) {
+                    uniq.insert(n.substr(0, n.size() - suffix_len));
+                }
+            }
+            layer_prefixes.assign(uniq.begin(), uniq.end());
+        }
+        if (!layer_prefixes.empty()) {
+            std::size_t fused_count = 0;
+            for (const auto& base : layer_prefixes) {
+                // Count experts: walk i=0,1,... until missing.
+                int E_count = 0;
+                for (;;) {
+                    if (e.weights_.find(base + ".experts." +
+                            std::to_string(E_count) +
+                            ".gate_proj.weight") == e.weights_.end()) break;
+                    ++E_count;
+                }
+                if (E_count == 0) continue;
+                // Reference shapes from expert 0.
+                const auto& gp0 = e.weights_.at(
+                    base + ".experts.0.gate_proj.weight");
+                const auto& dp0 = e.weights_.at(
+                    base + ".experts.0.down_proj.weight");
+                const int Im = static_cast<int>(gp0.shape()[0]);
+                const int H  = static_cast<int>(gp0.shape()[1]);
+                const int Im_dn = static_cast<int>(dp0.shape()[1]);
+                const std::size_t gu_per_expert = static_cast<std::size_t>(2)
+                    * Im * H * sizeof(std::uint16_t);
+                const std::size_t dn_per_expert = static_cast<std::size_t>(H)
+                    * Im_dn * sizeof(std::uint16_t);
+
+                DeviceTensor gu = DeviceTensor::allocate(
+                    DType::BF16,
+                    {static_cast<std::int64_t>(E_count),
+                     static_cast<std::int64_t>(2 * Im),
+                     static_cast<std::int64_t>(H)});
+                DeviceTensor dn = DeviceTensor::allocate(
+                    DType::BF16,
+                    {static_cast<std::int64_t>(E_count),
+                     static_cast<std::int64_t>(H),
+                     static_cast<std::int64_t>(Im_dn)});
+
+                for (int i = 0; i < E_count; ++i) {
+                    const std::string ep = base + ".experts." +
+                        std::to_string(i);
+                    const auto& gw = e.weights_.at(ep + ".gate_proj.weight");
+                    const auto& uw = e.weights_.at(ep + ".up_proj.weight");
+                    const auto& dw = e.weights_.at(ep + ".down_proj.weight");
+                    auto* gu_base = static_cast<std::uint8_t*>(gu.data())
+                        + i * gu_per_expert;
+                    // gate: rows [0, Im), then up: rows [Im, 2*Im).
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        gu_base, gw.data(),
+                        static_cast<std::size_t>(Im) * H * sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, /*stream=*/0));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        gu_base + Im * H * sizeof(std::uint16_t), uw.data(),
+                        static_cast<std::size_t>(Im) * H * sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, /*stream=*/0));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        static_cast<std::uint8_t*>(dn.data()) + i * dn_per_expert,
+                        dw.data(), dn_per_expert,
+                        cudaMemcpyDeviceToDevice, /*stream=*/0));
+                }
+                // Erase per-expert sources, install fused.
+                for (int i = 0; i < E_count; ++i) {
+                    const std::string ep = base + ".experts." +
+                        std::to_string(i);
+                    e.weights_.erase(ep + ".gate_proj.weight");
+                    e.weights_.erase(ep + ".up_proj.weight");
+                    e.weights_.erase(ep + ".down_proj.weight");
+                }
+                e.weights_.emplace(base + ".experts.gate_up_proj", std::move(gu));
+                e.weights_.emplace(base + ".experts.down_proj", std::move(dn));
+                ++fused_count;
+            }
+            if (fused_count > 0) {
+                CUDA_CHECK(cudaDeviceSynchronize());
+                std::cerr << "[pie-driver-cuda] MoE fuse: synthesized "
+                          << fused_count << " (gate_up_proj, down_proj) "
+                          << "fused 3-D tensors from per-expert 2-D\n";
+            }
         }
     }
 
@@ -1261,6 +1508,10 @@ void Engine::insert(std::string name, DeviceTensor tensor) {
     if (!inserted) {
         throw std::runtime_error("engine: weight already registered: " + it->first);
     }
+}
+
+void Engine::replace(std::string name, DeviceTensor tensor) {
+    weights_.insert_or_assign(std::move(name), std::move(tensor));
 }
 
 void Engine::set_quant_meta(const std::string& name, QuantMeta meta) {

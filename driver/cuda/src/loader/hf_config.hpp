@@ -44,13 +44,27 @@ struct HfConfig {
 
     // ── RoPE ──────────────────────────────────────────────────────────
     float rope_theta;
-    bool  has_rope_scaling;    // True when `rope_scaling.rope_type ==
-                               // "llama3"` (YaRN-style) is set.
-    // YaRN parameters. Inert when `has_rope_scaling == false`.
+    // RoPE scaling variant — `None` means plain RoPE (no scaling).
+    // `Llama3` uses the smoothed-interpolation YaRN ramp (low/high
+    // freq factors); `OriginalYaRN` uses the dim-index ramp from the
+    // YaRN paper (beta_fast/beta_slow + attention_factor mscale) and
+    // is what OLMo-3 / gpt-oss / DeepSeek-V3 ship.
+    enum class RopeScaling { None, Llama3, OriginalYaRN };
+    RopeScaling rope_scaling_kind = RopeScaling::None;
+    // Llama-3 YaRN params. Inert under `RopeScaling::OriginalYaRN`.
     float rope_factor;
     float rope_low_freq_factor;
     float rope_high_freq_factor;
     int   rope_original_max_position;
+    // Original-YaRN params. Inert under `RopeScaling::Llama3`.
+    float rope_beta_fast        = 32.f;
+    float rope_beta_slow        = 1.f;
+    float rope_attention_factor = 1.f;
+    // Backwards-compatible accessor: `has_rope_scaling` is true iff the
+    // ckpt uses Llama-3 YaRN (the only variant that took the YaRN code
+    // path before the OriginalYaRN dispatch was added). Per-arch code
+    // that branches on YaRN vs plain RoPE keeps its existing semantics.
+    bool has_rope_scaling = false;
 
     // ── Sliding-window attention ──────────────────────────────────────
     // -1 means full causal. Positive = `window_left` per request to
@@ -79,9 +93,21 @@ struct HfConfig {
 
     // ── Sparse MoE (Mixtral / GPT-OSS / Qwen-3.5 hybrid) ─────────────
     // Zero on dense models. `num_experts` is HF's `num_local_experts`;
-    // `num_experts_per_tok` is the top-K used by the router.
+    // `num_experts_per_tok` is the top-K used by the router. (Gemma-4
+    // calls these `num_experts` / `top_k_experts` — same fields.)
     int num_experts;
     int num_experts_per_tok;
+    // Gemma-4 26B-A4B runs **both** dense MLP and MoE in parallel per
+    // layer; the dense `intermediate_size` and `moe_intermediate_size`
+    // both apply when this is true. Inert on every other arch.
+    bool gemma4_enable_moe = false;
+    // Gemma-4 26B-A4B's "k_eq_v" mode: full-attention layers ship with
+    // no `v_proj.weight` (V is derived from raw k_proj output, then
+    // v-norm) and use `gemma4_num_global_key_value_heads` instead of
+    // `num_key_value_heads`. Sliding-attention layers stay on the
+    // standard `num_key_value_heads` and have their own v_proj.
+    bool gemma4_attention_k_eq_v = false;
+    int  gemma4_num_global_key_value_heads = 0;
 
     // GPT-OSS-specific knobs. Inert on every other model.
     //   * `swiglu_limit` — clipping threshold applied to gate values
