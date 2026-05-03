@@ -24,6 +24,8 @@ const char* pie_arch_name(PieArch a) {
         case PieArch::Mixtral:  return "mixtral";
         case PieArch::Qwen3Moe: return "qwen3_moe";
         case PieArch::Qwen3_5:  return "qwen3_5";
+        case PieArch::Phi3Small: return "phi3small";
+        case PieArch::Phi3_5Moe: return "phi3_5moe";
     }
     return "?";
 }
@@ -43,10 +45,13 @@ PieArch hf_model_type_to_pie_arch(const std::string& hf_model_type) {
         hf_model_type == "gemma3n_text")  return PieArch::Gemma3n;
     if (hf_model_type == "mistral")     return PieArch::Mistral3;
     if (hf_model_type == "mistral3")    return PieArch::Mistral3;
-    if (hf_model_type == "olmo3")       return PieArch::Olmo3;
+    if (hf_model_type == "olmo3" ||
+        hf_model_type == "olmo2")       return PieArch::Olmo3;
     if (hf_model_type == "gpt_oss")     return PieArch::GptOss;
     if (hf_model_type == "gptoss")      return PieArch::GptOss;
     if (hf_model_type == "phi3")        return PieArch::Phi3;
+    if (hf_model_type == "phi3small")   return PieArch::Phi3Small;
+    if (hf_model_type == "phimoe")      return PieArch::Phi3_5Moe;
     if (hf_model_type == "mixtral")     return PieArch::Mixtral;
     if (hf_model_type == "qwen3_moe")   return PieArch::Qwen3Moe;
     if (hf_model_type == "qwen3_5" ||
@@ -161,6 +166,21 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     // Gemma 4 alternative-attention only.
     h.num_global_key_value_heads =
         get_or<std::int32_t>(text, "num_global_key_value_heads", 0);
+    // Gemma 4 MoE (26B-A4B variant). HF accepts top_k_experts as an
+    // alias for num_experts_per_tok.
+    h.gemma4_enable_moe =
+        get_or<bool>(text, "enable_moe_block", false);
+    h.gemma4_moe_intermediate_size =
+        get_or<std::int32_t>(text, "moe_intermediate_size", 0);
+
+    // Phi-3-small mup parameterization. Default 0 means "unused";
+    // graph_phi3small consults these only when arch == Phi3Small.
+    h.mup_attn_multiplier =
+        get_or<float>(text, "mup_attn_multiplier", 0.0f);
+    h.mup_embedding_multiplier =
+        get_or<float>(text, "mup_embedding_multiplier", 0.0f);
+    h.mup_width_multiplier =
+        get_or<float>(text, "mup_width_multiplier", 0.0f);
     h.hidden_size = text.at("hidden_size").get<std::int32_t>();
     // Pure-MoE checkpoints (Qwen 3.6) omit `intermediate_size` because
     // every layer's FFN is the routed-expert path; the per-expert width
@@ -192,6 +212,30 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
     h.vocab_size = text.at("vocab_size").get<std::int32_t>();
     h.max_position_embeddings =
         get_or<std::int32_t>(text, "max_position_embeddings", 4096);
+
+    if (h.arch == PieArch::Phi3Small) {
+        h.phi3small_block_size =
+            get_or<std::int32_t>(text, "blocksparse_block_size", 64);
+        h.phi3small_num_local_blocks =
+            get_or<std::int32_t>(text, "blocksparse_num_local_blocks", 16);
+        h.phi3small_vert_stride =
+            get_or<std::int32_t>(text, "blocksparse_vert_stride", 8);
+        h.phi3small_dense_attention_every_n_layers =
+            get_or<std::int32_t>(text, "dense_attention_every_n_layers", 2);
+        // Phi-3-small spells the FFN width as `ff_intermediate_size`
+        // (the standard `intermediate_size` is absent), uses
+        // `layer_norm_epsilon` (not rms_norm_eps), and `rope_embedding_base`
+        // (not rope_theta). Apply these overrides AFTER the standard
+        // parsing so they take precedence.
+        if (h.intermediate_size == 0) {
+            h.intermediate_size =
+                get_or<std::int32_t>(text, "ff_intermediate_size", 0);
+        }
+        h.rms_norm_eps =
+            get_or<float>(text, "layer_norm_epsilon", h.rms_norm_eps);
+        h.rope_theta =
+            get_or<float>(text, "rope_embedding_base", h.rope_theta);
+    }
 
     if (text.contains("head_dim") && !text["head_dim"].is_null()) {
         h.head_dim = text["head_dim"].get<std::int32_t>();
@@ -361,7 +405,9 @@ Hparams parse_hf_config(const std::filesystem::path& config_json_path) {
         get_or<std::int32_t>(text, "num_experts",
             get_or<std::int32_t>(text, "num_local_experts", 0));
     h.num_experts_per_tok =
-        get_or<std::int32_t>(text, "num_experts_per_tok", 0);
+        get_or<std::int32_t>(text,
+            "num_experts_per_tok",
+            get_or<std::int32_t>(text, "top_k_experts", 0));
     h.moe_intermediate_size =
         get_or<std::int32_t>(text, "moe_intermediate_size",
             h.intermediate_size);  // fallback
