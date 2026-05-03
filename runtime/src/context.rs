@@ -1137,6 +1137,13 @@ impl ContextManager {
         num_input_tokens: u32,
         response: oneshot::Sender<Result<PinnedContext>>,
     ) {
+        // Note: with copy_d2d routed through shmem (Option 1 from
+        // pie-project/pie#339), pin no longer needs to defer for
+        // pending_d2d — fork() awaits the d2d ack before resolving
+        // Ok(new_id), so by the time the inferlet calls Pin the d2d
+        // kernel is already enqueued on the same stream. Forward-
+        // pass kernels launched after pin go on the same stream and
+        // run after d2d via FIFO.
         self.when_active(id, move |mgr| {
             let result = (|| -> Result<PinnedContext> {
                 // Token-budget gate: refuse to pin for a forward pass when
