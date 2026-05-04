@@ -29,27 +29,27 @@ cpmaddpackage(
   GITHUB_REPOSITORY ggerganov/llama.cpp
   GIT_TAG b8994
   EXCLUDE_FROM_ALL YES
-  # patches/ggml-fast-argsort.patch swaps ggml-cpu's O(n²) bubble sort
-  # in `ggml_compute_forward_argsort_f32` for `std::sort`. Critical for
-  # CPU sampling fast paths: a single `ggml_top_k(probs, K)` over the
-  # full vocab (e.g. 152 k for Qwen3) otherwise takes ~22 s per token.
-  #
   # patches/ggml-pie-paged-attn-ext.patch adds GGML_OP_PAGED_ATTN_EXT and
   # the `ggml_paged_attn_ext` constructor — the op proper. Backend kernels
   # land in follow-up patches; with no backend advertising support, the
   # Pie graph builders take the materialize+flash_attn_ext fallback path.
   #
-  # ExternalProject (which CPM uses under the hood) only runs PATCH_COMMAND
-  # once, after the initial populate step. Re-configures don't re-run the
-  # patch step, so we don't need to make `patch` idempotent. We also do
-  # NOT swallow patch's exit code with `|| true`: a failing patch on a
-  # fresh download silently leaves ggml.h without `ggml_paged_attn_ext`,
-  # which only surfaces ~60 minutes later as a model.cpp compile error.
-  # `-N` is kept as belt-and-suspenders for the rare manual re-populate.
-  PATCH_COMMAND ${CMAKE_COMMAND} -E echo "applying ggml-fast-argsort.patch"
-        COMMAND patch -p1 -N -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-fast-argsort.patch
-        COMMAND ${CMAKE_COMMAND} -E echo "applying ggml-pie-paged-attn-ext.patch"
-        COMMAND patch -p1 -N -i ${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-pie-paged-attn-ext.patch
+  # PATCH_COMMAND idempotency:
+  #   * On CI runners with a persistent build cache (our self-hosted
+  #     runner keeps `_deps/llama-src/` between jobs), the source tree
+  #     can already be patched when ExternalProject re-runs the populate
+  #     step — `patch -N` then exits 1 ("Reversed or previously applied")
+  #     and breaks the build.
+  #   * `--dry-run` lets us probe: if forward-apply succeeds the patch
+  #     hasn't been applied yet, so do it; otherwise the tree is already
+  #     in the patched state and we skip silently. Either way, the build
+  #     proceeds with a correctly-patched ggml.
+  #   * We deliberately do NOT swallow real patch failures: if a patch
+  #     stops applying cleanly (upstream rev bump, hunk drift), this
+  #     fails loudly at configure time rather than ~60 min later as a
+  #     missing-symbol error in model.cpp.
+  PATCH_COMMAND ${CMAKE_COMMAND} -DPATCH_FILE=${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-pie-paged-attn-ext.patch
+                                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/IdempotentPatch.cmake
   OPTIONS
     "LLAMA_BUILD_TESTS OFF"
     "LLAMA_BUILD_EXAMPLES OFF"
@@ -101,16 +101,6 @@ add_library(pie_driver_portable_lib STATIC
 target_compile_options(pie_driver_portable_lib PRIVATE
   -Wall -Wextra -Wno-unused-parameter
 )
-
-# We use `#pragma omp` directly in src/model.cpp (diagnostic probe of
-# the OpenMP runtime from our caller thread). The `OpenMP::OpenMP_CXX`
-# imported target already carries both the compile flags
-# (`INTERFACE_COMPILE_OPTIONS`) and the runtime lib link, so we don't
-# need a separate `target_compile_options(... ${OpenMP_CXX_FLAGS})` —
-# that line passed `OpenMP_CXX_FLAGS` as a single string, which broke
-# multi-word flag values like `"-Xclang -fopenmp"` on macOS clang.
-find_package(OpenMP REQUIRED)
-target_link_libraries(pie_driver_portable_lib PUBLIC OpenMP::OpenMP_CXX)
 
 target_include_directories(pie_driver_portable_lib
   PUBLIC

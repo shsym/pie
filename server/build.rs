@@ -88,42 +88,53 @@ fn build_portable() {
         .join("portable"));
     cfg.build_target("pie_driver_portable_lib")
         .define("BUILD_SHARED_LIBS", "OFF");
+    enable_position_independent_archives(&mut cfg);
+    // CMake caches option values under OUT_DIR. Define every backend flag
+    // explicitly so flipping PIE_PORTABLE_* between builds cannot leave stale
+    // CUDA/Vulkan/Metal sources compiled into the portable archive.
+    cfg.define("GGML_CUDA", if cuda_enabled { "ON" } else { "OFF" })
+        .define("GGML_VULKAN", if vulkan_enabled { "ON" } else { "OFF" })
+        .define("GGML_METAL", if metal_enabled { "ON" } else { "OFF" });
     if cuda_enabled {
-        cfg.define("GGML_CUDA", "ON")
+        cfg
             // ggml's CUDA-graph capture/replay is OFF by default at the ggml-
             // subproject level; llama.cpp's parent CMakeLists.txt flips it
             // ON. Embedding ggml directly (as we do here) misses that override
             // and ends up issuing ~30 kernel launches per decode step, which
             // costs ~1 ms vs ~0.3 ms with capture. Enable explicitly.
             .define("GGML_CUDA_GRAPHS", "ON")
-            .define("GGML_STATIC", "ON");
-        if let Ok(arch) = std::env::var("PIE_PORTABLE_CUDA_ARCH") {
-            cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
-        }
+            .define("GGML_STATIC", "ON")
+            // llama.cpp b8994 added a multi-GPU NCCL allreduce path inside
+            // ggml-cuda (`GGML_CUDA_NCCL`, default ON when NCCL is present
+            // on the host). When set, libggml-cuda.a references nccl
+            // symbols that the portable-cuda flavor (no driver-cuda) can't
+            // satisfy at link time. We have our own NCCL-backed
+            // tensor-parallel path in driver-cuda, so the ggml-cuda one
+            // is unused either way — disable to keep the libggml-cuda.a
+            // self-contained.
+            .define("GGML_CUDA_NCCL", "OFF");
+        let arch = std::env::var("PIE_PORTABLE_CUDA_ARCH")
+            .unwrap_or_else(|_| "native".to_string());
+        cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
     }
     if vulkan_enabled {
-        cfg.define("GGML_VULKAN", "ON")
-            .define("GGML_STATIC", "ON");
+        cfg.define("GGML_STATIC", "ON");
     }
     if metal_enabled {
         // ggml-metal links against Apple's MetalKit / Foundation. The
         // C++ side handles those via xcrun; we just need to flip the
         // ggml flag and add the framework links below.
-        cfg.define("GGML_METAL", "ON")
-            .define("GGML_STATIC", "ON");
+        cfg.define("GGML_STATIC", "ON");
     }
     // Disable ggml-cpu's OpenMP unconditionally. macOS's Apple clang
     // doesn't ship libomp; on Linux, `-Wl,--as-needed -lgomp` is
     // ordered before `-Wl,--start-group … libggml-cpu.a` and the
     // linker discards libgomp before ggml-cpu.a's GOMP_* symbols
     // are seen, leading to `undefined reference to GOMP_barrier`.
-    // The portable driver's own `#pragma omp` probe in src/model.cpp
-    // still goes through `find_package(OpenMP REQUIRED)` and links
-    // libomp/libgomp via the OpenMP::OpenMP_CXX target — that one
-    // works because cmake places it correctly. Disabling ggml-cpu's
-    // OpenMP costs us multi-thread CPU inference on the portable
-    // backend; not relevant for CI artifacts where the GPU backends
-    // (Metal / CUDA / Vulkan) are the hot path.
+    // Cost: multi-thread CPU inference on the portable backend; not
+    // relevant for CI artifacts where the GPU backends (Metal / CUDA
+    // / Vulkan) are the hot path. The portable driver no longer uses
+    // OpenMP itself.
     cfg.define("GGML_OPENMP", "OFF");
     let dst = cfg.build();
     let build_dir = dst.join("build");
@@ -131,57 +142,37 @@ fn build_portable() {
     add_link_search_paths(&build_dir);
 
     println!("cargo:rustc-link-lib=static=pie_driver_portable_lib");
-    // GNU ld's `--start-group`/`--end-group` + `-l:libfoo.a` syntax
-    // are Linux-only. Apple ld64 has no equivalent for either
-    // (`-l:` is rejected outright; group resolution is automatic).
-    // For non-Linux, use the portable `cargo:rustc-link-lib=static=NAME`
-    // form which lets rustc pick the static archive via lib-search.
-    let is_linux = target_os == "linux";
-    if is_linux {
-        println!("cargo:rustc-link-arg=-Wl,--start-group");
-        println!("cargo:rustc-link-arg=-l:libggml.a");
-        println!("cargo:rustc-link-arg=-l:libggml-cpu.a");
-        if cuda_enabled {
-            println!("cargo:rustc-link-arg=-l:libggml-cuda.a");
-        }
-        if vulkan_enabled {
-            println!("cargo:rustc-link-arg=-l:libggml-vulkan.a");
-        }
-        println!("cargo:rustc-link-arg=-l:libggml-base.a");
-        println!("cargo:rustc-link-arg=-Wl,--end-group");
-    } else {
-        println!("cargo:rustc-link-lib=static=ggml");
-        println!("cargo:rustc-link-lib=static=ggml-cpu");
-        if cuda_enabled {
-            println!("cargo:rustc-link-lib=static=ggml-cuda");
-        }
-        if vulkan_enabled {
-            println!("cargo:rustc-link-lib=static=ggml-vulkan");
-        }
+    println!("cargo:rustc-link-lib=static=ggml");
+    println!("cargo:rustc-link-lib=static=ggml-cpu");
+    if cuda_enabled {
+        println!("cargo:rustc-link-lib=static=ggml-cuda");
+    }
+    if vulkan_enabled {
+        println!("cargo:rustc-link-lib=static=ggml-vulkan");
+    }
+    if metal_enabled {
+        println!("cargo:rustc-link-lib=static=ggml-metal");
+    }
+    // ggml-cpu's macOS build pulls in the BLAS backend (calls
+    // `_ggml_backend_blas_reg`); ggml-cpu uses Apple's Accelerate
+    // framework for vDSP. Both need explicit links on macOS.
+    if target_os == "macos" {
+        println!("cargo:rustc-link-lib=static=ggml-blas");
+        println!("cargo:rustc-link-arg=-framework");
+        println!("cargo:rustc-link-arg=Accelerate");
         if metal_enabled {
-            println!("cargo:rustc-link-lib=static=ggml-metal");
-        }
-        // ggml-cpu's macOS build pulls in the BLAS backend (calls
-        // `_ggml_backend_blas_reg`); ggml-cpu uses Apple's Accelerate
-        // framework for vDSP. Both need explicit links on macOS.
-        if target_os == "macos" {
-            println!("cargo:rustc-link-lib=static=ggml-blas");
-            println!("cargo:rustc-link-arg=-framework");
-            println!("cargo:rustc-link-arg=Accelerate");
-            if metal_enabled {
-                for fw in [
-                    "Foundation",
-                    "Metal",
-                    "MetalKit",
-                    "MetalPerformanceShaders",
-                ] {
-                    println!("cargo:rustc-link-arg=-framework");
-                    println!("cargo:rustc-link-arg={fw}");
-                }
+            for fw in [
+                "Foundation",
+                "Metal",
+                "MetalKit",
+                "MetalPerformanceShaders",
+            ] {
+                println!("cargo:rustc-link-arg=-framework");
+                println!("cargo:rustc-link-arg={fw}");
             }
         }
-        println!("cargo:rustc-link-lib=static=ggml-base");
     }
+    println!("cargo:rustc-link-lib=static=ggml-base");
 
     if cuda_enabled {
         // ggml-cuda calls `cublasGemmEx` (libcublas), nothing in
@@ -205,7 +196,7 @@ fn build_portable() {
         println!("cargo:rustc-link-lib=vulkan");
     }
 
-    add_system_libs(&["gomp"], metal_enabled);
+    add_system_libs(metal_enabled);
 
     println!(
         "cargo:rustc-env=PIE_DRIVER_PORTABLE_BUILD_DIR={}",
@@ -237,6 +228,17 @@ fn build_cuda() {
         .join("cuda"));
     cfg.build_target("pie_driver_cuda_lib")
         .define("BUILD_SHARED_LIBS", "OFF");
+    enable_position_independent_archives(&mut cfg);
+
+    // CUDA architecture. driver/cuda's `DetectCudaArchitecture.cmake`
+    // shells out to `nvidia-smi` if `CMAKE_CUDA_ARCHITECTURES` isn't
+    // pre-set, which fails on CI runners with no GPU. cmake-rs does
+    // not auto-forward env vars, so honor the standard
+    // `CMAKE_CUDA_ARCHITECTURES` env var explicitly.
+    println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
+    if let Ok(arch) = std::env::var("CMAKE_CUDA_ARCHITECTURES") {
+        cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
+    }
 
     // NCCL discovery hint. The cuda driver's CMakeLists.txt does
     // `find_path(NCCL_INCLUDE_DIR nccl.h ...)` against `/usr/include`
@@ -281,10 +283,7 @@ fn build_cuda() {
     // archives — those two are header-only at the time of writing but
     // we still walk the tree in case that changes).
     println!("cargo:rustc-link-lib=static=pie_driver_cuda_lib");
-    println!("cargo:rustc-link-arg=-Wl,--start-group");
-    println!("cargo:rustc-link-arg=-l:libpie_driver_cuda_lib.a");
-    println!("cargo:rustc-link-arg=-l:libzstd.a");
-    println!("cargo:rustc-link-arg=-Wl,--end-group");
+    println!("cargo:rustc-link-lib=static=zstd");
 
     // CUDA toolkit: dynamic-link cudart + cublas + cublasLt.
     // The cuda driver's `src/ops/gemm.cpp` directly references
@@ -294,9 +293,6 @@ fn build_cuda() {
     // together with the toolkit.
     link_cuda_toolkit_dynamic(&["cudart", "cublas", "cublasLt"]);
     link_cuda_driver_stub();
-
-    let cuda_home = std::env::var("CUDA_HOME")
-        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
 
     // NCCL: dynamic-linked. Two install shapes in the wild:
     //   * System `libnccl-dev`: `libnccl.so` -> `libnccl.so.2.X` symlink,
@@ -328,7 +324,7 @@ fn build_cuda() {
         println!("cargo:rustc-link-lib=nccl");
     }
 
-    add_system_libs(&[], /*metal=*/ false);
+    add_system_libs(/*metal=*/ false);
 
     println!(
         "cargo:rustc-env=PIE_DRIVER_CUDA_BUILD_DIR={}",
@@ -340,6 +336,14 @@ fn build_cuda() {
 // -----------------------------------------------------------------------------
 // Shared helpers
 // -----------------------------------------------------------------------------
+
+/// The embedded drivers are static CMake archives, but downstream crates may
+/// link them into a shared object (notably the pyo3 `pie-server` wheel). Keep
+/// the archives PIC-compatible so the same embedded driver build works for both
+/// the standalone CLI binary and Python extension module.
+fn enable_position_independent_archives(cfg: &mut cmake::Config) {
+    cfg.define("CMAKE_POSITION_INDEPENDENT_CODE", "ON");
+}
 
 /// Dynamic-link CUDA toolkit `.so`s (`-lcudart -lcublas` etc.) from
 /// `$CUDA_HOME/lib64`. We deliberately do NOT static-link: NVIDIA's
@@ -385,12 +389,9 @@ fn link_cuda_driver_stub() {
     println!("cargo:rustc-link-lib=cuda");
 }
 
-/// Emit per-OS system library link directives. `extra` is appended on
-/// linux only (typically `gomp` for OpenMP). On macOS, `metal=true`
-/// links the Metal/MetalKit/Foundation frameworks ggml-metal needs +
-/// resolves libomp from a typical brew location (override via
-/// `OPENMP_DIR`).
-fn add_system_libs(extra: &[&str], metal: bool) {
+/// Emit per-OS system library link directives. On macOS, `metal=true`
+/// also links the Metal/MetalKit/Foundation frameworks ggml-metal needs.
+fn add_system_libs(metal: bool) {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "linux" => {
@@ -399,32 +400,9 @@ fn add_system_libs(extra: &[&str], metal: bool) {
             println!("cargo:rustc-link-lib=m");
             println!("cargo:rustc-link-lib=dl");
             println!("cargo:rustc-link-lib=rt");
-            for lib in extra {
-                println!("cargo:rustc-link-lib={lib}");
-            }
         }
         "macos" => {
             println!("cargo:rustc-link-lib=c++");
-
-            // OpenMP via Homebrew's `libomp` (Apple Silicon: `/opt/homebrew`,
-            // Intel: `/usr/local`). Override via `OPENMP_DIR` for a custom
-            // install. We always link omp on macOS since ggml's CPU backend
-            // is OpenMP-enabled by default; missing it is a confusing
-            // link-time error.
-            println!("cargo:rerun-if-env-changed=OPENMP_DIR");
-            let openmp_dir = std::env::var("OPENMP_DIR").ok().map(PathBuf::from);
-            let candidates: Vec<PathBuf> = match openmp_dir {
-                Some(d) => vec![d.join("lib")],
-                None => vec![
-                    PathBuf::from("/opt/homebrew/opt/libomp/lib"),
-                    PathBuf::from("/usr/local/opt/libomp/lib"),
-                ],
-            };
-            for p in candidates.iter().filter(|p| p.is_dir()) {
-                println!("cargo:rustc-link-search=native={}", p.display());
-            }
-            println!("cargo:rustc-link-lib=omp");
-
             if metal {
                 // ggml-metal pulls these three frameworks. -framework on
                 // macOS is the moral equivalent of -l on linux.
