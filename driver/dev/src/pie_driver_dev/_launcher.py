@@ -117,7 +117,8 @@ def launch(*, prog: str, config_cls, worker) -> int:
         worker: the driver's `worker` module. Must export
             `calculate_topology(world_size, tp_degree)` and
             `worker_main(local_rank, world_size, devices, master_port,
-            model_config, driver_config, group_topology, ready_queue)`.
+            model_config, driver_config, group_topology, group_id_base,
+            ready_queue)`.
 
     Returns:
         Exit code (0 on graceful shutdown). Raises SystemExit for hard
@@ -159,6 +160,7 @@ def launch(*, prog: str, config_cls, worker) -> int:
     world_size = len(devices)
 
     tp_degree = int(driver_section.get("tensor_parallel_size", 0)) or world_size
+    group_id_base = int(driver_section.get("group_id", 0))
     master_port = int(driver_section.get("master_port", 29500))
     activation_dtype = driver_section.get("activation_dtype", "bfloat16")
     random_seed = int(driver_section.get("random_seed", 42))
@@ -194,6 +196,7 @@ def launch(*, prog: str, config_cls, worker) -> int:
             model_config_dict,
             driver_options_dict,
             group_topology,
+            group_id_base,
             ready_queue,
         ),
         nprocs=world_size,
@@ -257,12 +260,13 @@ def launch(*, prog: str, config_cls, worker) -> int:
     # it, and `embedded_driver::DriverCapabilities` accepts the field
     # missing via `#[serde(default)]`.
     for gid in range(num_groups):
+        global_gid = group_id_base + gid
         caps = caps_by_group[gid]
         caps_dict = asdict(caps) if dataclasses.is_dataclass(caps) else dict(caps)
         _write_handshake(args.handshake_fd, {
-            "group_id": gid,
+            "group_id": global_gid,
             "server_name": server_names_by_group[gid],
-            "shmem_name": f"/pie_shmem_g{gid}",
+            "shmem_name": f"/pie_shmem_g{global_gid}",
             "caps": caps_dict,
         })
     _write_handshake(args.handshake_fd, {"ready": True, "num_groups": num_groups})
@@ -270,6 +274,12 @@ def launch(*, prog: str, config_cls, worker) -> int:
         os.close(args.handshake_fd)
     except OSError:
         pass
+
+    # Track the first dead worker's exit code so the launcher's exit
+    # status reflects the actual failure. Returning 0 here used to mask
+    # worker crashes — pie-server's watchdog would log "driver exited
+    # unexpectedly" but with rc=0, hiding which worker died and how.
+    first_failure_code = 0
 
     while not _shutdown_requested["flag"]:
         any_dead = False
@@ -279,6 +289,11 @@ def launch(*, prog: str, config_cls, worker) -> int:
                     f"[{prog}] worker pid={p.pid} exited with code {p.exitcode}",
                     file=sys.stderr,
                 )
+                if first_failure_code == 0:
+                    # exitcode is negative for signal-killed workers (-N
+                    # for SIGN); +N for `os._exit(N)`. Map both to a
+                    # non-zero positive code for the parent's view.
+                    first_failure_code = abs(p.exitcode) or 1
                 any_dead = True
         if any_dead:
             for p in ctx.processes:
@@ -292,4 +307,4 @@ def launch(*, prog: str, config_cls, worker) -> int:
         if p.is_alive():
             p.kill()
     ctx.join(timeout=1)
-    return 0
+    return first_failure_code

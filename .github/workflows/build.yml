@@ -235,6 +235,15 @@ jobs:
     runs-on: [self-hosted, linux, x64, gpu, cuda]
     strategy:
       fail-fast: false
+      # Force serial execution on the self-hosted GPU runner. All matrix
+      # entries share the same `CARGO_TARGET_DIR` and write into the
+      # same `pie-server-<hash>/out/portable/build/` cmake build
+      # directory; running in parallel races on the per-object .o.d
+      # dependency files and trips EACCES the moment two jobs configure
+      # cmake at the same instant. The runner has 32 cores so each
+      # entry already fans out internally — serializing the matrix
+      # costs wall-clock but keeps the build cache coherent.
+      max-parallel: 1
       matrix:
         # sm_75 (Turing, e.g. T4 / RTX 20-series) intentionally
         # excluded: flashinfer's `vllm_custom_all_reduce.cuh` only
@@ -265,6 +274,27 @@ jobs:
       # outweighed the cache benefit. The 32-core runner builds Rust
       # crates fast enough cold; we can revisit later.
       CARGO_INCREMENTAL: "0"
+      # Block ggml's CMakeLists from auto-wiring sccache as the global
+      # `RULE_LAUNCH_COMPILE`. Its detection path is
+      # `if (GGML_CCACHE AND NOT CMAKE_C_COMPILER_LAUNCHER ...) find_program(... sccache)`
+      # so any non-empty value short-circuits the AND chain. `env` is
+      # the unix `env` command — when invoked as `env cc -c foo.c`, it
+      # executes the trailing args verbatim without altering anything,
+      # so it acts as a transparent launcher.
+      #
+      # Why this matters on a bare-metal runner: sccache's client
+      # connects to the daemon on the configured port (default 4226)
+      # without checking the daemon's owner. If a different user on the
+      # box (e.g. a developer's interactive session) has an sccache
+      # daemon running on 4226, every `sccache cc …` from this job
+      # routes through that foreign daemon. The daemon then forks the
+      # actual compiler under its own UID, the compiler tries to write
+      # `.o.d` / `.o` into the gh-runner-owned target tree, and EACCES
+      # kills the build with the misleading "Permission denied" trace
+      # we hit on run 25346461606.
+      CMAKE_C_COMPILER_LAUNCHER: env
+      CMAKE_CXX_COMPILER_LAUNCHER: env
+      CMAKE_CUDA_COMPILER_LAUNCHER: env
 
     steps:
       - uses: actions/checkout@v4

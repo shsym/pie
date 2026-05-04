@@ -119,6 +119,7 @@ def run_worker(
     model_config: dict,
     group_topology: list[list[int]],
     ready_queue,
+    group_id_base: int,
     build_engine,
     runtime_config_extras: dict | None = None,
     config_cls=None,
@@ -179,6 +180,7 @@ def run_worker(
                 my_group_id = i
                 tp_rank = group.index(rank)
                 break
+        global_group_id = group_id_base + my_group_id
         tp_degree = len(group_topology[my_group_id])
 
         # Per-replica MASTER_PORT so DP replicas on the same host don't
@@ -236,7 +238,7 @@ def run_worker(
                     engine=engine,
                     server=server,
                     stop_event=stop_event,
-                    group_id=my_group_id,
+                    group_id=global_group_id,
                 )
             else:
                 ready_queue.put((rank, None, None))
@@ -269,6 +271,7 @@ def worker_main(
     model_config: dict,
     driver_config: dict,
     group_topology: list[list[int]],
+    group_id_base: int,
     ready_queue,
 ):
     """Worker entry point — `native` driver.
@@ -287,6 +290,7 @@ def worker_main(
         master_port=master_port,
         model_config=model_config,
         group_topology=group_topology,
+        group_id_base=group_id_base,
         ready_queue=ready_queue,
         build_engine=lambda cfg: Engine.load(cfg),
         runtime_config_extras=driver_config,
@@ -794,13 +798,24 @@ def _leader_loop(
 
             try:
                 sampling_results, batch, timings = _run_fire_batch_inner(args)
-            except Exception as e:
+            except Exception:
+                # Fail loudly and die. Catching here used to silently
+                # retry, which had two costs: the worker spun on broken
+                # state forever (the runtime treated the garbage response
+                # as success and the scheduler kept resubmitting), and
+                # the traceback only reached mp.spawn's per-worker stderr
+                # tempfile — invisible to operators. Print to sys.stderr
+                # so the launcher's inherited stderr surfaces it in the
+                # terminal, then `os._exit(1)` so the launcher's post-
+                # ready watcher sees a dead worker within 1s. The runtime
+                # in-flight shmem call is canceled by the watchdog →
+                # `ShmemClient::abort()` path on the Rust side; there's
+                # no point sending a response here.
                 import traceback
-                tb = traceback.format_exc()
-                print(f"[Shmem Worker Error] fire_batch: {e}\n{tb}")
-                response = msgpack.packb(str(e))
-                _shmem_server.respond(slot, response, 0)
-                continue
+                _sys.stderr.write(f"[shmem worker pid={_os.getpid()}] fire_batch raised; aborting:\n")
+                traceback.print_exc(file=_sys.stderr)
+                _sys.stderr.flush()
+                _os._exit(1)
             t_after_handler = _time.perf_counter()
 
             # Direct encode: bypass Batch.create_responses + dict comp on
