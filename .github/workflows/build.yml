@@ -1,0 +1,368 @@
+name: build (manual)
+
+# Manual builds of `pie` for distribution. Each run rewrites the
+# `latest-build` rolling pre-release on this repo's GitHub Releases —
+# every artifact is uploaded with `gh release upload --clobber`, so
+# download URLs stay stable across runs.
+#
+# One-time setup before the first dispatch:
+#
+#   gh release create latest-build --prerelease --notes "Rolling build"
+#
+# After that, this workflow keeps the assets on that release fresh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to update (assets uploaded with --clobber)"
+        type: string
+        default: "latest-build"
+      portable:
+        description: "Build portable matrix (linux/macos/windows)"
+        type: boolean
+        default: true
+      cuda:
+        description: "Build CUDA matrix (linux/windows × cuda 12.6/12.8/13.0)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write     # needed for `gh release upload`
+
+env:
+  # Same release notes refresh for every job — keeps the page in sync
+  # with the latest workflow run.
+  RELEASE_NOTES: |
+    Rolling build from commit ${{ github.sha }} on ${{ github.ref_name }}.
+    Triggered: ${{ github.event.workflow_run.created_at || github.event.repository.updated_at }}
+    Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+jobs:
+  # =========================================================================
+  # Portable matrix — no CUDA toolkit needed.
+  # =========================================================================
+  portable:
+    if: inputs.portable
+    name: portable / ${{ matrix.target.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - label: x86_64-manylinux_2_28
+            runner: ubuntu-22.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            triple: x86_64-unknown-linux-gnu
+            archive: tar.gz
+            backend_env: ""
+          - label: aarch64-manylinux_2_28
+            runner: ubuntu-22.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            triple: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            backend_env: ""
+          - label: aarch64-darwin
+            # macos-15 gets Xcode 16 with libc++ 17, which has
+            # `std::atomic_ref` (C++20). macos-14's Xcode 15.4 ships
+            # libc++ 15, which doesn't.
+            runner: macos-15
+            container: ""
+            triple: aarch64-apple-darwin
+            archive: tar.gz
+            backend_env: "PIE_PORTABLE_METAL=1"
+          # TODO(windows): re-enable once `runtime/src/shmem_ipc.rs`
+          # has a Windows backend (CreateFileMapping/MapViewOfFile).
+          # Currently it uses POSIX-only libc symbols (mmap, mode_t,
+          # PROT_READ, …) unconditionally, so the runtime crate
+          # doesn't compile on x86_64-pc-windows-msvc. Once shmem_ipc
+          # has a Windows impl, restore this entry with
+          # backend_env: "PIE_PORTABLE_VULKAN=1".
+          # - label: x86_64-windows
+          #   runner: windows-latest
+          #   container: ""
+          #   triple: x86_64-pc-windows-msvc
+          #   archive: zip
+          #   backend_env: "PIE_PORTABLE_VULKAN=1"
+    runs-on: ${{ matrix.target.runner }}
+    container: ${{ matrix.target.container || '' }}
+    env:
+      ARTIFACT_NAME: pie-${{ matrix.target.label }}.${{ matrix.target.archive }}
+    steps:
+      - uses: actions/checkout@v6
+
+      # manylinux containers ship gcc + cmake + ninja but no rust.
+      # We dnf-install:
+      #   - `openssl-devel` + `pkg-config`: for `openssl-sys` (reqwest's
+      #     default features).
+      #   - `perl`: openssl-sys build script's vendored fallback.
+      #   - `gcc-toolset-14-gcc(-c++)`: pulls libgomp matching the
+      #     toolset's ld. The system gcc-8/libgomp-8.5 is also installed
+      #     by default but that mismatches the toolset's linker, hence
+      #     `undefined reference to GOMP_barrier` if we don't activate
+      #     the toolset.
+      #
+      # Then `source enable` puts gcc-toolset-14's bin first on PATH so
+      # cmake-rs picks `gcc-toolset-14/cc` instead of the system one,
+      # and cmake-rs's compiler stays in lockstep with the linker.
+      - name: Install build deps + rustup (manylinux only)
+        if: startsWith(matrix.target.container, 'quay.io/pypa/manylinux')
+        shell: bash
+        run: |
+          set -euxo pipefail
+          dnf install -y --setopt=install_weak_deps=False \
+            openssl-devel pkg-config perl git \
+            gcc-toolset-14-gcc gcc-toolset-14-gcc-c++
+          # GitHub CLI — used by the upload step. The manylinux image
+          # doesn't ship `gh` and the upload step's --clobber flow has
+          # no clean curl equivalent. `gh` rpm depends on `git`,
+          # installed above.
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo \
+            https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y gh --repo gh-cli
+          # Pin compiler + linker to gcc-toolset-14 for subsequent
+          # steps. cmake-rs (via cc-rs) reads CC/CXX, so this forces
+          # CMake to use gcc-14 even though manylinux's `/opt/clang/bin`
+          # is also on PATH. Without explicit pinning, `which cc` may
+          # resolve to clang and produce a libggml-cpu.a that the
+          # gcc-14 linker can't link (missing GOMP_* symbols because
+          # libgomp's symbol versioning doesn't match).
+          {
+            echo "CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc"
+            echo "CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++"
+            echo "AR=/opt/rh/gcc-toolset-14/root/usr/bin/ar"
+            echo "PATH=/opt/rh/gcc-toolset-14/root/usr/bin:${PATH}"
+            echo "MANPATH=/opt/rh/gcc-toolset-14/root/usr/share/man:"
+            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64:/opt/rh/gcc-toolset-14/root/usr/lib"
+            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-14/root/usr/lib64/pkgconfig"
+          } >> "$GITHUB_ENV"
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust (non-container runners)
+        if: matrix.target.container == ''
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target.triple }}
+
+      - name: Install libomp (macos only)
+        # `driver/portable/CMakeLists.txt:102` does
+        # `find_package(OpenMP REQUIRED)` for a diagnostic `#pragma omp`
+        # probe in src/model.cpp. Apple clang doesn't ship OpenMP, so
+        # we pull libomp via Homebrew and set OpenMP_ROOT for CMake's
+        # FindOpenMP. Keeps the probe working without code changes.
+        if: matrix.target.label == 'aarch64-darwin'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          brew install libomp
+          LIBOMP_PREFIX=$(brew --prefix libomp)
+          echo "OpenMP_ROOT=${LIBOMP_PREFIX}" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=${LIBOMP_PREFIX}/lib" >> "$GITHUB_ENV"
+          echo "CPATH=${LIBOMP_PREFIX}/include" >> "$GITHUB_ENV"
+
+      - name: Install Vulkan SDK (windows only)
+        if: matrix.target.label == 'x86_64-windows'
+        uses: humbletim/install-vulkan-sdk@v1.2
+        with:
+          version: latest
+          cache: true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-${{ matrix.target.label }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-${{ matrix.target.label }}-
+
+      - name: cargo build --release
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -n "${{ matrix.target.backend_env }}" ]; then
+            export ${{ matrix.target.backend_env }}
+          fi
+          cargo build --release \
+            --target ${{ matrix.target.triple }} \
+            -p pie-server \
+            --features driver-portable,driver-dummy
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          BIN_DIR="target/${{ matrix.target.triple }}/release"
+          if [[ "${{ matrix.target.archive }}" == "zip" ]]; then
+            # Windows .exe; 7z preinstalled on windows-latest.
+            7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"
+          else
+            tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
+          fi
+          ls -la dist/
+
+      - name: Upload to release (--clobber)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"
+
+  # =========================================================================
+  # CUDA matrix — Linux jobs run inside `nvidia/cuda` images (toolkit + nccl
+  # preinstalled, glibc 2.28 → manylinux_2_28-compatible). Windows jobs use
+  # Jimver/cuda-toolkit on `windows-latest` (no Linux-only `driver-cuda`
+  # feature; CUDA reaches portable via PIE_PORTABLE_CUDA).
+  # =========================================================================
+  cuda:
+    if: inputs.cuda
+    name: cuda / ${{ matrix.os.label }} / cuda${{ matrix.cuda.version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - label: x86_64-manylinux_2_28
+            runner: ubuntu-22.04
+            triple: x86_64-unknown-linux-gnu
+            cargo_features: "driver-portable,driver-cuda,driver-dummy"
+            archive: tar.gz
+          # TODO(windows): same `runtime/src/shmem_ipc.rs` POSIX-only
+          # blocker as the portable matrix. Re-enable once shmem_ipc
+          # has a Windows backend.
+          # - label: x86_64-windows
+          #   runner: windows-latest
+          #   triple: x86_64-pc-windows-msvc
+          #   cargo_features: "driver-portable,driver-dummy"
+          #   archive: zip
+        cuda:
+          - { version: "12.6.3", short: "12.6", arch: "75;80;86;89;90" }
+          - { version: "12.8.1", short: "12.8", arch: "75;80;86;89;90;100;120" }
+          - { version: "13.0.0", short: "13.0", arch: "75;80;86;89;90;100;120" }
+    runs-on: ${{ matrix.os.runner }}
+    container: ${{ matrix.os.label == 'x86_64-manylinux_2_28' && format('nvidia/cuda:{0}-devel-rockylinux8', matrix.cuda.version) || '' }}
+    env:
+      ARTIFACT_NAME: pie-${{ matrix.os.label }}-cuda${{ matrix.cuda.short }}.${{ matrix.os.archive }}
+      PIE_PORTABLE_CUDA: "1"
+      PIE_PORTABLE_CUDA_ARCH: ${{ matrix.cuda.arch }}
+      CMAKE_CUDA_ARCHITECTURES: ${{ matrix.cuda.arch }}
+      CMAKE_CUDA_RUNTIME_LIBRARY: Shared
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Bootstrap container (linux)
+        if: matrix.os.label == 'x86_64-manylinux_2_28'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # nvidia/cuda:rockylinux8 images have glibc 2.28 (matches
+          # manylinux_2_28) but minimal userland. `ninja-build` lives in
+          # the PowerTools repo on Rocky 8, EPEL provides extras.
+          dnf install -y epel-release dnf-plugins-core
+          dnf config-manager --set-enabled powertools
+          dnf install -y --setopt=install_weak_deps=False \
+            cmake ninja-build gcc-toolset-12 git \
+            openssl-devel
+          # GitHub CLI — used by the upload step.
+          dnf install -y 'dnf-command(config-manager)'
+          dnf config-manager --add-repo \
+            https://cli.github.com/packages/rpm/gh-cli.repo
+          dnf install -y gh --repo gh-cli
+          source /opt/rh/gcc-toolset-12/enable
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+            sh -s -- -y --profile minimal --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          # Pin compiler explicitly. `source enable` only adjusts PATH —
+          # cmake-rs probes CC/CXX env vars and otherwise hard-codes
+          # `/usr/bin/cc` / `/usr/bin/c++`, which on rockylinux8 are
+          # gcc-8.5. gcc-8 is missing `<span>` (added in libstdc++ 10),
+          # so the portable driver's C++20 headers fail to compile.
+          {
+            echo "CC=/opt/rh/gcc-toolset-12/root/usr/bin/gcc"
+            echo "CXX=/opt/rh/gcc-toolset-12/root/usr/bin/g++"
+            echo "AR=/opt/rh/gcc-toolset-12/root/usr/bin/ar"
+            echo "PATH=/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
+            echo "MANPATH=/opt/rh/gcc-toolset-12/root/usr/share/man:"
+            echo "INFOPATH=/opt/rh/gcc-toolset-12/root/usr/share/info"
+            echo "LD_LIBRARY_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64:/opt/rh/gcc-toolset-12/root/usr/lib"
+            echo "PKG_CONFIG_PATH=/opt/rh/gcc-toolset-12/root/usr/lib64/pkgconfig"
+          } >> "$GITHUB_ENV"
+
+      - name: Install Rust (windows)
+        if: matrix.os.label == 'x86_64-windows'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os.triple }}
+
+      - name: Install CUDA toolkit (windows)
+        if: matrix.os.label == 'x86_64-windows'
+        uses: Jimver/cuda-toolkit@v0.2.19
+        with:
+          cuda: ${{ matrix.cuda.version }}
+          method: network
+          # Headers + libs only; the runner already has a compatible MSVC.
+          sub-packages: '["nvcc", "cudart", "thrust", "cublas", "cublas_dev", "curand", "curand_dev"]'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: build-cuda-${{ matrix.os.label }}-${{ matrix.cuda.short }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: build-cuda-${{ matrix.os.label }}-${{ matrix.cuda.short }}-
+
+      - name: cargo build --release
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cargo build --release \
+            --target ${{ matrix.os.triple }} \
+            -p pie-server \
+            --features ${{ matrix.os.cargo_features }}
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          BIN_DIR="target/${{ matrix.os.triple }}/release"
+          if [[ "${{ matrix.os.archive }}" == "zip" ]]; then
+            7z a "dist/${ARTIFACT_NAME}" "${BIN_DIR}/pie.exe"
+          else
+            tar -C "${BIN_DIR}" -czf "dist/${ARTIFACT_NAME}" pie
+          fi
+          ls -la dist/
+
+      - name: Upload to release (--clobber)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gh release upload "${{ inputs.tag }}" "dist/${ARTIFACT_NAME}" --clobber --repo "${{ github.repository }}"
+
+  # =========================================================================
+  # Refresh the release notes once after all builds finish.
+  # =========================================================================
+  refresh-notes:
+    if: always() && (inputs.portable || inputs.cuda)
+    needs: [portable, cuda]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Edit release notes + body
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euxo pipefail
+          gh release edit "${{ inputs.tag }}" \
+            --notes "${RELEASE_NOTES}" \
+            --repo "${{ github.repository }}"
