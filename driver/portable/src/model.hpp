@@ -249,6 +249,17 @@ public:
     // vocabs (which we don't care about).
     bool supports_in_graph_topk() const noexcept { return supports_in_graph_topk_; }
 
+    // True iff the primary backend implements `ggml_paged_attn_ext` — the
+    // single-op replacement for the per-layer
+    //   K_tmp = get_rows(K_pool, packed_gather);
+    //   V_tmp = get_rows(V_pool, packed_gather);
+    //   flash_attn_ext(Q, permute(K_tmp), permute(V_tmp), mask)
+    // chain on Pie's pure-decode fast path. When false, per-arch graph
+    // builders fall through to the materialize+flash_attn_ext fallback.
+    // Probed once at model load; backend support is process-invariant so
+    // the answer never changes for the lifetime of the Model.
+    bool supports_paged_attn_ext() const noexcept { return supports_paged_attn_ext_; }
+
     // Friendly arch string for the READY handshake.
     std::string arch_name_pie() const { return pie_arch_name(hparams_.arch); }
 
@@ -454,6 +465,9 @@ private:
     // Probed in the constructor once the primary backend exists. Drives
     // the slow_only sampling path in ForwardEngine when false.
     bool                  supports_in_graph_topk_ = true;
+    // Probed alongside `supports_in_graph_topk_`. False until at least one
+    // backend ships a `ggml_paged_attn_ext` implementation.
+    bool                  supports_paged_attn_ext_ = false;
     ggml_threadpool_t     threadpool_  = nullptr;
     ggml_context*         ctx_         = nullptr;
     ggml_backend_buffer_t buf_         = nullptr;
@@ -480,6 +494,13 @@ private:
         // weights together are <1 MB on a 1.7 B model. See
         // `is_small_weight_for_upcast()` in model.cpp for the predicate.
         bool         upcast_bf16_to_f32 = false;
+        // When set, the source F32 bytes are downcast to BF16 in a temp
+        // buffer before upload. Mirrors llama.cpp's GGUF conversion
+        // policy: large matmul weights stored as F32 in safetensors get
+        // 2x faster matmuls and half the VRAM at the cost of trailing
+        // mantissa bits. See `is_small_weight_for_upcast()` for the
+        // norms/biases that stay F32.
+        bool         downcast_f32_to_bf16 = false;
     };
     std::vector<DeclaredTensor> declared_;
 

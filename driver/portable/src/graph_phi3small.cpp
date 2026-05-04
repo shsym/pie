@@ -60,7 +60,8 @@ GraphResult build_phi3small_graph(ggml_context* ctx,
     auto* gf = ggml_new_graph_custom(
         ctx, static_cast<int>(GRAPH_MAX_NODES), /*grads=*/false);
 
-    GraphInputs in = declare_graph_inputs(ctx, plan, n_total, n_req);
+    GraphInputs in = declare_graph_inputs(ctx, plan, n_total, n_req,
+                                          model.supports_paged_attn_ext());
 
     std::vector<ggml_tensor*> live_k(h.num_hidden_layers, nullptr);
     std::vector<ggml_tensor*> live_v(h.num_hidden_layers, nullptr);
@@ -116,22 +117,36 @@ GraphResult build_phi3small_graph(ggml_context* ctx,
         // ---- Attention (causal; v1 skips blocksparse) ----
         ggml_tensor* attn_2d = nullptr;
         if (plan.pure_decode) {
-            // Single packed flash_attn per layer.
             auto* Q_4d = ggml_reshape_4d(ctx, Q, head_dim, 1, n_q_heads, n_req);
-            auto* K_g = ggml_get_rows(ctx, k_cached, in.packed_gather);
-            auto* V_g = ggml_get_rows(ctx, v_cached, in.packed_gather);
-            auto* K_4d = ggml_reshape_4d(
-                ctx, K_g, head_dim, n_kv_heads, plan.max_n_kv, n_req);
-            auto* V_4d = ggml_reshape_4d(
-                ctx, V_g, head_dim, n_kv_heads, plan.max_n_kv, n_req);
-            auto* K_p = ggml_permute(ctx, K_4d, 0, 2, 1, 3);
-            auto* V_p = ggml_permute(ctx, V_4d, 0, 2, 1, 3);
-            auto* attn = ggml_flash_attn_ext(
-                ctx, Q_4d, K_p, V_p, in.packed_mask,
-                attn_scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
-            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-            attn_2d = ggml_reshape_2d(
-                ctx, ggml_cont(ctx, attn), head_dim * n_q_heads, n_total);
+            if (in.page_indices != nullptr) {
+                auto* Q_bf16 = (Q_4d->type == GGML_TYPE_BF16)
+                    ? Q_4d : ggml_cast(ctx, Q_4d, GGML_TYPE_BF16);
+                auto* attn = ggml_paged_attn_ext(
+                    ctx, Q_bf16, k_cached, v_cached,
+                    in.page_indices, in.page_indptr, in.last_page_lens,
+                    kv.page_size(), head_dim, n_kv_heads,
+                    /*sliding_window=*/-1,
+                    attn_scale, /*softcap=*/0.0f);
+                auto* attn_f32 = ggml_cast(ctx, attn, GGML_TYPE_F32);
+                attn_2d = ggml_reshape_2d(
+                    ctx, attn_f32, head_dim * n_q_heads, n_total);
+            } else {
+                // Materialize: gather + permute + flash_attn_ext.
+                auto* K_g = ggml_get_rows(ctx, k_cached, in.packed_gather);
+                auto* V_g = ggml_get_rows(ctx, v_cached, in.packed_gather);
+                auto* K_4d = ggml_reshape_4d(
+                    ctx, K_g, head_dim, n_kv_heads, plan.max_n_kv, n_req);
+                auto* V_4d = ggml_reshape_4d(
+                    ctx, V_g, head_dim, n_kv_heads, plan.max_n_kv, n_req);
+                auto* K_p = ggml_permute(ctx, K_4d, 0, 2, 1, 3);
+                auto* V_p = ggml_permute(ctx, V_4d, 0, 2, 1, 3);
+                auto* attn = ggml_flash_attn_ext(
+                    ctx, Q_4d, K_p, V_p, in.packed_mask,
+                    attn_scale, /*max_bias=*/0.0f, /*logit_softcap=*/0.0f);
+                ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+                attn_2d = ggml_reshape_2d(
+                    ctx, ggml_cont(ctx, attn), head_dim * n_q_heads, n_total);
+            }
         } else {
             // Per-request prefill / mixed batch path. Use the shared
             // build_request_flash_attn helper.

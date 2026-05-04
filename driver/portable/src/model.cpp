@@ -259,7 +259,7 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
         // keeps Vulkan steady-state decode at GPU speed instead of
         // round-tripping each token through CPU for the argsort.
         ggml_init_params probe_ip{
-            /*.mem_size   =*/ ggml_tensor_overhead() * 8,
+            /*.mem_size   =*/ ggml_tensor_overhead() * 16,
             /*.mem_buffer =*/ nullptr,
             /*.no_alloc   =*/ true,
         };
@@ -271,11 +271,50 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
                 ggml_argsort(probe_ctx, probs, GGML_SORT_ORDER_DESC);
             supports_in_graph_topk_ =
                 ggml_backend_supports_op(backend_, sorted);
-            ggml_free(probe_ctx);
             std::cerr << "[model] in-graph top-k support on "
                       << ggml_backend_name(backend_) << ": "
                       << (supports_in_graph_topk_ ? "yes" : "no — using slow_only sampling path")
                       << "\n";
+
+            // ggml_paged_attn_ext probe. Shapes don't need to match this
+            // model's true KV layout — supports_op only inspects dtypes
+            // and shape-rank, not concrete extents. Pick the smallest
+            // viable head_dim/n_kv_heads to keep the probe cheap.
+            // Q must be BF16 to match the FlashInfer wrapper's expected dtype.
+            const int probe_head_dim   = 128;
+            const int probe_n_kv_heads = 1;
+            const int probe_page_size  = 16;
+            const int probe_n_req      = 1;
+            ggml_tensor* probe_q = ggml_new_tensor_4d(
+                probe_ctx, GGML_TYPE_BF16,
+                probe_head_dim, /*n_q_tokens=*/ 1,
+                /*n_q_heads=*/  probe_n_kv_heads,
+                /*n_req=*/      probe_n_req);
+            ggml_tensor* probe_kv_pool = ggml_new_tensor_2d(
+                probe_ctx, GGML_TYPE_F16,
+                probe_head_dim * probe_n_kv_heads, probe_page_size);
+            ggml_tensor* probe_page_indices = ggml_new_tensor_1d(
+                probe_ctx, GGML_TYPE_I32, probe_n_req);
+            ggml_tensor* probe_page_indptr = ggml_new_tensor_1d(
+                probe_ctx, GGML_TYPE_I32, probe_n_req + 1);
+            ggml_tensor* probe_last_page_lens = ggml_new_tensor_1d(
+                probe_ctx, GGML_TYPE_I32, probe_n_req);
+            ggml_tensor* probe_pa = ggml_paged_attn_ext(
+                probe_ctx, probe_q, probe_kv_pool, probe_kv_pool,
+                probe_page_indices, probe_page_indptr, probe_last_page_lens,
+                probe_page_size, probe_head_dim, probe_n_kv_heads,
+                /*sliding_window=*/ -1,
+                /*scale=*/ 1.0f / 8.0f, /*softcap=*/ 0.0f);
+            supports_paged_attn_ext_ =
+                ggml_backend_supports_op(backend_, probe_pa);
+            std::cerr << "[model] paged_attn_ext support on "
+                      << ggml_backend_name(backend_) << ": "
+                      << (supports_paged_attn_ext_
+                          ? "yes"
+                          : "no — using materialize+flash_attn_ext fallback")
+                      << "\n";
+
+            ggml_free(probe_ctx);
         }
     }
 
@@ -439,20 +478,29 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     // bf16 → f32 byte conversion happens in load_into_backend_().
     const bool upcast = t.dtype == StDtype::BF16
                      && is_small_weight_for_upcast(hf_name);
+    // Some HF releases (notably Gemma-2-2b) store weights as F32. The F32
+    // mul_mat path is ~2x slower than BF16 on tensor-core hardware and
+    // doubles VRAM. Downcast large matmul weights at load time, matching
+    // llama.cpp's GGUF default. Norms / biases stay F32 (precision).
+    const bool downcast = t.dtype == StDtype::F32
+                       && !is_small_weight_for_upcast(hf_name);
 
     ggml_tensor* tensor;
-    if (upcast) {
-        // Build the F32 tensor manually with the same shape as the
-        // safetensor (HF dim order reversed for ggml).
+    if (upcast || downcast) {
+        // Build the target tensor manually with the same shape as the
+        // safetensor (HF dim order reversed for ggml). Type differs
+        // from the source.
         std::int64_t ne[4] = {1, 1, 1, 1};
         for (std::size_t i = 0; i < t.shape.size(); ++i) {
             ne[t.shape.size() - 1 - i] = t.shape[i];
         }
-        tensor = ggml_new_tensor_4d(ctx_, GGML_TYPE_F32,
-                                    ne[0], ne[1], ne[2], ne[3]);
+        const ggml_type tgt = upcast ? GGML_TYPE_F32 : GGML_TYPE_BF16;
+        tensor = ggml_new_tensor_4d(ctx_, tgt, ne[0], ne[1], ne[2], ne[3]);
         if (!tensor) {
             throw std::runtime_error(
-                "model: ggml_new_tensor_4d (upcast) failed for '" + hf_name + "'");
+                std::string("model: ggml_new_tensor_4d (")
+                + (upcast ? "upcast" : "downcast")
+                + ") failed for '" + hf_name + "'");
         }
         ggml_set_name(tensor, hf_name.c_str());
     } else {
@@ -460,9 +508,10 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     }
 
     DeclaredTensor d;
-    d.hf_name            = hf_name;
-    d.tensor             = tensor;
-    d.upcast_bf16_to_f32 = upcast;
+    d.hf_name              = hf_name;
+    d.tensor               = tensor;
+    d.upcast_bf16_to_f32   = upcast;
+    d.downcast_f32_to_bf16 = downcast;
     declared_.push_back(std::move(d));
     return tensor;
 }
@@ -561,6 +610,23 @@ void Model::load_into_backend_() {
                 tmp.data(), n);
             ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
                                     n * sizeof(float));
+        } else if (d.downcast_f32_to_bf16) {
+            // Demote f32 source bytes to bf16 in a temp buffer, then
+            // upload. Matmul weights only — norms & biases keep F32 via
+            // is_small_weight_for_upcast().
+            const std::size_t n = static_cast<std::size_t>(ggml_nelements(d.tensor));
+            if (src.nbytes != n * sizeof(float)) {
+                throw std::runtime_error(
+                    "model: f32 downcast size mismatch for '" + d.hf_name +
+                    "': expected=" + std::to_string(n * sizeof(float)) +
+                    " safetensors=" + std::to_string(src.nbytes));
+            }
+            std::vector<ggml_bf16_t> tmp(n);
+            ggml_fp32_to_bf16_row(
+                reinterpret_cast<const float*>(src.data),
+                tmp.data(), n);
+            ggml_backend_tensor_set(d.tensor, tmp.data(), 0,
+                                    n * sizeof(ggml_bf16_t));
         } else if (d.copy_bytes > 0) {
             // Sliced load (phi3 fused QKV / gate_up) OR stacked-expert
             // load (one source written into a 3D dest at dst_offset).

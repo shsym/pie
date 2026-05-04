@@ -132,12 +132,41 @@ PlanArrays extract_plan_arrays(const schema::DecodedRequest& req) {
     a.total_n_tokens = static_cast<std::int32_t>(a.token_ids.size());
     a.batch_has_drafts =
         a.spec_indptr.size() == static_cast<std::size_t>(a.n_request) + 1;
-    // Custom (non-causal) masks are present iff the indptr fully covers
-    // every token's row. Otherwise the M11 packed-decode fast path is safe.
-    a.batch_has_attn_masks =
-        !a.flat_attn_masks.empty() &&
+    // Detect "no user mask" so we can take the M11 packed-decode fast
+    // path. The runtime always sends an attention mask (synthesizing
+    // Brle::all_true(pos+1) per row when the user supplied none, see
+    // runtime/src/api/inference.rs:341-352), so .empty() is never true.
+    // Instead we structurally recognize the synthesized causal pattern:
+    // every BRLE row is exactly [0, pos+1] (2 u32 elements).
+    a.batch_has_attn_masks = false;
+    if (!a.flat_attn_masks.empty() &&
         a.attn_mask_indptr.size() ==
-            static_cast<std::size_t>(a.total_n_tokens) + 1;
+            static_cast<std::size_t>(a.total_n_tokens) + 1) {
+        // First-pass cheap reject: any row whose byte step != 2 u32s
+        // is necessarily a user mask.
+        bool maybe_synthesized = true;
+        for (std::int32_t i = 0; i < a.total_n_tokens; ++i) {
+            const std::uint32_t lo = a.attn_mask_indptr[i];
+            const std::uint32_t hi = a.attn_mask_indptr[i + 1];
+            if (hi - lo != 2u) { maybe_synthesized = false; break; }
+        }
+        if (maybe_synthesized) {
+            // Second pass: confirm values match [0, position+1]. Position
+            // ids are u32 here; pos+1 cannot overflow within u32 for any
+            // realistic context length.
+            for (std::int32_t i = 0; i < a.total_n_tokens; ++i) {
+                const std::uint32_t off = a.attn_mask_indptr[i];
+                const std::uint32_t v0  = a.flat_attn_masks[off + 0];
+                const std::uint32_t v1  = a.flat_attn_masks[off + 1];
+                const std::uint32_t expected = a.position_ids[i] + 1u;
+                if (v0 != 0u || v1 != expected) {
+                    maybe_synthesized = false;
+                    break;
+                }
+            }
+        }
+        a.batch_has_attn_masks = !maybe_synthesized;
+    }
     return a;
 }
 
@@ -401,6 +430,7 @@ void plan_single_request(const PlanArrays& a,
 
 void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
                                std::int32_t n_request,
+                               std::int32_t page_size,
                                std::int32_t sliding_window,
                                bool also_build_no_swa_mask) {
     const std::int32_t M = plan.max_n_kv;
@@ -417,6 +447,14 @@ void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
     } else {
         plan.packed_mask_full_f16.clear();
     }
+    // Paged-attn inputs (FlashInfer / vLLM shape). Derived from
+    // rp.gather_idxs: for block b, page id = gather_idxs[b*page_size] /
+    // page_size (since gather_idxs[k] = page_id[k/page_size]*page_size +
+    // (k % page_size)). Variable-length flat layout via prefix sums.
+    plan.page_indptr_i32.assign(static_cast<std::size_t>(N + 1), 0);
+    plan.last_page_lens_i32.assign(static_cast<std::size_t>(N), 0);
+    plan.page_indices_i32.clear();
+    plan.page_indices_i32.reserve(static_cast<std::size_t>(M / page_size) * N);
     const auto zero = ggml_fp32_to_fp16(0.0f);
     const std::int32_t W = sliding_window;
     for (std::int32_t r = 0; r < N; ++r) {
@@ -425,6 +463,17 @@ void build_pure_decode_packing(ForwardEngine::BatchPlan& plan,
             plan.packed_gather_idxs[
                 static_cast<std::size_t>(r) * M + k] = rp.gather_idxs[k];
         }
+        const std::int32_t num_pages_r =
+            (rp.n_kv + page_size - 1) / page_size;
+        for (std::int32_t b = 0; b < num_pages_r; ++b) {
+            plan.page_indices_i32.push_back(
+                rp.gather_idxs[b * page_size] / page_size);
+        }
+        plan.page_indptr_i32[r + 1] =
+            plan.page_indptr_i32[r] + num_pages_r;
+        // Last-page slot count: 1..page_size.
+        const std::int32_t tail = rp.n_kv - (num_pages_r - 1) * page_size;
+        plan.last_page_lens_i32[r] = tail;
         // SWA-clipped row.
         std::uint16_t* row = plan.packed_mask_f16.data()
             + static_cast<std::size_t>(r) * M * MASK_PAD;

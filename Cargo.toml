@@ -11,8 +11,21 @@ members = [
     "runtime",
     "client/rust",
     "server/standalone",
+    "driver/dummy",
 ]
 exclude = [
     "inferlets",
     "sdk/rust",
 ]
+
+# Distribution profile for `pie-standalone`. Trades build time for
+# binary size: full LTO, single codegen unit, abort-on-panic
+# (no unwinder + smaller .eh_frame), all symbols stripped. Use
+# `cargo build --profile release-min -p pie-standalone --release`.
+# The regular `release` profile stays as the default dev/bench path.
+[profile.release-min]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
