@@ -164,9 +164,29 @@ jobs:
           version: latest
           cache: true
 
+      - name: Install Vulkan SDK development files (windows only)
+        if: matrix.target.platform == 'windows' && matrix.target.backend == 'vulkan'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # humbletim/install-vulkan-sdk extracts the SDK tools directly from
+          # the Windows installer, but CMake's FindVulkan also needs the
+          # headers and import library. Run the official unattended installer
+          # into the same VULKAN_SDK root and verify the files ggml needs.
+          rm -rf "$VULKAN_SDK"
+          mkdir -p "$VULKAN_SDK"
+          ./vulkan_sdk.exe \
+            --root "$VULKAN_SDK" \
+            --accept-licenses \
+            --default-answer \
+            --confirm-command install \
+            copy_only=1
+          test -f "$VULKAN_SDK/Include/vulkan/vulkan.h"
+          test -f "$VULKAN_SDK/Lib/vulkan-1.lib"
+
       - name: Install CUDA toolkit (windows portable cuda only)
         if: matrix.target.platform == 'windows' && matrix.target.backend == 'cuda'
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
           cuda: '12.9.1'
 
@@ -207,16 +227,16 @@ jobs:
             # Keep MSBuild/ggml from saturating smaller Windows hosts.
             export CMAKE_BUILD_PARALLEL_LEVEL=4
           fi
-          cargo_jobs=()
+          cargo_parallel_args=""
           if [[ "${{ matrix.target.platform }}" == "windows" ]]; then
-            cargo_jobs=(-j 4)
+            cargo_parallel_args="-j 4"
           fi
           # `release-min`: thin LTO, panic=abort, strip=symbols.
           # Defined in workspace Cargo.toml. Smaller + faster than
           # plain `release` (no LTO at all by default), without fat
           # LTO's many-hour link cost. Distribution profile.
           cargo build --profile release-min \
-            "${cargo_jobs[@]}" \
+            ${cargo_parallel_args} \
             --target ${{ matrix.target.triple }} \
             -p pie-server \
             --features driver-portable,driver-dummy
