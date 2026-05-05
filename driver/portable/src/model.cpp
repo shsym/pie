@@ -1,6 +1,7 @@
 #include "model.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <iostream>
@@ -169,7 +170,9 @@ ggml_tensor* new_tensor_from_st(ggml_context* ctx,
 
 }  // namespace
 
-Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
+Model::Model(const std::filesystem::path& snapshot_dir,
+             std::string backend,
+             bool verbose)
     : snapshot_dir_(snapshot_dir) {
     // The "snapshot" can be either:
     //   * an HF snapshot directory (config.json + *.safetensors)
@@ -194,16 +197,22 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
     }
     resolve_tensor_prefix_();
 
+    std::transform(backend.begin(), backend.end(), backend.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
     // Backend selection. With `GGML_CUDA=ON` (or Metal / Vulkan) at build
-    // time, `ggml_backend_load_all()` registers them as device providers and
-    // `ggml_backend_init_best()` picks GPU > CPU. Falls back to CPU if no
-    // GPU backend was compiled in or no device is available.
-    if (prefer_gpu) {
+    // time, `ggml_backend_load_all()` registers them as device providers.
+    // `auto` picks GPU > CPU via ggml; `cpu` is an explicit override for
+    // small-memory hosts and deterministic smoke tests.
+    if (backend == "cpu") {
+        backend_ = ggml_backend_cpu_init();
+    } else {
         backend_ = ggml_backend_init_best();
-        if (!backend_) {
-            std::cerr << "[model] ggml_backend_init_best() returned null; "
-                         "falling back to CPU\n";
-        }
+    }
+    if (!backend_ && backend != "cpu") {
+        std::cerr << "[model] ggml_backend_init_best() returned null; "
+                     "falling back to CPU\n";
     }
     if (!backend_) {
         backend_ = ggml_backend_cpu_init();
@@ -225,8 +234,10 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
     };
     if (ggml_backend_is_cpu(backend_)) {
         const unsigned n = pin_cpu_threads(backend_);
-        std::cerr << "[model] ggml CPU backend pinned to "
-                  << n << " thread(s)\n";
+        if (verbose) {
+            std::cerr << "[model] ggml CPU backend pinned to "
+                      << n << " thread(s)\n";
+        }
     } else {
         // Primary is a GPU backend. Set up a CPU companion so the
         // ForwardEngine's `ggml_backend_sched` has somewhere to route
@@ -239,9 +250,11 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
         cpu_fallback_ = ggml_backend_cpu_init();
         if (cpu_fallback_) {
             const unsigned n = pin_cpu_threads(cpu_fallback_);
-            std::cerr << "[model] CPU fallback backend pinned to "
-                      << n << " thread(s) (sched safety net for "
-                      << ggml_backend_name(backend_) << ")\n";
+            if (verbose) {
+                std::cerr << "[model] CPU fallback backend pinned to "
+                          << n << " thread(s) (sched safety net for "
+                          << ggml_backend_name(backend_) << ")\n";
+            }
         } else {
             // Continue without fallback: graphs that would have used
             // it will hard-abort instead of falling back. Better than
@@ -270,10 +283,12 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
                 ggml_argsort(probe_ctx, probs, GGML_SORT_ORDER_DESC);
             supports_in_graph_topk_ =
                 ggml_backend_supports_op(backend_, sorted);
-            std::cerr << "[model] in-graph top-k support on "
-                      << ggml_backend_name(backend_) << ": "
-                      << (supports_in_graph_topk_ ? "yes" : "no — using slow_only sampling path")
-                      << "\n";
+            if (verbose) {
+                std::cerr << "[model] in-graph top-k support on "
+                          << ggml_backend_name(backend_) << ": "
+                          << (supports_in_graph_topk_ ? "yes" : "no — using slow_only sampling path")
+                          << "\n";
+            }
 
             // ggml_paged_attn_ext probe. Use the model's real attention
             // geometry: FlashInfer supports only specific head_dim/GQA
@@ -308,12 +323,14 @@ Model::Model(const std::filesystem::path& snapshot_dir, bool prefer_gpu)
                 /*scale=*/ 1.0f / 8.0f, /*softcap=*/ 0.0f);
             supports_paged_attn_ext_ =
                 ggml_backend_supports_op(backend_, probe_pa);
-            std::cerr << "[model] paged_attn_ext support on "
-                      << ggml_backend_name(backend_) << ": "
-                      << (supports_paged_attn_ext_
-                          ? "yes"
-                          : "no — using materialize+flash_attn_ext fallback")
-                      << "\n";
+            if (verbose) {
+                std::cerr << "[model] paged_attn_ext support on "
+                          << ggml_backend_name(backend_) << ": "
+                          << (supports_paged_attn_ext_
+                              ? "yes"
+                              : "no — using materialize+flash_attn_ext fallback")
+                          << "\n";
+            }
 
             ggml_free(probe_ctx);
         }

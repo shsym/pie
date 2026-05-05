@@ -95,7 +95,7 @@ pub struct ServerConfig {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub verbose: bool,
     #[serde(default = "default_registry")]
     pub registry: String,
@@ -110,7 +110,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
-            verbose: true,
+            verbose: false,
             registry: default_registry(),
             max_concurrent_processes: None,
             python_snapshot: true,
@@ -565,8 +565,10 @@ pub struct PortableDriverOptions {
     pub max_batch_tokens: u32,
     pub max_batch_size: u32,
     pub cpu_pages: u32,
-    pub n_ctx: u32,
-    pub n_gpu_layers: i32,
+    #[serde(skip)]
+    pub device: String,
+    #[serde(skip)]
+    pub verbose: bool,
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
     /// Ignored in standalone (binary is statically linked); accepted
@@ -582,8 +584,8 @@ impl Default for PortableDriverOptions {
             max_batch_tokens: 10240,
             max_batch_size: 512,
             cpu_pages: 0,
-            n_ctx: 4096,
-            n_gpu_layers: 0,
+            device: "auto".to_string(),
+            verbose: false,
             ready_timeout_s: 120.0,
             shutdown_timeout_s: 5.0,
             binary_path: String::new(),
@@ -662,6 +664,8 @@ pub struct CudaNativeDriverOptions {
     pub max_num_kv_pages: u32,
     pub swap_pool_size: u32,
     pub weight_dtype: String,
+    #[serde(skip)]
+    pub verbose: bool,
     /// Runtime quantization mode applied after weight load. Empty = none;
     /// `"fp8"` enables per-tensor symmetric FP8_E4M3 on every llama-like
     /// projection weight. Currently only honored for model_type=qwen3 by
@@ -683,6 +687,7 @@ impl Default for CudaNativeDriverOptions {
             max_num_kv_pages: 1024,
             swap_pool_size: 0,
             weight_dtype: "bfloat16".to_string(),
+            verbose: false,
             runtime_quant: String::new(),
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,

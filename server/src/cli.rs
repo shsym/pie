@@ -3,7 +3,7 @@
 //! Subcommand layout is identical to the Python `pie_cli`:
 //!
 //! ```text
-//! pie serve   [--config --host --port --no-auth --verbose --no-snapshot]
+//! pie serve   [--config --host --port --no-auth --debug --no-snapshot]
 //! pie run     <inferlet> [--config --port --path --manifest --stdout]
 //! pie config  init|show|set
 //! pie auth    add|remove|list
@@ -28,6 +28,7 @@ mod config_cmd;
 mod diag_cmd;
 mod doctor_cmd;
 mod driver_cmd;
+mod inferlet_cmd;
 mod model_cmd;
 mod monitor;
 mod run_cmd;
@@ -70,6 +71,12 @@ pub enum Command {
     Model {
         #[command(subcommand)]
         cmd: model_cmd::ModelCmd,
+    },
+
+    /// Inspect inferlets from the registry.
+    Inferlet {
+        #[command(subcommand)]
+        cmd: inferlet_cmd::InferletCmd,
     },
 
     /// Manage per-driver venvs + diagnostics
@@ -122,6 +129,7 @@ pub fn dispatch() -> Result<()> {
         Command::Config { cmd } => config_cmd::run(cmd),
         Command::Auth { cmd } => auth_cmd::run(cmd),
         Command::Model { cmd } => model_cmd::run(cmd),
+        Command::Inferlet { cmd } => inferlet_cmd::run(cmd),
         Command::Driver { cmd } => driver_cmd::run(cmd),
         Command::New(args) => bakery_cmd::run_new(args),
         Command::Build(args) => bakery_cmd::run_build(args),

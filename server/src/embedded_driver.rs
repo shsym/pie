@@ -220,6 +220,10 @@ fn insert_str(table: &mut toml::Table, key: &str, value: impl Into<String>) {
     table.insert(key.into(), toml::Value::String(value.into()));
 }
 
+fn insert_bool(table: &mut toml::Table, key: &str, value: bool) {
+    table.insert(key.into(), toml::Value::Boolean(value));
+}
+
 fn insert_table(doc: &mut toml::Table, key: &str, table: toml::Table) {
     doc.insert(key.into(), toml::Value::Table(table));
 }
@@ -325,8 +329,7 @@ pub fn write_startup_toml(
 
     let mut model = toml::Table::new();
     insert_str(&mut model, "hf_path", path_string(snapshot_dir));
-    insert_int(&mut model, "n_gpu_layers", options.n_gpu_layers);
-    insert_int(&mut model, "n_ctx", options.n_ctx);
+    insert_str(&mut model, "backend", &options.device);
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
@@ -338,8 +341,17 @@ pub fn write_startup_toml(
     insert_table(&mut doc, "batching", batching);
 
     let mut aux_ipc = toml::Table::new();
-    insert_str(&mut aux_ipc, "socket_path", path_string(aux_socket_path));
+    let aux_path = if cfg!(windows) {
+        String::new()
+    } else {
+        path_string(aux_socket_path)
+    };
+    insert_str(&mut aux_ipc, "socket_path", aux_path);
     insert_table(&mut doc, "aux_ipc", aux_ipc);
+
+    let mut runtime = toml::Table::new();
+    insert_bool(&mut runtime, "verbose", options.verbose);
+    insert_table(&mut doc, "runtime", runtime);
 
     write_toml_table(out_path, doc)
 }
@@ -433,7 +445,8 @@ pub fn write_dummy_startup_toml(
 /// Write the cuda driver's startup TOML. Schema mirrors
 /// `driver/cuda/src/config.hpp`: `[shmem]` (8 MiB resp_buf), `[model]`
 /// with `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional `runtime_quant`,
-/// and `[batching]` with KV-page geometry plus `swap_pool_size`.
+/// `[batching]` with KV-page geometry plus `swap_pool_size`, and
+/// `[runtime]` with the server verbosity flag.
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the
 /// cuda driver's default (`tp_size=1, tp_rank=0`).
@@ -475,6 +488,10 @@ pub(crate) fn write_cuda_startup_toml(
     insert_int(&mut batching, "max_batch_size", opts.max_batch_size);
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
     insert_table(&mut doc, "batching", batching);
+
+    let mut runtime = toml::Table::new();
+    insert_bool(&mut runtime, "verbose", opts.verbose);
+    insert_table(&mut doc, "runtime", runtime);
 
     if let Some(tp) = tp {
         let mut distributed = toml::Table::new();
@@ -539,8 +556,8 @@ pub struct EmbeddedDriver {
     /// dispatches via this so heterogeneous configs (e.g. one cuda +
     /// one portable model) signal the right entry.
     pub flavor: Flavor,
-    /// POSIX shmem region the driver owns (e.g. `/pie_shmem_g0`).
-    /// `serve.rs` `shm_unlink`s this on shutdown to clean up after a
+    /// Shared-memory region the driver owns (e.g. `/pie_shmem_g0`).
+    /// Unix builds `shm_unlink` this on shutdown to clean up after a
     /// hard kill that bypassed the driver's own teardown.
     pub shmem_name: String,
     /// Driver's aux-IPC listener path. `serve.rs` opens an
@@ -883,6 +900,7 @@ mod tests {
             val["model"]["hf_path"].as_str().unwrap(),
             snap.to_str().unwrap()
         );
+        assert_eq!(val["model"]["backend"].as_str().unwrap(), "auto");
         assert_eq!(
             val["aux_ipc"]["socket_path"].as_str().unwrap(),
             aux.to_str().unwrap()
@@ -922,6 +940,22 @@ mod tests {
             1024
         );
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
+        assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
+    }
+
+    #[test]
+    fn cuda_startup_toml_emits_runtime_verbose_when_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.verbose = true;
+
+        write_cuda_startup_toml(&out, &opts, "Q/q", &snap, "cuda:0", 0, None).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), true);
     }
 
     #[test]
