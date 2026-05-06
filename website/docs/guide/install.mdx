@@ -54,6 +54,18 @@ pie doctor
 
 `pie doctor` checks platform readiness, lists compiled-in drivers, probes GPU visibility, and confirms that `~/.pie/config.toml` and any subprocess driver venvs resolve.
 
+## Optional: inferlet authoring
+
+The release installer provides the `pie` engine CLI. To scaffold, build, and
+publish inferlets, install Bakery from PyPI:
+
+```bash
+pip install pie-bakery
+```
+
+This provides the standalone `bakery` command and the Python package used by
+`pie new` / `pie build`.
+
 ## Optional: Python-backed drivers
 
 The `pie` binary runs the embedded `cuda_native` and `portable` drivers without Python. Python is required only for the subprocess drivers: `dev`, `vllm`, and `sglang`. Install one with:
@@ -104,7 +116,7 @@ curl -fsSL https://pie-project.org/install.sh | PIE_INSTALL_DIR=/usr/local/bin b
 ### Install a specific version
 
 ```bash
-curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=v0.1.2 bash
+curl -fsSL https://pie-project.org/install.sh | PIE_VERSION=0.3.0 bash
 ```
 
 ### Install from source

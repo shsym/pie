@@ -9,6 +9,10 @@ import TabItem from '@theme/TabItem';
 
 # MCP
 
+:::warning[Experimental]
+MCP support is a prototype. Interfaces, defaults, and capabilities change frequently.
+:::
+
 The [Model Context Protocol](https://modelcontextprotocol.io/) is an open standard for exposing tools, resources, and prompt templates to LLM applications. Pie ships an MCP client. Inferlets discover and call MCP servers without writing transport code. Read this after [Tool-call parser](../decoder/tool-calling).
 
 There are two sides to MCP in Pie:
@@ -147,7 +151,7 @@ mcp_session = mcp.connect(servers[0])
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { mcp } from 'inferlet';
+import { mcp } from '@pie-project/inferlet';
 
 const servers = mcp.availableServers();
 const mcpSession = mcp.connect(servers[0]);
@@ -402,7 +406,7 @@ async for step in g:
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { tools } from 'inferlet';
+import { tools } from '@pie-project/inferlet';
 
 // 1. Equip the model with the MCP tool schemas.
 const mcpTools = JSON.parse(mcpSession.listTools());

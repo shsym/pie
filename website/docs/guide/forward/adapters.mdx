@@ -9,6 +9,10 @@ import TabItem from '@theme/TabItem';
 
 # Adapters
 
+:::warning[Experimental]
+Adapter support is a prototype. Interfaces, defaults, and capabilities change frequently.
+:::
+
 LoRA adapters are runtime-managed overlays scoped to a model. The full lifecycle (create, open, fork, save, load, destroy) is available in all three SDKs. This page covers using an adapter at inference. Read this after [The forward pass](./overview).
 
 :::note[Running on the dummy driver?]
@@ -58,7 +62,7 @@ text = await ctx.generate(
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Adapter } from 'inferlet';
+import { Adapter } from '@pie-project/inferlet';
 
 const adapter = Adapter.open(model, 'my-adapter');
 
@@ -120,7 +124,7 @@ a.load("/data/adapters/draft-v1.bin")
 <TabItem value="js" label="JavaScript">
 
 ```typescript
-import { Adapter } from 'inferlet';
+import { Adapter } from '@pie-project/inferlet';
 
 const a = Adapter.create(model, 'draft-adapter');
 const a2 = a.fork('draft-adapter-v2');       // fork takes the new name
