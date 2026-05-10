@@ -835,20 +835,17 @@ class VllmEngine:
         scaled_softmax,
         top_p_sampling,
     ) -> None:
-        # Imported here to avoid a top-level import cycle with attn_metadata.
-        from .attn_metadata import build_common_metadata
         """Capture one fused graph at exactly `n` query tokens.
 
-        Builds synthetic attention metadata (page 0 scratch), enters
-        set_forward_context, then opens a torch.cuda.graph() and records the
-        entire trunk + sample sequence — calling the **unwrapped** compiled
-        model directly so vllm's CUDAGraphWrapper does not nest a capture.
+        Reuses Lever 5's `forward_pass.transform()` path so the FlashInfer
+        builder runs under the same conditions as the trunk-only capture.
+        Inside our outer torch.cuda.graph(), `transform()` dispatches via
+        vllm's CUDAGraphWrapper at FULL mode — which **replays** the
+        already-captured trunk graph (replay-inside-outer-capture is valid
+        in CUDA; the replayed kernels are absorbed into the outer graph).
+        Then we tack on compute_logits + softmax + sampling so the outer
+        graph captures the whole per-step forward in one record.
         """
-        from ._vllm_compat import (
-            CUDAGraphMode,
-            set_forward_context,
-        )
-
         fp = self.forward_pass
         device = fp.device
 
@@ -858,6 +855,7 @@ class VllmEngine:
         num_reqs = n // query_len
 
         # Synthetic uniform-decode batch — same shape as Lever 5's capture.
+        token_ids = torch.zeros(n, dtype=torch.long)
         position_ids = torch.zeros(n, dtype=torch.int32, device=device)
         qo_indptr = (
             torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
@@ -869,60 +867,45 @@ class VllmEngine:
             (num_reqs,), max(query_len, 1), dtype=torch.int32, device=device
         )
 
-        common = build_common_metadata(
-            qo_indptr=qo_indptr,
-            kv_page_indices=kv_page_indices,
-            kv_page_indptr=kv_page_indptr,
-            kv_last_page_lens=kv_last_page_lens,
-            page_size=page_size,
-            device=device,
-        )
+        inputs = {
+            "token_ids": token_ids,
+            "position_ids": position_ids,
+            "qo_indptr": qo_indptr,
+            "kv_page_indices": kv_page_indices,
+            "kv_page_indptr": kv_page_indptr,
+            "kv_last_page_lens": kv_last_page_lens,
+        }
 
-        # Substitute persistent slot_mapping buffer (data_ptr must be stable
-        # across replays).
-        sm_buf = fp._cg_slot_mapping_buf
-        sm_buf[:n].copy_(common.slot_mapping[:n], non_blocking=True)
-        common.slot_mapping = sm_buf[:n]
-
-        backend_metadata = fp._builder.build(
-            common_prefix_len=0,
-            common_attn_metadata=common,
-        )
-        slot_mapping_dict = {name: common.slot_mapping for name in fp._layer_names}
-
-        # Persistent positions buffer: copy synthetic int64 positions in.
-        positions = position_ids.to(device, dtype=torch.int64, non_blocking=True)
-        fp._cg_positions_buf[:n].copy_(positions, non_blocking=True)
+        # embed_inputs runs the input-embedding layer; its output writes into
+        # a per-call tensor. For the fused replay we'll re-run embed_inputs
+        # per fire_batch (outside the captured graph) and then copy into
+        # the persistent buffer — same shape as the Lever 5 capture path.
+        # During CAPTURE we don't need persistent embed input; transform()
+        # itself copies into _cg_inputs_embeds_buf when dispatching FULL.
+        embeds = fp.embed_inputs(inputs)
 
         graph = torch.cuda.CUDAGraph()
-
-        # Capture stream is created inside graph_capture() (the outer
-        # context manager in `_capture_fused_graphs`). We use the current
-        # stream which graph_capture has already activated.
-        with set_forward_context(
-            attn_metadata=backend_metadata,
-            vllm_config=fp.vllm_config,
-            num_tokens=n,
-            slot_mapping=slot_mapping_dict,
-            # NONE so any nested CUDAGraphWrapper-ish code inside the model
-            # does not try to capture/replay during our outer capture.
-            # We're calling the unwrapped model anyway, so this flag mainly
-            # documents intent.
-            cudagraph_runtime_mode=CUDAGraphMode.NONE,
-            batch_descriptor=None,
-        ):
-            with torch.cuda.graph(graph):
-                h = fp._unwrapped_model(
-                    input_ids=None,
-                    positions=fp._cg_positions_buf[:n],
-                    inputs_embeds=fp._cg_inputs_embeds_buf[:n],
-                )
-                logits = compute_logits(h)
-                probs = scaled_softmax(logits, fp._cg_sample_temperatures_buf[:n])
-                sampled = top_p_sampling(
-                    probs, top_p=fp._cg_sample_top_p_buf[:n], seed=None
-                )
-                fp._cg_sample_tokens_buf[:n].copy_(sampled.to(torch.int64))
+        with torch.cuda.graph(graph):
+            # transform() with single_token_mode=True will route through the
+            # dispatcher → vllm's CUDAGraphWrapper at FULL mode → replay
+            # Lever 5's captured trunk for size n. The replay's kernels are
+            # absorbed into our outer captured graph. Returns hidden_states
+            # backed by Lever 5's persistent output buffer.
+            hidden = fp.transform(
+                input_embeds=embeds,
+                position_ids=position_ids,
+                qo_indptr=qo_indptr,
+                kv_page_indices=kv_page_indices,
+                kv_page_indptr=kv_page_indptr,
+                kv_last_page_lens=kv_last_page_lens,
+                single_token_mode=True,
+            )
+            logits = compute_logits(hidden)
+            probs = scaled_softmax(logits, fp._cg_sample_temperatures_buf[:n])
+            sampled = top_p_sampling(
+                probs, top_p=fp._cg_sample_top_p_buf[:n], seed=None
+            )
+            fp._cg_sample_tokens_buf[:n].copy_(sampled.to(torch.int64))
 
         fp._cg_fused_graphs[n] = graph
 
