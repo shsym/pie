@@ -113,6 +113,19 @@ class VllmForwardPass:
         # path is actually faster than the eager baseline.
         self._sample_fastpath_used_last = False
 
+        # Lever 7 (ticket #113): fused trunk + sample cudagraph. One captured
+        # graph per cap_size records the WHOLE per-step forward — model
+        # forward + compute_logits + scaled_softmax + top_p_sampling — so a
+        # single graph.replay() does both stages with no host-side Python or
+        # cuda launch overhead between them. `_unwrapped_model` is the model
+        # reference *before* vllm's CUDAGraphWrapper is installed by Lever 5;
+        # we call it directly inside our outer capture so vllm's wrapper
+        # doesn't try to capture/replay a nested graph.
+        self._cg_fused_enabled = False
+        self._cg_fused_graphs: dict[int, "torch.cuda.CUDAGraph"] = {}
+        self._unwrapped_model: torch.nn.Module | None = None
+        self._fused_fastpath_used_last = False
+
     def _ensure_metadata_builder(self) -> None:
         """Construct the per-backend AttentionMetadataBuilder once.
 
@@ -502,3 +515,142 @@ class VllmForwardPass:
         graph.replay()
 
         return out[:n].tolist()
+
+    # ------------------------------------------------------------------
+    # Lever 7: fused trunk + sample cudagraph (ticket #113)
+    # ------------------------------------------------------------------
+
+    def fused_eligible(
+        self,
+        *,
+        num_tokens: int,
+        single_token_mode: bool,
+        sampling_metadata: dict,
+    ) -> bool:
+        """Host-side gate: does this batch qualify for the fused graph?
+
+        Combines Lever 5 trunk eligibility (uniform-decode, batch size in
+        capture set, qlen=1) AND Lever 6 sample eligibility (uniform TopP,
+        no logprobs/dists/raw-logits, no sampling_masks, indices_for_logits
+        = range(n)). All checks are host-side ints/dict lookups; no GPU sync.
+        """
+        if not self._cg_fused_enabled or not self._cg_fused_graphs:
+            return False
+        if not single_token_mode or self._cg_query_len != 1:
+            return False
+        if num_tokens not in self._cg_fused_graphs:
+            return False
+        if sampling_metadata.get("sampling_masks") is not None:
+            return False
+
+        sampler_groups = sampling_metadata.get("sampler_groups", {})
+        non_empty = [k for k, v in sampler_groups.items() if v]
+        if len(non_empty) != 1 or non_empty[0] != _SAMPLER_IDX_TOP_P:
+            return False
+        if RAW_LOGITS_TYPE in sampler_groups and sampler_groups[RAW_LOGITS_TYPE]:
+            return False
+        if any(t in sampler_groups and sampler_groups[t] for t in LOGPROB_TYPES):
+            return False
+        if 0 in sampler_groups and sampler_groups[0]:
+            return False
+
+        indices = sampling_metadata.get("indices_for_logits", [])
+        if not indices or len(indices) != num_tokens:
+            return False
+        if list(indices) != list(range(num_tokens)):
+            return False
+
+        if sampling_metadata.get("top_p") is None:
+            return False
+        if sampling_metadata.get("temperatures") is None:
+            return False
+        return True
+
+    def fused_replay(
+        self,
+        *,
+        input_embeds: torch.Tensor,
+        position_ids: torch.Tensor,
+        qo_indptr: torch.Tensor,
+        kv_page_indices: torch.Tensor,
+        kv_page_indptr: torch.Tensor,
+        kv_last_page_lens: torch.Tensor,
+        sampling_metadata: dict,
+    ) -> dict:
+        """Replay the fused trunk+sample graph for `num_tokens = input_embeds.shape[0]`.
+
+        Caller must have already checked `fused_eligible()`. Builds attention
+        metadata via FlashInfer plan() (writes into persistent buffers the
+        captured graph reads from), copies inputs into capture-time buffers,
+        then issues a single graph.replay(). Returns the same dict shape as
+        `sample()` so the dispatch site is a drop-in.
+        """
+        from ._vllm_compat import (
+            CUDAGraphMode,
+            set_forward_context,
+        )
+
+        self._ensure_metadata_builder()
+
+        n = int(input_embeds.shape[0])
+        graph = self._cg_fused_graphs.get(n)
+        assert graph is not None, f"fused graph missing for size {n}"
+
+        page_size = self._kv_spec.block_size
+
+        # FlashInfer plan() — writes into persistent buffers the captured
+        # graph reads from. No padding here because n is already in the
+        # capture set.
+        common = build_common_metadata(
+            qo_indptr=qo_indptr,
+            kv_page_indices=kv_page_indices,
+            kv_page_indptr=kv_page_indptr,
+            kv_last_page_lens=kv_last_page_lens,
+            page_size=page_size,
+            device=self.device,
+        )
+
+        # Substitute persistent slot_mapping buffer so backend metadata
+        # snapshots the data_ptr the captured graph was recorded against.
+        assert self._cg_slot_mapping_buf is not None
+        sm_buf = self._cg_slot_mapping_buf
+        sm_buf[:n].copy_(common.slot_mapping[:n], non_blocking=True)
+        common.slot_mapping = sm_buf[:n]
+
+        _ = self._builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common,
+        )
+
+        # Inputs into persistent buffers.
+        positions = position_ids.to(self.device, dtype=torch.int64, non_blocking=True)
+        embed_buf = self._cg_inputs_embeds_buf
+        pos_buf = self._cg_positions_buf
+        embed_buf[:n].copy_(input_embeds, non_blocking=True)
+        pos_buf[:n].copy_(positions, non_blocking=True)
+
+        # Sample-side persistent buffers.
+        top_p = sampling_metadata["top_p"]
+        temps = sampling_metadata["temperatures"]
+        if top_p.device != self.device:
+            top_p = top_p.to(self.device, non_blocking=True)
+        if temps.device != self.device:
+            temps = temps.to(self.device, non_blocking=True)
+        self._cg_sample_top_p_buf[:n].copy_(top_p, non_blocking=True)
+        self._cg_sample_temperatures_buf[:n].copy_(
+            temps.unsqueeze(1) if temps.ndim == 1 else temps, non_blocking=True
+        )
+
+        graph.replay()
+
+        self._fused_fastpath_used_last = True
+        num_out = len(sampling_metadata["indices_for_logits"])
+        tokens = self._cg_sample_tokens_buf[:n].tolist()
+        return {
+            "tokens": tokens,
+            "dists": [None] * num_out,
+            "logits": [None] * num_out,
+            "logprobs": [None] * num_out,
+            "entropies": [None] * num_out,
+            "nan_indices": [],
+        }

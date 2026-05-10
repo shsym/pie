@@ -206,6 +206,19 @@ class VllmEngine:
                 logger.exception("vllm sample-graph capture FAILED")
                 raise
 
+        # Lever 7 (ticket #113): fold the Lever 5 trunk graph + Lever 6 sample
+        # graph into ONE captured cuda graph per cap_size. Drops the inter-
+        # stage Python (transform return → sample dispatch / fastpath checks
+        # / hidden copy) and one cudagraph replay launch (~5-10 us) per
+        # decode step. Requires PIE_SAMPLE_GRAPH=1 (sample buffers must
+        # already be allocated). Gated behind PIE_FUSED_GRAPH=1.
+        if int(os.environ.get("PIE_FUSED_GRAPH", "0")) == 1:
+            try:
+                engine._capture_fused_graphs(_log)
+            except Exception:
+                logger.exception("vllm fused-graph capture FAILED")
+                raise
+
         return engine
 
     @torch.inference_mode()
@@ -421,6 +434,11 @@ class VllmEngine:
         # forward_context for cudagraph_runtime_mode/batch_descriptor and
         # captures (first call per descriptor) or replays (subsequent).
         # Pass-through if mode does not match (e.g. prefill batches).
+        # Stash a reference to the unwrapped model BEFORE installing the
+        # wrapper — Lever 7 (`_capture_fused_graphs`) calls the underlying
+        # compiled model directly inside its outer torch.cuda.graph() so
+        # vllm's wrapper does not try to capture a nested graph.
+        self.forward_pass._unwrapped_model = self.forward_pass.model
         wrapped = CUDAGraphWrapper(
             self.forward_pass.model,
             vllm_config,
@@ -688,6 +706,227 @@ class VllmEngine:
         )
 
     @torch.inference_mode()
+    def _capture_fused_graphs(self, log_fn=None) -> None:
+        """Capture trunk + sample into ONE cuda graph per decode size (Lever 7).
+
+        Records the WHOLE per-step forward — model.forward + compute_logits +
+        scaled_softmax + top_p_sampling_from_probs + tokens copy — inside a
+        single torch.cuda.graph() context. One replay() per step does both
+        stages with no Python or cudagraph-launch overhead between them.
+
+        Prerequisites: `_capture_cudagraphs` must have already run (we reuse
+        its persistent inputs_embeds / positions / slot_mapping buffers and
+        the saved `_unwrapped_model` reference) and `_capture_sample_graphs`
+        must have already run (we reuse its top_p / temperatures / tokens
+        buffers). Both Lever 5 and Lever 6 must therefore be enabled.
+
+        Skipped (no-op) if those prerequisites are not met; the dispatch
+        gate in `forward_pass.fused_eligible()` will then return False and
+        fire_batch falls back to the Lever 5+6 split-graph path.
+        """
+        import time as _time
+
+        from ._vllm_compat import (
+            CUDAGraphMode,
+            graph_capture,
+            set_cudagraph_capturing_enabled,
+            set_current_vllm_config,
+            set_forward_context,
+        )
+
+        device = self.forward_pass.device
+
+        def _log(msg: str, level: str = "INFO") -> None:
+            logger.log(_level_to_int(level), "fused-cudagraph: %s", msg)
+            if log_fn is not None:
+                log_fn(msg, level)
+
+        if not torch.cuda.is_available() or not str(device).startswith("cuda"):
+            _log(f"skipped (device={device})", "INFO")
+            return
+
+        fp = self.forward_pass
+        if fp._unwrapped_model is None:
+            _log("skipped (Lever 5 not enabled; no unwrapped model)", "WARN")
+            return
+        if not fp._cg_sample_enabled or not fp._cg_sample_graphs:
+            _log("skipped (Lever 6 not enabled; sample buffers missing)", "WARN")
+            return
+
+        vllm_config = fp.vllm_config
+        cc = vllm_config.compilation_config
+        if cc.cudagraph_mode == CUDAGraphMode.NONE:
+            _log("skipped (cudagraph_mode=NONE)", "INFO")
+            return
+        cap_sizes = sorted({int(s) for s in (cc.cudagraph_capture_sizes or []) if s > 0})
+        if not cap_sizes:
+            _log("skipped (no cudagraph_capture_sizes)", "WARN")
+            return
+
+        from pie_driver.model.common import scaled_softmax
+        from pie_kernels.sampling import top_p_sampling_from_probs
+
+        # Drain any work still queued before switching to the capture stream.
+        torch.cuda.synchronize()
+
+        compute_logits = fp._unwrapped_model.compute_logits
+        query_len = fp._cg_query_len
+        page_size = int(fp._kv_spec.block_size)
+        max_n = int(fp._cg_sample_hidden_buf.shape[0])  # = max_cudagraph_capture_size
+
+        # Initialize persistent buffers to safe values (sample buffers were
+        # already initialized by _capture_sample_graphs; trunk buffers were
+        # by _capture_cudagraphs after Lever 5 capture but their contents
+        # may now be stale). top_p in (0, 1] keeps the sampling kernel in
+        # its fast branch.
+        fp._cg_inputs_embeds_buf.zero_()
+        fp._cg_positions_buf.zero_()
+        fp._cg_sample_top_p_buf.fill_(0.9)
+        fp._cg_sample_temperatures_buf.fill_(1.0)
+
+        torch.cuda.empty_cache()
+        start_free = torch.cuda.mem_get_info()[0]
+        t0 = _time.perf_counter()
+
+        set_cudagraph_capturing_enabled(True)
+        try:
+            with set_current_vllm_config(vllm_config), graph_capture(device=device):
+                for n in cap_sizes:
+                    if n > max_n:
+                        continue
+                    self._capture_one_fused(
+                        n=n,
+                        query_len=query_len,
+                        page_size=page_size,
+                        compute_logits=compute_logits,
+                        scaled_softmax=scaled_softmax,
+                        top_p_sampling=top_p_sampling_from_probs,
+                    )
+                    torch.cuda.synchronize()
+        finally:
+            set_cudagraph_capturing_enabled(False)
+
+        end_free = torch.cuda.mem_get_info()[0]
+        elapsed = _time.perf_counter() - t0
+        graph_bytes = max(0, start_free - end_free)
+        fp._cg_fused_enabled = True
+        _log(
+            f"captured fused graphs for {len(fp._cg_fused_graphs)} size(s) "
+            f"in {elapsed:.2f}s ({graph_bytes / (1 << 20):.1f} MiB graph memory); "
+            f"sizes={sorted(fp._cg_fused_graphs.keys())[:8]}"
+            f"{'...' if len(fp._cg_fused_graphs) > 8 else ''}",
+            "INFO",
+        )
+
+        # Capture writes K/V into page 0 (warmup scratch); zero so the first
+        # real context that gets allocated this page does not read stale
+        # activations.
+        for layer_kv in self.kv_cache_at_layer:
+            layer_kv[0].zero_()
+
+    @torch.inference_mode()
+    def _capture_one_fused(
+        self,
+        *,
+        n: int,
+        query_len: int,
+        page_size: int,
+        compute_logits,
+        scaled_softmax,
+        top_p_sampling,
+    ) -> None:
+        # Imported here to avoid a top-level import cycle with attn_metadata.
+        from .attn_metadata import build_common_metadata
+        """Capture one fused graph at exactly `n` query tokens.
+
+        Builds synthetic attention metadata (page 0 scratch), enters
+        set_forward_context, then opens a torch.cuda.graph() and records the
+        entire trunk + sample sequence — calling the **unwrapped** compiled
+        model directly so vllm's CUDAGraphWrapper does not nest a capture.
+        """
+        from ._vllm_compat import (
+            CUDAGraphMode,
+            set_forward_context,
+        )
+
+        fp = self.forward_pass
+        device = fp.device
+
+        assert n % query_len == 0, (
+            f"capture size {n} must be divisible by query_len {query_len}"
+        )
+        num_reqs = n // query_len
+
+        # Synthetic uniform-decode batch — same shape as Lever 5's capture.
+        position_ids = torch.zeros(n, dtype=torch.int32, device=device)
+        qo_indptr = (
+            torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
+            * query_len
+        )
+        kv_page_indices = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+        kv_page_indptr = torch.arange(num_reqs + 1, dtype=torch.int32, device=device)
+        kv_last_page_lens = torch.full(
+            (num_reqs,), max(query_len, 1), dtype=torch.int32, device=device
+        )
+
+        common = build_common_metadata(
+            qo_indptr=qo_indptr,
+            kv_page_indices=kv_page_indices,
+            kv_page_indptr=kv_page_indptr,
+            kv_last_page_lens=kv_last_page_lens,
+            page_size=page_size,
+            device=device,
+        )
+
+        # Substitute persistent slot_mapping buffer (data_ptr must be stable
+        # across replays).
+        sm_buf = fp._cg_slot_mapping_buf
+        sm_buf[:n].copy_(common.slot_mapping[:n], non_blocking=True)
+        common.slot_mapping = sm_buf[:n]
+
+        backend_metadata = fp._builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common,
+        )
+        slot_mapping_dict = {name: common.slot_mapping for name in fp._layer_names}
+
+        # Persistent positions buffer: copy synthetic int64 positions in.
+        positions = position_ids.to(device, dtype=torch.int64, non_blocking=True)
+        fp._cg_positions_buf[:n].copy_(positions, non_blocking=True)
+
+        graph = torch.cuda.CUDAGraph()
+
+        # Capture stream is created inside graph_capture() (the outer
+        # context manager in `_capture_fused_graphs`). We use the current
+        # stream which graph_capture has already activated.
+        with set_forward_context(
+            attn_metadata=backend_metadata,
+            vllm_config=fp.vllm_config,
+            num_tokens=n,
+            slot_mapping=slot_mapping_dict,
+            # NONE so any nested CUDAGraphWrapper-ish code inside the model
+            # does not try to capture/replay during our outer capture.
+            # We're calling the unwrapped model anyway, so this flag mainly
+            # documents intent.
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            batch_descriptor=None,
+        ):
+            with torch.cuda.graph(graph):
+                h = fp._unwrapped_model(
+                    input_ids=None,
+                    positions=fp._cg_positions_buf[:n],
+                    inputs_embeds=fp._cg_inputs_embeds_buf[:n],
+                )
+                logits = compute_logits(h)
+                probs = scaled_softmax(logits, fp._cg_sample_temperatures_buf[:n])
+                sampled = top_p_sampling(
+                    probs, top_p=fp._cg_sample_top_p_buf[:n], seed=None
+                )
+                fp._cg_sample_tokens_buf[:n].copy_(sampled.to(torch.int64))
+
+        fp._cg_fused_graphs[n] = graph
+
+    @torch.inference_mode()
     def fire_batch(
         self,
         inputs: dict,
@@ -699,49 +938,80 @@ class VllmEngine:
         # DriverCapabilities so the runtime can route mask-dependent
         # inferlets elsewhere (currently only `native`).
         #
-        # When `gpu_timings` is provided, we record cuda.Event markers
-        # around embed/transform/sample to break apart the GPU-side cost
-        # of each stage. Reading elapsed_time forces a single sync at the
-        # end (already implicit in the inferlet's host-side .tolist() of
-        # sampler outputs), so the events themselves do not stall the
-        # pipeline. Used by #68085 Phase 44 to localize prefill vs decode
-        # overhead at sub-stage granularity.
-        # Sync-then-time approach: torch.cuda.synchronize() drains all kernels
-        # on every CUDA stream, then perf_counter captures wall — the
-        # difference between two adjacent syncs IS the GPU time of the
-        # intervening stage. cuda.Events on default stream were unreliable
-        # here (vllm/inductor uses dedicated streams; events recorded on
-        # default stream don't capture compiled-graph kernels and can also
-        # interfere with pie's snapshot.fork() copy_d2d on a separate
-        # thread, producing the qo_indptr CUDA assert seen on H100). This
-        # is heavier (4× sync per fire_batch) but reliable. Only enabled
-        # when gpu_timings is requested, so the hot path is unaffected.
+        # When `gpu_timings` is provided, we record per-stage timings by
+        # syncing between stages. This is gated to bench/profiling runs
+        # only — the production hot path (gpu_timings=None) does zero
+        # extra syncs. cuda.Events on default stream were unreliable here
+        # (vllm/inductor uses dedicated streams; events recorded on
+        # default stream don't capture compiled-graph kernels) so we use
+        # sync-then-perf_counter when timings are explicitly requested.
+        fp = self.forward_pass
+        fp._fused_fastpath_used_last = False
+
+        # Lever 7 (#113): if the fused trunk+sample graph is eligible for
+        # this batch, run it instead of the split embed/transform/sample
+        # path. embed_inputs still runs eagerly (cheap, and its output is
+        # the input buffer the fused graph expects).
+        single_token_mode = inputs.get("single_token_inference_mode", False)
+        # Embed always runs first; its result is also needed for the
+        # eligibility-num_tokens check.
         if gpu_timings is not None:
             torch.cuda.synchronize()
             import time as _time
             t0 = _time.perf_counter()
 
-        input_embeds = self.forward_pass.embed_inputs(inputs)
+        input_embeds = fp.embed_inputs(inputs)
+        num_tokens = int(input_embeds.shape[0])
 
         if gpu_timings is not None:
             torch.cuda.synchronize()
             t1 = _time.perf_counter()
 
-        hidden_states = self.forward_pass.transform(
+        fused_eligible = fp.fused_eligible(
+            num_tokens=num_tokens,
+            single_token_mode=single_token_mode,
+            sampling_metadata=sampling_metadata,
+        )
+
+        if fused_eligible:
+            # Fused trunk + sample replay. Returns the same dict shape as
+            # `sample()`. Bypasses both transform() and sample().
+            out = fp.fused_replay(
+                input_embeds=input_embeds,
+                position_ids=inputs["position_ids"],
+                qo_indptr=inputs["qo_indptr"],
+                kv_page_indices=inputs["kv_page_indices"],
+                kv_page_indptr=inputs["kv_page_indptr"],
+                kv_last_page_lens=inputs["kv_last_page_lens"],
+                sampling_metadata=sampling_metadata,
+            )
+            if gpu_timings is not None:
+                torch.cuda.synchronize()
+                t3 = _time.perf_counter()
+                gpu_timings["embed_ms"] = (t1 - t0) * 1000.0
+                gpu_timings["transform_ms"] = 0.0
+                gpu_timings["sample_ms"] = 0.0
+                gpu_timings["fused_ms"] = (t3 - t1) * 1000.0
+                gpu_timings["fused_fastpath_used"] = True
+                gpu_timings["sample_fastpath_used"] = False
+            return out
+
+        # Fallback: split-graph path (Lever 5 trunk + Lever 6 or eager sample).
+        hidden_states = fp.transform(
             input_embeds=input_embeds,
             position_ids=inputs["position_ids"],
             qo_indptr=inputs["qo_indptr"],
             kv_page_indices=inputs["kv_page_indices"],
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
-            single_token_mode=inputs.get("single_token_inference_mode", False),
+            single_token_mode=single_token_mode,
         )
 
         if gpu_timings is not None:
             torch.cuda.synchronize()
             t2 = _time.perf_counter()
 
-        out = self.forward_pass.sample(hidden_states, sampling_metadata)
+        out = fp.sample(hidden_states, sampling_metadata)
 
         if gpu_timings is not None:
             torch.cuda.synchronize()
@@ -749,13 +1019,9 @@ class VllmEngine:
             gpu_timings["embed_ms"] = (t1 - t0) * 1000.0
             gpu_timings["transform_ms"] = (t2 - t1) * 1000.0
             gpu_timings["sample_ms"] = (t3 - t2) * 1000.0
-            # Lever 6 telemetry: surface whether the captured sample graph
-            # actually fired this batch. A bench probe can compare wall
-            # cost on `sample_fastpath_used=True` vs `False` rows in the
-            # same run to localize residual sample-stage overhead.
-            gpu_timings["sample_fastpath_used"] = (
-                self.forward_pass._sample_fastpath_used_last
-            )
+            gpu_timings["fused_ms"] = 0.0
+            gpu_timings["fused_fastpath_used"] = False
+            gpu_timings["sample_fastpath_used"] = fp._sample_fastpath_used_last
 
         return out
 

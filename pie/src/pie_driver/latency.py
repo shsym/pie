@@ -32,7 +32,8 @@ def _maybe_open_csv():
                 "broadcast_ms,inference_ms,create_responses_ms,"
                 "decode_u32_ms,mask_loop_ms,brle_decode_ms,sampler_loop_ms,"
                 "embed_gpu_ms,transform_gpu_ms,sample_gpu_ms,"
-                "batch_total_tokens,batch_num_seqs,sample_fastpath_used\n"
+                "batch_total_tokens,batch_num_seqs,sample_fastpath_used,"
+                "fused_fastpath_used,fused_gpu_ms\n"
             )
             _LATENCY_CSV_HEADER_WRITTEN = True
     return _LATENCY_CSV_FH
@@ -68,6 +69,11 @@ class StepTiming(NamedTuple):
     # step, 0 when sample_common ran eagerly. 0 also covers drivers that
     # don't expose the flag (pie_driver native, pie_driver_sgl).
     sample_fastpath_used: int = 0
+    # Lever 7 (#113) probe — 1 when the fused trunk+sample graph fired
+    # this step, 0 otherwise. When 1, the per-stage embed/transform/sample
+    # columns will reflect 0 (fused_gpu_ms holds the whole-step replay).
+    fused_fastpath_used: int = 0
+    fused_gpu: float = 0.0
 
 
 @dataclass
@@ -111,7 +117,9 @@ class LatencyStats:
                     f"{timing.sample_gpu*1000:.3f},"
                     f"{timing.batch_total_tokens},"
                     f"{timing.batch_num_seqs},"
-                    f"{timing.sample_fastpath_used}\n"
+                    f"{timing.sample_fastpath_used},"
+                    f"{timing.fused_fastpath_used},"
+                    f"{timing.fused_gpu*1000:.3f}\n"
                 )
 
         if not self.enabled:

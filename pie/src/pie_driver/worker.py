@@ -643,6 +643,10 @@ def _leader_loop(
                 # Lever 6 telemetry — VllmEngine sets this in the gpu_timings
                 # dict; native / sgl drivers don't, so default to 0.
                 sample_fastpath_used=int(bool(gpu.get("sample_fastpath_used", False))),
+                # Lever 7 telemetry — same shape; default 0 for drivers that
+                # don't set the flag.
+                fused_fastpath_used=int(bool(gpu.get("fused_fastpath_used", False))),
+                fused_gpu=gpu.get("fused_ms", 0.0) / 1000.0,
             ),
             traceparent=timings["traceparent"],
         )
