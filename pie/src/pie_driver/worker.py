@@ -647,6 +647,11 @@ def _leader_loop(
                 # don't set the flag.
                 fused_fastpath_used=int(bool(gpu.get("fused_fastpath_used", False))),
                 fused_gpu=gpu.get("fused_ms", 0.0) / 1000.0,
+                # Sub-transform breakdown (#113 follow-up — measure, don't guess).
+                xform_dispatch=gpu.get("xform_dispatch_ms", 0.0) / 1000.0,
+                xform_meta_build=gpu.get("xform_meta_build_ms", 0.0) / 1000.0,
+                xform_plan=gpu.get("xform_plan_ms", 0.0) / 1000.0,
+                xform_forward=gpu.get("xform_forward_ms", 0.0) / 1000.0,
             ),
             traceparent=timings["traceparent"],
         )

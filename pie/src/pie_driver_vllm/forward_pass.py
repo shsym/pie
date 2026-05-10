@@ -180,6 +180,7 @@ class VllmForwardPass:
         kv_page_indptr: torch.Tensor,
         kv_last_page_lens: torch.Tensor,
         single_token_mode: bool = False,
+        sub_timings: dict | None = None,
     ) -> torch.Tensor:
         """Run the model's transformer trunk inside `set_forward_context`.
 
@@ -194,6 +195,18 @@ class VllmForwardPass:
             BatchDescriptor,
             set_forward_context,
         )
+
+        import time as _t
+
+        def _mark(key: str) -> None:
+            """sync-then-time stamp into sub_timings. No-op when sub_timings is None."""
+            if sub_timings is None:
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            sub_timings[key] = _t.perf_counter()
+
+        _mark("t_enter")
 
         self._ensure_metadata_builder()
 
@@ -266,6 +279,8 @@ class VllmForwardPass:
             kv_page_indptr_eff = kv_page_indptr
             kv_last_page_lens_eff = kv_last_page_lens
 
+        _mark("t_pad_done")
+
         common = build_common_metadata(
             qo_indptr=qo_indptr_eff,
             kv_page_indices=kv_page_indices_eff,
@@ -278,6 +293,8 @@ class VllmForwardPass:
         if padded_tokens != num_tokens:
             # Mark padded query tokens as no-write so KV cache stays clean.
             common.slot_mapping[num_tokens:padded_tokens] = -1
+
+        _mark("t_meta_done")
 
         # When replaying a captured graph, the KV-append op (and any other op
         # that reads slot_mapping out of forward_context) was captured against
@@ -303,6 +320,8 @@ class VllmForwardPass:
             common_prefix_len=0,
             common_attn_metadata=common,
         )
+
+        _mark("t_plan_done")
 
         # Same slot_mapping for every layer (no cross-attention or shared KV).
         slot_mapping_dict = {
@@ -358,6 +377,8 @@ class VllmForwardPass:
             # Trim padding rows from the captured graph's output before
             # downstream sampling/logits.
             hidden_states = hidden_states[:num_tokens]
+
+        _mark("t_forward_done")
 
         return hidden_states
 

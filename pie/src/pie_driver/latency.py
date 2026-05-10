@@ -33,7 +33,8 @@ def _maybe_open_csv():
                 "decode_u32_ms,mask_loop_ms,brle_decode_ms,sampler_loop_ms,"
                 "embed_gpu_ms,transform_gpu_ms,sample_gpu_ms,"
                 "batch_total_tokens,batch_num_seqs,sample_fastpath_used,"
-                "fused_fastpath_used,fused_gpu_ms\n"
+                "fused_fastpath_used,fused_gpu_ms,"
+                "xform_dispatch_ms,xform_meta_build_ms,xform_plan_ms,xform_forward_ms\n"
             )
             _LATENCY_CSV_HEADER_WRITTEN = True
     return _LATENCY_CSV_FH
@@ -74,6 +75,13 @@ class StepTiming(NamedTuple):
     # columns will reflect 0 (fused_gpu_ms holds the whole-step replay).
     fused_fastpath_used: int = 0
     fused_gpu: float = 0.0
+    # Sub-transform breakdown (#113 follow-up). Used to verify the residual
+    # decomposition before committing to a build_common_metadata refactor.
+    # All values are seconds (multiplied by 1000 when written to CSV).
+    xform_dispatch: float = 0.0
+    xform_meta_build: float = 0.0
+    xform_plan: float = 0.0
+    xform_forward: float = 0.0
 
 
 @dataclass
@@ -119,7 +127,11 @@ class LatencyStats:
                     f"{timing.batch_num_seqs},"
                     f"{timing.sample_fastpath_used},"
                     f"{timing.fused_fastpath_used},"
-                    f"{timing.fused_gpu*1000:.3f}\n"
+                    f"{timing.fused_gpu*1000:.3f},"
+                    f"{timing.xform_dispatch*1000:.3f},"
+                    f"{timing.xform_meta_build*1000:.3f},"
+                    f"{timing.xform_plan*1000:.3f},"
+                    f"{timing.xform_forward*1000:.3f}\n"
                 )
 
         if not self.enabled:

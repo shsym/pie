@@ -279,7 +279,12 @@ class Engine:
     # ========================================================================
 
     @torch.inference_mode()
-    def fire_batch(self, inputs: dict, sampling_metadata: dict) -> list:
+    def fire_batch(
+        self,
+        inputs: dict,
+        sampling_metadata: dict,
+        gpu_timings: dict | None = None,
+    ) -> list:
         """Execute a single inference step (Embed → Transform → Sample).
 
         This is the core forward pass. It does NOT handle batching, TP barriers,
@@ -292,8 +297,21 @@ class Engine:
         Returns:
             Sampling results list
         """
+        # When gpu_timings is requested, do sync-then-time around each stage.
+        # Mirrors pie_driver_vllm.engine.fire_batch so the per-stage breakdown
+        # is comparable across drivers (#113 follow-up). Hot path is unaffected
+        # (gpu_timings=None means zero extra syncs).
+        if gpu_timings is not None:
+            torch.cuda.synchronize()
+            import time as _time
+            _t0 = _time.perf_counter()
+
         # Embed inputs
         input_embeds = self.forward_pass.embed_inputs(inputs)
+
+        if gpu_timings is not None:
+            torch.cuda.synchronize()
+            _t1 = _time.perf_counter()
 
         # Create AdapterSubpass if adapters are active
         adapter_subpass = None
@@ -364,8 +382,19 @@ class Engine:
             adapter_subpass=adapter_subpass,
         )
 
+        if gpu_timings is not None:
+            torch.cuda.synchronize()
+            _t2 = _time.perf_counter()
+
         # Sampling pass
         sampling_results = self.forward_pass.sample(hidden_states, sampling_metadata)
+
+        if gpu_timings is not None:
+            torch.cuda.synchronize()
+            _t3 = _time.perf_counter()
+            gpu_timings["embed_ms"] = (_t1 - _t0) * 1000.0
+            gpu_timings["transform_ms"] = (_t2 - _t1) * 1000.0
+            gpu_timings["sample_ms"] = (_t3 - _t2) * 1000.0
 
         return sampling_results
 

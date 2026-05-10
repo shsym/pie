@@ -980,6 +980,10 @@ class VllmEngine:
             return out
 
         # Fallback: split-graph path (Lever 5 trunk + Lever 6 or eager sample).
+        # When gpu_timings is requested, also collect transform() sub-stage
+        # timings (meta_build / plan / forward) so the residual decomposition
+        # can be measured rather than hand-attributed.
+        _sub_timings: dict | None = {} if gpu_timings is not None else None
         hidden_states = fp.transform(
             input_embeds=input_embeds,
             position_ids=inputs["position_ids"],
@@ -988,6 +992,7 @@ class VllmEngine:
             kv_page_indptr=inputs["kv_page_indptr"],
             kv_last_page_lens=inputs["kv_last_page_lens"],
             single_token_mode=single_token_mode,
+            sub_timings=_sub_timings,
         )
 
         if gpu_timings is not None:
@@ -1005,6 +1010,22 @@ class VllmEngine:
             gpu_timings["fused_ms"] = 0.0
             gpu_timings["fused_fastpath_used"] = False
             gpu_timings["sample_fastpath_used"] = fp._sample_fastpath_used_last
+            # Sub-transform breakdown. Each sub-stage delta is sync-then-time
+            # gated on having both endpoints recorded. Stages:
+            #   t_enter        → t_pad_done        : dispatch decide + padding (host)
+            #   t_pad_done     → t_meta_done       : build_common_metadata (CPU+Numba+H2D)
+            #   t_meta_done    → t_plan_done       : FlashInfer _builder.build (plan)
+            #   t_plan_done    → t_forward_done    : positions/embed buf copy + model.forward replay
+            if _sub_timings:
+                st = _sub_timings
+                def _delta(a: str, b: str) -> float:
+                    if a in st and b in st:
+                        return (st[b] - st[a]) * 1000.0
+                    return 0.0
+                gpu_timings["xform_dispatch_ms"] = _delta("t_enter", "t_pad_done")
+                gpu_timings["xform_meta_build_ms"] = _delta("t_pad_done", "t_meta_done")
+                gpu_timings["xform_plan_ms"] = _delta("t_meta_done", "t_plan_done")
+                gpu_timings["xform_forward_ms"] = _delta("t_plan_done", "t_forward_done")
 
         return out
 
