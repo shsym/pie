@@ -640,6 +640,9 @@ def _leader_loop(
                 sample_gpu=gpu.get("sample_ms", 0.0) / 1000.0,
                 batch_total_tokens=int(timings.get("batch_total_tokens", 0)),
                 batch_num_seqs=int(timings.get("batch_num_seqs", 0)),
+                # Lever 6 telemetry — VllmEngine sets this in the gpu_timings
+                # dict; native / sgl drivers don't, so default to 0.
+                sample_fastpath_used=int(bool(gpu.get("sample_fastpath_used", False))),
             ),
             traceparent=timings["traceparent"],
         )
