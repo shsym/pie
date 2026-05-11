@@ -828,6 +828,10 @@ class VllmEngine:
             torch.cuda.synchronize()
             t1 = _time.perf_counter()
 
+        # Sub-stage breakdown inside transform() (build_common_metadata vs
+        # FlashInfer plan vs model.forward replay). Adds ~3 syncs (~40 us
+        # total) when gpu_timings is set; zero overhead when not.
+        _sub_timings: dict | None = {} if gpu_timings is not None else None
         hidden_states = self.forward_pass.transform(
             input_embeds=input_embeds,
             position_ids=inputs["position_ids"],
@@ -840,6 +844,7 @@ class VllmEngine:
             # `forward_pass` routes these to the mamba state-slot allocator;
             # pure-attention paths ignore the field.
             context_ids=inputs.get("context_ids"),
+            sub_timings=_sub_timings,
         )
 
         if gpu_timings is not None:
@@ -859,6 +864,21 @@ class VllmEngine:
             gpu_timings["sample_fastpath_used"] = (
                 self.forward_pass._sample_fastpath_used_last
             )
+            # Transform sub-stages: dispatch / meta_build / plan / forward.
+            # Falsified the hypothesis (#113) that residual gap to vllm-direct
+            # is graph dispatch; measurement showed it is intrinsic per-batch
+            # CPU/H2D for attention metadata + FlashInfer plan. Keep the
+            # timing knob in so future refactor targets can be validated.
+            if _sub_timings:
+                st = _sub_timings
+                def _delta(a: str, b: str) -> float:
+                    if a in st and b in st:
+                        return (st[b] - st[a]) * 1000.0
+                    return 0.0
+                gpu_timings["xform_dispatch_ms"] = _delta("t_enter", "t_pad_done")
+                gpu_timings["xform_meta_build_ms"] = _delta("t_pad_done", "t_meta_done")
+                gpu_timings["xform_plan_ms"] = _delta("t_meta_done", "t_plan_done")
+                gpu_timings["xform_forward_ms"] = _delta("t_plan_done", "t_forward_done")
 
         return out
 

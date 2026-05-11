@@ -33,7 +33,8 @@ def _maybe_open_csv():
                 "decode_u32_ms,mask_loop_ms,brle_decode_ms,sampler_loop_ms,"
                 "embed_gpu_ms,transform_gpu_ms,sample_gpu_ms,"
                 "batch_total_tokens,batch_num_seqs,inter_call_gap_ms,"
-                "sample_fastpath_used\n"
+                "sample_fastpath_used,"
+                "xform_dispatch_ms,xform_meta_build_ms,xform_plan_ms,xform_forward_ms\n"
             )
             _LATENCY_CSV_HEADER_WRITTEN = True
     return _LATENCY_CSV_FH
@@ -74,6 +75,18 @@ class StepTiming(NamedTuple):
     # 1 when the captured sample-stage graph fired this step, 0 when
     # sample_common ran eagerly. 0 also for drivers that don't expose it.
     sample_fastpath_used: int = 0
+    # Sub-stage breakdown of forward_pass.transform() inside fire_batch
+    # (#113 follow-up). Lets bench-side analysis localize residual
+    # transform_gpu_ms cost into:
+    #   xform_dispatch:    mode decide + padding (host)
+    #   xform_meta_build:  build_common_metadata (CPU+Numba+H2D for attn metadata)
+    #   xform_plan:        FlashInfer attn-backend builder.build()
+    #   xform_forward:     positions/embed copy + model.forward (graph replay)
+    # Zero for drivers that don't surface the fields (e.g. native, sglang).
+    xform_dispatch: float = 0.0
+    xform_meta_build: float = 0.0
+    xform_plan: float = 0.0
+    xform_forward: float = 0.0
 
 
 @dataclass
@@ -118,7 +131,11 @@ class LatencyStats:
                     f"{timing.batch_total_tokens},"
                     f"{timing.batch_num_seqs},"
                     f"{timing.inter_call_gap*1000:.3f},"
-                    f"{timing.sample_fastpath_used}\n"
+                    f"{timing.sample_fastpath_used},"
+                    f"{timing.xform_dispatch*1000:.3f},"
+                    f"{timing.xform_meta_build*1000:.3f},"
+                    f"{timing.xform_plan*1000:.3f},"
+                    f"{timing.xform_forward*1000:.3f}\n"
                 )
 
         if not self.enabled:

@@ -660,6 +660,13 @@ def _leader_loop(
                 inter_call_gap=float(timings.get("inter_call_gap", 0.0)),
                 # VllmEngine sets this in gpu_timings; other drivers default to 0.
                 sample_fastpath_used=int(bool(gpu.get("sample_fastpath_used", False))),
+                # Sub-transform breakdown (#113 follow-up). Defaulted to 0
+                # so non-vllm-bridge drivers (which don't surface these
+                # fields) write zeros in the CSV.
+                xform_dispatch=gpu.get("xform_dispatch_ms", 0.0) / 1000.0,
+                xform_meta_build=gpu.get("xform_meta_build_ms", 0.0) / 1000.0,
+                xform_plan=gpu.get("xform_plan_ms", 0.0) / 1000.0,
+                xform_forward=gpu.get("xform_forward_ms", 0.0) / 1000.0,
             ),
             traceparent=timings["traceparent"],
         )

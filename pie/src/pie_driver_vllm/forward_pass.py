@@ -196,6 +196,7 @@ class VllmForwardPass:
         kv_last_page_lens: torch.Tensor,
         single_token_mode: bool = False,
         context_ids: list[int] | None = None,
+        sub_timings: dict | None = None,
     ) -> torch.Tensor:
         """Run the model's transformer trunk inside `set_forward_context`.
 
@@ -204,12 +205,34 @@ class VllmForwardPass:
         a captured FULL graph by padding inputs into persistent buffers and
         threading `cudagraph_runtime_mode` + `batch_descriptor` into
         set_forward_context. Mixed and prefill batches always run eager.
+
+        Optional `sub_timings` dict, when provided, is populated with
+        sync-then-time `perf_counter` stamps at four stage boundaries
+        (`t_enter`, `t_pad_done`, `t_meta_done`, `t_plan_done`,
+        `t_forward_done`) so callers can compute per-stage GPU wall:
+            dispatch:    t_pad_done   - t_enter
+            meta_build:  t_meta_done  - t_pad_done    (CPU+Numba+H2D for attn metadata)
+            plan:        t_plan_done  - t_meta_done   (FlashInfer _builder.build)
+            forward:     t_forward_done - t_plan_done (model.forward replay)
+        Default `None` is a no-op on the hot path (zero extra syncs).
         """
         from ._vllm_compat import (
             CUDAGraphMode,
             BatchDescriptor,
             set_forward_context,
         )
+
+        import time as _t
+
+        def _mark(key: str) -> None:
+            """sync-then-time stamp into sub_timings. No-op when sub_timings is None."""
+            if sub_timings is None:
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            sub_timings[key] = _t.perf_counter()
+
+        _mark("t_enter")
 
         self._ensure_metadata_builder()
 
@@ -288,6 +311,8 @@ class VllmForwardPass:
             kv_page_indptr_eff = kv_page_indptr
             kv_last_page_lens_eff = kv_last_page_lens
 
+        _mark("t_pad_done")
+
         common = build_common_metadata(
             qo_indptr=qo_indptr_eff,
             kv_page_indices=kv_page_indices_eff,
@@ -319,6 +344,8 @@ class VllmForwardPass:
             )
             common.slot_mapping = sm_buf[:padded_tokens]
 
+        _mark("t_meta_done")
+
         # Backend-specific attention metadata. `common_prefix_len=0`
         # disables cascade attention. Returns one dataclass shared by all
         # attention layers (FlashInfer reads `common.block_table_tensor`
@@ -330,6 +357,8 @@ class VllmForwardPass:
             )
         else:
             backend_metadata = None
+
+        _mark("t_plan_done")
 
         # Per-layer attn_metadata dict. vllm's hybrid path (qwen3-next /
         # qwen3.5-moe) reads `forward_context.attn_metadata[layer.prefix]`
@@ -441,6 +470,8 @@ class VllmForwardPass:
             # Trim padding rows from the captured graph's output before
             # downstream sampling/logits.
             hidden_states = hidden_states[:num_tokens]
+
+        _mark("t_forward_done")
 
         return hidden_states
 
