@@ -34,17 +34,15 @@ from __future__ import annotations
 import numpy as np
 
 MAGIC = 0x42504951  # 'BPIQ'
-# v2 added A_PREDICT_FLAGS (u8 per request) for pass-level speculative
-# execution. See SPECULATIVE_EXECUTION_DESIGN.md.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 1
 
 # Response schema constants
 RESP_MAGIC = 0x42504953  # 'BPIS'
 RESP_HEADER_SIZE = 16
 RESP_MODE_FLAT = 0
 RESP_MODE_MSGPACK = 1
-HEADER_SIZE = 512
-NUM_ARRAYS = 29
+HEADER_SIZE = 256
+NUM_ARRAYS = 28
 FIXED_HEADER = 32
 
 # Array indices (must match Rust).
@@ -76,11 +74,10 @@ A_SPEC_POSITION_IDS = 24
 A_SPEC_INDPTR = 25
 A_OUTPUT_SPEC_FLAGS = 26  # u8
 A_CONTEXT_IDS = 27  # u64
-A_PREDICT_FLAGS = 28  # u8 (v2)
 
 ELEM_SIZE = [
     4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
-    4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 4, 4, 4, 1, 8, 1,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 8, 8, 4, 4, 4, 1, 8,
 ]
 
 
@@ -209,7 +206,6 @@ def parse_request(view: memoryview) -> dict:
         "spec_indptr": slice_bytes(A_SPEC_INDPTR),
         "output_spec_flags": slice_bool_array(A_OUTPUT_SPEC_FLAGS),
         "context_ids": slice_u64_array(A_CONTEXT_IDS),
-        "predict_flags": slice_bool_array(A_PREDICT_FLAGS),  # v2
         "single_token_mode": single_token_mode,
         "device_id": device_id,
     }
@@ -268,11 +264,7 @@ def write_response_v2(sampling_results, batch, dst_buf, msgpack_module=None) -> 
             }
             for resp in responses
         ]
-        return write_response(
-            {"results": results},
-            dst_buf,
-            msgpack_module,
-        )
+        return write_response({"results": results}, dst_buf, msgpack_module)
 
     # Fast path: counts come straight from `request_output_counts`, tokens
     # from `sampling_results['tokens']` (already in flat order).

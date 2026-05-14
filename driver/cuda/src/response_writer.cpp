@@ -4,7 +4,6 @@
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
-#include <string>
 
 namespace pie_cuda_driver::response {
 
@@ -214,7 +213,7 @@ std::size_t write_msgpack_response(
     auto body = buf.subspan(HEADER_SIZE);
     MsgpackWriter w(body);
 
-    // {"results": [...]} — one map per ctx.
+    // {"results": [...]}
     w.map(1);
     w.str("results");
     w.array(static_cast<std::uint32_t>(per_request.size()));

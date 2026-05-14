@@ -41,14 +41,10 @@ impl Behavior for EchoBehavior {
                 .map(|_| ForwardPassResponse {
                     tokens: vec![self.0],
                     dists: vec![],
-                    logits: vec![],
-                    logprobs: vec![],
-                    entropies: vec![],
                     spec_tokens: vec![],
                     spec_positions: vec![],
                 })
                 .collect(),
-            speculative_results: Vec::new(),
         }
     }
 }
@@ -76,15 +72,11 @@ impl Behavior for CounterBehavior {
                     ForwardPassResponse {
                         tokens: vec![token],
                         dists: vec![],
-                        logits: vec![],
-                        logprobs: vec![],
-                        entropies: vec![],
                         spec_tokens: vec![],
                         spec_positions: vec![],
                     }
                 })
                 .collect(),
-            speculative_results: Vec::new(),
         }
     }
 }
@@ -121,7 +113,7 @@ impl<B: Behavior> Behavior for FailAfterBehavior<B> {
     fn handle_fire_batch(&self, req: &BatchedForwardPassRequest) -> BatchedForwardPassResponse {
         if self.remaining.fetch_sub(1, Ordering::Relaxed) == 0 {
             // Return empty results to simulate failure
-            BatchedForwardPassResponse { results: vec![], speculative_results: vec![] }
+            BatchedForwardPassResponse { results: vec![] }
         } else {
             self.inner.handle_fire_batch(req)
         }

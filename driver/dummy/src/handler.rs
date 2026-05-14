@@ -11,8 +11,7 @@ use rand::{RngCore, SeedableRng};
 use rand::rngs::SmallRng;
 
 use crate::schema::{
-    self, BatchedForwardPassResponse, DecodedRequest,
-    ForwardPassResponse, sampler_type,
+    self, BatchedForwardPassResponse, DecodedRequest, ForwardPassResponse, sampler_type,
 };
 
 pub struct Handler {
