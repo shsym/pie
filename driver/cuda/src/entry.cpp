@@ -57,6 +57,7 @@
 #include <unistd.h>
 #include "ops/gemm.hpp"
 #include "request_handler.hpp"
+#include "response_writer.hpp"
 #include "shmem_ipc.hpp"
 
 namespace {
@@ -571,9 +572,6 @@ int run_impl(int argc,
     if (cli_tp_rank >= 0) cfg.distributed.tp_rank = cli_tp_rank;
     if (!cli_nccl_unique_id_hex.empty())
         cfg.distributed.nccl_unique_id_hex = cli_nccl_unique_id_hex;
-    // CLI flag forces graphs on; TOML can also enable. Either-or, never
-    // unset what TOML asked for.
-    if (use_cuda_graphs) cfg.runtime.cuda_graphs = true;
     const bool verbose = cfg.runtime.verbose;
     if (cfg.distributed.tp_size > 1 &&
         cfg.distributed.tp_rank > 0 &&
@@ -980,16 +978,6 @@ int run_impl(int argc,
                   << "workspace tokens=" << max_workspace_tokens
                   << "; swap_pool=" << swap_pool.num_pages() << " pages\n";
     }
-
-    // bf16 GEMM cuBLASLt pre-tune is wired (see ops/gemm.cpp:pretune_
-    // bf16_gemm and the cached path in gemm_bf16_impl). It is OFF by
-    // default because in benchmarking the autotuned algos consistently
-    // landed 4-5% slower than cublasGemmEx's default routing — cuBLAS
-    // has its own per-call adaptive heuristic that considers runtime
-    // context (concurrent kernels, recent allocations) which a static
-    // "fastest in isolation" picker can't model. The infrastructure
-    // stays in tree so we can revisit with better autotune methodology
-    // (per-shape multi-iteration timing inside a fake fire, etc.).
 
     // Cold-path control thread. Runtime → wrapper (RPC) → us (socketpair)
     // for KV swap operations. Gated on the wrapper having passed a valid
@@ -1438,26 +1426,20 @@ int run_impl(int argc,
                 qo_indptr_h, kv_page_indptr_h,
                 N, R, is_pure_decode, mask_d, mask_indptr_d);
         };
-        // Pure-decode path is graph-safe: all kernel arg pointers are
-        // persistent (PersistentInputs, ws.*, kv_cache pages), the
-        // decode plan is run by the prepare hook *outside* the capture
-        // region (so per-fire scheduling lives in int_buffer at stable
-        // offsets), and flashinfer's plan_info fields are deterministic
-        // given (R, num_q_heads, num_kv_heads, head_dim, page_size).
-        // Activated only when cuda_graphs config is on AND the fire is
-        // pure-decode without a custom mask.
-        forward_fn.graph_safe = true;
     }
 
     pie_cuda_driver::ForwardContext fwd_ctx{
         engine, ws, kv_cache, attn_ws, cublas,
         max_workspace_tokens, persistent_inputs, verbose, std::move(forward_fn),
-        cfg.runtime.cuda_graphs ? &graph_cache : nullptr,
+        use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
         /*slot_alloc=*/{},
     };
     fwd_ctx.tp_cpu_gate_key = cfg.distributed.startup_barrier_path;
+    // Phase D: speculation lives entirely in the runtime now. The
+    // driver no longer runs chain steps; the runtime depth knob is
+    // `scheduler.speculation_depth` in the toml.
     // Size the linear-attn slot allocator only when this arch actually
     // uses a state cache. Default-constructed (max_slots=0) on every
     // other arch — handle_fire_batch's `use_slots` predicate stays false
@@ -1466,7 +1448,7 @@ int run_impl(int argc,
         qwen3_5_state_cache.max_slots() > 0) {
         fwd_ctx.slot_alloc.reset(qwen3_5_state_cache.max_slots());
     }
-    if (verbose && cfg.runtime.cuda_graphs) {
+    if (verbose && use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
 
@@ -1500,17 +1482,17 @@ int run_impl(int argc,
         c.max_batch_tokens = max_workspace_tokens;
         c.swap_pool_size = swap_pool.num_pages();
         nlohmann::json caps = {
-            {"total_pages",      c.total_pages},
-            {"kv_page_size",     c.kv_page_size},
-            {"swap_pool_size",   c.swap_pool_size},
-            {"max_batch_tokens", c.max_batch_tokens},
-            {"max_batch_size",   c.max_batch_size},
-            {"arch_name",        c.arch_name},
-            {"vocab_size",       c.vocab_size},
-            {"max_model_len",    c.max_model_len},
-            {"activation_dtype", c.activation_dtype},
-            {"snapshot_dir",     c.snapshot_dir},
-            {"shmem_name",       cfg.shmem.name},
+            {"total_pages",           c.total_pages},
+            {"kv_page_size",          c.kv_page_size},
+            {"swap_pool_size",        c.swap_pool_size},
+            {"max_batch_tokens",      c.max_batch_tokens},
+            {"max_batch_size",        c.max_batch_size},
+            {"arch_name",             c.arch_name},
+            {"vocab_size",            c.vocab_size},
+            {"max_model_len",         c.max_model_len},
+            {"activation_dtype",      c.activation_dtype},
+            {"snapshot_dir",          c.snapshot_dir},
+            {"shmem_name",            cfg.shmem.name},
         };
         const std::string caps_json = caps.dump();
         ready_cb(caps_json.c_str(), ready_ctx);
@@ -1522,15 +1504,18 @@ int run_impl(int argc,
                       << "resp_buf=" << server_p->resp_buf_size() << ")\n";
         }
         server_p->serve_forever([&](const pie_cuda_driver::SlotRequest& req,
-                                    std::span<std::uint8_t> response) -> std::size_t {
+                                    std::span<std::uint8_t> response,
+                                    pie_cuda_driver::Responder& responder) -> std::size_t {
             ++handled;
-            if (req.method_tag != pie_cuda_driver::METHOD_TAG_FIRE_BATCH) {
-                std::cerr << "[pie-driver-cuda] unsupported method_tag="
-                          << req.method_tag << " req_id=" << req.req_id << "\n";
-                return 0;
+            switch (req.method_tag) {
+                case pie_cuda_driver::METHOD_TAG_FIRE_BATCH:
+                    return pie_cuda_driver::handle_fire_batch(
+                        req, response, responder, fwd_ctx, handled);
+                default:
+                    std::cerr << "[pie-driver-cuda] unsupported method_tag="
+                              << req.method_tag << " req_id=" << req.req_id << "\n";
+                    return 0;
             }
-            return pie_cuda_driver::handle_fire_batch(
-                req, response, fwd_ctx, handled);
         });
         // Leader exited serve loop — wake followers so they can tear
         // down cleanly.

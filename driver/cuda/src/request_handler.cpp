@@ -192,6 +192,7 @@ void tp_broadcast_inputs(NcclComm& comm, PersistentInputs& pi,
 std::size_t handle_fire_batch(
     const SlotRequest& req,
     std::span<std::uint8_t> response,
+    Responder& responder,
     ForwardContext& ctx,
     std::uint64_t handled)
 {
@@ -467,15 +468,8 @@ std::size_t handle_fire_batch(
                 // Persistent inputs (pi.*) provide stable kernel-arg
                 // pointers; the next replay reads new contents from the
                 // same addresses, refreshed by `prepare` above.
-                // Capture-stream plumbing: every kernel inside the body
-                // must launch on `cstream` for the graph to record
-                // anything. The body reads its stream from
-                // `cublas.handle()`, so we swap cublas's stream to
-                // cstream before capture and restore the legacy default
-                // afterwards.
                 cudaStream_t cstream = nullptr;
                 CUDA_CHECK(cudaStreamCreateWithFlags(&cstream, cudaStreamNonBlocking));
-                cublas.set_stream(cstream);
                 CUDA_CHECK(cudaStreamBeginCapture(cstream, cudaStreamCaptureModeRelaxed));
                 forward_fn.body(
                     ws, kv_cache, attn_ws, cublas,
@@ -490,7 +484,6 @@ std::size_t handle_fire_batch(
                     use_slots ? pi.slot_ids.data() : nullptr);
                 cudaGraph_t graph = nullptr;
                 CUDA_CHECK(cudaStreamEndCapture(cstream, &graph));
-                cublas.set_stream(nullptr);
                 CUDA_CHECK(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
                 cudaGraphDestroy(graph);
                 cudaStreamDestroy(cstream);
@@ -644,7 +637,7 @@ std::size_t handle_fire_batch(
         }
 
         dispatch_sampling(
-            ws, pi, pi.sampled.data(),
+            ws, pi.sampled.data(),
             SamplingPlan{
                 any_topk_topp,
                 std::span<const float>(h_per_temp),
@@ -657,16 +650,37 @@ std::size_t handle_fire_batch(
             N, num_sampling, engine.hf_config().vocab_size,
             /*prng_offset=*/static_cast<std::uint64_t>(handled));
 
-        // Async D2H into pinned staging + a single stream sync. The sync
-        // is unavoidable (the host scatter below needs the tokens), but
-        // copying into pinned memory keeps the D2H off the driver's
-        // pageable-staging path and removes a per-fire host allocation.
-        CUDA_CHECK(cudaMemcpyAsync(
-            pi.h_sampled_pinned, pi.sampled.data(),
-            sizeof(std::int32_t) * static_cast<std::size_t>(N),
-            cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaStreamSynchronize(/*stream=*/nullptr));
-        const std::int32_t* all_sampled = pi.h_sampled_pinned;
+        // Only copy the first N entries — `pi.sampled` is sized for
+        // max_workspace_tokens, but only [0, N) are valid this fire.
+        std::vector<std::int32_t> all_sampled(N);
+        CUDA_CHECK(cudaMemcpy(all_sampled.data(), pi.sampled.data(),
+                              sizeof(std::int32_t) * N,
+                              cudaMemcpyDeviceToHost));
+
+        // =====================================================================
+        // Pass-level speculation (phase B4b.3 — async chain firing)
+        //
+        // Two halves, split around the response write below:
+        //
+        //   (pre-respond)  Build `cands` from the real pass's outputs
+        //                  and snapshot any payload-backed data the
+        //                  chain needs. We MUST snapshot before
+        //                  `responder.respond()` fires: once the
+        //                  Rust client unblocks, it can reuse this
+        //                  slot and overwrite the request payload
+        //                  while we're still reading from it.
+        //   (post-respond) Fire chain-step kernels, sample, push
+        //                  events. This runs after responder.respond
+        //                  so the inferlet's WASM time overlaps with
+        //                  the chain.
+        //
+        // Constraints (skip otherwise):
+        //   - has_spec_drafts == false  (combined mode is a later step)
+        //   - use_slots == false        (linear-attn state cache is per-fire)
+        //   - Phase D: chain step removed. Runtime now self-stages
+        //     the next forward pass through the normal scheduler
+        //     queue. The driver is stateless wrt speculation.
+        // =====================================================================
 
         // Flat-path arrays: token sampler is the only slot type allowed
         // here (need_msgpack would have flipped otherwise), so counts
@@ -698,7 +712,7 @@ std::size_t handle_fire_batch(
             std::vector<pie_cuda_driver::response::PerRequestMsgpack> per_req(R);
 
             const MsgpackSubpassContext sub_ctx{
-                ws, pi,
+                ws,
                 R, num_sampling, engine.hf_config().vocab_size,
                 std::span<const std::uint32_t>(per_slot_type),
                 std::span<const float>(per_slot_temp),
@@ -765,6 +779,9 @@ std::size_t handle_fire_batch(
                       << " max_kv=" << max_kv_len
                       << " resp=" << resp_bytes << "B\n";
         }
+
+        // Publish the response to unblock the Rust client.
+        responder.respond(resp_bytes);
         return resp_bytes;
 
     } catch (const std::exception& e) {
