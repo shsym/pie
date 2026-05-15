@@ -1,0 +1,109 @@
+# Dockerfile.portable — Pie with the ggml-backed portable driver.
+#
+# Builds a CPU-capable Pie server image. The portable driver is the default
+# Cargo feature for `pie-server`; it statically links llama.cpp's ggml
+# library and runs models loaded from HuggingFace safetensors. No CUDA, no
+# PyTorch, no flashinfer.
+#
+# Build:
+#   docker build -f Dockerfile.portable -t pieproject/pie:portable .
+# Or with the development stage:
+#   docker build -f Dockerfile.portable --target development -t pieproject/pie:portable-dev .
+#
+# Run:
+#   docker run -p 9090:9090 -v ~/.cache/pie:/root/.cache/pie pieproject/pie:portable
+#
+# Inferlets bundled into the image come from `inferlets/` (the in-repo
+# examples). To run hardened inferlets from the sibling `pie-inferlets`
+# repo, mount the .wasm into /workspace/inferlets/ at runtime:
+#   -v ~/Workspace/pie-inferlets/target/wasm32-wasip2/release:/workspace/inferlets/external:ro
+
+# ============================================================================
+# Stage 1: Builder — full toolchain, builds pie + the example inferlets
+# ============================================================================
+FROM ubuntu:24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git \
+        build-essential cmake ninja-build pkg-config \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain + wasm32-wasip2 target (for building inferlets in-tree).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal \
+    && rustup target add wasm32-wasip2
+
+WORKDIR /workspace
+COPY . .
+
+# Build the pie binary with default features (driver-portable + driver-dummy).
+# The build.rs invokes cmake to compile the ggml static lib for the driver.
+RUN cargo install --path server --root /usr/local
+
+# Build the in-repo example inferlets to wasm.
+RUN cd inferlets \
+    && for d in helloworld text-completion; do \
+        (cd "$d" && cargo build --target wasm32-wasip2 --release); \
+    done
+
+# Pre-create a Pie config tuned for Docker: host bound to 0.0.0.0 so the
+# server is reachable from the container host. `pie config init` writes
+# the template that matches the compiled flavor (portable in this image).
+RUN mkdir -p /workspace/runtime \
+    && pie config init --path /workspace/runtime/docker_config.toml --force \
+    && pie config set server.host 0.0.0.0 --path /workspace/runtime/docker_config.toml
+
+# ============================================================================
+# Stage 2: Development — keep the full builder stage for iteration
+# ============================================================================
+FROM builder AS development
+
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# 9090 = Pie WebSocket protocol (pie-client, pie-litellm)
+EXPOSE 9090
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]
+
+# ============================================================================
+# Stage 3: Runtime — slim, binary-only
+# ============================================================================
+FROM ubuntu:24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIE_HOME=/root/.cache/pie \
+    PATH="/usr/local/bin:${PATH}"
+
+# Runtime shared libraries the statically-linked pie binary still needs:
+#   - libstdc++6: C++ stdlib used by ggml
+#   - libgomp1:   OpenMP for ggml's CPU kernels
+#   - libssl3:    TLS for model registry / HuggingFace downloads
+#   - ca-certificates: trust store for HTTPS
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libstdc++6 libgomp1 libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Copy the pie binary + built inferlets + the Docker config.
+COPY --from=builder /usr/local/bin/pie /usr/local/bin/pie
+COPY --from=builder /workspace/inferlets/text-completion/target/wasm32-wasip2/release/*.wasm /workspace/inferlets/
+COPY --from=builder /workspace/inferlets/helloworld/target/wasm32-wasip2/release/*.wasm /workspace/inferlets/
+COPY --from=builder /workspace/runtime/docker_config.toml /workspace/runtime/docker_config.toml
+
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# 9090 = Pie WebSocket protocol (pie-client, pie-litellm)
+EXPOSE 9090
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]

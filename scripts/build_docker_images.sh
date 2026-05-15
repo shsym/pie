@@ -1,105 +1,91 @@
 #!/bin/bash
-# Build Pie Docker images for verified CUDA/PyTorch combinations
-# Only specific tested versions are supported
+# Build Pie Docker images.
+#
+# Variants:
+#   portable — CPU/ggml-backed; small, runs anywhere; ~/.cache/pie cache vol.
+#   cuda     — TBD (the previous Dockerfile referenced deleted paths and was
+#              removed pending a rewrite for the new driver/ architecture).
+#
+# Usage:
+#   scripts/build_docker_images.sh              # build all variants
+#   scripts/build_docker_images.sh portable     # build only the portable variant
+#   PIE_IMAGE_REPO=ghcr.io/pie-project/pie scripts/build_docker_images.sh
+#
+# Tags produced (REPO defaults to "pieproject/pie"):
+#   $REPO:portable        — runtime stage (slim)
+#   $REPO:portable-dev    — development stage (full builder toolchain)
 
-set -e
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO="${PIE_IMAGE_REPO:-pieproject/pie}"
 
-# Check if running as root
 if [ "$EUID" -eq 0 ]; then
     SUDO=""
 else
     SUDO="sudo"
 fi
 
-# Verified CUDA/PyTorch combinations
-# Format: "CUDA_VERSION:CUDA_MINOR:PYTORCH_CUDA:TAG"
-declare -a VERIFIED_CONFIGS=(
-    "12.6:1:cu126:cuda12.6"
-)
+# Variants requested on the command line. Default = all known variants.
+if [ $# -gt 0 ]; then
+    VARIANTS=("$@")
+else
+    VARIANTS=(portable)
+fi
 
-echo "=================================================="
-echo "Building Pie Docker Images"
-echo "=================================================="
-echo ""
-echo "Verified configurations:"
-for config in "${VERIFIED_CONFIGS[@]}"; do
-    IFS=':' read -r cuda_ver cuda_minor torch_cuda tag <<< "$config"
-    echo "  - CUDA ${cuda_ver}.${cuda_minor} + PyTorch ${torch_cuda}"
-    echo "    → pie:${tag}-latest"
-    echo "    → pie:${tag}-dev"
-done
-echo ""
-
-cd "$PROJECT_ROOT"
-
-# Build each verified configuration
-for config in "${VERIFIED_CONFIGS[@]}"; do
-    IFS=':' read -r cuda_ver cuda_minor torch_cuda tag <<< "$config"
-
-    echo "Building pie:${tag}-latest..."
-    echo "→ CUDA: ${cuda_ver}.${cuda_minor}"
-    echo "→ PyTorch: ${torch_cuda}"
-
+build_portable() {
+    echo "=================================================="
+    echo "Building ${REPO}:portable (runtime stage, slim)"
+    echo "=================================================="
     $SUDO docker build \
-        --build-arg CUDA_VERSION=${cuda_ver} \
-        --build-arg CUDA_MINOR=${cuda_minor} \
-        --build-arg PYTORCH_CUDA=${torch_cuda} \
-        -t pie:${tag} \
-        -t pie:latest \
-        .
-
-    echo "✓ Built pie:${tag}-latest"
+        -f "$PROJECT_ROOT/Dockerfile.portable" \
+        --target runtime \
+        -t "${REPO}:portable" \
+        "$PROJECT_ROOT"
+    echo "✓ ${REPO}:portable"
     echo ""
 
-    echo "Building pie:${tag}-dev..."
-    echo "→ CUDA: ${cuda_ver}.${cuda_minor}"
-    echo "→ PyTorch: ${torch_cuda}"
-
+    echo "=================================================="
+    echo "Building ${REPO}:portable-dev (development stage)"
+    echo "=================================================="
     $SUDO docker build \
-        --build-arg CUDA_VERSION=${cuda_ver} \
-        --build-arg CUDA_MINOR=${cuda_minor} \
-        --build-arg PYTORCH_CUDA=${torch_cuda} \
+        -f "$PROJECT_ROOT/Dockerfile.portable" \
         --target development \
-        -t pie:${tag}-dev \
-        -t pie:dev \
-        .
-
-    echo "✓ Built pie:${tag}-dev"
+        -t "${REPO}:portable-dev" \
+        "$PROJECT_ROOT"
+    echo "✓ ${REPO}:portable-dev"
     echo ""
+}
+
+for variant in "${VARIANTS[@]}"; do
+    case "$variant" in
+        portable) build_portable ;;
+        cuda)
+            echo "ERROR: cuda variant is TBD — needs Dockerfile.cuda rewrite for the new driver/ architecture." >&2
+            exit 2
+            ;;
+        *)
+            echo "ERROR: unknown variant '$variant' (expected: portable | cuda)" >&2
+            exit 2
+            ;;
+    esac
 done
 
 echo "=================================================="
 echo "Build Summary"
 echo "=================================================="
+$SUDO docker images | grep -E "^${REPO//\//\\/}\s+(portable|cuda)" || true
 echo ""
-echo "Available images:"
-$SUDO docker images | grep -E "^pie" || echo "No pie images found"
-echo ""
-echo "To run:"
-echo "  Latest: $SUDO docker run --gpus all -d -p 8080:8080 -v ~/.cache:/root/.cache pie:latest"
-echo "  Development: $SUDO docker run --gpus all -d -p 8080:8080 -v ~/.cache:/root/.cache pie:dev"
-echo ""
-echo "With authentication setup (pass SSH public key):"
-echo "  $SUDO docker run --gpus all -d -p 8080:8080 \\"
-echo "    -e PIE_AUTH_USER=\"myuser\" \\"
-echo "    -e PIE_AUTH_KEY=\"\$(cat ~/.ssh/id_ed25519.pub)\" \\"
-echo "    -v ~/.cache:/root/.cache \\"
-echo "    pie:latest"
-echo ""
-echo "Or mount key file:"
-echo "  $SUDO docker run --gpus all -d -p 8080:8080 \\"
-echo "    -e PIE_AUTH_USER=\"myuser\" \\"
-echo "    -e PIE_AUTH_KEY_FILE=\"/keys/id_ed25519.pub\" \\"
-echo "    -v ~/.ssh/id_ed25519.pub:/keys/id_ed25519.pub:ro \\"
-echo "    -v ~/.cache:/root/.cache \\"
-echo "    pie:latest"
-echo ""
-echo "Note: Mount ~/.cache (not just ~/.cache/pie) to persist both models and FlashInfer JIT cache"
+echo "To run portable variant:"
+echo "  docker run --rm -p 9090:9090 \\"
+echo "    -v ~/.cache/pie:/root/.cache/pie \\"
+echo "    ${REPO}:portable"
 echo ""
 echo "To download a model first:"
-echo "  $SUDO docker run --rm --gpus all -v ~/.cache:/root/.cache pie:latest pie model add \"llama-3.2-1b-instruct\""
+echo "  docker run --rm -v ~/.cache/pie:/root/.cache/pie ${REPO}:portable \\"
+echo "    pie model add \"Qwen/Qwen3-0.6B\""
 echo ""
-echo "Build complete!"
+echo "Auth setup (pass SSH public key via env or file):"
+echo "  -e PIE_AUTH_USER=myuser -e PIE_AUTH_KEY=\"\$(cat ~/.ssh/id_ed25519.pub)\""
+echo ""
