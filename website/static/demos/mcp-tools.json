@@ -4,8 +4,7 @@
   "tagline": "In Pie the tool-use loop runs inside the engine. User code detects a tool call, runs it in the same WASM module, feeds the result back into the KV cache — no client round-trip per call.",
   "question": "What's the temperature in Paris in Celsius? Use get_temperature, then fahrenheit_to_celsius.",
   "naive": {
-    "label": "With Stock API",
-    "note": "(via vLLM/SGLang/llama.cpp)",
+    "label": "Naive",
     "sublabel": "client-driven loop — each tool call ships out and back",
     "tone": "warn",
     "events": [
@@ -67,7 +66,7 @@
     ]
   },
   "pie": {
-    "label": "With Pie",
+    "label": "Pie",
     "sublabel": "tools run in the inferlet — same WASM, no transport",
     "tone": "good",
     "events": [

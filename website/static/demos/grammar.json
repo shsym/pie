@@ -4,8 +4,7 @@
   "tagline": "In Pie the logit mask is user code. JSON Schema is a built-in, and the Constrain trait lets you write your own state machine when the built-ins do not fit.",
   "question": "Bio: \"Hi, I am Bob, bob@x.io, 35yo.\" — extract {name, email, age}.",
   "naive": {
-    "label": "With Stock API",
-    "note": "(via vLLM/SGLang/llama.cpp)",
+    "label": "Naive",
     "sublabel": "free decode (no response_format) → strict JSON parse → retry on failure",
     "tone": "warn",
     "events": [
@@ -67,7 +66,7 @@
     ]
   },
   "pie": {
-    "label": "With Pie",
+    "label": "Pie",
     "sublabel": "constrain_with(JsonSchema) — built in; or write your own Constrain impl",
     "tone": "good",
     "events": [

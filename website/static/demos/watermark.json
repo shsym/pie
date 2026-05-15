@@ -4,8 +4,7 @@
   "tagline": "In Pie the sampler and per-token distribution are exposed to user code. Apply a green-list bias before sampling, then run a detector in the same engine. Both outputs read naturally; only one carries a verifiable signal.",
   "question": "Explain in three sentences how LLMs decode tokens. Plain ASCII, no markdown.",
   "naive": {
-    "label": "With Stock API",
-    "note": "(via vLLM/SGLang/llama.cpp)",
+    "label": "Naive",
     "sublabel": "argmax sample from the model's distribution — no bias",
     "tone": "warn",
     "events": [
@@ -37,7 +36,7 @@
     ]
   },
   "pie": {
-    "label": "With Pie",
+    "label": "Pie",
     "sublabel": "+δ bias on green-list logits, then argmax of the biased distribution",
     "tone": "good",
     "events": [

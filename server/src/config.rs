@@ -408,6 +408,17 @@ pub struct DriverConfig {
     pub activation_dtype: String,
     #[serde(default = "default_random_seed")]
     pub random_seed: u64,
+    /// IPC wait profile. `balanced` is the default hybrid path;
+    /// `low_latency` busy-polls for fastest wakeups; `low_power`
+    /// parks immediately whenever no work is ready.
+    #[serde(default)]
+    pub ipc_profile: IpcProfile,
+    /// Expert override for the profile's busy-spin window, in µs.
+    ///
+    /// Leave unset for the profile default. `0` parks immediately;
+    /// larger values trade CPU for lower wake latency.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spin_budget_us: Option<u64>,
     /// Driver-specific knobs. Embedded drivers parse this into typed
     /// option structs; Python drivers receive the raw table after
     /// standalone-only `venv` / `python` keys are stripped.
@@ -416,6 +427,15 @@ pub struct DriverConfig {
 }
 
 impl DriverConfig {
+    pub fn effective_spin_budget_us(&self) -> u64 {
+        self.spin_budget_us
+            .unwrap_or_else(|| self.ipc_profile.default_spin_budget_us())
+    }
+
+    pub fn use_inproc_polling_channel(&self) -> bool {
+        self.ipc_profile == IpcProfile::LowLatency
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(
             !self.device.is_empty(),
@@ -476,6 +496,30 @@ fn validate_subprocess_driver_options(options: &toml::Table, kind: DriverKind) -
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IpcProfile {
+    /// Lowest wake latency. Uses the polling in-process channel for
+    /// embedded drivers and unbounded busy-spin for shmem drivers
+    /// unless `spin_budget_us` overrides it.
+    LowLatency,
+    /// Hybrid spin-then-park path. Good default for GPU-bound work.
+    #[default]
+    Balanced,
+    /// Park immediately after an empty poll. Minimizes idle CPU.
+    LowPower,
+}
+
+impl IpcProfile {
+    pub fn default_spin_budget_us(self) -> u64 {
+        match self {
+            Self::LowLatency => u64::MAX,
+            Self::Balanced => default_spin_budget_us(),
+            Self::LowPower => 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverKind {
@@ -517,6 +561,11 @@ fn default_activation_dtype() -> String {
 }
 fn default_random_seed() -> u64 {
     42
+}
+/// Default busy-spin budget (µs) before the driver-side channel falls
+/// back to parking. Matches `pie::driver::InProcChannel::new()`.
+fn default_spin_budget_us() -> u64 {
+    1_000
 }
 
 /// Accept either a single string or a list of strings, matching
@@ -664,6 +713,11 @@ pub struct CudaNativeDriverOptions {
     pub max_num_kv_pages: u32,
     pub swap_pool_size: u32,
     pub weight_dtype: String,
+    /// CUDA device string, e.g. `"cuda:0"`. Populated by the caller
+    /// from `model.driver.device`; set on the C++ side via
+    /// `cudaSetDevice` (see `driver/cuda/src/engine.cpp`).
+    #[serde(skip)]
+    pub device: String,
     #[serde(skip)]
     pub verbose: bool,
     /// Runtime quantization mode applied after weight load. Empty = none;
@@ -687,6 +741,7 @@ impl Default for CudaNativeDriverOptions {
             max_num_kv_pages: 1024,
             swap_pool_size: 0,
             weight_dtype: "bfloat16".to_string(),
+            device: String::new(),
             verbose: false,
             runtime_quant: String::new(),
             ready_timeout_s: 600.0,
@@ -716,7 +771,52 @@ device = ["cpu"]
         assert_eq!(cfg.models.len(), 1);
         assert_eq!(cfg.models[0].driver.kind, DriverKind::Portable);
         assert_eq!(cfg.models[0].driver.device, vec!["cpu".to_string()]);
+        assert_eq!(cfg.models[0].driver.ipc_profile, IpcProfile::Balanced);
+        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 1_000);
         assert_eq!(cfg.server.port, 8080);
+    }
+
+    #[test]
+    fn parses_ipc_profiles_and_spin_override() {
+        let low_latency = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "portable"
+device = "cpu"
+ipc_profile = "low_latency"
+"#;
+        let cfg: Config = toml::from_str(low_latency).unwrap();
+        assert_eq!(cfg.models[0].driver.ipc_profile, IpcProfile::LowLatency);
+        assert!(cfg.models[0].driver.use_inproc_polling_channel());
+        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), u64::MAX);
+
+        let low_power = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "portable"
+device = "cpu"
+ipc_profile = "low_power"
+"#;
+        let cfg: Config = toml::from_str(low_power).unwrap();
+        assert_eq!(cfg.models[0].driver.ipc_profile, IpcProfile::LowPower);
+        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 0);
+
+        let override_spin = r#"
+[[model]]
+name = "m"
+hf_repo = "x"
+[model.driver]
+type = "portable"
+device = "cpu"
+ipc_profile = "low_latency"
+spin_budget_us = 25
+"#;
+        let cfg: Config = toml::from_str(override_spin).unwrap();
+        assert_eq!(cfg.models[0].driver.effective_spin_budget_us(), 25);
     }
 
     #[test]
