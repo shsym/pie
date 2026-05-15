@@ -11,7 +11,7 @@
 #   docker build -f Dockerfile.portable --target development -t pieproject/pie:portable-dev .
 #
 # Run:
-#   docker run -p 9090:9090 -v ~/.cache/pie:/root/.cache/pie pieproject/pie:portable
+#   docker run -p 8080:8080 -v ~/.cache/pie:/root/.cache/pie pieproject/pie:portable
 #
 # Inferlets bundled into the image come from `inferlets/` (the in-repo
 # examples). To run hardened inferlets from the sibling `pie-inferlets`
@@ -67,8 +67,8 @@ FROM builder AS development
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# 9090 = Pie WebSocket protocol (pie-client, pie-litellm)
-EXPOSE 9090
+# 8080 = Pie WebSocket protocol (pie-client, pie-litellm)
+EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]
@@ -102,8 +102,8 @@ COPY --from=builder /workspace/runtime/docker_config.toml /workspace/runtime/doc
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
-# 9090 = Pie WebSocket protocol (pie-client, pie-litellm)
-EXPOSE 9090
+# 8080 = Pie WebSocket protocol (pie-client, pie-litellm)
+EXPOSE 8080
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]

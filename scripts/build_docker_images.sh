@@ -78,7 +78,7 @@ echo "=================================================="
 $SUDO docker images | grep -E "^${REPO//\//\\/}\s+(portable|cuda)" || true
 echo ""
 echo "To run portable variant:"
-echo "  docker run --rm -p 9090:9090 \\"
+echo "  docker run --rm -p 8080:8080 \\"
 echo "    -v ~/.cache/pie:/root/.cache/pie \\"
 echo "    ${REPO}:portable"
 echo ""
