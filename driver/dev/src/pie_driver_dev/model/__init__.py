@@ -5,7 +5,7 @@ from types import ModuleType
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
+    from ..config import RuntimeConfig
 
 
 # =============================================================================

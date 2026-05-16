@@ -11,9 +11,9 @@ import torch.distributed as dist
 import math
 
 from . import ModelConfig as ModelConfigBase
-from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
+from ..config import RuntimeConfig
 from ..adapter import AdapterSubpass
-from pie_driver_dev.utils import get_available_memory
+from ..utils import get_available_memory
 from ..schema import Schema, Source, WeightStore
 
 import pie_kernels as ops

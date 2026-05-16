@@ -11,17 +11,15 @@
 
 #include <algorithm>
 #include <atomic>
-#include <barrier>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <iostream>
-#include <memory>
 #include <mutex>
 #include <span>
 #include <string>
-#include <unordered_map>
 #include <utility>
 
 #include <CLI/CLI.hpp>
@@ -34,8 +32,9 @@
 #include "attention_workspace.hpp"
 #include "brle.hpp"
 #include "config.hpp"
+#include "control_socket.hpp"
 #include "cuda_check.hpp"
-#include "model/loaded_model.hpp"
+#include "engine.hpp"
 #include "kernels/argmax.hpp"
 #include "kernels/sample_flashinfer.hpp"
 #include "kernels/sample_temp.hpp"
@@ -57,23 +56,22 @@
 #include <thread>
 #include <unistd.h>
 #include "ops/gemm.hpp"
-#include "executor/executor.hpp"
-#include "service/inproc_service.hpp"
-#include <pie_bridge/inproc_server.hpp>
+#include "request_handler.hpp"
+#include "shmem_ipc.hpp"
 
 namespace {
 
 std::mutex g_servers_mu;
-std::vector<pie_driver::InProcServer*> g_servers;
-std::atomic<pie_driver::InProcServer*> g_signal_server{nullptr};
+std::vector<pie_cuda_driver::ShmemServer*> g_servers;
+std::atomic<pie_cuda_driver::ShmemServer*> g_signal_server{nullptr};
 
-void register_server(pie_driver::InProcServer* server) {
+void register_server(pie_cuda_driver::ShmemServer* server) {
     std::lock_guard<std::mutex> lk(g_servers_mu);
     g_servers.push_back(server);
     g_signal_server.store(server);
 }
 
-void unregister_server(pie_driver::InProcServer* server) {
+void unregister_server(pie_cuda_driver::ShmemServer* server) {
     std::lock_guard<std::mutex> lk(g_servers_mu);
     g_servers.erase(
         std::remove(g_servers.begin(), g_servers.end(), server),
@@ -84,7 +82,7 @@ void unregister_server(pie_driver::InProcServer* server) {
 }
 
 void stop_servers() {
-    std::vector<pie_driver::InProcServer*> servers;
+    std::vector<pie_cuda_driver::ShmemServer*> servers;
     {
         std::lock_guard<std::mutex> lk(g_servers_mu);
         servers = g_servers;
@@ -98,31 +96,38 @@ void on_signal(int) {
     if (auto* server = g_signal_server.load()) server->stop();
 }
 
-// All TP ranks in one DP group are threads in the same pie-server
-// process. Rendezvous via an in-process `std::barrier` keyed by the
-// shared `nccl_unique_id_hex` (which is per-DP-group by construction).
-// `nccl_unique_id_hex` doubles as `tp_cpu_gate_key` for the per-fire
-// CPU gate downstream (executor/executor.cpp).
 void tp_startup_cpu_barrier(const pie_cuda_driver::Config& cfg) {
-    if (cfg.distributed.tp_size <= 1) return;
-
-    const std::string& key = cfg.distributed.nccl_unique_id_hex;
-    if (key.empty()) return;
-
-    static std::mutex registry_mu;
-    static std::unordered_map<std::string, std::shared_ptr<std::barrier<>>>
-        registry;
-
-    std::shared_ptr<std::barrier<>> b;
-    {
-        std::lock_guard<std::mutex> lk(registry_mu);
-        auto& entry = registry[key];
-        if (!entry) {
-            entry = std::make_shared<std::barrier<>>(cfg.distributed.tp_size);
-        }
-        b = entry;
+    if (cfg.distributed.tp_size <= 1 ||
+        cfg.distributed.startup_barrier_path.empty()) {
+        return;
     }
-    b->arrive_and_wait();
+
+    const std::filesystem::path base(cfg.distributed.startup_barrier_path);
+    if (base.has_parent_path()) {
+        std::filesystem::create_directories(base.parent_path());
+    }
+    const auto rank_path =
+        base.string() + ".rank" + std::to_string(cfg.distributed.tp_rank);
+    {
+        std::ofstream f(rank_path, std::ios::out | std::ios::trunc);
+        f << "ready\n";
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(600);
+    while (std::chrono::steady_clock::now() < deadline) {
+        bool all_ready = true;
+        for (int r = 0; r < cfg.distributed.tp_size; ++r) {
+            const auto p = base.string() + ".rank" + std::to_string(r);
+            if (!std::filesystem::exists(p)) {
+                all_ready = false;
+                break;
+            }
+        }
+        if (all_ready) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    throw std::runtime_error("timed out waiting for TP startup CPU barrier");
 }
 
 }  // namespace
@@ -139,7 +144,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                bool decode_after_prefill = false,
                pie_cuda_driver::NcclComm* tp_comm = nullptr)
 {
-    auto engine = pie_cuda_driver::LoadedModel::load(cfg, tp_comm);
+    auto engine = pie_cuda_driver::Engine::load(cfg, tp_comm);
     const auto& mt_for_parity = engine.hf_config().model_type;
     const bool is_gpt_oss  = (mt_for_parity == "gpt_oss");
     const bool is_gemma3n  = (mt_for_parity == "gemma3n" || mt_for_parity == "gemma3n_text");
@@ -505,15 +510,11 @@ int run_parity(const pie_cuda_driver::Config& cfg,
 
 namespace {
 
-// `vtable_opt` is non-null for the in-process serve loop; null for the
-// parity-only standalone entry (`pie_driver_cuda_run`), which exits
-// after running the parity test and never enters serve_forever.
 int run_impl(int argc,
              char** argv,
              int install_signal_handlers,
              pie_driver_cuda_ready_cb ready_cb,
-             void* ready_ctx,
-             const pie_driver::PieInProcVTable* vtable_opt) {
+             void* ready_ctx) {
     if (ready_cb == nullptr) {
         std::cerr << "[pie-driver-cuda] fatal: ready_cb is null\n";
         return -1;
@@ -532,22 +533,22 @@ int run_impl(int argc,
     parity->add_option("--parity-out", parity_out,
                        "Where to write the last-token logits as bf16 [vocab]");
     parity->add_flag("--parity-paged", parity_paged,
-                     "Run the paged forward path (wire-shaped KV layout)");
+                     "Run the paged forward path (BPIQ-shaped KV layout)");
     parity->add_flag("--parity-decode-after-prefill", parity_decode_after_prefill,
                      "After prefill on the first N-1 tokens, run a single "
                      "qo_len=1 decode step at position N-1 and dump that "
                      "step's logits. Exercises the decode kernel + KV-cache "
                      "read path in addition to prefill. Requires --parity-paged.");
 
-    // Default-on under llama-like. `enable_cuda_graph=true` on the
-    // flashinfer DecodePlan side pins plan_info layout (padded_batch_size,
-    // request_indices_offset, …) across fires; per-fire DecodePlan calls
-    // only update int_buf content (request_indices, block_valid_mask), and
-    // device pointers stay stable. See `forward_fn.graph_safe = true` below.
-    bool use_cuda_graphs = true;
-    app.add_flag("--cuda-graphs,!--no-cuda-graphs", use_cuda_graphs,
+    bool use_cuda_graphs = false;
+    app.add_flag("--cuda-graphs", use_cuda_graphs,
                  "Capture decode forward into CUDA graphs and replay per "
-                 "shape bucket. Default on for cuda_native.");
+                 "shape bucket. Experimental; default off.");
+
+    int control_fd = -1;
+    app.add_option("--control-fd", control_fd,
+                   "Pre-opened SOCK_SEQPACKET fd for the wrapper control "
+                   "channel (copy_d2h / copy_h2d / copy_d2d / copy_h2h).");
 
     // Tensor-parallel knobs. Override [distributed] in the TOML when
     // present so the wrapper can launch ad-hoc TP groups without
@@ -596,10 +597,12 @@ int run_impl(int argc,
     }
 
     // Informational logs go to stderr — stdout is reserved for the READY
-    // handshake line consumed by the host process.
+    // handshake line consumed by the Python wrapper.
     if (verbose) {
         std::cerr << "[pie-driver-cuda] config loaded\n"
-                  << "  model.snap_dir  = " << cfg.model.snapshot_dir << "\n"
+                  << "  shmem.name      = " << cfg.shmem.name << "\n"
+                  << "  shmem.num_slots = " << cfg.shmem.num_slots << "\n"
+                  << "  model.hf_repo   = " << cfg.model.hf_repo << "\n"
                   << "  model.device    = " << cfg.model.device << "\n"
                   << "  model.dtype     = " << cfg.model.dtype << "\n"
                   << "  tp_size         = " << cfg.distributed.tp_size << "\n"
@@ -687,7 +690,7 @@ int run_impl(int argc,
                           parity_decode_after_prefill, tp_comm_ptr);
     }
 
-    auto engine = pie_cuda_driver::LoadedModel::load(cfg, tp_comm_ptr);
+    auto engine = pie_cuda_driver::Engine::load(cfg, tp_comm_ptr);
 
     {
         const auto& mt = engine.hf_config().model_type;
@@ -975,26 +978,61 @@ int run_impl(int argc,
                   << "; swap_pool=" << swap_pool.num_pages() << " pages\n";
     }
 
-    // Followers skip the server: rank 0 owns the fast path and broadcasts
-    // each fire to followers via NCCL. tp_follower_serve (entered at the
-    // end of run_impl) consumes those broadcasts and exits via
-    // `tp_send_shutdown` from rank 0 once the next broadcast completes.
+    // Cold-path control thread. Runtime → wrapper (RPC) → us (socketpair)
+    // for KV swap operations. Gated on the wrapper having passed a valid
+    // --control-fd; otherwise we just don't service swap requests, which is
+    // fine when swap_pool_size==0 (admission control prevents the runtime
+    // from issuing them).
+    std::thread control_thread;
+    if (control_fd >= 0) {
+        control_thread = std::thread([&swap_pool, &kv_cache, control_fd] {
+            pie_cuda_driver::serve_control_socket(
+                control_fd,
+                [&swap_pool, &kv_cache](
+                    const pie_cuda_driver::CtrlRequest& req) -> std::uint32_t {
+                    using namespace pie_cuda_driver;
+                    std::span<const std::uint32_t> srcs(
+                        req.src_dst_pairs, req.num_pairs);
+                    std::span<const std::uint32_t> dsts(
+                        req.src_dst_pairs + req.num_pairs, req.num_pairs);
+                    // Pairs are laid out as [src_0, src_1, ..., dst_0, dst_1, ...]
+                    // so we can pass two contiguous spans without rebuilding.
+                    switch (req.method) {
+                        case CTRL_METHOD_COPY_D2H:
+                            swap_pool.copy_d2h(kv_cache, srcs, dsts);
+                            return 0;
+                        case CTRL_METHOD_COPY_H2D:
+                            swap_pool.copy_h2d(kv_cache, srcs, dsts);
+                            return 0;
+                        case CTRL_METHOD_COPY_D2D:
+                            swap_pool.copy_d2d(kv_cache, srcs, dsts);
+                            return 0;
+                        case CTRL_METHOD_COPY_H2H:
+                            swap_pool.copy_h2h(srcs, dsts);
+                            return 0;
+                        default:
+                            return 3;  // unknown method
+                    }
+                });
+        });
+    }
+
+    // Followers skip the shmem server: rank 0 owns the shmem fast path
+    // and broadcasts each fire to followers via NCCL. tp_follower_serve
+    // (entered at the end of run_impl) consumes those broadcasts and
+    // exits via `tp_send_shutdown` from rank 0 once the next broadcast
+    // completes.
     const bool is_tp_follower =
         cfg.distributed.tp_size > 1 && cfg.distributed.tp_rank > 0;
-    std::unique_ptr<pie_driver::InProcServer> server_p;
-    if (!is_tp_follower && vtable_opt != nullptr) {
-        // Response scratch lives in the per-backend `ResponseBuilder`
-        // inside Executor — no central byte buffer on this path.
-        server_p = std::make_unique<pie_driver::InProcServer>(*vtable_opt);
+    std::unique_ptr<pie_cuda_driver::ShmemServer> server_p;
+    if (!is_tp_follower) {
+        server_p = std::make_unique<pie_cuda_driver::ShmemServer>(
+            cfg.shmem.name,
+            cfg.shmem.num_slots,
+            cfg.shmem.req_buf,
+            cfg.shmem.resp_buf,
+            cfg.shmem.spin_us);
         register_server(server_p.get());
-    } else if (!is_tp_follower && vtable_opt == nullptr) {
-        // Parity-only invocation should have returned by now (the parity
-        // branch above exits before reaching here). Falling through means
-        // the caller didn't set parity flags — error out instead of
-        // hanging without a server.
-        std::cerr << "[pie-driver-cuda] standalone binary supports parity "
-                     "tests only; embed via pie_driver_cuda_run_inproc\n";
-        return 2;
     }
 
     if (install_signal_handlers) {
@@ -1355,17 +1393,6 @@ int run_impl(int argc,
                 slot_ids_h, is_fresh_h, slot_ids_d);
         };
     } else {
-        // Llama-like decode is graph-replay-safe because (a) the body
-        // is host-work-free (the prepare hook hoisted DecodePlan out of
-        // the capture region); (b) flashinfer's plan_info layout is
-        // pinned across fires when `enable_cuda_graph=true` —
-        // `padded_batch_size = max_grid_size / gdy` (stable), and the
-        // int_buf offsets are deterministic from that; (c) per-fire,
-        // DecodePlan only refreshes int_buf content (request_indices,
-        // kv_tile_indices, o_indptr, block_valid_mask) at the same
-        // device offsets, so the captured kernel reads fresh data through
-        // its stable pointer args.
-        forward_fn.graph_safe = true;
         forward_fn.prepare = [&engine, &kv_cache, &fwd_cfg, &llama_plan](
             pie_cuda_driver::AttentionWorkspace& attn_ws,
             const std::uint32_t* kv_page_indptr_h,
@@ -1400,26 +1427,22 @@ int run_impl(int argc,
         };
     }
 
-    pie_cuda_driver::Executor executor{
+    pie_cuda_driver::ForwardContext fwd_ctx{
         engine, ws, kv_cache, attn_ws, cublas,
         max_workspace_tokens, persistent_inputs, verbose, std::move(forward_fn),
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
         /*slot_alloc=*/{},
-        /*response_builder=*/{},
     };
-    executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
-    // Speculation lives entirely in the runtime. The driver runs
-    // forward passes; the runtime's `scheduler.speculation_depth`
-    // toml knob controls per-ctx chain depth.
+    fwd_ctx.tp_cpu_gate_key = cfg.distributed.startup_barrier_path;
     // Size the linear-attn slot allocator only when this arch actually
     // uses a state cache. Default-constructed (max_slots=0) on every
     // other arch — handle_fire_batch's `use_slots` predicate stays false
     // and the body's slot_ids/is_fresh args remain nullptr.
     if ((is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
         qwen3_5_state_cache.max_slots() > 0) {
-        executor.slot_alloc.reset(qwen3_5_state_cache.max_slots());
+        fwd_ctx.slot_alloc.reset(qwen3_5_state_cache.max_slots());
     }
     if (verbose && use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
@@ -1438,14 +1461,14 @@ int run_impl(int argc,
             std::cerr << "[pie-driver-cuda] tp follower rank "
                       << cfg.distributed.tp_rank
                       << " ready (waiting on rank-0 broadcasts"
-                      << (executor.tp_cpu_gate_key.empty()
+                      << (fwd_ctx.tp_cpu_gate_key.empty()
                               ? ", cpu_gate=off"
                               : ", cpu_gate=on")
                       << ")\n";
         }
         // Followers: block on rank-0 broadcasts until shutdown.
         std::atomic<bool> stop{false};
-        pie_cuda_driver::tp_follower_serve(executor, stop);
+        pie_cuda_driver::tp_follower_serve(fwd_ctx, stop);
     } else {
         // Capabilities reflect both the loaded HF config and the live
         // KV cache. Only rank 0 reports — the wrapper expects exactly
@@ -1465,22 +1488,33 @@ int run_impl(int argc,
             {"max_model_len",    c.max_model_len},
             {"activation_dtype", c.activation_dtype},
             {"snapshot_dir",     c.snapshot_dir},
+            {"shmem_name",       cfg.shmem.name},
         };
         const std::string caps_json = caps.dump();
         ready_cb(caps_json.c_str(), ready_ctx);
 
         if (verbose) {
-            std::cerr << "[pie-driver-cuda] serving on in-process channel\n";
+            std::cerr << "[pie-driver-cuda] serving on shmem " << server_p->name()
+                      << " (" << server_p->num_slots() << " slots, "
+                      << "req_buf=" << server_p->req_buf_size() << ", "
+                      << "resp_buf=" << server_p->resp_buf_size() << ")\n";
         }
-        pie_cuda_driver::service::InProcService service{
-            executor, kv_cache, swap_pool};
-        service.serve_forever(*server_p);
-        handled = service.handled();
+        server_p->serve_forever([&](const pie_cuda_driver::SlotRequest& req,
+                                    std::span<std::uint8_t> response) -> std::size_t {
+            ++handled;
+            if (req.method_tag != pie_cuda_driver::METHOD_TAG_FIRE_BATCH) {
+                std::cerr << "[pie-driver-cuda] unsupported method_tag="
+                          << req.method_tag << " req_id=" << req.req_id << "\n";
+                return 0;
+            }
+            return pie_cuda_driver::handle_fire_batch(
+                req, response, fwd_ctx, handled);
+        });
         // Leader exited serve loop — wake followers so they can tear
         // down cleanly.
         if (cfg.distributed.tp_size > 1) {
             pie_cuda_driver::tp_send_shutdown(
-                *tp_comm_ptr, executor.tp_cpu_gate_key);
+                *tp_comm_ptr, fwd_ctx.tp_cpu_gate_key);
         }
     }
 
@@ -1491,42 +1525,26 @@ int run_impl(int argc,
         std::cerr << "[pie-driver-cuda] shutting down (handled " << handled
                   << " requests)\n";
     }
+
+    if (control_thread.joinable()) {
+        // Closing the wrapper-side fd makes recv() return 0 and the thread
+        // exits cleanly. We don't have that fd here, so close ours; SEQPACKET
+        // will EOF on either side closing.
+        ::close(control_fd);
+        control_thread.join();
+    }
     return 0;
 }
 
 }  // namespace
 
-// Standalone-binary entry. Now parity-test-only — if `--parity-tokens` is
-// supplied the engine runs one forward pass and exits; otherwise we
-// error out (use `pie_driver_cuda_run_inproc` for serve). The standalone
-// `pie_driver_cuda` executable exists solely to host the parity tests
-// under `driver/cuda/tests/`.
 extern "C" int pie_driver_cuda_run(int argc,
                                    char** argv,
                                    int install_signal_handlers,
                                    pie_driver_cuda_ready_cb ready_cb,
                                    void* ready_ctx) {
     try {
-        return run_impl(argc, argv, install_signal_handlers, ready_cb, ready_ctx,
-                        /*vtable_opt=*/nullptr);
-    } catch (const std::exception& e) {
-        std::cerr << "[pie-driver-cuda] fatal: " << e.what() << "\n";
-        return -1;
-    } catch (...) {
-        std::cerr << "[pie-driver-cuda] fatal: unknown exception\n";
-        return -1;
-    }
-}
-
-extern "C" int pie_driver_cuda_run_inproc(int argc,
-                                          char** argv,
-                                          int install_signal_handlers,
-                                          pie_driver_cuda_ready_cb ready_cb,
-                                          void* ready_ctx,
-                                          pie_driver::PieInProcVTable vtable) {
-    try {
-        return run_impl(argc, argv, install_signal_handlers, ready_cb, ready_ctx,
-                        &vtable);
+        return run_impl(argc, argv, install_signal_handlers, ready_cb, ready_ctx);
     } catch (const std::exception& e) {
         std::cerr << "[pie-driver-cuda] fatal: " << e.what() << "\n";
         return -1;
@@ -1537,9 +1555,8 @@ extern "C" int pie_driver_cuda_run_inproc(int argc,
 }
 
 // Reaches into the same server registry the SIGINT/SIGTERM handler uses.
-// One host process can embed multiple same-flavor DP replicas, so stop
-// every live driver server (shmem or inproc) rather than only the most
-// recently registered one.
+// One host process can embed multiple same-flavor DP replicas, so stop every
+// live CUDA shmem server rather than only the most recently registered one.
 extern "C" void pie_driver_cuda_request_stop(void) {
     stop_servers();
 }
