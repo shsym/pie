@@ -1,0 +1,156 @@
+# Dockerfile.cuda — Pie with the native CUDA driver.
+#
+# Builds a GPU-accelerated Pie server image. The cuda driver statically
+# links flashinfer attention kernels (AOT — no Python wheel, no nvcc at
+# runtime) and PIE's custom CUDA ops into `pie_driver_cuda_lib.a`, then
+# into the Rust `pie` binary via `--features driver-cuda`.
+#
+# CUDA 12.9 base — requires host NVIDIA driver >= 570.xx (575.xx
+# recommended). Most current production GPUs (A100/L40/L40S/H100/H200,
+# RTX 30xx/40xx) ship with sufficient drivers. Older driver hosts need
+# either a driver upgrade or a back-port to a 12.x devel image.
+#
+# Build (on a CUDA-capable Linux host with the NVIDIA Container Toolkit):
+#   docker build -f Dockerfile.cuda -t pieproject/pie:cuda .
+# Or with the development stage (full toolchain, for in-container debug):
+#   docker build -f Dockerfile.cuda --target development -t pieproject/pie:cuda-dev .
+#
+# Run (requires NVIDIA Container Toolkit on the host).
+# Pin to one GPU explicitly so it maps to `cuda:0` inside the container
+# (matching the baked config's `device = ["cuda:0"]`). `--gpus device=N`
+# is preferred over `--gpus all` + CUDA_VISIBLE_DEVICES — the latter
+# exposes every host GPU to the container and can have intermittent
+# cold-start `cudaSetDevice` failures.
+#   docker run --gpus device=0 --shm-size=2g -p 8080:8080 \
+#     -v ~/.cache/pie:/root/.cache/pie \
+#     -v ~/.cache/huggingface:/root/.cache/huggingface \
+#     pieproject/pie:cuda
+# For multiple GPUs on the same container:
+#   docker run --gpus '"device=0,1"' --shm-size=2g ... pieproject/pie:cuda
+#
+# Supported GPUs: compute capability ≥ 8.0 (Ampere or newer — A10/A40/A100,
+# L4/L40/L40S, RTX 30xx/40xx, H100/H200). Pre-Ampere cards are not supported
+# by flashinfer's paged-KV kernels.
+#
+# `--shm-size=2g` is REQUIRED. The cuda driver uses POSIX shared memory
+# (shmem_ipc) for zero-copy engine↔driver buffers. Docker's default
+# /dev/shm is 64 MiB; pie writes past that and the kernel SIGBUSes the
+# mapping (exit code 135) once the engine boots. 2 GiB is comfortably
+# above the default `max_batch_tokens` working set; raise further only
+# if you bump batch limits via a custom config.
+
+# ============================================================================
+# Stage 1: Builder — CUDA devel base, full toolchain, builds pie + inferlets
+# ============================================================================
+FROM nvidia/cuda:12.9.0-devel-ubuntu24.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_HOME=/usr/local/rustup \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+# Build deps. NOTE: libnccl-dev / libnccl2 are pre-installed in the CUDA
+# devel base image at the version matching this CUDA release. Don't apt
+# install them — the nvidia apt repo will try to upgrade to the latest
+# NCCL (built for a later CUDA branch) and break dependency resolution.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl git \
+        build-essential cmake ninja-build pkg-config \
+        libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain. We deliberately do NOT add the wasm32-wasip2 target or
+# build the in-repo inferlets here — that path needs nightly-only stdlib
+# features (the workspace Cargo.lock is not committed, so a fresh resolve
+# can land on deps that gate `wasip2`). Inferlets are workloads, not part
+# of the server image; users mount them in at runtime.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain stable --profile minimal
+
+WORKDIR /workspace
+COPY . .
+
+# Compile flashinfer attention templates + PIE custom kernels for SM 8.0
+# through 9.0 (Ampere, Ada, Hopper). Override at build time with e.g.
+#   --build-arg CMAKE_CUDA_ARCHITECTURES="80;90" to target only A100+H100.
+# DetectCudaArchitecture.cmake would auto-detect via nvidia-smi, but
+# `docker build` has no GPU access — we must set this explicitly.
+ARG CMAKE_CUDA_ARCHITECTURES="80;86;89;90"
+ENV CMAKE_CUDA_ARCHITECTURES=${CMAKE_CUDA_ARCHITECTURES}
+
+# Build the pie binary with driver-cuda statically linked.
+# --no-default-features turns off driver-portable (the default), so we
+# don't drag in the ggml CMake build for a backend we won't use.
+RUN cargo install --path server --root /usr/local \
+        --no-default-features --features driver-cuda
+
+# Pre-create a Pie config tuned for Docker:
+#  - host 0.0.0.0 so the server is reachable from the container host
+#  - python_snapshot disabled: the snapshot file lives under PIE_HOME
+#    which isn't COPYed into the slim runtime stage
+#  - KV cache defaults left at pie's config init values: driver-cuda
+#    uses GPU memory for KV (not /dev/shm) so the portable image's
+#    aggressive downsizing isn't needed; the runtime adapts to the
+#    detected GPU. Tune at runtime via `-e PIE_CONFIG=...` or mount a
+#    custom config if your GPU has <24 GB.
+# The pie binary links libcuda.so.1, which is only present at runtime
+# (mounted by --gpus all via NVIDIA Container Toolkit). At build time we
+# only have the link stub at /usr/local/cuda/lib64/stubs/libcuda.so;
+# symlink it as libcuda.so.1 and point LD_LIBRARY_PATH at it so `pie
+# config init` can load and run for the duration of this layer only.
+RUN ln -sf /usr/local/cuda/lib64/stubs/libcuda.so \
+           /usr/local/cuda/lib64/stubs/libcuda.so.1 \
+ && export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-} \
+ && mkdir -p /workspace/runtime \
+ && pie config init --path /workspace/runtime/docker_config.toml --force \
+ && CFG=/workspace/runtime/docker_config.toml \
+ && pie config set server.host 0.0.0.0 --path $CFG \
+ && pie config set server.python_snapshot false --path $CFG
+
+# Strip the pie binary in-place to shrink the runtime COPY.
+RUN strip /usr/local/bin/pie
+
+# ============================================================================
+# Stage 2: Development — full builder + entrypoint, for in-container debug
+# ============================================================================
+FROM builder AS development
+
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+# 8080 = Pie WebSocket protocol (pie-client, pie-litellm)
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]
+
+# ============================================================================
+# Stage 3: Runtime — slim CUDA runtime base, ships pie + wasm inferlets only
+# ============================================================================
+FROM nvidia/cuda:12.9.0-runtime-ubuntu24.04 AS runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIE_HOME=/root/.cache/pie
+
+# nvidia/cuda:*-runtime already ships libcudart / libcublas / libcublasLt
+# and the matching libnccl2 / libstdc++6. Only pull in the few non-CUDA
+# extras we need (TLS for hf-hub, libgomp for OpenMP-linked kernels).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgomp1 libssl3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the pie binary (stripped in builder stage above).
+COPY --from=builder /usr/local/bin/pie /usr/local/bin/pie
+
+# Pre-baked config (host=0.0.0.0, python_snapshot=false, CUDA defaults).
+COPY --from=builder /workspace/runtime/docker_config.toml /workspace/runtime/docker_config.toml
+
+# Entrypoint handles optional auth setup (PIE_AUTH_USER / PIE_AUTH_KEY).
+COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+VOLUME ["/root/.cache/pie", "/root/.cache/huggingface"]
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["pie", "serve", "--config", "/workspace/runtime/docker_config.toml"]

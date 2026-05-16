@@ -4,6 +4,12 @@
 .gitattributes
 .github
 
+# Dockerfiles are passed via `-f` and shouldn't pollute the build context
+# (editing one would otherwise invalidate the COPY layer + every cached
+# step after it, forcing a full cargo install rebuild).
+Dockerfile*
+.dockerignore
+
 # Build artifacts (will be rebuilt in Docker)
 **/target/
 **/build/
