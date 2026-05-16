@@ -54,9 +54,9 @@ COPY . .
 # The build.rs invokes cmake to compile the ggml static lib for the driver.
 RUN cargo install --path server --root /usr/local
 
-# Build the in-repo example inferlets to wasm.
+# Build the in-repo inferlets that ship in the slim runtime image.
 RUN cd inferlets \
-    && for d in helloworld text-completion; do \
+    && for d in helloworld text-completion chat-completion; do \
         (cd "$d" && cargo build --target wasm32-wasip2 --release); \
     done
 
@@ -119,8 +119,9 @@ WORKDIR /workspace
 
 # Copy the pie binary + built inferlets + the Docker config.
 COPY --from=builder /usr/local/bin/pie /usr/local/bin/pie
-COPY --from=builder /workspace/inferlets/text-completion/target/wasm32-wasip2/release/*.wasm /workspace/inferlets/
 COPY --from=builder /workspace/inferlets/helloworld/target/wasm32-wasip2/release/*.wasm /workspace/inferlets/
+COPY --from=builder /workspace/inferlets/text-completion/target/wasm32-wasip2/release/*.wasm /workspace/inferlets/
+COPY --from=builder /workspace/inferlets/chat-completion/target/wasm32-wasip2/release/*.wasm /workspace/inferlets/
 COPY --from=builder /workspace/runtime/docker_config.toml /workspace/runtime/docker_config.toml
 
 COPY scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh

@@ -1,0 +1,20 @@
+[package]
+name = "chat-completion"
+version = "0.1.0"
+description = "OpenAI-compatible chat completion with automatic prefix caching"
+authors = ["Pie Project"]
+repository = "https://github.com/pie-project/pie"
+
+[runtime]
+core = "^0.2.0"
+
+# Pie's manifest parser only accepts scalar [parameters], so the OpenAI-shaped
+# `messages` array is documented in the doc-comment at the top of src/lib.rs
+# rather than as structured metadata. Scalars below are recognized by tools
+# (CLI tab-completion, schema generators) when they apply.
+[parameters]
+max_tokens  = {type = "int",   optional = true, description = "Maximum tokens to generate (default: 1024, max: 65536)"}
+temperature = {type = "float", optional = true, description = "Sampling temperature in [0.0, 2.0] (default: 0.7)"}
+top_p       = {type = "float", optional = true, description = "Top-p nucleus sampling in (0.0, 1.0] (default: 0.95)"}
+stream      = {type = "bool",  optional = true, description = "Emit OpenAI-shaped delta chunks via stdout (default: true)"}
+apc         = {type = "bool",  optional = true, description = "Enable automatic prefix caching (default: true)"}
