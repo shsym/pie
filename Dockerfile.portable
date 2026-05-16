@@ -11,7 +11,15 @@
 #   docker build -f Dockerfile.portable --target development -t pieproject/pie:portable-dev .
 #
 # Run:
-#   docker run -p 8080:8080 -v ~/.cache/pie:/root/.cache/pie pieproject/pie:portable
+#   docker run --shm-size=4g -p 8080:8080 \
+#     -v ~/.cache/pie:/root/.cache/pie pieproject/pie:portable
+#
+# --shm-size=4g is NOT optional. The portable driver places the KV cache
+# and the engine<->driver shared-memory region on /dev/shm. Docker's
+# default tmpfs there is 64 MiB; pie writes well past that and SIGBUSes
+# at the tmpfs boundary (exits 135) once model load finishes. 4 GiB
+# covers the default config (256 KV pages * 32 page_size * 28 layers,
+# ~900 MiB). Bump higher if you raise max_num_kv_pages.
 #
 # Inferlets bundled into the image come from `inferlets/` (the in-repo
 # examples). To run hardened inferlets from the sibling `pie-inferlets`
@@ -55,9 +63,25 @@ RUN cd inferlets \
 # Pre-create a Pie config tuned for Docker: host bound to 0.0.0.0 so the
 # server is reachable from the container host. `pie config init` writes
 # the template that matches the compiled flavor (portable in this image).
+# Pre-create a Pie config tuned for Docker:
+#  - host 0.0.0.0 so the server is reachable from the container host
+#  - python_snapshot disabled: the snapshot file lives under PIE_HOME
+#    which isn't COPYed into the slim runtime stage; leaving it enabled
+#    SIGBUSes when pie mmaps the missing snapshot file
+#  - conservative KV cache + batch sizing: the portable driver runs on
+#    the host CPU and shares VM memory with everything else. Defaults
+#    (1024 pages, 10240 batch tokens) want ~5 GB resident — too much
+#    for an 8 GB Colima/Docker-Desktop default. Drop to 256 pages for
+#    a working out-of-the-box smoke; bump via `pie config set` or a
+#    custom mounted config when the host has more RAM.
 RUN mkdir -p /workspace/runtime \
     && pie config init --path /workspace/runtime/docker_config.toml --force \
-    && pie config set server.host 0.0.0.0 --path /workspace/runtime/docker_config.toml
+    && CFG=/workspace/runtime/docker_config.toml \
+    && pie config set server.host 0.0.0.0 --path $CFG \
+    && pie config set server.python_snapshot false --path $CFG \
+    && pie config set model.0.driver.options.max_num_kv_pages 256 --path $CFG \
+    && pie config set model.0.driver.options.max_batch_tokens 4096 --path $CFG \
+    && pie config set model.0.driver.options.max_batch_size 32 --path $CFG
 
 # ============================================================================
 # Stage 2: Development — keep the full builder stage for iteration
