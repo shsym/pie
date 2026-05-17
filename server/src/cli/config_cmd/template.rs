@@ -68,7 +68,7 @@ hf_repo = "Qwen/Qwen3-0.6B"
 batch_policy = "adaptive"
 request_timeout_secs = 120
 default_endowment_pages = 64
-admission_oversubscription_factor = 1.0
+admission_oversubscription_factor = 4.0
 restore_pause_at_utilization = 0.85
 # Per-context depth of pass-level speculative execution. `0`
 # disables speculation entirely (every submit goes through the
@@ -85,7 +85,11 @@ const PORTABLE_DRIVER_BLOCK: &str = r#"
 [model.driver]
 type = "portable"
 device = ["auto"]
-ipc_profile = "balanced" # "latency", "balanced", or "power"
+ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
+
+[model.driver.options]
+max_batch_tokens = 10240
+max_batch_size = 512
 "#;
 
 #[cfg(feature = "driver-cuda")]
@@ -95,12 +99,12 @@ type = "cuda_native"
 device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
-# ipc_profile omitted: cuda_native defaults to "latency".
-# Set "power" to minimize idle CPU.
+ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
 
 [model.driver.options]
-gpu_mem_utilization = 0.90
-memory_profile = "auto"
+gpu_mem_utilization = 0.85
+max_batch_tokens = 10240
+max_batch_size = 512
 "#;
 
 const DUMMY_DRIVER_BLOCK: &str = r#"
@@ -108,7 +112,7 @@ const DUMMY_DRIVER_BLOCK: &str = r#"
 type = "dummy"
 device = ["cpu"]
 activation_dtype = "bfloat16"
-ipc_profile = "balanced" # "latency", "balanced", or "power"
+ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
 
 [model.driver.options]
 vocab_size = 151936

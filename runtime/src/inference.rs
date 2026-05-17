@@ -18,7 +18,7 @@ pub mod structured;
 use tokio::sync::oneshot;
 
 use crate::context::pagestore::PhysicalPageId;
-use crate::driver::{DriverId, SchedulerLimits};
+use crate::driver::DriverId;
 use crate::service::{ServiceArray, ServiceHandler};
 use anyhow::Result;
 use scheduler::BatchScheduler;
@@ -34,19 +34,13 @@ pub use speculator::{
 
 use speculator::StagedEntry;
 
-pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
-    let pinned = crate::context::pinned_count(driver_idx);
-    let (active, cached_pinned) = crate::context::resident_count(driver_idx);
-    pinned.max(active.saturating_add(cached_pinned)) > 1
-}
-
 /// Aggregated inference stats for a single model (across all drivers).
 #[derive(Debug, Default, serde::Serialize)]
 pub struct InferenceStats {
     pub total_batches: u64,
     pub total_tokens_processed: u64,
     pub total_requests_processed: u64,
-    pub max_forward_requests_observed: u64,
+    pub max_batch_size_observed: u64,
     /// Histogram buckets (1, 2-3, 4-7, 8-15, 16-31, 32-63, 64-127, 128+).
     pub batch_size_hist: [u64; 8],
     pub last_batch_latency_us: u64,
@@ -79,7 +73,7 @@ pub async fn spawn(
         let info = crate::driver::get_spec(driver_idx)
             .await
             .unwrap_or_else(|e| panic!("Failed to get driver info for index {driver_idx}: {e}"));
-        driver_batch_limits.push(info.scheduler_limits());
+        driver_batch_limits.push((info.max_batch_size, info.max_batch_tokens));
     }
 
     let model_idx = SERVICES.len();
@@ -116,7 +110,7 @@ pub async fn submit(
     physical_page_ids: Vec<PhysicalPageId>,
     extra_pages: Vec<PhysicalPageId>,
     last_page_len: u32,
-) -> Result<ForwardOutput> {
+) -> Result<pie_bridge::ForwardResponse> {
     let (tx, rx) = oneshot::channel();
     SERVICES.send(
         model_idx,
@@ -129,33 +123,9 @@ pub async fn submit(
             response: tx,
         },
     )?;
-    rx.await
-        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?
-}
-
-/// Internal forward result shape passed from the scheduler to a waiting
-/// inferlet. Normal decode returns a single token per request; carrying that
-/// directly avoids allocating a one-request `ForwardResponse` for every token.
-#[derive(Debug)]
-pub enum ForwardOutput {
-    Token(u32),
-    Tokens(Vec<u32>),
-    Response(pie_bridge::ForwardResponse),
-}
-
-impl ForwardOutput {
-    pub(crate) fn first_token(&self) -> Option<u32> {
-        match self {
-            Self::Token(t) => Some(*t),
-            Self::Tokens(tokens) => tokens.first().copied(),
-            Self::Response(resp) => resp.tokens.first().copied(),
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn from_response(resp: pie_bridge::ForwardResponse) -> Self {
-        Self::Response(resp)
-    }
+    Ok(rx
+        .await
+        .map_err(|_| anyhow::anyhow!("inference submit: scheduler dropped response channel"))?)
 }
 
 /// Returns aggregated inference stats for a model (lock-free, non-blocking).
@@ -208,7 +178,7 @@ impl InferenceService {
     fn new(
         model_idx: usize,
         driver_ids: Vec<DriverId>,
-        driver_batch_limits: Vec<SchedulerLimits>,
+        driver_batch_limits: Vec<(usize, usize)>,
         page_size: u32,
         request_timeout_secs: u64,
         batch_policy: String,
@@ -219,12 +189,13 @@ impl InferenceService {
             .iter()
             .enumerate()
             .map(|(driver_idx, &driver_id)| {
-                let limits = driver_batch_limits[driver_idx];
+                let (max_batch_size, max_batch_tokens) = driver_batch_limits[driver_idx];
                 BatchScheduler::new(
                     driver_id,
                     driver_idx,
                     page_size,
-                    limits,
+                    max_batch_size,
+                    max_batch_tokens,
                     request_timeout_secs,
                     batch_policy.clone(),
                 )
@@ -255,7 +226,7 @@ impl InferenceService {
         let mut total_batches = 0u64;
         let mut total_tokens = 0u64;
         let mut total_requests = 0u64;
-        let mut max_forward_requests = 0u64;
+        let mut max_batch_size = 0u64;
         let mut hist = [0u64; 8];
         let mut last_latency = 0u64;
         let mut cumulative_latency = 0u64;
@@ -264,8 +235,7 @@ impl InferenceService {
             total_batches += s.total_batches.load(Relaxed);
             total_tokens += s.total_tokens_processed.load(Relaxed);
             total_requests += s.total_requests_processed.load(Relaxed);
-            max_forward_requests =
-                max_forward_requests.max(s.max_forward_requests_observed.load(Relaxed));
+            max_batch_size = max_batch_size.max(s.max_batch_size_observed.load(Relaxed));
             for (dst, src) in hist.iter_mut().zip(s.batch_size_hist.iter()) {
                 *dst += src.load(Relaxed);
             }
@@ -283,7 +253,7 @@ impl InferenceService {
             total_batches,
             total_tokens_processed: total_tokens,
             total_requests_processed: total_requests,
-            max_forward_requests_observed: max_forward_requests,
+            max_batch_size_observed: max_batch_size,
             batch_size_hist: hist,
             last_batch_latency_us: last_latency,
             avg_batch_latency_us: avg_latency,
@@ -309,7 +279,7 @@ enum Message {
         /// full reserved range without re-allocating.
         extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
-        response: oneshot::Sender<Result<ForwardOutput>>,
+        response: oneshot::Sender<pie_bridge::ForwardResponse>,
     },
     GetStats {
         response: oneshot::Sender<InferenceStats>,
@@ -371,11 +341,7 @@ impl ServiceHandler for InferenceService {
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();
                 let request_clone = request.clone();
-                let speculation_depth = if crate::context::pinned_count(idx) > 1 {
-                    self.speculation_depth
-                } else {
-                    0
-                };
+                let speculation_depth = self.speculation_depth;
 
                 if let Some(entry) = staged_entry {
                     // HIT: forward the staged rx; the chain

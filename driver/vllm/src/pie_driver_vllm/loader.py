@@ -71,9 +71,8 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     """Build a VllmConfig from pie's `RuntimeConfig` (universal slice) and
     `VllmDriverConfig` (vllm-native knobs).
 
-    Exposed driver config field names mirror EngineArgs, so we splat policy
-    knobs into EngineArgs as kwargs. Capacity limits are resolved by vLLM and
-    reported later through DriverCapabilities.
+    Driver config field names mirror EngineArgs exactly, so we splat them
+    into EngineArgs as kwargs.
     """
     from dataclasses import asdict
     from ._vllm_compat import EngineArgs
@@ -94,7 +93,7 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
         download_dir=config.cache_dir,
     )
 
-    # Driver-specific policy fields splat verbatim — names match EngineArgs.
+    # Driver-specific fields splat verbatim — names match EngineArgs.
     # `None` means "leave default" (vllm picks). Pie-only knobs that don't
     # correspond to vllm EngineArgs are filtered out: spec_ngram_* drive
     # pie's NGRAM drafter (engine-side, see VllmEngine.spec_step).

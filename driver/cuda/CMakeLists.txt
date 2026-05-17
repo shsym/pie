@@ -56,16 +56,6 @@ cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
-set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
-foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-  string(REGEX REPLACE "[-+].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
-  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120")
-    set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce_stub.cpp)
-  endif()
-endforeach()
-if(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE MATCHES "stub")
-  message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
-endif()
 
 # pie_driver_cuda — native CUDA backend. Built two ways from the same
 # translation units:
@@ -86,9 +76,14 @@ add_library(pie_driver_cuda_lib STATIC
   src/sampling_dispatch.cpp
   src/spec_expansion.cpp
   src/tensor.cpp
+  src/model/weight_store.cpp
   src/model/loaded_model.cpp
+  src/model/bound_model.cpp
   ../common/src/safetensors_manifest.cpp
   src/loader/hf_config.cpp
+  src/loader/load_plan.cpp
+  src/loader/materializer.cpp
+  src/loader/model_schema.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
   src/model/qwen3_forward.cpp
@@ -145,7 +140,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/brle.cpp
   src/swap_pool.cpp
   src/distributed.cpp
-  ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
+  src/custom_all_reduce.cu
   src/ops/attention_flashinfer.cu
 )
 
@@ -162,7 +157,7 @@ target_compile_options(pie_driver_cuda_lib PRIVATE
   >
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
 )
-# Marlin sources are added to the `pie_driver_cuda` executable below
+# Marlin sources are added to the static driver library below
 # (see `PIE_CUDA_BUILD_MARLIN`); they need the same nvcc relaxed-
 # constexpr / extended-lambda flags the lib gets, since vendored
 # kernels mix `__host__ constexpr` helpers into `__device__` paths.
@@ -196,15 +191,15 @@ if(PIE_CUDA_BUILD_MARLIN)
     # A100; rerun with a different arch to add Hopper / Ada coverage.
     file(GLOB MARLIN_SM_KERNELS
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/sm*_kernel_*.cu")
-    target_sources(pie_driver_cuda PRIVATE
+    target_sources(pie_driver_cuda_lib PRIVATE
         third_party/marlin/marlin.cu
         third_party/marlin/gptq_marlin_repack.cu
         third_party/marlin/awq_marlin_repack.cu
         third_party/marlin/marlin_wrapper.cpp
         ${MARLIN_SM_KERNELS})
-    target_include_directories(pie_driver_cuda PRIVATE
+    target_include_directories(pie_driver_cuda_lib PRIVATE
         third_party/marlin)
-    target_compile_definitions(pie_driver_cuda PRIVATE PIE_CUDA_HAS_MARLIN=1)
+    target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
 endif()
 
 # Standalone test for flashinfer sampling debugging.
@@ -231,9 +226,19 @@ target_include_directories(test_driver_common PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
 target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 
+add_executable(test_load_plan
+  tests/test_load_plan.cpp
+  src/loader/load_plan.cpp
+  src/loader/model_schema.cpp)
+target_include_directories(test_load_plan PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+target_link_libraries(test_load_plan PRIVATE tomlplusplus::tomlplusplus)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME driver_common COMMAND test_driver_common)
+add_test(NAME load_plan COMMAND test_load_plan)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

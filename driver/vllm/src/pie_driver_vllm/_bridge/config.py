@@ -1,7 +1,7 @@
 """Worker-internal runtime configuration.
 
 Bridge owns only the universal `RuntimeConfig`: identity, devices, dtype,
-telemetry, swap budget, and the engine-computed `total_pages`. Each
+telemetry, swap budget, and the engine-computed `max_num_kv_pages`. Each
 flavor wheel ships its own subclass for flavor-specific knobs and torch
 typing (see `pie_driver_dev.config.NativeRuntimeConfig`). Bridge stays
 torch-free; the storage fields hold device / dtype as strings, and the
@@ -73,12 +73,13 @@ class RuntimeConfig:
     swap_budget_bytes: int = 0
 
     # Engine-computed at load time. None pre-load; set by the engine.
-    total_pages: int | None = None
+    max_num_kv_pages: int | None = None
 
-    # NOTE: some driver runtime configs carry the resolved `kv_page_size`
-    # and `max_dist_size`. The shared RPC worker falls back to
-    # `engine.capabilities().kv_page_size` when the runtime config does
-    # not carry a page size.
+    # NOTE: `kv_page_size` and `max_dist_size` are
+    # `NativeRuntimeConfig`-only (see `pie_driver_dev.config`). The shared
+    # RPC worker (`_handle_fire_batch`) falls back to
+    # `engine.capabilities().kv_page_size` for drivers (vllm/sglang) that
+    # don't carry them on their config — see pie_driver_dev/worker.py.
 
     # ---------- properties ----------
     @property

@@ -86,10 +86,10 @@ use dashmap::DashMap;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::time::Instant;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::oneshot;
 
 use crate::adapter::AdapterId;
-use crate::driver::DriverId;
+use crate::driver::{self, DriverId};
 use crate::process::ProcessId;
 use crate::service::{ServiceArray, ServiceHandler};
 use pie_bridge::Brle;
@@ -165,7 +165,6 @@ pub(crate) static CACHED_CONTEXT_INFO: LazyLock<DashMap<(usize, ContextId), Cach
 /// Per-model market data: clearing prices, dividend rate, balances.
 /// Indexed by `model_idx` (the spawn order).
 pub(crate) static MARKET: LazyLock<boxcar::Vec<Market>> = LazyLock::new(boxcar::Vec::new);
-static ADMISSION_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 /// Real-time pinned context count per driver (max 8 drivers).
 /// Updated atomically on every pin/unpin — readable without actor overhead.
@@ -262,7 +261,6 @@ pub fn spawn(
     page_size: usize,
     num_gpu_pages: Vec<usize>,
     num_cpu_pages: Vec<usize>,
-    max_forward_requests: usize,
     default_endowment_pages: usize,
     default_token_limit: Option<usize>,
     admission_oversubscription_factor: f64,
@@ -277,7 +275,6 @@ pub fn spawn(
                 page_size,
                 &num_gpu_pages,
                 &num_cpu_pages,
-                max_forward_requests,
                 default_endowment_pages,
                 default_token_limit,
                 admission_oversubscription_factor,
@@ -380,31 +377,11 @@ pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
 /// Register a process across all models.
 /// Called from `InstanceState::new` before any context operations.
 ///
-/// Waits if a model's admission gate is temporarily full (the
+/// Fails fast if any model's admission gate would refuse the request (the
 /// `Σ endowment ≤ capacity × admission_oversubscription_factor` invariant).
 /// On partial failure — e.g., model 0 admits but model 1 refuses — the
 /// successful registrations are rolled back so no orphan state remains.
 pub async fn register_process(pid: ProcessId, token_budget: Option<usize>) -> Result<()> {
-    loop {
-        match try_register_process(pid, token_budget).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let Some(admission) = e.downcast_ref::<sched::AdmissionDenied>() else {
-                    return Err(e);
-                };
-                if admission.endowment_pages > admission.cap {
-                    return Err(e);
-                }
-                tokio::select! {
-                    _ = ADMISSION_NOTIFY.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
-                }
-            }
-        }
-    }
-}
-
-async fn try_register_process(pid: ProcessId, token_budget: Option<usize>) -> Result<()> {
     let mut admitted: Vec<usize> = Vec::new();
     for model_idx in 0..SERVICES.len() {
         let (tx, rx) = oneshot::channel();
@@ -1041,7 +1018,6 @@ impl ContextManager {
         page_size: usize,
         num_gpu_pages: &[usize],
         num_cpu_pages: &[usize],
-        _max_forward_requests: usize,
         default_endowment_pages: usize,
         default_token_limit: Option<usize>,
         admission_oversubscription_factor: f64,
@@ -2092,7 +2068,6 @@ impl ServiceHandler for ContextManager {
             Message::UnregisterProcess { pid } => {
                 let t0 = Instant::now();
                 self.unregister_process(pid);
-                ADMISSION_NOTIFY.notify_waiters();
                 self.sched_counters.unregister_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.unregister_count += 1;
             }

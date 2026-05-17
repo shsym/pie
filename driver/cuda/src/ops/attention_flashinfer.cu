@@ -4,7 +4,6 @@
 
 #include <cmath>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include <cuda_bf16.h>
@@ -120,11 +119,6 @@ DecodePlanCachePtr make_decode_plan() {
     return DecodePlanCachePtr(new DecodePlanCache{});
 }
 
-std::uint8_t decode_plan_graph_layout(const DecodePlanCache& cache) {
-    if (!cache.valid) return 0;
-    return cache.plan_info.split_kv ? 1u : 0u;
-}
-
 namespace {
 
 template <uint32_t HEAD_DIM>
@@ -134,8 +128,7 @@ cudaError_t plan_decode_for_head_dim(
     uint32_t num_requests, uint32_t num_q_heads, uint32_t page_size,
     int gqa_group_size,
     AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    bool enable_cuda_graph)
+    cudaStream_t stream)
 {
     auto plan_for = [&](auto work_estimator) {
         return ::flashinfer::DecodePlan<HEAD_DIM, POS_ENC, AttnVariant, DecodeParams>(
@@ -145,7 +138,7 @@ cudaError_t plan_decode_for_head_dim(
             cache.plan_info,
             const_cast<IdType*>(indptr_h_buf.data()),
             num_requests, num_q_heads, page_size,
-            enable_cuda_graph,
+            /*enable_cuda_graph=*/true,
             stream, work_estimator);
     };
     // Must match the kernel-side DISPATCH_GQA_GROUP_SIZE set in
@@ -172,8 +165,7 @@ void plan_attention_flashinfer_decode_bf16(
     int num_requests,
     int num_q_heads, int num_kv_heads, int head_dim, int page_size,
     AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    bool enable_cuda_graph)
+    cudaStream_t stream)
 {
     const int gqa_group_size = num_q_heads / num_kv_heads;
 
@@ -188,31 +180,31 @@ void plan_attention_flashinfer_decode_bf16(
             status = plan_decode_for_head_dim<64>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream);
             break;
         case 96:
             status = plan_decode_for_head_dim<96>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream);
             break;
         case 128:
             status = plan_decode_for_head_dim<128>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream);
             break;
         case 256:
             status = plan_decode_for_head_dim<256>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream);
             break;
         case 512:
             status = plan_decode_for_head_dim<512>(
                 cache, indptr_h_buf,
                 num_requests, num_q_heads, page_size, gqa_group_size,
-                workspace, stream, enable_cuda_graph);
+                workspace, stream);
             break;
         default:
             throw std::runtime_error(
@@ -298,7 +290,7 @@ cudaError_t dispatch_decode_for_head_dim_v(
 
     return ::flashinfer::BatchDecodeWithPagedKVCacheDispatched<
         HEAD_DIM, POS_ENC, Variant, DecodeParams>(
-        params, tmp_v, tmp_s, /*enable_pdl=*/true, stream);
+        params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
 }
 
 // Soft-cap-aware HEAD_DIM dispatch. Routes to either the plain or the
@@ -336,8 +328,7 @@ cudaError_t dispatch_decode_for_head_dim(
 
 void dispatch_attention_flashinfer_decode_bf16(
     const DecodePlanCache& cache,
-    const void* q,
-    void* k_pages, void* v_pages, void* o,
+    const void* q, void* k_pages, void* v_pages, void* o,
     const std::uint32_t* kv_page_indices_d,
     const std::uint32_t* kv_page_indptr_d,
     const std::uint32_t* kv_last_page_lens_d,

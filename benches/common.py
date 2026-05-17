@@ -126,7 +126,7 @@ def print_summary(s: BenchSummary) -> None:
         "chain submits",
         "chain drops",
         "total requests",
-        "max forward requests",
+        "max batch size",
         "batch size hist",
     )
     if any(k in s.config for k in spec_keys):
@@ -167,11 +167,12 @@ def add_mode_subcommands(parser: argparse.ArgumentParser) -> None:
     latency = sub.add_parser("latency", help="single-request latency")
     add_common_args(latency)
     latency.add_argument("--requests", type=int, default=16)
-    latency.set_defaults(num_requests=0)
+    latency.set_defaults(num_requests=0, concurrency=1)
 
-    tput = sub.add_parser("tput", help="many-request throughput")
+    tput = sub.add_parser("tput", help="high-concurrency throughput")
     add_common_args(tput)
     tput.add_argument("--num-requests", type=int, default=512)
+    tput.add_argument("--concurrency", type=int, default=128)
     tput.set_defaults(requests=0)
 
 
@@ -185,16 +186,10 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--unique-prompts", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--warmup", type=int, default=2)
-    p.add_argument(
-        "--warmup-max-tokens",
-        type=int,
-        default=None,
-        help="Override max_tokens only for warmup requests.",
-    )
     p.add_argument("--json-out", default=None)
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
-    p.add_argument("--gpu-mem-util", type=float, default=0.90)
+    p.add_argument("--gpu-mem-util", type=float, default=0.80)
     p.add_argument("--max-model-len", type=int, default=2048)
     p.add_argument(
         "--wasm-delay-us",

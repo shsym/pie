@@ -21,13 +21,12 @@ def run(args: argparse.Namespace):
     prompts, prompt_counts = hf_chat_prompts_and_counts(
         args.model, args.system, make_prompts(args, n + args.warmup)
     )
-    max_running_requests = args.num_requests if args.mode == "tput" else 1
     engine = sgl.Engine(
         model_path=args.model,
         mem_fraction_static=args.gpu_mem_util,
         disable_cuda_graph=False,
         disable_radix_cache=True,
-        max_running_requests=max_running_requests,
+        max_running_requests=args.concurrency if args.mode == "tput" else 1,
         tp_size=args.tp_size,
         context_length=args.max_model_len,
     )
@@ -82,7 +81,7 @@ def run(args: argparse.Namespace):
         config={
             "disable_cuda_graph": False,
             "disable_radix_cache": True,
-            "max_running_requests": max_running_requests,
+            "max_running_requests": args.concurrency if args.mode == "tput" else 1,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,

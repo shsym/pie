@@ -25,9 +25,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 
-use crate::config::{
-    CudaMemoryProfile, CudaNativeDriverOptions, DummyDriverOptions, PortableDriverOptions,
-};
+use crate::config::{CudaNativeDriverOptions, DummyDriverOptions, PortableDriverOptions};
 use crate::driver_ffi::{self, Flavor};
 
 #[cfg(feature = "driver-cuda")]
@@ -299,9 +297,10 @@ pub use pie_bridge::DriverCapabilities;
 /// struct. Lives in pie-server (not bridge) so bridge can stay free of a
 /// serde_json dependency.
 fn parse_caps_json(json: &str) -> Result<DriverCapabilities> {
-    let value: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| anyhow::anyhow!("driver caps JSON parse: {e}"))?;
-    serde_json::from_value(value).map_err(|e| anyhow::anyhow!("driver caps schema mismatch: {e}"))
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| anyhow::anyhow!("driver caps JSON parse: {e}"))?;
+    serde_json::from_value(value)
+        .map_err(|e| anyhow::anyhow!("driver caps schema mismatch: {e}"))
 }
 
 /// Write the portable driver's startup TOML, returning the path the
@@ -310,7 +309,7 @@ fn parse_caps_json(json: &str) -> Result<DriverCapabilities> {
 ///
 /// The driver consumes:
 ///   - `[model]` — local snapshot dir + GGML offload knobs.
-///   - `[runtime]` — logging / diagnostic flags.
+///   - `[batching]` — KV page geometry + per-batch budgets.
 ///
 /// Cold-path RPC (page copies, adapter loads) is no longer wired
 /// through this TOML — it now travels through direct `extern "C"`
@@ -329,6 +328,14 @@ pub fn write_startup_toml(
     insert_str(&mut model, "backend", &options.device);
     insert_table(&mut doc, "model", model);
 
+    let mut batching = toml::Table::new();
+    insert_int(&mut batching, "kv_page_size", options.kv_page_size);
+    insert_int(&mut batching, "max_num_kv_pages", options.max_num_kv_pages);
+    insert_int(&mut batching, "max_batch_tokens", options.max_batch_tokens);
+    insert_int(&mut batching, "max_batch_size", options.max_batch_size);
+    insert_int(&mut batching, "cpu_pages", options.cpu_pages);
+    insert_table(&mut doc, "batching", batching);
+
     let mut runtime = toml::Table::new();
     insert_bool(&mut runtime, "verbose", options.verbose);
     insert_table(&mut doc, "runtime", runtime);
@@ -336,11 +343,11 @@ pub fn write_startup_toml(
     write_toml_table(out_path, doc)
 }
 
-/// Read model facts out of `<snapshot>/config.json`.
+/// Read `vocab_size` + `architectures[0]` out of `<snapshot>/config.json`.
 /// Used by [`write_dummy_startup_toml`] when the user didn't explicitly
 /// specify them in `[model.driver.options]`. Mirrors the legacy Python
 /// dummy driver's `hf_utils.load_hf_config()`-based discovery.
-fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
+fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String)> {
     let path = snapshot_dir.join("config.json");
     let text = std::fs::read_to_string(&path).map_err(|e| anyhow!("read {path:?}: {e}"))?;
     let v: serde_json::Value =
@@ -358,22 +365,13 @@ fn read_hf_config_defaults(snapshot_dir: &Path) -> Result<(u32, String, u32)> {
         .and_then(|a| a.as_str())
         .ok_or_else(|| anyhow!("`architectures[0]` missing from {path:?}"))?;
     // "Qwen3ForCausalLM" → "qwen3" — same heuristic the Python wrapper used.
-    let raw_arch_lower = raw_arch.to_lowercase();
-    let arch_name = raw_arch_lower
+    let arch_name = raw_arch
+        .to_lowercase()
         .strip_suffix("forcausallm")
-        .unwrap_or(&raw_arch_lower)
+        .unwrap_or(&raw_arch.to_lowercase())
         .to_string();
 
-    let max_model_len = v
-        .get("max_position_embeddings")
-        .or_else(|| v.get("max_sequence_length"))
-        .or_else(|| v.get("model_max_length"))
-        .or_else(|| v.get("context_length"))
-        .or_else(|| v.get("n_positions"))
-        .and_then(|x| x.as_u64())
-        .unwrap_or(4096) as u32;
-
-    Ok((vocab_size, arch_name, max_model_len))
+    Ok((vocab_size, arch_name))
 }
 
 /// Write the dummy driver's startup TOML. Shape mirrors `driver/dummy/src/config.rs`:
@@ -393,25 +391,18 @@ pub fn write_dummy_startup_toml(
     group_id: usize,
     spin_budget_us: u64,
 ) -> Result<()> {
-    let (vocab_size, arch_name, max_model_len) = match (opts.vocab_size, opts.arch_name.as_deref())
-    {
-        (Some(v), Some(a)) => {
-            let (_, _, auto_len) =
-                read_hf_config_defaults(snapshot_dir).unwrap_or_else(|_| (v, a.to_string(), 4096));
-            (v, a.to_string(), auto_len)
-        }
+    let (vocab_size, arch_name) = match (opts.vocab_size, opts.arch_name.as_deref()) {
+        (Some(v), Some(a)) => (v, a.to_string()),
         (v_opt, a_opt) => {
-            let (auto_v, auto_a, auto_len) =
-                read_hf_config_defaults(snapshot_dir).with_context(|| {
-                    format!(
-                        "auto-discovering vocab_size + arch_name for dummy driver. \
+            let (auto_v, auto_a) = read_hf_config_defaults(snapshot_dir).with_context(|| {
+                format!(
+                    "auto-discovering vocab_size + arch_name for dummy driver. \
                      Set them explicitly in [model.driver.options] to skip this lookup."
-                    )
-                })?;
+                )
+            })?;
             (
                 v_opt.unwrap_or(auto_v),
                 a_opt.map(str::to_string).unwrap_or(auto_a),
-                auto_len,
             )
         }
     };
@@ -424,9 +415,13 @@ pub fn write_dummy_startup_toml(
     );
 
     let mut dummy = toml::Table::new();
+    insert_int(&mut dummy, "kv_page_size", opts.kv_page_size);
+    insert_int(&mut dummy, "max_num_kv_pages", opts.max_num_kv_pages);
+    insert_int(&mut dummy, "max_batch_tokens", opts.max_batch_tokens);
+    insert_int(&mut dummy, "max_batch_size", opts.max_batch_size);
     insert_int(&mut dummy, "vocab_size", vocab_size);
     insert_str(&mut dummy, "arch_name", arch_name);
-    insert_int(&mut dummy, "max_model_len", max_model_len);
+    insert_int(&mut dummy, "max_model_len", opts.max_model_len);
     insert_str(&mut dummy, "activation_dtype", activation_dtype);
     insert_int(&mut dummy, "random_seed", random_seed as i64);
     insert_str(&mut dummy, "snapshot_dir", path_string(snapshot_dir));
@@ -437,9 +432,9 @@ pub fn write_dummy_startup_toml(
 
 /// Write the cuda driver's startup TOML. Schema mirrors
 /// `driver/cuda/src/config.hpp`: `[model]` with
-/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional `runtime_quant`,
-/// `[batching]` with memory planner knobs plus `swap_pool_size`, and
-/// `[runtime]` with the server verbosity flag.
+/// `hf_repo`/`snapshot_dir`/`device`/`dtype`/optional load policy knobs,
+/// `[batching]` with KV-page geometry plus `swap_pool_size`, and `[runtime]`
+/// with the server verbosity flag.
 ///
 /// `[distributed]` is emitted only for TP launches; single-rank uses the
 /// cuda driver's default (`tp_size=1, tp_rank=0`).
@@ -459,24 +454,16 @@ pub(crate) fn write_cuda_startup_toml(
     if !opts.runtime_quant.is_empty() {
         insert_str(&mut model, "runtime_quant", opts.runtime_quant.clone());
     }
+    if !opts.mxfp4_moe.is_empty() && opts.mxfp4_moe != "auto" {
+        insert_str(&mut model, "mxfp4_moe", opts.mxfp4_moe.clone());
+    }
     insert_table(&mut doc, "model", model);
 
     let mut batching = toml::Table::new();
-    batching.insert(
-        "gpu_mem_utilization".into(),
-        toml::Value::Float(opts.gpu_mem_utilization),
-    );
-    insert_str(
-        &mut batching,
-        "memory_profile",
-        match opts.memory_profile {
-            CudaMemoryProfile::Auto => "auto",
-            CudaMemoryProfile::Latency => "latency",
-            CudaMemoryProfile::Balanced => "balanced",
-            CudaMemoryProfile::Throughput => "throughput",
-            CudaMemoryProfile::Capacity => "capacity",
-        },
-    );
+    insert_int(&mut batching, "kv_page_size", opts.kv_page_size);
+    insert_int(&mut batching, "max_num_kv_pages", opts.max_num_kv_pages);
+    insert_int(&mut batching, "max_batch_tokens", opts.max_batch_tokens);
+    insert_int(&mut batching, "max_batch_size", opts.max_batch_size);
     insert_int(&mut batching, "swap_pool_size", opts.swap_pool_size);
     insert_table(&mut doc, "batching", batching);
 
@@ -531,14 +518,12 @@ fn run_driver(
     inproc_vtable: Option<pie::driver::InProcVTable>,
 ) -> i32 {
     if let Some(vtable) = inproc_vtable {
-        return unsafe { driver_ffi::run_inproc(flavor, argc, argv, 0, cb, ctx, vtable) }
-            .unwrap_or(-1);
+        return unsafe {
+            driver_ffi::run_inproc(flavor, argc, argv, 0, cb, ctx, vtable)
+        }
+        .unwrap_or(-1);
     }
-    unsafe {
-        driver_ffi::run(
-            flavor, argc, argv, /*install_signal_handlers=*/ 0, cb, ctx,
-        )
-    }
+    unsafe { driver_ffi::run(flavor, argc, argv, /*install_signal_handlers=*/ 0, cb, ctx) }
 }
 
 unsafe extern "C" fn embedded_caps_cb(caps_json: *const c_char, ctx: *mut c_void) {
@@ -705,7 +690,13 @@ impl EmbeddedDriver {
             }
             #[cfg(feature = "driver-cuda")]
             DriverOptions::CudaNative(opts) => {
-                write_cuda_startup_toml(&toml_path, opts, snapshot_dir, group_id, tp.as_ref())?;
+                write_cuda_startup_toml(
+                    &toml_path,
+                    opts,
+                    snapshot_dir,
+                    group_id,
+                    tp.as_ref(),
+                )?;
             }
             DriverOptions::Dummy {
                 opts,
@@ -931,14 +922,8 @@ mod tests {
             "total_pages": 1024,
             "kv_page_size": 32,
             "swap_pool_size": 0,
-            "max_forward_tokens": 4096,
-            "max_forward_requests": 512,
-            "max_page_refs": 262144,
-            "max_logit_rows": 4096,
-            "max_prob_rows": 4096,
-            "max_custom_mask_bytes": 8388608,
-            "max_sampler_rows": 4096,
-            "max_logprob_labels": 4096,
+            "max_batch_tokens": 10240,
+            "max_batch_size": 512,
             "arch_name": "qwen3",
             "vocab_size": 151936,
             "max_model_len": 4096,
@@ -950,8 +935,6 @@ mod tests {
         assert_eq!(caps.total_pages, 1024);
         assert_eq!(caps.arch_name, "qwen3");
         assert_eq!(caps.shmem_name.as_deref(), Some("/pie_shmem_g0"));
-        assert_eq!(caps.max_forward_tokens, 4096);
-        assert_eq!(caps.max_page_refs, 262144);
     }
 
     #[test]
@@ -962,6 +945,11 @@ mod tests {
         let opts = DummyDriverOptions {
             vocab_size: Some(32000),
             arch_name: Some("qwen3".to_string()),
+            kv_page_size: 16,
+            max_num_kv_pages: 256,
+            max_batch_tokens: 4096,
+            max_batch_size: 128,
+            max_model_len: 4096,
             ready_timeout_s: 5.0,
         };
 
@@ -973,10 +961,6 @@ mod tests {
             val["shmem"]["spin_budget_us"].as_str(),
             Some("18446744073709551615"),
         );
-        assert!(val["dummy"].get("max_num_kv_pages").is_none());
-        assert!(val["dummy"].get("kv_page_size").is_none());
-        assert!(val["dummy"].get("max_forward_tokens").is_none());
-        assert!(val["dummy"].get("max_forward_requests").is_none());
     }
 
     #[test]
@@ -993,18 +977,9 @@ mod tests {
         // driver/portable/src/config.hpp uses the same structure).
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
-        assert!(
-            val.get("shmem").is_none(),
-            "portable no longer emits [shmem]"
-        );
-        assert!(
-            val.get("aux_ipc").is_none(),
-            "portable no longer emits [aux_ipc]"
-        );
-        assert!(
-            val.get("batching").is_none(),
-            "portable capacities are derived by the driver"
-        );
+        assert!(val.get("shmem").is_none(), "portable no longer emits [shmem]");
+        assert!(val.get("aux_ipc").is_none(), "portable no longer emits [aux_ipc]");
+        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
         assert_eq!(
             val["model"]["hf_path"].as_str().unwrap(),
             snap.to_str().unwrap()
@@ -1028,10 +1003,7 @@ mod tests {
         let text = std::fs::read_to_string(&out).unwrap();
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert!(val.get("shmem").is_none(), "cuda no longer emits [shmem]");
-        assert!(
-            val["model"].get("hf_repo").is_none(),
-            "cuda derives from snapshot_dir"
-        );
+        assert!(val["model"].get("hf_repo").is_none(), "cuda derives from snapshot_dir");
         assert_eq!(
             val["model"]["snapshot_dir"].as_str().unwrap(),
             snap.to_str().unwrap()
@@ -1039,13 +1011,11 @@ mod tests {
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:0");
         assert_eq!(val["model"]["dtype"].as_str().unwrap(), "bfloat16");
         assert!(val["model"].get("runtime_quant").is_none()); // omitted when empty
-        assert!(val["batching"].get("kv_page_size").is_none());
+        assert_eq!(val["batching"]["kv_page_size"].as_integer().unwrap(), 32);
         assert_eq!(
-            val["batching"]["gpu_mem_utilization"].as_float().unwrap(),
-            0.90
+            val["batching"]["max_num_kv_pages"].as_integer().unwrap(),
+            1024
         );
-        assert_eq!(val["batching"]["memory_profile"].as_str().unwrap(), "auto");
-        assert_eq!(val["batching"].as_table().unwrap().len(), 3);
         assert_eq!(val["batching"]["swap_pool_size"].as_integer().unwrap(), 0);
         assert_eq!(val["runtime"]["verbose"].as_bool().unwrap(), false);
     }
@@ -1081,6 +1051,22 @@ mod tests {
         let val: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(val["model"]["runtime_quant"].as_str().unwrap(), "fp8");
         assert_eq!(val["model"]["device"].as_str().unwrap(), "cuda:1");
+    }
+
+    #[test]
+    fn cuda_startup_toml_emits_mxfp4_policy_when_non_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("cuda.toml");
+        let snap = tmp.path().join("snap");
+        let mut opts = CudaNativeDriverOptions::default();
+        opts.device = "cuda:0".to_string();
+        opts.mxfp4_moe = "bf16".to_string();
+
+        write_cuda_startup_toml(&out, &opts, &snap, 0, None).unwrap();
+
+        let text = std::fs::read_to_string(&out).unwrap();
+        let val: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(val["model"]["mxfp4_moe"].as_str().unwrap(), "bf16");
     }
 
     #[test]

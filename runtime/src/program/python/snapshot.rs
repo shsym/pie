@@ -1318,6 +1318,7 @@ pub(crate) async fn snapshot_from_bytes(
         "snapshot".to_string(),
         false,            // capture_outputs
         &snapshot_policy, // deny fs + deny network — snapshot init only
+        None,             // token_budget
         py_runtime::dir(),
     )
     .await?;

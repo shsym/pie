@@ -71,7 +71,10 @@ pub enum ClientMessage {
     TerminateProcess { corr_id: u32, process_id: String },
 
     #[serde(rename = "signal_process")]
-    SignalProcess { process_id: String, message: String },
+    SignalProcess {
+        process_id: String,
+        message: String,
+    },
 
     #[serde(rename = "transfer_file")]
     TransferFile {
@@ -110,10 +113,16 @@ pub enum ClientMessage {
     },
 
     #[serde(rename = "submit_workflow")]
-    SubmitWorkflow { corr_id: u32, json: String },
+    SubmitWorkflow {
+        corr_id: u32,
+        json: String,
+    },
 
     #[serde(rename = "cancel_workflow")]
-    CancelWorkflow { corr_id: u32, workflow_id: String },
+    CancelWorkflow {
+        corr_id: u32,
+        workflow_id: String,
+    },
 
     #[serde(rename = "attach_workflow")]
     AttachWorkflow { corr_id: u32, workflow_id: String },
