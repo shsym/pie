@@ -490,26 +490,14 @@ void Model::resolve_tensor_prefix_() {
 ggml_tensor* Model::declare_(const std::string& hf_name) {
     const auto& t = archive_->at(hf_name);
 
-    // Norm-style weights stored in bf16 get promoted to f32 here. The
-    // tensor we hand back to the graph builder is typed F32, so the
-    // implicit `ggml_cast` in `norm_scale` becomes a no-op. The actual
-    // bf16 → f32 byte conversion happens in load_into_backend_().
-    //
-    // GGUF tensors carry their ggml type in `ggml_type_override` and
-    // leave `dtype` as a placeholder F32 (see gguf_archive). The cast
-    // logic below is keyed off `dtype` and would mistrigger on every
-    // GGUF tensor, so we only apply it on the safetensors path.
+    // Cast logic is safetensors-only — GGUF leaves StDtype as a F32
+    // placeholder and carries the real type in ggml_type_override.
+    // Norms/biases: BF16 → F32 (free; no-op in ggml_cast). Large matmul
+    // weights: F32 → BF16 (Gemma-2 ships F32; ~2× faster + half VRAM).
     const bool is_safetensors = t.ggml_type_override < 0;
-    const bool upcast = is_safetensors
-                     && t.dtype == StDtype::BF16
-                     && is_small_weight_for_upcast(hf_name);
-    // Some HF releases (notably Gemma-2-2b) store weights as F32. The F32
-    // mul_mat path is ~2x slower than BF16 on tensor-core hardware and
-    // doubles VRAM. Downcast large matmul weights at load time, matching
-    // llama.cpp's GGUF default. Norms / biases stay F32 (precision).
-    const bool downcast = is_safetensors
-                       && t.dtype == StDtype::F32
-                       && !is_small_weight_for_upcast(hf_name);
+    const bool small = is_small_weight_for_upcast(hf_name);
+    const bool upcast   = is_safetensors && t.dtype == StDtype::BF16 && small;
+    const bool downcast = is_safetensors && t.dtype == StDtype::F32  && !small;
 
     ggml_tensor* tensor;
     if (upcast || downcast) {
@@ -792,50 +780,36 @@ void Model::load_moe_layer_(std::int32_t i,
     const std::int64_t ff     = h.moe_intermediate_size > 0
         ? h.moe_intermediate_size : h.intermediate_size;
 
-    // GGUF MoE: experts are stored as three stacked 3D tensors (one slab
-    // per gate / up / down) rather than the per-expert HF safetensors
-    // layout. The GGUF name mapper translates `blk.N.ffn_{gate,up,down}_exps`
-    // to `mlp.experts.{gate,up,down}_proj.weight` uniformly across
-    // qwen3_moe / mixtral / gpt-oss, so a single probe distinguishes
-    // GGUF stacked from per-expert safetensors regardless of `kind`.
+    // GGUF MoE: gate/up/down arrive as three stacked 3D slabs under
+    // canonical names (the gguf_archive mapper translates `ffn_*_exps`
+    // uniformly for qwen3_moe / mixtral / gpt-oss). Probe gate to detect.
     const std::string gate_stacked = p + "mlp.experts.gate_proj.weight";
-    const std::string up_stacked   = p + "mlp.experts.up_proj.weight";
-    const std::string down_stacked = p + "mlp.experts.down_proj.weight";
     if (archive_->find(gate_stacked) != nullptr) {
-        // Router. GGUF's `ffn_gate_inp.weight` maps to `mlp.gate.weight`
-        // for both Qwen-MoE and Mixtral, so this is uniform here too.
         L.moe_router = declare_(p + "mlp.gate.weight");
 
-        const auto& gate_src = archive_->at(gate_stacked);
-        const auto& up_src   = archive_->at(up_stacked);
-        const auto& down_src = archive_->at(down_stacked);
-        // GGUF stores the ggml type directly in ggml_type_override
-        // (Q4_K, Q5_K, F16, ...); st_to_ggml_dtype only covers F32/F16/BF16
-        // and would throw on quants, so use the override path explicitly.
-        auto src_dtype = [&](const StTensor& t, const std::string& nm) {
-            return (t.ggml_type_override >= 0)
-                ? static_cast<ggml_type>(t.ggml_type_override)
-                : st_to_ggml_dtype(t.dtype, nm);
+        struct Slab { const char* tag; std::string name;
+                      std::int64_t in_dim, out_dim; ggml_tensor** out; };
+        const Slab slabs[3] = {
+            {"moe_gate", gate_stacked,                       hidden, ff,     &L.moe_gate_exps},
+            {"moe_up",   p + "mlp.experts.up_proj.weight",   hidden, ff,     &L.moe_up_exps},
+            {"moe_down", p + "mlp.experts.down_proj.weight", ff,     hidden, &L.moe_down_exps},
         };
-        const ggml_type gate_dtype = src_dtype(gate_src, gate_stacked);
-        const ggml_type up_dtype   = src_dtype(up_src,   up_stacked);
-        const ggml_type down_dtype = src_dtype(down_src, down_stacked);
-
-        const std::size_t gate_per_expert = gate_src.nbytes /
-                                            static_cast<std::size_t>(n_exp);
-        const std::size_t up_per_expert   = up_src.nbytes /
-                                            static_cast<std::size_t>(n_exp);
-        const std::size_t down_per_expert = down_src.nbytes /
-                                            static_cast<std::size_t>(n_exp);
-        L.moe_gate_exps = declare_stacked_experts_from_3d_(
-            p + "moe_gate", gate_stacked, hidden, ff, n_exp,
-            gate_per_expert, /*intra_off=*/0, gate_dtype);
-        L.moe_up_exps   = declare_stacked_experts_from_3d_(
-            p + "moe_up",   up_stacked,   hidden, ff, n_exp,
-            up_per_expert,   /*intra_off=*/0, up_dtype);
-        L.moe_down_exps = declare_stacked_experts_from_3d_(
-            p + "moe_down", down_stacked, ff, hidden, n_exp,
-            down_per_expert, /*intra_off=*/0, down_dtype);
+        for (const auto& s : slabs) {
+            const auto& src = archive_->at(s.name);
+            if (src.nbytes % static_cast<std::size_t>(n_exp) != 0) {
+                throw std::runtime_error(
+                    "moe: stacked slab '" + s.name + "' nbytes not divisible by n_exp");
+            }
+            // GGUF quants come through ggml_type_override; st_to_ggml_dtype
+            // only knows F32/F16/BF16 and would throw on Q4_K / Q5_K / etc.
+            const ggml_type dt = (src.ggml_type_override >= 0)
+                ? static_cast<ggml_type>(src.ggml_type_override)
+                : st_to_ggml_dtype(src.dtype, s.name);
+            *s.out = declare_stacked_experts_from_3d_(
+                p + s.tag, s.name, s.in_dim, s.out_dim, n_exp,
+                src.nbytes / static_cast<std::size_t>(n_exp),
+                /*intra_off=*/0, dt);
+        }
         return;
     }
 
