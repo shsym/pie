@@ -24,10 +24,10 @@
 use crate::ForwardPassExt;
 use crate::Result;
 use crate::adapter::Adapter;
-use crate::context::{Context, compute_bid, brle_and};
+use crate::context::{Context, brle_and, compute_bid};
 use crate::forward::{Output, ProbeHandle, SampleHandle};
-use crate::pie::core::inference::{ForwardPass, Sampler as WitSampler, SlotOutput};
 use crate::pie::core::inference::Output as RawOutput;
+use crate::pie::core::inference::{ForwardPass, Sampler as WitSampler, SlotOutput};
 use crate::sample::{Probe, Sampler};
 use crate::spec::Speculator;
 
@@ -83,7 +83,9 @@ impl<'ctx> Generator<'ctx> {
         let dividend = crate::scheduling::dividend(&ctx.model);
         let pages = (ctx.committed_pages + ctx.working_pages).max(1) as f64;
         let page_size = ctx.page_size as f64;
-        ctx.set_bid(compute_bid(balance, pages, 4096.0, 1.0, page_size, dividend));
+        ctx.set_bid(compute_bid(
+            balance, pages, 4096.0, 1.0, page_size, dividend,
+        ));
 
         Self {
             ctx,
@@ -332,8 +334,7 @@ impl<'ctx> Generator<'ctx> {
         let schema = schemars::schema_for!(T);
         let schema_str = serde_json::to_string(&schema)
             .map_err(|e| format!("collect_json: serialize schema: {e}"))?;
-        let constraint =
-            GrammarConstraint::from_json_schema(&schema_str, &self.ctx.model)?;
+        let constraint = GrammarConstraint::from_json_schema(&schema_str, &self.ctx.model)?;
         let text = self.constrain(constraint).collect_text().await?;
         serde_json::from_str(&text).map_err(|e| format!("collect_json: deserialize: {e}"))
     }
@@ -418,9 +419,21 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         let n_pending = pending.len() as u32;
         let n_drafted = drafts.len() as u32;
 
-        if n_pending == 0 && n_drafted == 0 && user_cleared_sampler && extra_probes.is_empty() {
-            // Truly nothing to do — no input, no sampler, no probes.
-            // Mark done so collect_* sugars terminate cleanly.
+        if n_pending == 0 && n_drafted == 0 {
+            // No input, no drafts — there are no query positions for a
+            // sampler to land on. Firing in this state would produce a
+            // wire request with `qo_indptr=[0,0]` plus a sampler slot
+            // pointing at a non-existent query position; the driver
+            // would either crash (portable's old behavior) or return
+            // an empty response (cuda's short-circuit), and the SDK
+            // loop would just call us again with the same empty state.
+            //
+            // Mark done so `Generator::next()` returns `None` and the
+            // inferlet's `while let Some(step) = g.next()?` loop
+            // terminates cleanly. Reached when a prior step's response
+            // didn't yield an accepted token (e.g., a driver error
+            // returned an empty slot list), so this also acts as a
+            // fail-stop against a runaway empty-response loop.
             parent.done = true;
             return Ok(Output::new(RawOutput {
                 slots: Vec::new(),
@@ -439,7 +452,8 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             let pages_needed = (total_after + parent.ctx.page_size - 1) / parent.ctx.page_size;
             let additional = pages_needed.saturating_sub(parent.ctx.working_pages);
             if additional > 0 {
-                parent.ctx
+                parent
+                    .ctx
                     .inner
                     .reserve_working_pages(additional)
                     .map_err(|e| format!("GenStep::execute reserve: {e}"))?;
@@ -571,6 +585,9 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
                 })
                 .collect()
         };
+        if !user_cleared_sampler && accepted_tokens.is_empty() {
+            return Err("GenStep::execute: auto-sampler returned no token".into());
+        }
 
         // Stash next-iter system drafts (and let custom speculators see
         // accepted tokens).
@@ -615,7 +632,8 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             let new_working = parent.ctx.working_tokens + n_kv_tokens;
             let pages_to_commit = new_working / parent.ctx.page_size;
             if pages_to_commit > 0 {
-                parent.ctx
+                parent
+                    .ctx
                     .inner
                     .commit_working_pages(pages_to_commit)
                     .map_err(|e| format!("GenStep::execute commit: {e}"))?;
@@ -637,7 +655,9 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         // Advance constraint state with the accepted tokens (read by the
         // next iteration's mask compute).
         if !parent.constraints.is_empty() {
-            parent.constraint_pending.extend_from_slice(&accepted_tokens);
+            parent
+                .constraint_pending
+                .extend_from_slice(&accepted_tokens);
         }
 
         // Truncate at stop / max_tokens, accumulate counters, seed buffer.

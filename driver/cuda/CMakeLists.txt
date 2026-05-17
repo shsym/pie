@@ -21,6 +21,10 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 
+if(NOT PIE_BRIDGE_INCLUDE_DIR)
+  set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
+endif()
+
 # NCCL for tensor-parallel collectives. Single-GPU runs never load it (the
 # call sites are gated on tp_size > 1), but we always link so a TP-enabled
 # wrapper can talk to the same binary. System NCCL only — vendoring via CPM
@@ -52,6 +56,16 @@ cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
+set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
+foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX REPLACE "[-+].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120")
+    set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce_stub.cpp)
+  endif()
+endforeach()
+if(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE MATCHES "stub")
+  message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 # pie_driver_cuda — native CUDA backend. Built two ways from the same
 # translation units:
@@ -65,15 +79,15 @@ cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 #     `pie_driver_cuda_native` via subprocess.
 add_library(pie_driver_cuda_lib STATIC
   src/entry.cpp
-  src/persistent_inputs.cpp
-  src/request_handler.cpp
-  src/msgpack_subpass.cpp
+  src/executor/persistent_inputs.cpp
+  src/executor/executor.cpp
+  src/service/inproc_service.cpp
+  src/response_subpass.cpp
   src/sampling_dispatch.cpp
   src/spec_expansion.cpp
-  src/shmem_ipc.cpp
-  src/shmem_schema.cpp
   src/tensor.cpp
-  src/engine.cpp
+  src/model/loaded_model.cpp
+  ../common/src/safetensors_manifest.cpp
   src/loader/hf_config.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
@@ -90,11 +104,12 @@ add_library(pie_driver_cuda_lib STATIC
   src/ops/gemm.cpp
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
-  src/response_writer.cpp
   src/kernels/rmsnorm.cu
   src/kernels/embed.cu
   src/kernels/swiglu.cu
   src/kernels/rope.cu
+  src/kernels/split_packed.cu
+  src/kernels/scatter_int32.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu
   src/kernels/sample_temp.cu
@@ -128,10 +143,9 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/qwen3_5_moe_forward.cpp
   src/attention_workspace.cpp
   src/brle.cpp
-  src/control_socket.cpp
   src/swap_pool.cpp
   src/distributed.cpp
-  src/custom_all_reduce.cu
+  ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/ops/attention_flashinfer.cu
 )
 
@@ -162,6 +176,8 @@ target_compile_options(pie_driver_cuda PRIVATE
 target_include_directories(pie_driver_cuda_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_BRIDGE_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
@@ -204,24 +220,20 @@ target_compile_options(sample_flashinfer_test PRIVATE
 target_link_libraries(sample_flashinfer_test PRIVATE CUDA::cudart)
 
 # Wire-format unit tests. Pure C++ (no CUDA), short runtime; CTest runs
-# them under `cmake --build build --target test`. The msgpack roundtrip
-# verification is delegated to a sibling pytest that reads the binary's
-# output files.
+# them under `cmake --build build --target test`.
 add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
 target_include_directories(test_brle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-add_executable(test_response_writer
-  tests/test_response_writer.cpp
-  src/response_writer.cpp)
-target_include_directories(test_response_writer PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_executable(test_driver_common
+  ../common/tests/test_common.cpp
+  ../common/src/safetensors_manifest.cpp)
+target_include_directories(test_driver_common PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
 
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
-add_test(NAME response_writer
-  COMMAND test_response_writer
-    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_flat.bin
-    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_msgpack.bin)
+add_test(NAME driver_common COMMAND test_driver_common)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

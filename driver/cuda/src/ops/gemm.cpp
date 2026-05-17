@@ -4,7 +4,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <iostream>
 #include <stdexcept>
 #include <string>
 
@@ -45,6 +44,12 @@ void CublasHandle::set_stream(cudaStream_t s) {
     check(cublasSetStream(h_, s), "cublasSetStream");
 }
 
+cudaStream_t CublasHandle::stream() const noexcept {
+    cudaStream_t s = nullptr;
+    cublasGetStream(h_, &s);
+    return s;
+}
+
 namespace {
 
 void gemm_bf16_impl(
@@ -53,19 +58,7 @@ void gemm_bf16_impl(
     int M, int N, int K,
     float beta)
 {
-    // We want row-major y[M,N] = act[M,K] @ W[N,K]^T.
-    //
-    // Memory equivalences (row-major M[R,C] is col-major M'[C,R] with lda=C):
-    //   act'[K, M]  lda = K
-    //   W'  [K, N]  lda = K
-    //   y'  [N, M]  lda = N
-    //
-    // Row-major identity → col-major: y'[n,m] = sum_k W'[k,n] * act'[k,m]
-    //                                          = sum_k op(A)[n,k] * op(B)[k,m]
-    // where op(A) needs to be N × K (so transpose W'), op(B) needs to be
-    // K × M (so leave act' as-is). Hence OP_T for A=W, OP_N for B=act.
     const float alpha = 1.f;
-
     const auto status = cublasGemmEx(
               handle,
               /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
@@ -76,7 +69,7 @@ void gemm_bf16_impl(
               &beta,
               /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
               CUBLAS_COMPUTE_32F,
-              CUBLAS_GEMM_DEFAULT);
+              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -109,7 +102,7 @@ void gemm_batched_bf16_impl(
               /*C=*/y_ptrs_dev,   CUDA_R_16BF, /*ldc=*/N,
               batch_count,
               CUBLAS_COMPUTE_32F,
-              CUBLAS_GEMM_DEFAULT);
+              CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (status != CUBLAS_STATUS_SUCCESS) {
         throw std::runtime_error(
             "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
@@ -333,7 +326,7 @@ void gemm_fp8_e4m3_w_bf16_act_impl(
     if (!w_scale_fp32_dev) {
         throw std::runtime_error(
             "gemm_act_x_w[FP8_E4M3]: scale pointer is null — "
-            "weight_scale_inv must be registered via Engine::set_quant_meta "
+            "weight_scale_inv must be registered via LoadedModel::set_quant_meta "
             "as an FP32 device tensor before calling FP8 GEMM");
     }
     auto& ctx = LtCtx::instance();

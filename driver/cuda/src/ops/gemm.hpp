@@ -13,7 +13,7 @@
 #include <cuda_runtime.h>
 #include <memory>
 
-#include "engine.hpp"
+#include "model/loaded_model.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::ops {
@@ -53,7 +53,7 @@ struct WeightView {
     }
 
     // Quantized weight: ties together a weight DeviceTensor and a
-    // `QuantMeta` snapshot pulled from `Engine::quant_meta`.
+    // `QuantMeta` snapshot pulled from `LoadedModel::quant_meta`.
     static WeightView quantized(const DeviceTensor& weight, const QuantMeta& meta) {
         WeightView v;
         v.data = weight.data();
@@ -78,6 +78,11 @@ public:
 
     cublasHandle_t handle() const noexcept { return h_; }
     void set_stream(cudaStream_t s);
+    // Stream currently bound to the cublas handle. Used by per-arch
+    // forward bodies so their loose `<<<grid, block, 0, s>>>` kernel
+    // launches stay on the same stream as cublas — required for CUDA
+    // graph capture to record every kernel.
+    cudaStream_t stream() const noexcept;
 
 private:
     cublasHandle_t h_ = nullptr;

@@ -425,10 +425,17 @@ void full_attn_body(
         N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
 
-    kernels::launch_write_kv_to_pages_bf16(
-        cache.k(kv_layer), cache.v(kv_layer), ws.k.data(), ws.v.data(),
-        qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        N, R, cache.page_size(), num_kv_heads_local, d, stream);
+    if (decode_plan) {
+        kernels::launch_write_kv_decode_to_pages_bf16(
+            cache.k(kv_layer), cache.v(kv_layer), ws.k.data(), ws.v.data(),
+            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            R, cache.page_size(), num_kv_heads_local, d, stream);
+    } else {
+        kernels::launch_write_kv_to_pages_bf16(
+            cache.k(kv_layer), cache.v(kv_layer), ws.k.data(), ws.v.data(),
+            qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+            N, R, cache.page_size(), num_kv_heads_local, d, stream);
+    }
 
     // Decode path: pre-planned (graph-friendly). Prefill: includes host
     // work in the launcher (PrefillPlan), so non-graph-capturable.
@@ -547,7 +554,7 @@ void moe_block(
         //   5. `batched_weighted_sum` collapses [top_k, H] → moe_out[0].
         //
         // Every step has fixed kernel topology and stable device-pointer
-        // arguments, so the request handler's graph-capture path can fire
+        // arguments, so the executor's graph-capture path can fire
         // for the whole forward.
         kernels::launch_build_moe_ptrs_decode_bf16(
             moe_ws.topk_idx.data(),

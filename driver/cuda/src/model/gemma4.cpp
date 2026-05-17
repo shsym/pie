@@ -29,7 +29,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const Engine& e, const std::string& name) {
+const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("gemma4: missing weight '" + name + "'");
     }
@@ -78,7 +78,7 @@ Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
     return ws;
 }
 
-Gemma4Weights bind_gemma4(const Engine& engine) {
+Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     const auto& cfg = engine.hf_config();
     if (cfg.layer_types.empty()) {
         throw std::runtime_error(
@@ -788,10 +788,17 @@ void gemma4_forward_paged(
         // KV write only on non-shared layers — shared layers attend
         // through the source slot's already-populated pages.
         if (!layer.is_shared) {
-            kernels::launch_write_kv_to_pages_bf16(
-                cache.k(l), cache.v(l), ws.k.data(), ws.v.data(),
-                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                N, R, cache.page_size(), num_kv_heads_local, d, stream);
+            if (use_decode_path) {
+                kernels::launch_write_kv_decode_to_pages_bf16(
+                    cache.k(l), cache.v(l), ws.k.data(), ws.v.data(),
+                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    R, cache.page_size(), num_kv_heads_local, d, stream);
+            } else {
+                kernels::launch_write_kv_to_pages_bf16(
+                    cache.k(l), cache.v(l), ws.k.data(), ws.v.data(),
+                    qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                    N, R, cache.page_size(), num_kv_heads_local, d, stream);
+            }
         }
 
         // Plan + dispatch attention. Shared layers dispatch against the

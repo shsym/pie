@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
@@ -10,6 +11,7 @@
 #include <thread>
 
 #include <ggml-cpu.h>
+#include <pie_driver_common/tensor_names.hpp>
 
 #include "gguf_archive.hpp"
 #include "gguf_hparams.hpp"
@@ -51,12 +53,8 @@ bool is_small_weight_for_upcast(const std::string& hf_name) {
     //   `*.bias`       — any attention / projection bias
     static constexpr std::string_view kNormSuffix = "norm.weight";
     static constexpr std::string_view kBiasSuffix = ".bias";
-    auto ends_with = [&](std::string_view suf) {
-        return hf_name.size() >= suf.size() &&
-               hf_name.compare(hf_name.size() - suf.size(),
-                               suf.size(), suf) == 0;
-    };
-    return ends_with(kNormSuffix) || ends_with(kBiasSuffix);
+    return pie_driver_common::ends_with(hf_name, kNormSuffix) ||
+           pie_driver_common::ends_with(hf_name, kBiasSuffix);
 }
 
 ggml_type st_to_ggml_dtype(StDtype dt, const std::string& tensor_name) {
@@ -221,14 +219,23 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         throw std::runtime_error("model: backend init failed");
     }
 
-    // Pin the CPU backend to all available HW threads. ggml's default is
-    // 4 (sometimes 1 depending on backend init path), which leaves a
-    // 13900K idling. The static-lib build path in particular gets
-    // initialized from a Rust-spawned thread that may not inherit the
-    // process-level OpenMP affinity, so be explicit.
+    // Pin the CPU backend to a reasonable number of HW threads. ggml's
+    // default is 4 (sometimes 1 depending on backend init path), which
+    // leaves a 13900K idling. The static-lib build path in particular
+    // gets initialized from a Rust-spawned thread that may not inherit
+    // the process-level OpenMP affinity, so be explicit. Cap at 32 —
+    // beyond that ggml's per-op fork/join sync overhead dominates and
+    // throughput drops (observed on a 255-logical-CPU EPYC). Respect
+    // GGML_N_THREADS env override when the user wants something else.
     auto pin_cpu_threads = [](ggml_backend_t b) {
-        unsigned n = std::thread::hardware_concurrency();
-        if (n == 0) n = 4;
+        unsigned n = 0;
+        if (const char* env = std::getenv("GGML_N_THREADS")) {
+            n = std::strtoul(env, nullptr, 10);
+        }
+        if (n == 0) {
+            const unsigned hw = std::thread::hardware_concurrency();
+            n = hw == 0 ? 4 : std::min<unsigned>(hw, 32);
+        }
         ggml_backend_cpu_set_n_threads(b, static_cast<int>(n));
         return n;
     };
@@ -240,7 +247,7 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         }
     } else {
         // Primary is a GPU backend. Set up a CPU companion so the
-        // ForwardEngine's `ggml_backend_sched` has somewhere to route
+        // Executor's `ggml_backend_sched` has somewhere to route
         // ops the GPU can't handle. Cost is minimal: the CPU backend
         // doesn't allocate anything until sched actually splits work
         // to it. With Part A's norm-weight upcast, the steady-state
@@ -266,7 +273,7 @@ Model::Model(const std::filesystem::path& snapshot_dir,
         // Probe: can the primary backend run argsort on a vocab-sized
         // input? ggml-vulkan caps at 1024 cols (max_argsort_cols), so
         // Qwen3 (152k vocab) etc. fail. When this returns false the
-        // ForwardEngine forces the `slow_only` sampling path: download
+        // Executor forces the `slow_only` sampling path: download
         // raw logits, sample host-side, no in-graph `ggml_top_k`. This
         // keeps Vulkan steady-state decode at GPU speed instead of
         // round-tripping each token through CPU for the argsort.
@@ -438,13 +445,7 @@ Model::~Model() {
 }
 
 std::string Model::tname_(const std::string& name) const {
-    if (tensor_prefix_.empty()) return name;
-    constexpr std::string_view kModelPrefix = "model.";
-    if (name.size() >= kModelPrefix.size() &&
-        std::string_view(name).substr(0, kModelPrefix.size()) == kModelPrefix) {
-        return tensor_prefix_ + std::string(name.substr(kModelPrefix.size()));
-    }
-    return tensor_prefix_ + name;
+    return pie_driver_common::apply_tensor_prefix(name, tensor_prefix_);
 }
 
 void Model::resolve_tensor_prefix_() {
@@ -494,21 +495,13 @@ ggml_tensor* Model::declare_(const std::string& hf_name) {
     // tensor we hand back to the graph builder is typed F32, so the
     // implicit `ggml_cast` in `norm_scale` becomes a no-op. The actual
     // bf16 → f32 byte conversion happens in load_into_backend_().
-    //
-    // GGUF tensors carry their ggml type in `ggml_type_override` and
-    // leave `dtype` as a placeholder F32 (see gguf_archive). The cast
-    // logic below is keyed off `dtype` and would mistrigger on every
-    // GGUF tensor, so we only apply it on the safetensors path.
-    const bool is_safetensors = t.ggml_type_override < 0;
-    const bool upcast = is_safetensors
-                     && t.dtype == StDtype::BF16
+    const bool upcast = t.dtype == StDtype::BF16
                      && is_small_weight_for_upcast(hf_name);
     // Some HF releases (notably Gemma-2-2b) store weights as F32. The F32
     // mul_mat path is ~2x slower than BF16 on tensor-core hardware and
     // doubles VRAM. Downcast large matmul weights at load time, matching
     // llama.cpp's GGUF default. Norms / biases stay F32 (precision).
-    const bool downcast = is_safetensors
-                       && t.dtype == StDtype::F32
+    const bool downcast = t.dtype == StDtype::F32
                        && !is_small_weight_for_upcast(hf_name);
 
     ggml_tensor* tensor;
@@ -719,10 +712,7 @@ void Model::load_top_level_() {
     // the actual safetensors index and override the hparam to match.
     constexpr std::string_view kModelSuffix = "model.";
     std::string wrapper = tensor_prefix_;
-    if (wrapper.size() >= kModelSuffix.size() &&
-        std::string_view(wrapper).substr(wrapper.size() - kModelSuffix.size()) == kModelSuffix) {
-        wrapper = wrapper.substr(0, wrapper.size() - kModelSuffix.size());
-    }
+    wrapper = pie_driver_common::strip_suffix(wrapper, kModelSuffix);
     const std::string lm_wrapped = wrapper + "lm_head.weight";
     const std::string lm_plain   = "lm_head.weight";
     const std::string* found = nullptr;
@@ -792,54 +782,6 @@ void Model::load_moe_layer_(std::int32_t i,
     const std::int64_t ff     = h.moe_intermediate_size > 0
         ? h.moe_intermediate_size : h.intermediate_size;
 
-    // GGUF MoE: experts are stored as three stacked 3D tensors (one slab
-    // per gate / up / down) rather than the per-expert HF safetensors
-    // layout. The GGUF name mapper translates `blk.N.ffn_{gate,up,down}_exps`
-    // to `mlp.experts.{gate,up,down}_proj.weight` uniformly across
-    // qwen3_moe / mixtral / gpt-oss, so a single probe distinguishes
-    // GGUF stacked from per-expert safetensors regardless of `kind`.
-    const std::string gate_stacked = p + "mlp.experts.gate_proj.weight";
-    const std::string up_stacked   = p + "mlp.experts.up_proj.weight";
-    const std::string down_stacked = p + "mlp.experts.down_proj.weight";
-    if (archive_->find(gate_stacked) != nullptr) {
-        // Router. GGUF's `ffn_gate_inp.weight` maps to `mlp.gate.weight`
-        // for both Qwen-MoE and Mixtral, so this is uniform here too.
-        L.moe_router = declare_(p + "mlp.gate.weight");
-
-        const auto& gate_src = archive_->at(gate_stacked);
-        const auto& up_src   = archive_->at(up_stacked);
-        const auto& down_src = archive_->at(down_stacked);
-        // GGUF stores the ggml type directly in ggml_type_override
-        // (Q4_K, Q5_K, F16, ...); st_to_ggml_dtype only covers F32/F16/BF16
-        // and would throw on quants, so use the override path explicitly.
-        auto src_dtype = [&](const StTensor& t, const std::string& nm) {
-            return (t.ggml_type_override >= 0)
-                ? static_cast<ggml_type>(t.ggml_type_override)
-                : st_to_ggml_dtype(t.dtype, nm);
-        };
-        const ggml_type gate_dtype = src_dtype(gate_src, gate_stacked);
-        const ggml_type up_dtype   = src_dtype(up_src,   up_stacked);
-        const ggml_type down_dtype = src_dtype(down_src, down_stacked);
-
-        const std::size_t gate_per_expert = gate_src.nbytes /
-                                            static_cast<std::size_t>(n_exp);
-        const std::size_t up_per_expert   = up_src.nbytes /
-                                            static_cast<std::size_t>(n_exp);
-        const std::size_t down_per_expert = down_src.nbytes /
-                                            static_cast<std::size_t>(n_exp);
-        L.moe_gate_exps = declare_stacked_experts_from_3d_(
-            p + "moe_gate", gate_stacked, hidden, ff, n_exp,
-            gate_per_expert, /*intra_off=*/0, gate_dtype);
-        L.moe_up_exps   = declare_stacked_experts_from_3d_(
-            p + "moe_up",   up_stacked,   hidden, ff, n_exp,
-            up_per_expert,   /*intra_off=*/0, up_dtype);
-        L.moe_down_exps = declare_stacked_experts_from_3d_(
-            p + "moe_down", down_stacked, ff, hidden, n_exp,
-            down_per_expert, /*intra_off=*/0, down_dtype);
-        return;
-    }
-
-    // Per-expert safetensors layout (Qwen-MoE / Mixtral / GPT-OSS HF).
     std::vector<std::string> gate_names, up_names, down_names;
     gate_names.reserve(n_exp);
     up_names.reserve(n_exp);

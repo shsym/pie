@@ -21,10 +21,11 @@ def run(args: argparse.Namespace):
     prompts, prompt_counts = hf_chat_prompts_and_counts(
         args.model, args.system, make_prompts(args, n + args.warmup)
     )
+    max_num_seqs = args.num_requests if args.mode == "tput" else 1
     llm = LLM(
         model=args.model,
         gpu_memory_utilization=args.gpu_mem_util,
-        max_num_seqs=args.concurrency if args.mode == "tput" else 1,
+        max_num_seqs=max_num_seqs,
         tensor_parallel_size=args.tp_size,
         max_model_len=args.max_model_len,
         enable_prefix_caching=False,
@@ -48,17 +49,9 @@ def run(args: argparse.Namespace):
             outputs = llm.generate([p], sampling)
             req_wall = time.perf_counter() - req_start
             for out in outputs:
-                latency = req_wall
-                metrics = getattr(out, "metrics", None)
-                if (
-                    metrics
-                    and metrics.finished_time is not None
-                    and metrics.arrival_time is not None
-                ):
-                    latency = metrics.finished_time - metrics.arrival_time
                 results.append(
                     RequestResult(
-                        True, float(latency), len(out.outputs[0].token_ids), prompt_count
+                        True, float(req_wall), len(out.outputs[0].token_ids), prompt_count
                     )
                 )
     else:
@@ -77,7 +70,7 @@ def run(args: argparse.Namespace):
         wall_s=wall,
         config={
             "enable_prefix_caching": False,
-            "max_num_seqs": args.concurrency if args.mode == "tput" else 1,
+            "max_num_seqs": max_num_seqs,
             "temperature": args.temperature,
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
