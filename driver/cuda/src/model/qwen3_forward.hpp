@@ -32,12 +32,6 @@ struct Qwen3Workspace {
     DeviceTensor up;         // [max_tokens, intermediate]
     DeviceTensor logits;     // [max_tokens, vocab]
     DeviceTensor probs;      // [max_tokens, vocab] FP32 — softmax scratch for sampling
-    DeviceTensor greedy_values;      // [max_tokens] FP32, TP greedy local maxima
-    DeviceTensor greedy_tokens;      // [max_tokens] INT32, TP greedy local token ids
-    DeviceTensor greedy_values_all;  // [8, max_tokens] FP32, rank-major gather
-    DeviceTensor greedy_tokens_all;  // [8, max_tokens] INT32, rank-major gather
-    DeviceTensor greedy_pairs;       // [max_tokens] packed {FP32 value, INT32 token}
-    DeviceTensor greedy_pairs_all;   // [8, max_tokens] packed rank-major gather
 
     // Padded variants for the attention kernel when `head_dim_kernel >
     // head_dim` (Phi-3 ships head_dim=96; flashinfer's TC kernel only
@@ -57,8 +51,7 @@ struct Qwen3Workspace {
     // Caller passes the worst-case value; ws.gate / ws.up / logits are
     // sized accordingly. Other shapes match the standard `allocate`.
     static Qwen3Workspace allocate_with_max_intermediate(
-        const HfConfig& cfg, int max_tokens, int max_intermediate,
-        int max_output_rows = -1);
+        const HfConfig& cfg, int max_tokens, int max_intermediate);
 
     // Variant for architectures whose per-layer attention dimensions
     // (Hq = num_q_heads * head_dim, Hk = num_kv_heads * head_dim) vary
@@ -68,8 +61,7 @@ struct Qwen3Workspace {
     // layers. Caller passes the worst-case `Hq` and `Hk`.
     static Qwen3Workspace allocate_full(
         const HfConfig& cfg, int max_tokens,
-        int max_intermediate, int max_Hq, int max_Hk,
-        int max_output_rows = -1);
+        int max_intermediate, int max_Hq, int max_Hk);
 };
 
 // Run prefill on `num_tokens` consecutive tokens starting at position 0.

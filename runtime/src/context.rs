@@ -86,10 +86,10 @@ use dashmap::DashMap;
 use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::LazyLock;
 use std::time::Instant;
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::oneshot;
 
 use crate::adapter::AdapterId;
-use crate::driver::DriverId;
+use crate::driver::{self, DriverId};
 use crate::process::ProcessId;
 use crate::service::{ServiceArray, ServiceHandler};
 use pie_bridge::Brle;
@@ -165,7 +165,6 @@ pub(crate) static CACHED_CONTEXT_INFO: LazyLock<DashMap<(usize, ContextId), Cach
 /// Per-model market data: clearing prices, dividend rate, balances.
 /// Indexed by `model_idx` (the spawn order).
 pub(crate) static MARKET: LazyLock<boxcar::Vec<Market>> = LazyLock::new(boxcar::Vec::new);
-static ADMISSION_NOTIFY: LazyLock<Notify> = LazyLock::new(Notify::new);
 
 /// Real-time pinned context count per driver (max 8 drivers).
 /// Updated atomically on every pin/unpin — readable without actor overhead.
@@ -254,15 +253,14 @@ impl Market {
 ///   don't declare an explicit token limit at admission.
 /// - `default_token_limit`: compute-wallet cap for the same;
 ///   `None` means unlimited (the system-wide default).
-/// - `admission_oversubscription_factor`: admission gate — `Σ admission_claim`
-///   must not exceed `total_pages × factor`.
+/// - `admission_oversubscription_factor`: admission gate — `Σ endowment` must not
+///   exceed `total_pages × factor`.
 /// - `restore_pause_at_utilization`: the restore loop pauses when any
 ///   driver's GPU page utilization exceeds this fraction.
 pub fn spawn(
     page_size: usize,
     num_gpu_pages: Vec<usize>,
     num_cpu_pages: Vec<usize>,
-    max_forward_requests: usize,
     default_endowment_pages: usize,
     default_token_limit: Option<usize>,
     admission_oversubscription_factor: f64,
@@ -277,7 +275,6 @@ pub fn spawn(
                 page_size,
                 &num_gpu_pages,
                 &num_cpu_pages,
-                max_forward_requests,
                 default_endowment_pages,
                 default_token_limit,
                 admission_oversubscription_factor,
@@ -380,31 +377,11 @@ pub async fn destroy(model_idx: usize, id: ContextId) -> Result<()> {
 /// Register a process across all models.
 /// Called from `InstanceState::new` before any context operations.
 ///
-/// Waits if a model's admission gate is temporarily full (the
-/// `Σ admission_claim ≤ capacity × admission_oversubscription_factor` invariant).
+/// Fails fast if any model's admission gate would refuse the request (the
+/// `Σ endowment ≤ capacity × admission_oversubscription_factor` invariant).
 /// On partial failure — e.g., model 0 admits but model 1 refuses — the
 /// successful registrations are rolled back so no orphan state remains.
 pub async fn register_process(pid: ProcessId, token_budget: Option<usize>) -> Result<()> {
-    loop {
-        match try_register_process(pid, token_budget).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let Some(admission) = e.downcast_ref::<sched::AdmissionDenied>() else {
-                    return Err(e);
-                };
-                if admission.admission_pages > admission.cap {
-                    return Err(e);
-                }
-                tokio::select! {
-                    _ = ADMISSION_NOTIFY.notified() => {}
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
-                }
-            }
-        }
-    }
-}
-
-async fn try_register_process(pid: ProcessId, token_budget: Option<usize>) -> Result<()> {
     let mut admitted: Vec<usize> = Vec::new();
     for model_idx in 0..SERVICES.len() {
         let (tx, rx) = oneshot::channel();
@@ -773,14 +750,6 @@ pub(crate) struct TokenInfo {
     pub adapter_seed: Option<i64>,
 }
 
-pub(super) fn materialize_lineage_mask(mask: &Brle, position: u32) -> Brle {
-    if mask.buffer.is_empty() && mask.total_size == 0 {
-        Brle::all_true((position + 1) as usize)
-    } else {
-        mask.clone()
-    }
-}
-
 // =============================================================================
 // Internal Types
 // =============================================================================
@@ -1026,21 +995,13 @@ pub(crate) struct ContextManager {
     /// an explicit token_budget at admission.
     /// `None` = unlimited (the system-wide default); `Some(n)` = cap at `n`.
     pub(crate) default_token_limit: Option<usize>,
-    /// Admission cap: `Σ admission_claim ≤ total_gpu_capacity × admission_oversubscription_factor`.
-    /// At 1.0 claims are strictly bound by physical capacity; > 1.0 allows overbook.
+    /// Admission cap: `Σ endowment ≤ total_gpu_capacity × admission_oversubscription_factor`.
+    /// At 1.0 strictly bound by physical capacity; > 1.0 allows overbook.
     pub(crate) admission_oversubscription_factor: f64,
     /// Hard admission gate for the restore loop: pause restoring suspended
     /// contexts when any driver's page utilization exceeds this fraction.
     /// Prevents the evict→restore→re-evict thrash cascade.
     pub(crate) restore_pause_at_utilization: f64,
-    /// Total driver-reported forward request slots across this model's
-    /// registered drivers. Admission uses this as the largest useful launch
-    /// wave and as the upper bound on page-rounding slack.
-    pub(crate) admission_wave_requests: usize,
-    /// Set after an admission denial caused by a full endowment pool. While
-    /// active, new admissions wait until enough endowment has drained to fit
-    /// the next full wave that can live inside the effective admission cap.
-    pub(crate) admission_drain_barrier: bool,
     /// Diagnostic counters for scheduler health.
     pub(crate) sched_counters: SchedCounters,
     /// Round-robin counter for new-context driver assignment. Used when
@@ -1057,7 +1018,6 @@ impl ContextManager {
         page_size: usize,
         num_gpu_pages: &[usize],
         num_cpu_pages: &[usize],
-        max_forward_requests: usize,
         default_endowment_pages: usize,
         default_token_limit: Option<usize>,
         admission_oversubscription_factor: f64,
@@ -1087,8 +1047,6 @@ impl ContextManager {
             default_token_limit,
             admission_oversubscription_factor,
             restore_pause_at_utilization,
-            admission_wave_requests: max_forward_requests.max(1),
-            admission_drain_barrier: false,
             sched_counters: SchedCounters::default(),
             next_driver_rr: 0,
         }
@@ -1408,7 +1366,7 @@ impl ContextManager {
         for info in &ctx.working_page_tokens[..total_tokens] {
             tokens.push(info.token);
             positions.push(info.position);
-            masks.push(materialize_lineage_mask(&info.mask, info.position));
+            masks.push(info.mask.clone());
         }
 
         // Validate positions are strictly after any previously committed position.
@@ -1752,17 +1710,6 @@ impl ContextManager {
         }
     }
 
-    pub(crate) fn publish_working_token_count(&self, id: ContextId) {
-        let Some(ctx) = self.contexts.get(&id) else {
-            return;
-        };
-        if let Some(mut info) = CACHED_CONTEXT_INFO.get_mut(&(self.model_idx, id)) {
-            info.working_tokens = ctx.working_page_tokens.len() as u32;
-        } else {
-            self.publish_context_counts(id);
-        }
-    }
-
     /// Remove cached entry for a context (on destroy).
     pub(crate) fn remove_context_caches(&self, id: ContextId) {
         CACHED_CONTEXT_INFO.remove(&(self.model_idx, id));
@@ -2100,7 +2047,7 @@ impl ServiceHandler for ContextManager {
                 ) {
                     tracing::warn!("append_working_page_tokens for ctx {id}: {e:#}");
                 }
-                self.publish_working_token_count(id);
+                self.publish_context_counts(id);
                 self.sched_counters.append_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.append_count += 1;
             }
@@ -2121,7 +2068,6 @@ impl ServiceHandler for ContextManager {
             Message::UnregisterProcess { pid } => {
                 let t0 = Instant::now();
                 self.unregister_process(pid);
-                ADMISSION_NOTIFY.notify_waiters();
                 self.sched_counters.unregister_us += t0.elapsed().as_micros() as u64;
                 self.sched_counters.unregister_count += 1;
             }

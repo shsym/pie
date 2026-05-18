@@ -27,6 +27,9 @@
 
 namespace pie_portable_driver {
 
+class Model;
+bool try_load_with_rust_storage_program(Model& model, const char* planner_mode);
+
 // Per-layer weights, raw split-projection layout (matches HF; no QKV/MLP
 // fusion). The graph builder is free to fuse on the fly. Optional tensors
 // (biases, QK-norm) are nullptr when the architecture doesn't use them.
@@ -269,6 +272,8 @@ public:
     std::string activation_dtype_str() const;
 
 private:
+    friend bool try_load_with_rust_storage_program(Model& model, const char* planner_mode);
+
     // Per-arch loader description. Captures the structural variations across
     // archs (extra norms, fused/biased QKV, MoE naming) so a single set of
     // loader helpers can drive all of them. Specialized cases that don't fit
@@ -502,6 +507,11 @@ private:
         // mantissa bits. See `is_small_weight_for_upcast()` for the
         // norms/biases that stay F32.
         bool         downcast_f32_to_bf16 = false;
+        // FP8 checkpoints store projection weights as raw E4M3 bytes plus
+        // a scalar or per-row scale tensor. Runtime ggml matmuls consume
+        // BF16 here, so the loader lowers this as Decode(FP8, scale).
+        bool         decode_fp8_to_bf16 = false;
+        std::string  fp8_scale_hf_name;
     };
     std::vector<DeclaredTensor> declared_;
 

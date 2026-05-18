@@ -128,7 +128,7 @@ class Engine:
 
         # Create model-specific components
         model_config = mod.ModelConfig.from_dict(normalized_arch)
-        config.total_pages = model_config.eval_total_pages(config)
+        config.max_num_kv_pages = model_config.eval_max_num_kv_pages(config)
 
         forward_pass = mod.ForwardPass(
             model_config,
@@ -201,7 +201,7 @@ class Engine:
         model_config = DummyModelConfig()
         if hf_vocab_size is not None:
             model_config.vocab_size = int(hf_vocab_size)
-        config.total_pages = model_config.eval_total_pages(config)
+        config.max_num_kv_pages = model_config.eval_max_num_kv_pages(config)
 
         forward_pass = DummyForwardPass(model_config, config)
         kv_cache_at_layer = create_kv_cache(model_config, config)
@@ -581,24 +581,12 @@ class Engine:
             getattr(self.model_config, "num_vocabs", None)
             or getattr(self.model_config, "vocab_size", 0)
         )
-        total_pages = int(self.config.total_pages or 0)
-        max_forward_tokens = max(
-            1, min(10240, total_pages * int(self.config.kv_page_size))
-        )
-        max_forward_requests = max(1, min(512, max_forward_tokens))
-        unconstrained = (1 << 32) - 1
         return DriverCapabilities(
-            total_pages=total_pages,
+            total_pages=int(self.config.max_num_kv_pages or 0),
             kv_page_size=int(self.config.kv_page_size),
             swap_pool_size=int(self.swap_pool_size),
-            max_forward_tokens=max_forward_tokens,
-            max_forward_requests=max_forward_requests,
-            max_page_refs=total_pages,
-            max_logit_rows=unconstrained,
-            max_prob_rows=unconstrained,
-            max_custom_mask_bytes=unconstrained,
-            max_sampler_rows=unconstrained,
-            max_logprob_labels=unconstrained,
+            max_batch_tokens=int(self.config.max_batch_tokens or 0),
+            max_batch_size=int(self.config.max_batch_size or 0),
             arch_name=self.arch_type,
             vocab_size=vocab_size,
             max_model_len=max_model_len,
