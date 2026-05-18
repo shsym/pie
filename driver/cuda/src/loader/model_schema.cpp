@@ -9,7 +9,6 @@
 
 #include "loader/model_adapter.hpp"
 #include "loader/model_family.hpp"
-#include "loader/layout_optimizer.hpp"
 #include "loader/layout_planner.hpp"
 #include "loader/runtime_abi.hpp"
 #include "loader/safetensors.hpp"
@@ -78,7 +77,10 @@ void register_tensor_spec(
     TensorOwnershipKind ownership,
     TensorParallelKind parallel,
     std::string backing_tensor = {},
-    QuantSpec quant = {})
+    QuantSpec quant = {},
+    int view_axis = -1,
+    std::int64_t view_start = 0,
+    std::int64_t view_length = 0)
 {
     TensorDecl spec;
     spec.name = std::move(name);
@@ -89,6 +91,9 @@ void register_tensor_spec(
     spec.parallel = parallel;
     spec.quant = std::move(quant);
     spec.backing_tensor = std::move(backing_tensor);
+    spec.view_axis = view_axis;
+    spec.view_start = view_start;
+    spec.view_length = view_length;
     const std::string key = spec.name;
     auto [it, inserted] = plan.tensors.emplace(key, std::move(spec));
     if (!inserted) {
@@ -461,7 +466,10 @@ void register_tensor_contract(
         contract.ownership,
         contract.parallel,
         std::move(contract.backing_tensor),
-        std::move(contract.quant));
+        std::move(contract.quant),
+        contract.view_axis,
+        contract.view_start,
+        contract.view_length);
 }
 
 void estimate_temporary_bytes(LayoutPlan& plan, std::uint64_t bytes) {
@@ -553,6 +561,11 @@ bool try_add_packed_axis_group(
         const auto& info = loader.info(group.raw_names[i]);
         const auto local_shape = sharded_shape(
             info.shape, 0, tp_size, group.runtime_names[i]);
+        std::int64_t view_start = 0;
+        for (std::size_t j = 0; j < i; ++j) {
+            view_start += loader.info(group.raw_names[j]).shape[0] / tp_size;
+        }
+        const std::int64_t view_length = local_shape[0];
         register_tensor_contract(
             plan,
             runtime_abi.view_contract(
@@ -560,17 +573,17 @@ bool try_add_packed_axis_group(
                 info.dtype,
                 local_shape,
                 packed_name,
+                /*axis=*/0,
+                view_start,
+                view_length,
                 TensorParallelKind::Column));
         TensorDecl view_decl = tensor_decl_for(plan, group.runtime_names[i]);
         LayoutExpr view = make_expr(LayoutExprKind::View, view_decl);
         view.inputs = {joined};
         view.runtime_name = group.runtime_names[i];
         view.axis = 0;
-        view.start = i == 0 ? 0 : 0;
-        for (std::size_t j = 0; j < i; ++j) {
-            view.start += loader.info(group.raw_names[j]).shape[0] / tp_size;
-        }
-        view.length = local_shape[0];
+        view.start = view_start;
+        view.length = view_length;
         const LayoutExprId view_root = add_expr(plan, std::move(view));
         plan.algebra.bindings.push_back(LayoutBinding{
             .runtime_name = group.runtime_names[i],
@@ -2616,10 +2629,8 @@ LayoutPlan build_model_layout_plan(
         build_model_semantic_graph(hf, boot_cfg, loader);
     if (can_use_native_dense_algebra_plan(
             hf, boot_cfg, loader, semantic_graph, schema)) {
-        plan = build_native_dense_algebra_plan(
+        return build_native_dense_algebra_plan(
             semantic_graph, loader, tp_size);
-        (void)optimize_layout_algebra(plan);
-        return plan;
     }
     std::unordered_map<std::string, const SemanticGroup*> packed_group_by_raw;
     packed_group_by_raw.reserve(semantic_graph.groups.size() * 3);
@@ -2887,7 +2898,6 @@ LayoutPlan build_model_layout_plan(
             "scheduled");
     }
     finalize_memory_plan(plan);
-    (void)optimize_layout_algebra(plan);
     return plan;
 }
 

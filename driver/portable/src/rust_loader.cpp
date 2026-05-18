@@ -49,12 +49,6 @@ namespace pie_portable_driver {
 
 namespace {
 
-enum class PlannerMode {
-    Cpp,
-    Rust,
-    Dual,
-};
-
 std::string lowercase(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
         return static_cast<char>(std::tolower(c));
@@ -62,23 +56,16 @@ std::string lowercase(std::string value) {
     return value;
 }
 
-PlannerMode parse_mode(const char* value) {
+void validate_loader_mode(const char* value) {
     const std::string mode = lowercase(value == nullptr ? std::string{} : value);
-    if (mode.empty() || mode == "cpp") return PlannerMode::Cpp;
-    if (mode == "rust") return PlannerMode::Rust;
-    if (mode == "dual") return PlannerMode::Dual;
-    throw std::runtime_error(
-        "portable rust loader: PIE_PORTABLE_LOADER_PLANNER must be one of "
-        "{cpp,rust,dual}");
-}
-
-const char* mode_name(PlannerMode mode) noexcept {
-    switch (mode) {
-        case PlannerMode::Cpp: return "cpp";
-        case PlannerMode::Rust: return "rust";
-        case PlannerMode::Dual: return "dual";
+    if (mode.empty() || mode == "rust") return;
+    if (mode == "cpp" || mode == "dual") {
+        throw std::runtime_error(
+            "portable rust loader: cpp/dual planner modes were removed; "
+            "portable weight loading is always the Rust storage program");
     }
-    return "?";
+    throw std::runtime_error(
+        "portable rust loader: PIE_PORTABLE_LOADER_PLANNER must be unset or 'rust'");
 }
 
 std::string bytes_to_string(pie_weight_loader::PieLoaderBytes bytes) {
@@ -1341,6 +1328,10 @@ private:
 
 std::string describe_program(const pie_weight_loader::PieLoaderStorageProgramView& view,
                              const CompileResult& result) {
+    std::uint64_t optimizer_rewrites = 0;
+    for (std::size_t i = 0; i < view.optimizer.passes.len; ++i) {
+        optimizer_rewrites += view.optimizer.passes.ptr[i].rewrites;
+    }
     std::ostringstream out;
     out << "rust_storage_program(version=" << view.version
         << ", source_tensors=" << result.source_tensor_count
@@ -1350,6 +1341,8 @@ std::string describe_program(const pie_weight_loader::PieLoaderStorageProgramVie
         << ", buffers=" << view.buffers.len
         << ", instrs=" << view.instrs.len
         << ", schedule=" << view.schedule.len
+        << ", optimizer_passes=" << view.optimizer.passes.len
+        << ", optimizer_rewrites=" << optimizer_rewrites
         << ", persistent_bytes=" << view.memory.persistent_bytes
         << ", read_bytes=" << view.memory.checkpoint_read_bytes
         << ", write_bytes=" << view.memory.device_write_bytes
@@ -1412,6 +1405,25 @@ void dump_count_map(std::ostringstream& out,
     out << "}" << suffix << "\n";
 }
 
+void dump_optimizer_report(
+    std::ostringstream& out,
+    const pie_weight_loader::PieLoaderOptimizerReportView& optimizer,
+    const char* suffix) {
+    out << "  \"optimizer\": {\n"
+        << "    \"passes\": [\n";
+    for (std::size_t i = 0; i < optimizer.passes.len; ++i) {
+        const auto& pass = optimizer.passes.ptr[i];
+        out << "      {\"name\": \"" << bytes_to_string(pass.name)
+            << "\", \"exprs_before\": " << pass.exprs_before
+            << ", \"exprs_after\": " << pass.exprs_after
+            << ", \"rewrites\": " << pass.rewrites << "}";
+        if (i + 1 < optimizer.passes.len) out << ",";
+        out << "\n";
+    }
+    out << "    ]\n"
+        << "  }" << suffix << "\n";
+}
+
 std::string dump_program_json(const pie_weight_loader::PieLoaderStorageProgramView& view,
                               const CompileResult& result) {
     std::map<std::string, std::size_t> instruction_kinds;
@@ -1443,6 +1455,7 @@ std::string dump_program_json(const pie_weight_loader::PieLoaderStorageProgramVi
         << view.memory.checkpoint_read_bytes << ",\n"
         << "    \"device_write_bytes\": " << view.memory.device_write_bytes << "\n"
         << "  },\n";
+    dump_optimizer_report(out, view.optimizer, ",");
     dump_count_map(out, "instruction_kinds", instruction_kinds, ",");
     dump_count_map(out, "tile_map_kinds", tile_map_kinds, "");
     out
@@ -1465,9 +1478,8 @@ void maybe_dump_program(const pie_weight_loader::PieLoaderStorageProgramView& vi
 
 }  // namespace
 
-bool try_load_with_rust_storage_program(Model& model, const char* planner_mode) {
-    const PlannerMode mode = parse_mode(planner_mode);
-    if (mode == PlannerMode::Cpp) return false;
+void load_with_rust_storage_program(Model& model, const char* planner_mode) {
+    validate_loader_mode(planner_mode);
 
     std::vector<ContractCandidate> candidates;
     candidates.reserve(model.declared_.size());
@@ -1492,25 +1504,21 @@ bool try_load_with_rust_storage_program(Model& model, const char* planner_mode) 
     const auto view = result.program.view();
     maybe_dump_program(view, result);
     std::cerr << "[model] " << describe_program(view, result)
-              << " (planner=" << mode_name(mode) << ")\n";
+              << " (planner=rust)\n";
 
     const bool complete = result.emitted_contracts == result.required_contracts;
     if (!complete) {
-        if (mode == PlannerMode::Dual) return false;
         throw std::runtime_error(
             "portable rust loader: incomplete contract coverage (" +
             std::to_string(result.emitted_contracts) + "/" +
             std::to_string(result.required_contracts) + ")");
     }
 
-    if (mode == PlannerMode::Dual) return false;
-
     Executor executor(*model.archive_, std::move(result.source_names), std::move(result.targets));
     executor.execute(view);
     for (const auto& s : model.synth_) {
         ggml_backend_tensor_set(s.tensor, s.data.data(), 0, s.data.size());
     }
-    return true;
 }
 
 }  // namespace pie_portable_driver
