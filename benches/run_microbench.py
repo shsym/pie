@@ -92,11 +92,10 @@ def main():
     p.add_argument("--worker-threads", type=int, default=None)
     p.add_argument("--default-token-limit", type=int, default=None)
     p.add_argument("--default-endowment-pages", type=int, default=64)
-    p.add_argument("--admission-oversubscription-factor", type=float, default=2.0)
+    p.add_argument("--admission-oversubscription-factor", type=float, default=1.0)
     args = p.parse_args()
     args.mode = "latency"  # pie_bench.build_config uses this
     args.num_requests = 1
-    args.concurrency = 1
     args.warmup = 0
 
     asyncio.run(run(args))

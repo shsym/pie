@@ -85,11 +85,7 @@ const PORTABLE_DRIVER_BLOCK: &str = r#"
 [model.driver]
 type = "portable"
 device = ["auto"]
-ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
-
-[model.driver.options]
-max_batch_tokens = 10240
-max_batch_size = 512
+ipc_profile = "balanced" # "latency", "balanced", or "power"
 "#;
 
 #[cfg(feature = "driver-cuda")]
@@ -99,12 +95,12 @@ type = "cuda_native"
 device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
-ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
+# ipc_profile omitted: cuda_native defaults to "latency".
+# Set "power" to minimize idle CPU.
 
 [model.driver.options]
-gpu_mem_utilization = 0.85
-max_batch_tokens = 10240
-max_batch_size = 512
+gpu_mem_utilization = 0.90
+memory_profile = "auto"
 "#;
 
 const DUMMY_DRIVER_BLOCK: &str = r#"
@@ -112,7 +108,7 @@ const DUMMY_DRIVER_BLOCK: &str = r#"
 type = "dummy"
 device = ["cpu"]
 activation_dtype = "bfloat16"
-ipc_profile = "balanced" # "low_latency", "balanced", or "low_power"
+ipc_profile = "balanced" # "latency", "balanced", or "power"
 
 [model.driver.options]
 vocab_size = 151936

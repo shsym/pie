@@ -37,6 +37,7 @@ class VllmEngine:
 
     config: RuntimeConfig
     forward_pass: object
+    vllm_config: object
     model_config: object
     kv_cache_at_layer: list[torch.Tensor]
     kv_cache_at_layer_host: list[torch.Tensor]
@@ -52,6 +53,7 @@ class VllmEngine:
         config: RuntimeConfig,
         driver_config,
         model_config,
+        vllm_config,
         forward_pass,
         kv_cache_at_layer: list,
         adapter_at_layer: list,
@@ -64,6 +66,7 @@ class VllmEngine:
         self.config = config
         self.driver_config = driver_config
         self.model_config = model_config
+        self.vllm_config = vllm_config
         self.forward_pass = forward_pass
         self.kv_cache_at_layer = kv_cache_at_layer
         self.kv_cache_at_layer_host = kv_cache_at_layer_host or []
@@ -157,6 +160,7 @@ class VllmEngine:
             config=config,
             driver_config=driver_config,
             model_config=loaded.model_config,
+            vllm_config=loaded.vllm_config,
             forward_pass=forward_pass,
             kv_cache_at_layer=kv_cache_at_layer,
             adapter_at_layer=[],
@@ -284,7 +288,7 @@ class VllmEngine:
         from vllm.v1.spec_decode.ngram_proposer import batch_propose_numba
 
         max_model_len = int(self.info.get("max_model_len", 0)) or 4096
-        max_num_seqs = int(getattr(self.driver_config, "max_num_seqs", 256))
+        max_num_seqs = int(self.vllm_config.scheduler_config.max_num_seqs)
         k = int(self.driver_config.spec_ngram_num_drafts)
         min_n = int(self.driver_config.spec_ngram_min_n)
         max_n = int(self.driver_config.spec_ngram_max_n)
@@ -437,9 +441,8 @@ class VllmEngine:
         """Report this driver's resolved capacities up to pie's runtime.
 
         Sources every value from vllm's resolved `VllmConfig` rather than
-        echoing the user's `RuntimeConfig`. In particular `kv_page_size`
-        comes from the attention backend's chosen block size, which may
-        differ from what the user requested.
+        echoing input config. In particular `kv_page_size` comes from the
+        attention backend's chosen block size.
 
         Fails loudly if any expected value is missing — the runtime/Rust
         side relies on these being correct, so silent defaulting is unsafe.
@@ -450,9 +453,9 @@ class VllmEngine:
         mc = vc.model_config
         cc = vc.cache_config
 
-        if self.config.max_num_kv_pages is None:
+        if self.config.total_pages is None:
             raise RuntimeError(
-                "config.max_num_kv_pages was not set by the loader — KV cache "
+                "config.total_pages was not set by the loader — KV cache "
                 "allocation must run before capabilities() is called."
             )
         if not self.snapshot_dir:
@@ -465,23 +468,24 @@ class VllmEngine:
                 "torch.dtype with a 'torch.' prefix."
             )
 
-        # vllm expresses batch limits as max_num_seqs / max_num_batched_tokens.
-        # Capabilities normalizes them to max_batch_size / max_batch_tokens
-        # for pie's runtime side. If max_num_batched_tokens is None (vllm
-        # default), use scheduler_config's resolved value.
-        max_batch_size = int(self.driver_config.max_num_seqs)
-        max_batch_tokens = self.driver_config.max_num_batched_tokens
-        if max_batch_tokens is None:
-            max_batch_tokens = int(vc.scheduler_config.max_num_batched_tokens)
-        else:
-            max_batch_tokens = int(max_batch_tokens)
+        # vllm resolves scheduler capacity while building VllmConfig. Pie
+        # reports those resolved limits rather than accepting user overrides.
+        max_forward_requests = int(vc.scheduler_config.max_num_seqs)
+        max_forward_tokens = int(vc.scheduler_config.max_num_batched_tokens)
+        unconstrained = (1 << 32) - 1
 
         return DriverCapabilities(
-            total_pages=int(self.config.max_num_kv_pages),
+            total_pages=int(self.config.total_pages),
             kv_page_size=int(cc.block_size),
             swap_pool_size=int(self.swap_pool_size),
-            max_batch_tokens=max_batch_tokens,
-            max_batch_size=max_batch_size,
+            max_forward_tokens=max_forward_tokens,
+            max_forward_requests=max_forward_requests,
+            max_page_refs=int(self.config.total_pages),
+            max_logit_rows=unconstrained,
+            max_prob_rows=unconstrained,
+            max_custom_mask_bytes=unconstrained,
+            max_sampler_rows=unconstrained,
+            max_logprob_labels=unconstrained,
             arch_name=self.arch_type,
             vocab_size=int(mc.get_vocab_size()),
             max_model_len=int(mc.max_model_len),

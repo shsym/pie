@@ -1,9 +1,8 @@
 #pragma once
 
 // Llama-style transformer weight schema. Holds non-owning pointers into the
-// LoadedModel's weight pool, grouped by transformer block. Projection groups
-// may be backed by packed loader-owned tensors with q/k/v and gate/up exposed
-// as non-owning views for the unfused fallback.
+// LoadedModel's weight pool, grouped by transformer block. Unfused — Q/K/V and
+// gate/up are kept separate; QKV fusion is an optimization for later.
 //
 // Same struct shape covers Qwen3, Llama 3, Qwen 2, and Mistral. The Qwen3
 // quirk (per-head q_norm / k_norm) is captured by leaving those pointers
@@ -100,6 +99,11 @@ struct Qwen3Weights {
     const DeviceTensor* embed       = nullptr;  // [vocab, hidden]
     const DeviceTensor* final_norm  = nullptr;  // [hidden]
     const DeviceTensor* lm_head     = nullptr;  // [vocab, hidden] (may alias embed)
+    // Optional TP row-slice of lm_head, backed by the replicated full
+    // tensor. Used only for the greedy decode fast path; full logits still
+    // use `lm_head` so probes and stochastic samplers keep their old path.
+    const DeviceTensor* lm_head_tp_shard = nullptr;  // [vocab/tp, hidden]
+    int lm_head_tp_vocab_offset = 0;
     std::vector<Qwen3LayerWeights> layers;
 };
 
@@ -108,16 +112,16 @@ struct Qwen3Weights {
 /// `embed` when `tie_word_embeddings` is set). Reads `cfg.use_qk_norm` to
 /// decide whether to require q/k_norm weights, and `cfg.use_qkv_bias` to
 /// decide whether to bind q/k/v bias terms.
-Qwen3Weights bind_llama_like(const LoadedModel& engine, bool verbose = false);
+Qwen3Weights bind_llama_like(LoadedModel& engine, bool drop_fused_originals = true);
 
 // Backward-compatible alias for callers still using `bind_qwen3`.
-inline Qwen3Weights bind_qwen3(const LoadedModel& engine) { return bind_llama_like(engine); }
+inline Qwen3Weights bind_qwen3(LoadedModel& engine) { return bind_llama_like(engine); }
 
 // Phi-3 ships fused `qkv_proj` and `gate_up_proj` weights. The bind
 // function below splits them into the standard q/k/v/gate/up slots
 // expected by the Llama-like forward, by registering virtual sub-views
 // in the engine's weight pool. Returns the same `Qwen3Weights` shape.
-Qwen3Weights bind_phi3(const LoadedModel& engine);
+Qwen3Weights bind_phi3(LoadedModel& engine);
 
 // OLMo-3 ships separate Q/K/V (no fused weights), but stores its norms
 // at HF positions that don't match Llama. Map:
@@ -127,6 +131,6 @@ Qwen3Weights bind_phi3(const LoadedModel& engine);
 // OLMo-3 has no `input_layernorm` because the architecture is
 // post-norm. The forward path for OLMo-3 selects post-norm via
 // `LlamaLikeForwardCfg::norm_placement = NormPlacement::Post`.
-Qwen3Weights bind_olmo3(const LoadedModel& engine);
+Qwen3Weights bind_olmo3(LoadedModel& engine);
 
 }  // namespace pie_cuda_driver::model

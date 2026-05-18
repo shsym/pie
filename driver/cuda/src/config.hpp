@@ -2,8 +2,10 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 #include <toml++/toml.hpp>
 
@@ -13,46 +15,20 @@ struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
-    // Runtime quantization mode applied during load-plan materialization.
-    // Empty (default) = no quantization. Recognised values:
-    //   * "fp8"  — per-channel symmetric FP8_E4M3 for projection weights.
-    //   * "int8" — per-channel symmetric INT8 for projection weights.
-    // Norms, biases, embeddings, and lm_head stay in their native dtype.
+    // Runtime quantization mode applied after weight load. Empty (default)
+    // = no quantization. Recognised values:
+    //   * "fp8"  — per-tensor symmetric FP8_E4M3 on every projection
+    //              weight (Q/K/V/O/gate/up/down). Norms, biases,
+    //              embeddings, lm_head stay in their native dtype.
+    // M3 will add `"int4"` for offline GPTQ/AWQ; M2 may add `"int8"`.
     std::string runtime_quant;
-    // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects the best
-    // registered backend for this build. Recognised values:
-    //   * "auto" / "routed_dequant" / "packed" — keep MXFP4 resident and
-    //     dequantize only routed experts into bounded BF16 runtime scratch.
-    //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
-    //   * "native" — require a true MXFP4 MoE GEMM backend.
-    std::string mxfp4_moe = "auto";
-    // Checkpoint byte-source policy for storage-program materialization.
-    // Recognised values:
-    //   * "auto" — use GPUDirect Storage when libcufile + filesystem support
-    //     are available, otherwise mmap + cudaMemcpy.
-    //   * "mmap" — always use mmap + cudaMemcpy.
-    //   * "gds" — require GPUDirect Storage direct reads into device memory.
-    std::string checkpoint_io = "auto";
-    // Enables the storage program optimizer/validator. Kept as an explicit
-    // target policy so diagnostics and experiments do not hide behind env vars.
-    bool storage_program_optimizer = true;
 };
 
 struct BatchingConfig {
-    std::uint32_t kv_page_size = 32;
-    std::uint32_t max_num_kv_pages = 1024;
-    std::uint32_t max_batch_tokens = 10240;
-    std::uint32_t max_batch_size = 512;
+    double gpu_mem_utilization = 0.90;
+    std::string memory_profile = "auto";
     // Pinned host KV slots for swap-out. 0 = swap disabled.
     std::uint32_t swap_pool_size = 0;
-    // Cap for the linear-attention state cache slot count (Qwen3.5/3.6).
-    // 0 = "follow max_batch_size" — fine on small/medium models. Bound it
-    // explicitly on huge MoE × wide max_batch_size combos to avoid OOM:
-    //   per-slot bytes ≈ num_linear_layers
-    //                  * (V_h * K_d * V_d * 4   // recurrent_state fp32
-    //                     + conv_K * conv_dim * 2)  // conv_state bf16
-    // Qwen3.6-35B-A3B at max_batch_size=2048 → ~48 GB; 256 → ~6 GB.
-    std::uint32_t linear_attn_max_slots = 0;
 };
 
 // Tensor-parallel group geometry. Default {1, 0, ""} = single-GPU; nothing
@@ -78,6 +54,25 @@ struct Config {
     RuntimeConfig runtime;
 };
 
+inline int parse_cuda_device_id(const std::string& device) {
+    const auto colon = device.find(':');
+    const std::string id_str =
+        colon == std::string::npos ? device : device.substr(colon + 1);
+    std::size_t consumed = 0;
+    int id = 0;
+    try {
+        id = std::stoi(id_str, &consumed);
+    } catch (const std::exception&) {
+        throw std::runtime_error(
+            "invalid CUDA device '" + device + "'; expected cuda:N or N");
+    }
+    if (consumed != id_str.size() || id < 0) {
+        throw std::runtime_error(
+            "invalid CUDA device '" + device + "'; expected cuda:N or N");
+    }
+    return id;
+}
+
 inline Config load_config(const std::filesystem::path& path) {
     if (!std::filesystem::exists(path)) {
         throw std::runtime_error("config not found: " + path.string());
@@ -91,19 +86,41 @@ inline Config load_config(const std::filesystem::path& path) {
         c.model.device        = (*m)["device"].value_or(c.model.device);
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});
-        c.model.mxfp4_moe     = (*m)["mxfp4_moe"].value_or(c.model.mxfp4_moe);
-        c.model.checkpoint_io = (*m)["checkpoint_io"].value_or(c.model.checkpoint_io);
-        c.model.storage_program_optimizer =
-            (*m)["storage_program_optimizer"].value_or(c.model.storage_program_optimizer);
     }
     if (auto b = tbl["batching"].as_table()) {
-        c.batching.kv_page_size     = (*b)["kv_page_size"].value_or<int64_t>(c.batching.kv_page_size);
-        c.batching.max_num_kv_pages = (*b)["max_num_kv_pages"].value_or<int64_t>(c.batching.max_num_kv_pages);
-        c.batching.max_batch_tokens = (*b)["max_batch_tokens"].value_or<int64_t>(c.batching.max_batch_tokens);
-        c.batching.max_batch_size   = (*b)["max_batch_size"].value_or<int64_t>(c.batching.max_batch_size);
-        c.batching.swap_pool_size   = (*b)["swap_pool_size"].value_or<int64_t>(c.batching.swap_pool_size);
-        c.batching.linear_attn_max_slots = (*b)["linear_attn_max_slots"]
-            .value_or<int64_t>(c.batching.linear_attn_max_slots);
+        constexpr std::string_view allowed[] = {
+            "gpu_mem_utilization",
+            "memory_profile",
+            "swap_pool_size",
+        };
+        for (const auto& [key, _] : *b) {
+            const auto name = key.str();
+            bool ok = false;
+            for (const auto candidate : allowed) {
+                if (name == candidate) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) {
+                throw std::runtime_error(
+                    "config: unknown [batching] key: " + std::string{name});
+            }
+        }
+        c.batching.gpu_mem_utilization =
+            (*b)["gpu_mem_utilization"].value_or<double>(
+                static_cast<double>(c.batching.gpu_mem_utilization));
+        c.batching.memory_profile =
+            (*b)["memory_profile"].value_or(c.batching.memory_profile);
+        const auto swap_pool_size =
+            (*b)["swap_pool_size"].value_or<int64_t>(c.batching.swap_pool_size);
+        if (swap_pool_size < 0 ||
+            swap_pool_size > std::numeric_limits<std::uint32_t>::max()) {
+            throw std::runtime_error(
+                "config: [batching].swap_pool_size must be in [0, u32::MAX]");
+        }
+        c.batching.swap_pool_size =
+            static_cast<std::uint32_t>(swap_pool_size);
     }
     if (auto d = tbl["distributed"].as_table()) {
         c.distributed.tp_size = static_cast<int>(
@@ -120,11 +137,19 @@ inline Config load_config(const std::filesystem::path& path) {
     if (c.model.snapshot_dir.empty()) {
         throw std::runtime_error("config: [model].snapshot_dir is required");
     }
-    if (c.model.checkpoint_io != "auto" &&
-        c.model.checkpoint_io != "mmap" &&
-        c.model.checkpoint_io != "gds") {
+    if (!(c.batching.gpu_mem_utilization > 0.0 &&
+          c.batching.gpu_mem_utilization <= 1.0)) {
         throw std::runtime_error(
-            "config: [model].checkpoint_io must be one of {auto,mmap,gds}");
+            "config: [batching].gpu_mem_utilization must be in (0.0, 1.0]");
+    }
+    if (c.batching.memory_profile != "auto" &&
+        c.batching.memory_profile != "latency" &&
+        c.batching.memory_profile != "balanced" &&
+        c.batching.memory_profile != "throughput" &&
+        c.batching.memory_profile != "capacity") {
+        throw std::runtime_error(
+            "config: [batching].memory_profile must be one of auto, "
+            "latency, balanced, throughput, capacity");
     }
     if (c.distributed.tp_size < 1) {
         throw std::runtime_error("config: [distributed].tp_size must be >= 1");

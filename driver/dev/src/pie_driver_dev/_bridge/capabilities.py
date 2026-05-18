@@ -11,7 +11,7 @@ Pie's configuration has two distinct concepts that this module separates:
   * **Capacities** (bottom-up, driver-computed in this dataclass): "given
     that budget plus the kernel's real ceiling, here is what I actually
     have" — number of KV pages, page size the attention impl supports,
-    clamped batch sizes, model-architecture facts read from HF config. These
+    forward limits, model-architecture facts read from HF config. These
     flow from the worker back to the server via the `ready_queue` handshake
     and are then forwarded to the Rust runtime when applicable.
 
@@ -45,20 +45,24 @@ class DriverCapabilities:
     total_pages: int
 
     # Block size in tokens that the chosen attention kernel actually uses.
-    # The user's `ModelConfig.kv_page_size` is a *preference*; the driver
-    # may resolve to a different value (e.g., FlashInfer requires 16/32/64).
-    # Forwarded to Rust as ModelConfig.kv_page_size.
+    # Resolved by the driver and forwarded to Rust as ModelConfig.kv_page_size.
     kv_page_size: int
 
     # Pinned host-side KV slot count for swap-out. 0 = swap disabled.
     # Forwarded to Rust as DeviceConfig.cpu_pages.
     swap_pool_size: int
 
-    # ── Batching limits ────────────────────────────────────────────────
-    # Clamped to what the driver's kernel actually supports — not just an
-    # echo of the user's request. Forwarded to Rust as DeviceConfig fields.
-    max_batch_tokens: int
-    max_batch_size: int
+    # ── Forward limits ─────────────────────────────────────────────────
+    # Clamped to what the driver's kernel actually supports. Dynamic
+    # allocation drivers can use u32::MAX for sub-limits that do not apply.
+    max_forward_tokens: int
+    max_forward_requests: int
+    max_page_refs: int
+    max_logit_rows: int
+    max_prob_rows: int
+    max_custom_mask_bytes: int
+    max_sampler_rows: int
+    max_logprob_labels: int
 
     # ── Model-architecture facts ───────────────────────────────────────
     # First architecture string from the HF config (e.g. "LlamaForCausalLM",
