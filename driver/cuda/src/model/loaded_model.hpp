@@ -9,8 +9,8 @@
 #include <utility>
 
 #include "config.hpp"
+#include "loader/backend_target.hpp"
 #include "loader/hf_config.hpp"
-#include "loader/model_schema.hpp"
 #include "loader/safetensors.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
@@ -68,7 +68,7 @@ public:
     std::optional<QuantMeta> quant_meta(const std::string& name) const;
 
 private:
-    // Owns runtime-layout tensors produced by the schema/layout-plan load_executor.
+    // Owns runtime-layout tensors produced by the Rust storage-program loader.
     // Some names are non-owning views into packed backing tensors so older
     // forward paths can keep their unfused fallback pointers.
     Config boot_;

@@ -405,11 +405,10 @@ pipelined executor that issues async CUDA copies over a small stream pool for
 ready writes. Transform fusion remains represented as `TileMap` rather
 than hidden post-load mutation.
 
-The CUDA implementation supports both `MmapByteSource` and `GdsByteSource`.
-`[model].checkpoint_io = "auto"` selects GDS when libcufile is available and
-falls back to mmap for unsupported non-contiguous writes. Explicit
-`checkpoint_io = "gds"` fails loudly if a storage write cannot be served
-directly by cuFile. GDS is a byte-source backend, not a semantic IR change.
+The production CUDA loader now enters through the Rust storage program only.
+The old C++ byte-source executor is no longer linked into the driver. GDS
+support should re-enter as a Rust `ByteSource` backend after the storage-source
+interface is stable; it must not be exposed as a hidden fallback path.
 
 ### LoadCompiler
 
@@ -1093,13 +1092,11 @@ Last updated: 2026-05-17.
   `"eager_bf16"`. True native MXFP4 is represented as a `BackendTarget`
   capability and should bind to FlashInfer/TRT-LLM, CUTLASS, or Marlin rather
   than an architecture-local custom GEMM.
-- `PIE_CUDA_LAYOUT_PLAN_DUMP=/path/to/plan.json` writes a JSON plan artifact with
+- `PIE_CUDA_RUST_LAYOUT_PLAN_DUMP=/path/to/plan.json` writes a JSON plan artifact with
   algebra expressions, tensor specs, storage extent writes, tile maps, and
   semantic/storage memory estimates.
-- `[model].checkpoint_io = "auto" | "mmap" | "gds"` controls checkpoint byte
-  source policy. `[model].storage_program_optimizer = true | false` controls
-  storage optimizer passes. GPT-OSS MXFP4 policy is expressed as target
-  policy through `[model].mxfp4_moe`, not hidden env-var behavior.
+- GPT-OSS MXFP4 policy is expressed as target policy through
+  `[model].mxfp4_moe`, not hidden env-var behavior.
 - The planner computes persistent bytes from final owned tensors and computes
   semantic temporary high-water bytes from algebra lifetimes.
 - The storage compiler computes resident temporary high-water from the actual
@@ -1131,35 +1128,27 @@ Last updated: 2026-05-17.
   `model*.safetensors` are fetched, while duplicate `.pt`, `.bin`, `.gguf`,
   and non-loader safetensors artifacts are skipped. `pie model download --all`
   remains available when a complete HF snapshot is explicitly needed.
-- The planner accepts a metadata-only tensor source, so layout-plan tests can run
-  on synthetic checkpoint metadata without real safetensors files or GPU
-  allocation.
-- `LayoutPlanner` is the native semantic-to-algebra migration target. The
-  production loader now emits algebra directly from semantic tensors/groups and
-  `RuntimeABI`; the storage compiler lowers those plans without a compatibility
-  op stream.
+- The Rust loader accepts a metadata-only tensor source and can synthesize the
+  CUDA `RuntimeABI` directly from safetensors metadata plus `config.json`.
+  CUDA no longer builds or translates the former C++ `LayoutPlan`.
+- Rust is the production semantic-to-algebra migration target. The production
+  loader now emits algebra directly from Rust schema/default ABI rules; the
+  storage compiler lowers those plans without a compatibility op stream.
 - Algebra-only packed row-group plans now emit typed `CreateView` schedule
   records for compatibility views. The executor can materialize those views
   from `LayoutExpr::View` metadata without consulting a planner op.
 - Dense, quantized, MoE, Phi-3 row-split, GPT-OSS MXFP4, and packed Llama-like
   production plans now have no compatibility step stream.
-- CPU-only layout-plan tests cover dense Qwen packed QKV/gate-up lowering,
-  scheduled runtime INT8 quantization, scheduled FP16/FP32-to-BF16 casts,
-  Phi-3 tensor-parallel row-range sharding, symmetric GPTQ lowering into
-  scheduled `RepackLayout`, and GPTQ tensor-parallel local slicing for column-
-  and row-parallel projections. They also cover AWQ Marlin repack and BF16
-  fallback, asymmetric GPTQ and GPTQ act-order dequant fallbacks,
-  compressed-tensors INT8 metadata attachment, scheduled Qwen per-expert MoE
-  fusion, Qwen MoE expert tensor-parallel sharding, and GPT-OSS MXFP4
-  target-dependent plans for BF16 fallback and packed runtime representations.
-  The Phi-3 test caught and fixed a moved-from `LayoutExpr::output_name` bug in
-  row-range spec registration.
+- Rust unit tests cover algebra rewrites, FFI safety, semantic-role contracts,
+  explicit `ByteSpans`, default CUDA ABI synthesis, tensor-parallel row/column
+  sharding, packed quant byte alignment, storage lowering, and generated C++
+  wrapper/header compatibility.
 
 ### Remaining Implementation Work
 
-- Schema adaptation, runtime ABI decisions, and lowering are still concentrated
-  in `model_schema.cpp`; the next cleanup is splitting those into per-family
-  adapters plus reusable planner modules.
+- Schema adaptation, runtime ABI decisions, and lowering now live in Rust.
+  The next cleanup is to split `abi.rs` default-contract synthesis into
+  per-family `schema.rs` modules plus reusable ABI builders.
 - The IR is typed and broad enough for current layouts, but some less common
   checkpoint quantization sub-modes still need schema coverage before they can
   lower into scheduled algebra.
@@ -1247,33 +1236,45 @@ Useful metrics for the system paper:
 
 Latest verification:
 
+- Rust-default CUDA ABI cutover on 2026-05-19:
+  `cargo test --manifest-path driver/weight_loader/Cargo.toml`,
+  `cmake -S driver/cuda -B driver/cuda/build`,
+  `cmake --build driver/cuda/build --target pie_driver_cuda_lib -j2`,
+  `cmake --build driver/cuda/build --target pie_driver_cuda -j2`,
+  `ctest --test-dir driver/cuda/build --output-on-failure`, and
+  `cmake --build driver/portable/build --target pie_driver_portable_lib -j2`
+  pass. `cargo build -p pie-server --release --no-default-features --features driver-cuda`
+  also links. The former CUDA C++ `LayoutPlan`/`model_schema`/`RuntimeABI` sources
+  and `test_layout_plan` target have been removed from the build tree; CUDA now
+  compiles safetensors metadata directly through the Rust default ABI, algebra,
+  optimizer, and storage compiler.
+
 - Storage schedule/executor implementation pass on 2026-05-17:
   `CUDACXX=/usr/local/cuda-12.8/bin/nvcc cmake -S driver/cuda -B /tmp/pie-cuda-loader-build -DCMAKE_BUILD_TYPE=Release`,
-  `cmake --build /tmp/pie-cuda-loader-build --target test_layout_plan pie_driver_cuda_lib test_loader_golden -j2`,
-  `/tmp/pie-cuda-loader-build/bin/test_layout_plan`, and
-  `/tmp/pie-cuda-loader-build/bin/test_loader_golden` pass. After building
+  `cmake --build /tmp/pie-cuda-loader-build --target test_layout_plan pie_driver_cuda_lib -j2`,
+  and `/tmp/pie-cuda-loader-build/bin/test_layout_plan` pass. After building
   `test_brle` and `test_driver_common`,
   `ctest --test-dir /tmp/pie-cuda-loader-build --output-on-failure` passes
-  4/4 tests. `cargo build -p pie-server --release --no-default-features --features driver-cuda`
+  3/3 tests. `cargo build -p pie-server --release --no-default-features --features driver-cuda`
   also passes. This covers
   source-offset extent writes, file-ordered storage schedules, static schedule
   validation, compiled-extent-write materialization plumbing, and CUDA library
-  compilation of the async mmap executor.
+  compilation of the Rust storage-program executor.
 - North-star implementation pass on 2026-05-17:
-  `cmake --build driver/cuda/build --target pie_driver_cuda test_loader_golden -j 8`,
+  `cmake --build driver/cuda/build --target pie_driver_cuda test_layout_plan -j 8`,
   `ctest --test-dir driver/cuda/build --output-on-failure`,
   `cargo test -p pie-server cuda -- --nocapture`,
   `cargo build -p pie-server --release --no-default-features --features driver-cuda`,
   and `python3 -m py_compile benches/run_loader_evidence.py benches/pie_bench.py benches/sglang_bench.py benches/vllm_bench.py`
   all pass.
 - One-command evidence:
-  `benches/run_loader_evidence.py --model Qwen/Qwen3-32B --engines pie,vllm,sglang --modes latency,tput --requests 1 --num-requests 2 --concurrency 2 --max-tokens 8 --warmup 0 --max-model-len 512 --checkpoint-io auto`.
+  `benches/run_loader_evidence.py --model Qwen/Qwen3-32B --engines pie,vllm,sglang --modes latency,tput --requests 1 --num-requests 2 --concurrency 2 --max-tokens 8 --warmup 0 --max-model-len 512`.
   Artifact: `.tmp/loader_evidence/qwen32b-final/evidence.json`.
 - Qwen3-32B Pie loader telemetry from that artifact:
-  GDS selected under `checkpoint_io=auto`; storage program had 707
-  `ExtentWrite` records, 62,488 MiB checkpoint/device bytes, planned
-  storage temp <= 0 MiB, planned peak ~= 62,488 MiB, actual CUDA delta
-  ~= 62,490 MiB, and free-memory high-water 96,704 -> 34,214 -> 34,214 MiB
+  Rust storage program had 707 `ExtentWrite` records, 62,488 MiB
+  checkpoint/device bytes, planned storage temp <= 0 MiB, planned peak ~=
+  62,488 MiB, actual CUDA delta ~= 62,490 MiB, and free-memory high-water
+  96,704 -> 34,214 -> 34,214 MiB
   across 1,032 samples.
 - Qwen3-32B short benchmark from that artifact:
   Pie latency 493.0 ms p50 / 16.23 output tok/s and throughput 18.69 output
@@ -1403,8 +1404,8 @@ Latest verification:
     selection pushdown, encode/select movement, select/decode movement, cast
     sinking, partition-join cancellation, and Encode-Decode transcode fusion.
   - Verification: full CUDA CMake build, CTest (`brle`, `driver_common`,
-    `layout_plan`, `loader_golden`), Rust CUDA-feature build, Rust CUDA config
-    tests, evidence smoke, and `git diff --check`.
+    `layout_plan`), Rust CUDA-feature build, Rust CUDA config tests, evidence
+    smoke, and `git diff --check`.
 
 ## Paper Framing
 

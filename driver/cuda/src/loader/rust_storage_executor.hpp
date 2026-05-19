@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "../../../weight_loader/include/weight_loader.h"
+#include "../../../weight_loader/include/weight_loader_cpp.hpp"
 #if defined(__has_include)
 #if __has_include(<cuda_runtime.h>)
 #define PIE_CUDA_RUST_STORAGE_EXECUTOR_HAS_CUDA 1
@@ -26,6 +27,8 @@
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
+
+namespace wl_cpp = pie_weight_loader::cpp;
 
 class RustStorageProgramExecutor {
 public:
@@ -48,10 +51,11 @@ public:
         stats.planned_storage_peak_bytes = program.memory.persistent_bytes +
             program.memory.temporary_peak_bytes;
         stats.planned_storage_temp_bytes = program.memory.temporary_peak_bytes;
+        program_index_.reset(program);
 
         for (std::size_t i = 0; i < program.schedule.len; ++i) {
             const std::uint32_t instr_id = program.schedule.ptr[i];
-            const auto& instr = instruction(program, instr_id);
+            const auto& instr = program_index_.instruction(instr_id);
             switch (instr.kind) {
             case pie_weight_loader::PieLoaderStorageInstrKind::Allocate:
                 allocate(program, instr);
@@ -92,15 +96,6 @@ private:
         return QuantMeta::Kind::PerTensor;
     }
 
-    static std::string bytes_to_string(
-        pie_weight_loader::PieLoaderBytes bytes)
-    {
-        if (bytes.ptr == nullptr || bytes.len == 0) return {};
-        return std::string(
-            reinterpret_cast<const char*>(bytes.ptr),
-            reinterpret_cast<const char*>(bytes.ptr) + bytes.len);
-    }
-
     static DType dtype_from_rust(pie_weight_loader::PieLoaderDType dtype)
     {
         switch (dtype) {
@@ -123,109 +118,11 @@ private:
         return DType::UINT8;
     }
 
-    static std::vector<std::int64_t> shape_from_slice(
-        pie_weight_loader::PieLoaderI64Slice shape)
-    {
-        if (shape.ptr == nullptr || shape.len == 0) return {};
-        return std::vector<std::int64_t>(shape.ptr, shape.ptr + shape.len);
-    }
-
-    static std::vector<std::int64_t> shape_from_extent(
-        const pie_weight_loader::PieLoaderStridedExtentView& extent)
-    {
-        std::vector<std::int64_t> shape;
-        shape.reserve(extent.dims.len);
-        for (std::size_t i = 0; i < extent.dims.len; ++i) {
-            shape.push_back(extent.dims.ptr[i].count);
-        }
-        return shape;
-    }
-
-    static bool compact_extent(
-        const pie_weight_loader::PieLoaderStridedExtentView& extent)
-    {
-        std::int64_t stride =
-            static_cast<std::int64_t>(extent.element_bytes);
-        for (std::size_t i = extent.dims.len; i > 0; --i) {
-            const auto& dim = extent.dims.ptr[i - 1];
-            if (dim.src_stride != stride || dim.dst_stride != stride) {
-                return false;
-            }
-            stride *= dim.count;
-        }
-        return true;
-    }
-
-    static std::uint64_t extent_bytes(
-        const pie_weight_loader::PieLoaderStridedExtentView& extent)
-    {
-        std::uint64_t elements = 1;
-        for (std::size_t i = 0; i < extent.dims.len; ++i) {
-            const auto count = extent.dims.ptr[i].count;
-            if (count < 0) {
-                throw std::runtime_error(
-                    "rust storage executor: negative extent dimension");
-            }
-            const auto ucount = static_cast<std::uint64_t>(count);
-            if (ucount != 0 && elements > UINT64_MAX / ucount) {
-                throw std::runtime_error(
-                    "rust storage executor: extent element count overflow");
-            }
-            elements *= ucount;
-        }
-        if (extent.element_bytes != 0 &&
-            elements > UINT64_MAX / extent.element_bytes) {
-            throw std::runtime_error(
-                "rust storage executor: extent byte count overflow");
-        }
-        return elements * extent.element_bytes;
-    }
-
-    const pie_weight_loader::PieLoaderStorageInstrView& instruction(
-        const pie_weight_loader::PieLoaderStorageProgramView& program,
-        std::uint32_t id) const
-    {
-        for (std::size_t i = 0; i < program.instrs.len; ++i) {
-            if (program.instrs.ptr[i].id == id) return program.instrs.ptr[i];
-        }
-        throw std::runtime_error(
-            "rust storage executor: instruction id out of range");
-    }
-
-    const pie_weight_loader::PieLoaderBufferDeclView& buffer_decl(
-        const pie_weight_loader::PieLoaderStorageProgramView& program,
-        std::uint32_t id) const
-    {
-        for (std::size_t i = 0; i < program.buffers.len; ++i) {
-            if (program.buffers.ptr[i].id == id) return program.buffers.ptr[i];
-        }
-        throw std::runtime_error(
-            "rust storage executor: buffer id out of range");
-    }
-
-    const pie_weight_loader::PieLoaderTensorDeclView& tensor_decl(
-        const pie_weight_loader::PieLoaderStorageProgramView& program,
-        std::uint32_t id) const
-    {
-        for (std::size_t i = 0; i < program.tensors.len; ++i) {
-            if (program.tensors.ptr[i].id == id) return program.tensors.ptr[i];
-        }
-        throw std::runtime_error(
-                "rust storage executor: tensor id out of range");
-    }
-
-    static std::vector<std::uint32_t> ids_from_slice(
-        pie_weight_loader::PieLoaderBufferIdSlice ids)
-    {
-        if (ids.ptr == nullptr || ids.len == 0) return {};
-        return std::vector<std::uint32_t>(ids.ptr, ids.ptr + ids.len);
-    }
-
     void allocate(
         const pie_weight_loader::PieLoaderStorageProgramView& program,
         const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
-        const auto& buffer = buffer_decl(program, instr.buffer_id);
+        const auto& buffer = program_index_.buffer(instr.buffer_id);
         if (!buffer.has_tensor) {
             buffers_.emplace(
                 buffer.id,
@@ -234,12 +131,21 @@ private:
                     {static_cast<std::int64_t>(buffer.bytes)}));
             return;
         }
-        const auto& tensor = tensor_decl(program, buffer.tensor_id);
+        const auto& tensor = program_index_.tensor(buffer.tensor_id);
+        if (tensor.encoding_kind ==
+            pie_weight_loader::PieLoaderEncodingKind::Quant) {
+            buffers_.emplace(
+                buffer.id,
+                DeviceTensor::allocate(
+                    DType::UINT8,
+                    {static_cast<std::int64_t>(buffer.bytes)}));
+            return;
+        }
         buffers_.emplace(
             buffer.id,
             DeviceTensor::allocate(
                 dtype_from_rust(tensor.dtype),
-                shape_from_slice(tensor.shape)));
+                wl_cpp::i64_slice_to_vector(tensor.shape)));
     }
 
     void extent_write(
@@ -259,18 +165,95 @@ private:
                 "rust storage executor: destination buffer missing");
         }
         auto* dst = static_cast<std::uint8_t*>(dst_it->second.data()) +
-            instr.dest.offset;
-        if (!compact_extent(instr.source.stride) ||
-            !compact_extent(instr.dest.stride)) {
+            instr.dest.offset + instr.dest.stride.base_offset;
+        if (!wl_cpp::compact_extent(instr.dest.stride)) {
             throw std::runtime_error(
-                "rust storage executor: non-compact ExtentWrite is not "
+                "rust storage executor: non-compact ExtentWrite destination is not "
                 "implemented");
+        }
+        if (!wl_cpp::compact_extent(instr.source.stride)) {
+            copy_strided_extent_to_device(instr, dst);
+            return;
         }
         loader_.copy_storage_bytes_to_device(
             instr.source.file_id,
-            instr.source.file_offset,
+            instr.source.file_offset + instr.source.stride.base_offset,
             instr.source.span_bytes,
             dst);
+    }
+
+    void copy_strided_extent_to_device(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        void* dst)
+    {
+        const std::string& name = source_tensor_names_[instr.source.tensor_id];
+        const TensorInfo& info = loader_.info(name);
+        const TensorStorageInfo storage = loader_.storage_info(name);
+        if (instr.source.file_offset < storage.file_offset) {
+            throw std::runtime_error(
+                "rust storage executor: strided source starts before tensor");
+        }
+        const auto rank = info.shape.size();
+        if (instr.source.stride.dims.len != rank) {
+            throw std::runtime_error(
+                "rust storage executor: strided source rank mismatch for '" +
+                name + "'");
+        }
+
+        std::vector<std::int64_t> dense_strides(rank, 1);
+        std::int64_t stride = static_cast<std::int64_t>(dtype_bytes(info.dtype));
+        for (std::size_t i = rank; i > 0; --i) {
+            dense_strides[i - 1] = stride;
+            stride *= info.shape[i - 1];
+        }
+
+        std::uint64_t relative =
+            instr.source.file_offset - storage.file_offset +
+            instr.source.stride.base_offset;
+        std::vector<TensorSlice> slices;
+        slices.reserve(rank);
+        for (std::size_t axis = 0; axis < rank; ++axis) {
+            const auto& dim = instr.source.stride.dims.ptr[axis];
+            if (dim.src_stride != dense_strides[axis]) {
+                throw std::runtime_error(
+                    "rust storage executor: unsupported strided source layout "
+                    "for '" + name + "'");
+            }
+            if (dim.count < 0 || dim.count > info.shape[axis]) {
+                throw std::runtime_error(
+                    "rust storage executor: strided source count out of range "
+                    "for '" + name + "'");
+            }
+            const auto axis_stride =
+                static_cast<std::uint64_t>(dense_strides[axis]);
+            const std::int64_t start =
+                axis_stride == 0
+                    ? 0
+                    : static_cast<std::int64_t>(relative / axis_stride);
+            relative = axis_stride == 0 ? relative : relative % axis_stride;
+            if (start < 0 || start + dim.count > info.shape[axis]) {
+                throw std::runtime_error(
+                    "rust storage executor: strided source offset out of "
+                    "range for '" + name + "'");
+            }
+            if (start != 0 || dim.count != info.shape[axis]) {
+                slices.push_back(TensorSlice{
+                    .axis = static_cast<int>(axis),
+                    .start = start,
+                    .length = dim.count,
+                });
+            }
+        }
+        if (relative != 0) {
+            throw std::runtime_error(
+                "rust storage executor: strided source offset is not aligned "
+                "to tensor strides for '" + name + "'");
+        }
+        loader_.copy_strided_to_device(
+            name,
+            slices,
+            dst,
+            wl_cpp::extent_shape(instr.dest.stride));
     }
 
     DeviceTensor& buffer_tensor(std::uint32_t buffer_id)
@@ -360,7 +343,7 @@ private:
                 throw std::runtime_error(
                     "rust storage executor: Cast source tensor id out of range");
             }
-            if (!compact_extent(instr.source.stride)) {
+            if (!wl_cpp::compact_extent(instr.source.stride)) {
                 throw std::runtime_error(
                     "rust storage executor: non-compact Cast source is not "
                     "implemented");
@@ -368,7 +351,9 @@ private:
             const TensorInfo& info =
                 loader_.info(source_tensor_names_[instr.source.tensor_id]);
             DeviceTensor scratch =
-                DeviceTensor::allocate(info.dtype, shape_from_extent(instr.source.stride));
+                DeviceTensor::allocate(
+                    info.dtype,
+                    wl_cpp::extent_shape(instr.source.stride));
             if (scratch.nbytes() != instr.source.span_bytes) {
                 throw std::runtime_error(
                     "rust storage executor: Cast source byte size mismatch");
@@ -403,7 +388,9 @@ private:
         const auto dst_offset =
             instr.has_dest ? instr.dest.offset + instr.dest.stride.base_offset : 0;
         const auto bytes = instr.has_dest
-            ? extent_bytes(instr.dest.stride)
+            ? wl_cpp::extent_bytes(
+                  instr.dest.stride,
+                  "rust storage executor")
             : static_cast<std::uint64_t>(input.nbytes());
         if (bytes > input.nbytes() ||
             dst_offset + bytes > output.nbytes()) {
@@ -442,8 +429,10 @@ private:
         const pie_weight_loader::PieLoaderStorageProgramView& program,
         const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
-        const auto inputs = ids_from_slice(instr.input_buffers);
-        const auto outputs = ids_from_slice(instr.output_buffers);
+        const auto inputs =
+            wl_cpp::buffer_id_slice_to_vector(instr.input_buffers);
+        const auto outputs =
+            wl_cpp::buffer_id_slice_to_vector(instr.output_buffers);
         if (inputs.size() != 1 || outputs.size() != 1 || !instr.has_dest) {
             throw std::runtime_error(
                 "rust storage executor: CreateView expects one input, one "
@@ -452,16 +441,17 @@ private:
         const auto input_id = inputs.front();
         const auto output_id = outputs.front();
         const DeviceTensor& input = buffer_or_finalized_tensor(input_id);
-        const auto& output_buffer = buffer_decl(program, output_id);
+        const auto& output_buffer = program_index_.buffer(output_id);
         if (!output_buffer.has_tensor) {
             throw std::runtime_error(
                 "rust storage executor: CreateView output buffer has no "
                 "tensor declaration");
         }
-        const auto& tensor = tensor_decl(program, output_buffer.tensor_id);
-        const auto shape = shape_from_slice(tensor.shape);
+        const auto& tensor = program_index_.tensor(output_buffer.tensor_id);
+        const auto shape = wl_cpp::i64_slice_to_vector(tensor.shape);
         const auto* input_base =
-            static_cast<const std::uint8_t*>(input.data()) + instr.dest.offset;
+            static_cast<const std::uint8_t*>(input.data()) + instr.dest.offset +
+            instr.dest.stride.base_offset;
         buffers_.emplace(
             output_id,
             DeviceTensor::view(
@@ -474,10 +464,11 @@ private:
             finalized != finalized_buffer_names_.end()) {
             backing_name = finalized->second;
         } else {
-            const auto& input_buffer = buffer_decl(program, input_id);
+            const auto& input_buffer = program_index_.buffer(input_id);
             if (input_buffer.has_tensor) {
                 backing_name =
-                    bytes_to_string(tensor_decl(program, input_buffer.tensor_id).name);
+                    wl_cpp::bytes_to_string(
+                        program_index_.tensor(input_buffer.tensor_id).name);
             }
         }
         if (!backing_name.empty()) {
@@ -495,12 +486,18 @@ private:
             throw std::runtime_error(
                 "rust storage executor: finalize buffer missing");
         }
-        const auto& buffer_info = buffer_decl(program, instr.buffer_id);
-        const auto& tensor = tensor_decl(program, buffer_info.tensor_id);
+        const auto& buffer_info = program_index_.buffer(instr.buffer_id);
+        const auto& tensor = program_index_.tensor(buffer_info.tensor_id);
         TensorDecl spec;
-        spec.name = bytes_to_string(tensor.name);
-        spec.dtype = dtype_from_rust(tensor.dtype);
-        spec.shape = shape_from_slice(tensor.shape);
+        spec.name = wl_cpp::bytes_to_string(tensor.name);
+        if (tensor.encoding_kind ==
+            pie_weight_loader::PieLoaderEncodingKind::Quant) {
+            spec.dtype = DType::UINT8;
+            spec.shape = {static_cast<std::int64_t>(buffer.mapped().nbytes())};
+        } else {
+            spec.dtype = dtype_from_rust(tensor.dtype);
+            spec.shape = wl_cpp::i64_slice_to_vector(tensor.shape);
+        }
         spec.layout = TensorLayoutKind::Dense;
         spec.ownership = TensorOwnershipKind::Owned;
         spec.parallel = TensorParallelKind::Replicated;
@@ -511,7 +508,7 @@ private:
             spec.backing_tensor = backing->second;
         }
         stats.loaded_bytes += buffer.mapped().nbytes();
-        const std::string runtime_name = bytes_to_string(instr.name);
+        const std::string runtime_name = wl_cpp::bytes_to_string(instr.name);
         weights_.insert(
             runtime_name,
             std::move(buffer.mapped()),
@@ -550,6 +547,7 @@ private:
     std::unordered_map<std::uint32_t, DeviceTensor> buffers_;
     std::unordered_map<std::uint32_t, std::string> finalized_buffer_names_;
     std::unordered_map<std::uint32_t, std::string> view_backing_names_;
+    wl_cpp::StorageProgramIndex program_index_{"rust storage executor"};
 };
 
 }  // namespace pie_cuda_driver

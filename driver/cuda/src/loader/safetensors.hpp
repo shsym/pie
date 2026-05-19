@@ -9,7 +9,7 @@
 //
 // We mmap the file, slice into its header, and copy checkpoint bytes into
 // caller-owned device storage via cudaMemcpyAsync. Allocation and runtime
-// representation decisions live in the layout plan load_executor, not here.
+// representation decisions live in the compiled storage program, not here.
 // Sharded models (`model.safetensors.index.json`) are transparently split
 // across files.
 
@@ -74,8 +74,8 @@ public:
         void* dst);
 
     /// Copy a slice of `name` along `axis`, keeping only this rank's portion
-    /// of the world. Used by layout-plan materialization to shard linear weights
-    /// directly into their final runtime allocations.
+    /// of the world. Used by storage-program materialization to shard linear
+    /// weights directly into their final runtime allocations.
     ///
     /// - 1-D tensors (biases): `axis` must be 0.
     /// - 2-D tensors (linear weights): `axis ∈ {0, 1}`.
