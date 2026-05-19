@@ -1,47 +1,54 @@
-"""Torch-bound runtime helpers for the native driver.
-
-Bridge ships a flavor-agnostic `._bridge.utils` that holds only
-torch-free helpers (`is_apple_silicon`, `terminate`). Anything that
-touches `torch.distributed` or `torch.cuda` lives here so the bridge
-stays torch-free.
-"""
-
-from __future__ import annotations
-
+import os
+import platform
+import sys
+import traceback
+import psutil
 from typing import Any
 
-import psutil
+
 import torch
 
 
-# CPU process group cache for GLOO-based metadata broadcasts. Populated
-# by the worker when it stands up a CPU companion group; None means
-# "use the default PG (NCCL)" inside `broadcast_struct`.
+# CPU process group for GLOO-based metadata broadcasts
 _cpu_group = None
 
 
-def get_device_sm() -> int:
+def is_apple_silicon() -> bool:
+    """Check if running on macOS with Apple Silicon (M1/M2/M3/M4).
+
+    Returns:
+        True if running on Apple Silicon, False otherwise
+    """
+    return platform.system() == "Darwin" and platform.processor() == "arm"
+
+
+
+def terminate(msg: str) -> None:
+    """Terminate the program with a message."""
+    print(f"\n[!!!] {msg} Terminating.", file=sys.stderr)
+    traceback.print_exc()
+    os._exit(1)
+
+
+def get_device_sm():
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
 
 
-def get_available_memory(devices: list, rank: int = 0) -> int:
-    """Free bytes on the local rank's device, min-reduced across the TP group."""
+def get_available_memory(devices: list[torch.device], rank: int = 0) -> int:
     device = devices[rank]
-    if isinstance(device, str):
-        device = torch.device(device)
 
     is_cuda = device.type == "cuda"
     is_cpu = device.type in ("cpu", "mps")
 
-    # Clear cache on the CUDA device for a better measurement
+    # Clear cache on all CUDA devices to get a better measurement
     if is_cuda and torch.cuda.is_available():
         with torch.cuda.device(device.index):
             torch.cuda.empty_cache()
 
-    total_free_bytes: int | list = []
+    total_free_bytes = []
 
     if is_cuda:
         if get_device_sm() in (87, 110, 121):  # Orin, Thor, Spark
@@ -73,22 +80,20 @@ def get_available_memory(devices: list, rank: int = 0) -> int:
 def broadcast_struct(
     data: Any,
     src: int = 0,
-    device=None,
-    group=None,
+    device: torch.device | None = None,
+    group: "torch.distributed.ProcessGroup | None" = None,
     group_id: int | None = None,
 ) -> Any:
-    """Broadcast a structure of data with embedded tensors efficiently.
+    """
+    Broadcast a structure of data with embedded tensors efficiently.
 
     Metadata is broadcast via GLOO (CPU), tensors via NCCL (GPU).
     """
     import torch.distributed as dist
 
-    if isinstance(device, str):
-        device = torch.device(device)
-
     rank = dist.get_rank()
     is_sender = rank == src
-    tensors: list = []
+    tensors = []
 
     def separate(obj):
         if isinstance(obj, torch.Tensor):
@@ -119,7 +124,7 @@ def broadcast_struct(
 
     # 3. Prepare tensors for broadcast (receiver allocates buffers)
     if not is_sender:
-        tensor_specs: dict = {}
+        tensor_specs = {}
 
         def find_specs(obj):
             if isinstance(obj, dict) and "__TENSOR__" in obj:
@@ -159,96 +164,3 @@ def broadcast_struct(
             return obj
 
     return reconstruct(metadata)
-
-
-def init_distributed(
-    tp_local_rank: int,
-    tp_degree: int,
-    group_id: int,
-    master_port: int,
-    device: str,
-) -> None:
-    """Initialize torch.distributed for one TP group.
-
-    Each DP replica brings up its own torch.distributed *world* whose size
-    is just `tp_degree`. The default process group thus equals the TP
-    group — no global PG, no subgroups. Cross-replica coordination happens
-    at the Rust runtime / RPC layer (request routing + KV swap framing),
-    not via torch.distributed.
-
-    The FileStore path is namespaced by `(master_port, group_id)` so each
-    TP group rendezvous independently when multiple groups share a host.
-    """
-    import datetime
-    import warnings
-    import torch.distributed as dist
-
-    torch.cuda.set_device(device)
-
-    warnings.filterwarnings(
-        "ignore", message=".*barrier.*device under current context.*"
-    )
-
-    store = dist.FileStore(
-        f"/tmp/pie_dist_store_{master_port}_g{group_id}", tp_degree
-    )
-    timeout = datetime.timedelta(seconds=300)
-
-    backend = "nccl" if torch.cuda.is_available() else "gloo"
-
-    device_id = None
-    if device.startswith("cuda:"):
-        device_id = torch.device(device)
-
-    dist.init_process_group(
-        backend,
-        store=store,
-        rank=tp_local_rank,
-        world_size=tp_degree,
-        timeout=timeout,
-        device_id=device_id,
-    )
-
-
-def set_device(device: str) -> None:
-    """Pin the current thread to `device` (no-op for non-CUDA strings)."""
-    if device.startswith("cuda"):
-        torch.cuda.set_device(device)
-
-
-def cleanup_runtime() -> None:
-    """Best-effort post-worker CUDA cleanup."""
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        try:
-            torch.cuda.reset_peak_memory_stats()
-        except Exception:
-            pass
-
-
-def cleanup_distributed() -> None:
-    import torch.distributed as dist
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
-
-
-def barrier() -> None:
-    import torch.distributed as dist
-
-    if dist.is_initialized():
-        dist.barrier()
-
-
-def validate_cuda_devices(devices: list[str]) -> None:
-    """Raise if any `cuda:N` device in `devices` exceeds the visible GPU count."""
-    available_gpus = torch.cuda.device_count()
-    for dev in devices:
-        if dev and dev.startswith("cuda:"):
-            idx = int(dev.split(":")[1])
-            if idx >= available_gpus:
-                raise RuntimeError(
-                    f"device {dev!r} not accessible — only {available_gpus} GPU(s) "
-                    f"visible (cuda:0..cuda:{available_gpus - 1}). "
-                    f"Check CUDA_VISIBLE_DEVICES."
-                )

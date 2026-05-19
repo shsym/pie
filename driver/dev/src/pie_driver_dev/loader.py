@@ -17,7 +17,7 @@ import torch
 from tqdm import tqdm
 import safetensors
 
-from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
+from .config import RuntimeConfig
 from .schema import Schema, Source, Definition, WeightStore, ReaderFn
 from . import hf_utils
 

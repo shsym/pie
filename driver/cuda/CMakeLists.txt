@@ -21,10 +21,6 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 
-if(NOT PIE_BRIDGE_INCLUDE_DIR)
-  set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
-endif()
-
 # NCCL for tensor-parallel collectives. Single-GPU runs never load it (the
 # call sites are gated on tp_size > 1), but we always link so a TP-enabled
 # wrapper can talk to the same binary. System NCCL only — vendoring via CPM
@@ -69,18 +65,15 @@ cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 #     `pie_driver_cuda_native` via subprocess.
 add_library(pie_driver_cuda_lib STATIC
   src/entry.cpp
-  src/executor/persistent_inputs.cpp
-  src/executor/executor.cpp
-  src/service/inproc_service.cpp
-  src/response_subpass.cpp
+  src/persistent_inputs.cpp
+  src/request_handler.cpp
+  src/msgpack_subpass.cpp
   src/sampling_dispatch.cpp
   src/spec_expansion.cpp
+  src/shmem_ipc.cpp
+  src/shmem_schema.cpp
   src/tensor.cpp
-  src/model/weight_store.cpp
-  src/model/loaded_model.cpp
-  src/model/bound_model.cpp
-  ../common/src/safetensors_manifest.cpp
-  src/loader/gguf_source.cpp
+  src/engine.cpp
   src/loader/hf_config.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
@@ -97,12 +90,11 @@ add_library(pie_driver_cuda_lib STATIC
   src/ops/gemm.cpp
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
+  src/response_writer.cpp
   src/kernels/rmsnorm.cu
   src/kernels/embed.cu
   src/kernels/swiglu.cu
   src/kernels/rope.cu
-  src/kernels/split_packed.cu
-  src/kernels/scatter_int32.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu
   src/kernels/sample_temp.cu
@@ -136,6 +128,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/qwen3_5_moe_forward.cpp
   src/attention_workspace.cpp
   src/brle.cpp
+  src/control_socket.cpp
   src/swap_pool.cpp
   src/distributed.cpp
   src/custom_all_reduce.cu
@@ -155,7 +148,7 @@ target_compile_options(pie_driver_cuda_lib PRIVATE
   >
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
 )
-# Marlin sources are added to the static driver library below
+# Marlin sources are added to the `pie_driver_cuda` executable below
 # (see `PIE_CUDA_BUILD_MARLIN`); they need the same nvcc relaxed-
 # constexpr / extended-lambda flags the lib gets, since vendored
 # kernels mix `__host__ constexpr` helpers into `__device__` paths.
@@ -169,8 +162,6 @@ target_compile_options(pie_driver_cuda PRIVATE
 target_include_directories(pie_driver_cuda_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${PIE_BRIDGE_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
@@ -189,15 +180,15 @@ if(PIE_CUDA_BUILD_MARLIN)
     # A100; rerun with a different arch to add Hopper / Ada coverage.
     file(GLOB MARLIN_SM_KERNELS
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/sm*_kernel_*.cu")
-    target_sources(pie_driver_cuda_lib PRIVATE
+    target_sources(pie_driver_cuda PRIVATE
         third_party/marlin/marlin.cu
         third_party/marlin/gptq_marlin_repack.cu
         third_party/marlin/awq_marlin_repack.cu
         third_party/marlin/marlin_wrapper.cpp
         ${MARLIN_SM_KERNELS})
-    target_include_directories(pie_driver_cuda_lib PRIVATE
+    target_include_directories(pie_driver_cuda PRIVATE
         third_party/marlin)
-    target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
+    target_compile_definitions(pie_driver_cuda PRIVATE PIE_CUDA_HAS_MARLIN=1)
 endif()
 
 # Standalone test for flashinfer sampling debugging.
@@ -213,20 +204,24 @@ target_compile_options(sample_flashinfer_test PRIVATE
 target_link_libraries(sample_flashinfer_test PRIVATE CUDA::cudart)
 
 # Wire-format unit tests. Pure C++ (no CUDA), short runtime; CTest runs
-# them under `cmake --build build --target test`.
+# them under `cmake --build build --target test`. The msgpack roundtrip
+# verification is delegated to a sibling pytest that reads the binary's
+# output files.
 add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
 target_include_directories(test_brle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-add_executable(test_driver_common
-  ../common/tests/test_common.cpp
-  ../common/src/safetensors_manifest.cpp)
-target_include_directories(test_driver_common PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
-target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
+add_executable(test_response_writer
+  tests/test_response_writer.cpp
+  src/response_writer.cpp)
+target_include_directories(test_response_writer PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
-add_test(NAME driver_common COMMAND test_driver_common)
+add_test(NAME response_writer
+  COMMAND test_response_writer
+    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_flat.bin
+    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_msgpack.bin)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
@@ -234,7 +229,6 @@ target_link_libraries(pie_driver_cuda_lib PUBLIC
   zstd
   nlohmann_json::nlohmann_json
   rt
-  dl
   CUDA::cudart
   CUDA::cublas
   CUDA::cublasLt

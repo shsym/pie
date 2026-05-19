@@ -17,10 +17,6 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-if(NOT PIE_BRIDGE_INCLUDE_DIR)
-  set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
-endif()
-
 include(cmake/CPM.cmake)
 
 # We vendor llama.cpp for the `ggml` library only. `EXCLUDE_FROM_ALL` keeps
@@ -71,20 +67,24 @@ cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 
 
-# pie_driver_portable — portable ggml backend, sibling to ../cuda (native
-# CUDA + flashinfer) and ../../runtime (Rust). Embedded-only: linked
-# in-process by `server/standalone` and invoked via the FFI vtable the
-# Rust runtime's `InProcChannel` hands in. Loads HuggingFace safetensors
-# directly (no GGUF conversion).
+# pie_driver_portable — portable ggml backend, sibling to ../cuda (native CUDA +
+# flashinfer) and ../../runtime (Rust). Talks to the runtime via the shmem
+# fast path; no ZMQ/protobuf needed. Loads HuggingFace safetensors directly
+# (no GGUF conversion). Built two ways from the same translation units:
+#   - `pie_driver_portable_lib` (STATIC): linked in-process by
+#     `server/standalone` so the all-Rust binary contains the driver.
+#   - `pie_driver_portable` (executable): a thin shim around the lib's
+#     `pie_driver_portable_run` entry. Consumed by the Python wrapper
+#     `pie_driver_portable` via subprocess.
 add_library(pie_driver_portable_lib STATIC
   src/entry.cpp
-  ../common/src/safetensors_manifest.cpp
+  src/shmem_ipc.cpp
+  src/shmem_schema.cpp
   src/safetensors.cpp
   src/hf_config.cpp
   src/gguf_archive.cpp
   src/gguf_hparams.cpp
   src/model.cpp
-  src/rust_loader.cpp
   src/kv_cache.cpp
   src/state_cache.cpp
   src/arch_spec.cpp
@@ -95,10 +95,10 @@ add_library(pie_driver_portable_lib STATIC
   src/graph_qwen3_5.cpp
   src/graph_phi3small.cpp
   src/graph_phi3_5moe.cpp
-  src/executor/executor.cpp
-  src/service/inproc_service.cpp
+  src/response.cpp
+  src/forward.cpp
   src/sampler.cpp
-  src/host_swap_pool.cpp
+  src/aux_server.cpp
   src/adapter.cpp
 )
 
@@ -109,10 +109,7 @@ target_compile_options(pie_driver_portable_lib PRIVATE
 
 target_include_directories(pie_driver_portable_lib
   PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../weight_loader/include
-    ${PIE_BRIDGE_INCLUDE_DIR})
+    ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
 target_link_libraries(pie_driver_portable_lib PUBLIC
   CLI11::CLI11
@@ -123,6 +120,9 @@ target_link_libraries(pie_driver_portable_lib PUBLIC
 if(UNIX AND NOT APPLE)
   target_link_libraries(pie_driver_portable_lib PUBLIC rt)
 endif()
+
+add_executable(pie_driver_portable src/main.cpp)
+target_link_libraries(pie_driver_portable PRIVATE pie_driver_portable_lib)
 
 # ── CUDA paged-attention (FlashInfer) ─────────────────────────────────────
 #

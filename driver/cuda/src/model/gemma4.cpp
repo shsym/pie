@@ -29,7 +29,7 @@ namespace pie_cuda_driver::model {
 
 namespace {
 
-const DeviceTensor& must(const LoadedModel& e, const std::string& name) {
+const DeviceTensor& must(const Engine& e, const std::string& name) {
     if (!e.has(name)) {
         throw std::runtime_error("gemma4: missing weight '" + name + "'");
     }
@@ -78,7 +78,7 @@ Gemma4MoeMlpWorkspace Gemma4MoeMlpWorkspace::allocate(
     return ws;
 }
 
-Gemma4Weights bind_gemma4(const LoadedModel& engine) {
+Gemma4Weights bind_gemma4(const Engine& engine) {
     const auto& cfg = engine.hf_config();
     if (cfg.layer_types.empty()) {
         throw std::runtime_error(
@@ -291,11 +291,11 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
             // (1/sqrt(H))` then a linear. Bake `1/sqrt(H)` into the
             // per-channel `scale` here so the forward collapses the
             // first three steps into a single rmsnorm-with-weight call.
-            const auto* raw_scale = &must(engine, lp + "router.scale");
-            const std::int64_t H64 = raw_scale->numel();
+            const auto& raw_scale = must(engine, lp + "router.scale");
+            const std::int64_t H64 = raw_scale.numel();
             const float inv_sqrt_h = 1.f / std::sqrt(static_cast<float>(H64));
             std::vector<std::uint16_t> host(static_cast<std::size_t>(H64));
-            CUDA_CHECK(cudaMemcpy(host.data(), raw_scale->data(),
+            CUDA_CHECK(cudaMemcpy(host.data(), raw_scale.data(),
                                   H64 * sizeof(std::uint16_t),
                                   cudaMemcpyDeviceToHost));
             for (auto& bits : host) {

@@ -2,7 +2,7 @@
 
 // Owning RAII wrapper around `cudaMalloc`'d memory. Replaces the scattered
 // raw `T* d_x = nullptr; cudaMalloc(&d_x, …); … cudaFree(d_x);` pattern in
-// the executor so cleanup happens implicitly on scope exit and
+// the request handler so cleanup happens implicitly on scope exit and
 // exception paths.
 //
 // Move-only. `data()` returns the device pointer for kernel calls. Build
@@ -46,10 +46,9 @@ public:
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
 
     DeviceBuffer(DeviceBuffer&& o) noexcept
-        : ptr_(o.ptr_), count_(o.count_), h_pinned_(o.h_pinned_) {
+        : ptr_(o.ptr_), count_(o.count_) {
         o.ptr_ = nullptr;
         o.count_ = 0;
-        o.h_pinned_ = nullptr;
     }
 
     DeviceBuffer& operator=(DeviceBuffer&& o) noexcept {
@@ -57,10 +56,8 @@ public:
             reset();
             ptr_ = o.ptr_;
             count_ = o.count_;
-            h_pinned_ = o.h_pinned_;
             o.ptr_ = nullptr;
             o.count_ = 0;
-            o.h_pinned_ = nullptr;
         }
         return *this;
     }
@@ -84,7 +81,7 @@ public:
     }
 
     // Same as `from_host(span<const T>)` but takes a raw byte view for
-    // the wire-format case where the source array is encoded as a
+    // the BPIQ wire-format case where the source array is encoded as a
     // bytes blob the schema decoder aliases to `T`. Length must be a
     // multiple of `sizeof(T)`.
     static DeviceBuffer<T> from_bytes(std::span<const std::uint8_t> bytes) {
@@ -116,15 +113,6 @@ public:
     //
     // Issues against the default stream; the kernel queue is
     // in-order, so subsequent kernel launches see the new contents.
-    //
-    // Stages through a lazily-allocated pinned host buffer so the
-    // `cudaMemcpyAsync` from `src` is truly async. Without the staging,
-    // `cudaMemcpyAsync` on pageable host memory blocks the host until
-    // CUDA's internal staging completes — adding ~1-2 ms per call. With
-    // 13+ per-fire copies of this kind, that dominates the wall time at
-    // small per-fire GPU work (~5× HtoD-vs-vllm gap shown in nsys
-    // profiles). The pinned scratch is allocated at the buffer's full
-    // capacity once on first use and reused thereafter.
     void copy_from_host(std::span<const T> src) {
         if (src.size() > count_) {
             throw std::runtime_error(
@@ -132,16 +120,15 @@ public:
                 std::to_string(src.size()) + " > capacity " +
                 std::to_string(count_));
         }
-        if (src.empty()) return;
-        ensure_pinned_staging();
-        std::memcpy(h_pinned_, src.data(), src.size() * sizeof(T));
-        CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_,
-                                   src.size() * sizeof(T),
-                                   cudaMemcpyHostToDevice));
+        if (!src.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(ptr_, src.data(),
+                                       src.size() * sizeof(T),
+                                       cudaMemcpyHostToDevice));
+        }
     }
 
     // Same as `copy_from_host(span<const T>)` but takes a raw byte view —
-    // the wire-format case where the source bytes alias `T`.
+    // the BPIQ wire-format case where the source bytes alias `T`.
     // Length must be a multiple of `sizeof(T)`.
     void copy_from_bytes(std::span<const std::uint8_t> bytes) {
         if (bytes.size() / sizeof(T) > count_) {
@@ -150,11 +137,10 @@ public:
                 std::to_string(bytes.size() / sizeof(T)) +
                 " > capacity " + std::to_string(count_));
         }
-        if (bytes.empty()) return;
-        ensure_pinned_staging();
-        std::memcpy(h_pinned_, bytes.data(), bytes.size());
-        CUDA_CHECK(cudaMemcpyAsync(ptr_, h_pinned_, bytes.size(),
-                                   cudaMemcpyHostToDevice));
+        if (!bytes.empty()) {
+            CUDA_CHECK(cudaMemcpyAsync(ptr_, bytes.data(), bytes.size(),
+                                       cudaMemcpyHostToDevice));
+        }
     }
 
     T*       data()       noexcept { return ptr_; }
@@ -179,25 +165,10 @@ private:
             ptr_ = nullptr;
             count_ = 0;
         }
-        if (h_pinned_) {
-            cudaFreeHost(h_pinned_);
-            h_pinned_ = nullptr;
-        }
-    }
-
-    // Lazily allocate the pinned host staging buffer at the device
-    // buffer's full capacity. Pinned alloc isn't cheap (single ~µs
-    // syscall per buffer), but it's one-shot — amortised across all
-    // fires that ever touch this buffer.
-    void ensure_pinned_staging() {
-        if (h_pinned_ != nullptr) return;
-        if (count_ == 0) return;
-        CUDA_CHECK(cudaMallocHost(&h_pinned_, count_ * sizeof(T)));
     }
 
     T* ptr_ = nullptr;
     std::size_t count_ = 0;
-    T* h_pinned_ = nullptr;
 };
 
 }  // namespace pie_cuda_driver

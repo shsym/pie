@@ -11,7 +11,9 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
-use crate::inference::structured::grammar::{Expr, ExprId, Grammar, RuleId};
+use crate::inference::structured::grammar::{
+    Expr, ExprId, Grammar, RuleId,
+};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -48,7 +50,7 @@ pub struct NfaGraph {
     edges: Vec<Vec<FsmEdge>>,
 }
 
-impl NfaGraph {
+impl NfaGraph{
     pub fn new() -> Self {
         Self { edges: Vec::new() }
     }
@@ -160,7 +162,7 @@ impl NfaGraph {
     }
 }
 
-impl Default for NfaGraph {
+impl Default for NfaGraph{
     fn default() -> Self {
         Self::new()
     }
@@ -200,9 +202,7 @@ impl DfaTable {
     /// Raw byte transition table: `byte_table[state * 256 + byte] → target_state`.
     /// `0xFFFF` = no transition.
     #[inline(always)]
-    pub fn byte_table(&self) -> &[u16] {
-        &self.byte_table
-    }
+    pub fn byte_table(&self) -> &[u16] { &self.byte_table }
 
     /// Get the next state for a given byte value (DFA: O(1) table lookup).
     #[inline(always)]
@@ -290,11 +290,11 @@ impl Automaton<NfaGraph> {
 
         // Look up or create a DFA state for an NFA state set.
         let get_or_create = |target_set: BTreeSet<StateId>,
-                             ends: &Vec<bool>,
-                             dfa: &mut NfaGraph,
-                             dfa_ends: &mut Vec<bool>,
-                             state_map: &mut HashMap<BTreeSet<StateId>, StateId>,
-                             worklist: &mut VecDeque<BTreeSet<StateId>>|
+                                  ends: &Vec<bool>,
+                                  dfa: &mut NfaGraph,
+                                  dfa_ends: &mut Vec<bool>,
+                                  state_map: &mut HashMap<BTreeSet<StateId>, StateId>,
+                                  worklist: &mut VecDeque<BTreeSet<StateId>>|
          -> StateId {
             if let Some(&existing) = state_map.get(&target_set) {
                 existing
@@ -332,12 +332,7 @@ impl Automaton<NfaGraph> {
                     continue;
                 }
                 let dfa_target = get_or_create(
-                    target_set,
-                    &self.ends,
-                    &mut dfa,
-                    &mut dfa_ends,
-                    &mut state_map,
-                    &mut worklist,
+                    target_set, &self.ends, &mut dfa, &mut dfa_ends, &mut state_map, &mut worklist,
                 );
                 dfa.add_char_edge(dfa_state, min, max, dfa_target);
             }
@@ -358,17 +353,10 @@ impl Automaton<NfaGraph> {
                         continue;
                     }
                     let dfa_target = get_or_create(
-                        target_set,
-                        &self.ends,
-                        &mut dfa,
-                        &mut dfa_ends,
-                        &mut state_map,
-                        &mut worklist,
+                        target_set, &self.ends, &mut dfa, &mut dfa_ends, &mut state_map, &mut worklist,
                     );
                     match edge {
-                        FsmEdge::RuleRef { rule, .. } => {
-                            dfa.add_rule_ref(dfa_state, *rule, dfa_target)
-                        }
+                        FsmEdge::RuleRef { rule, .. } => dfa.add_rule_ref(dfa_state, *rule, dfa_target),
                         FsmEdge::Eos(_) => dfa.add_eos(dfa_state, dfa_target),
                         _ => unreachable!(),
                     }
@@ -558,7 +546,13 @@ fn complement_codepoint_ranges(ranges: &[(u32, u32)]) -> Vec<(u32, u32)> {
 
 /// Add NFA paths for a contiguous codepoint range [lo, hi].
 /// Creates proper multi-byte UTF-8 byte-sequence transitions.
-fn add_codepoint_range_nfa(fsm: &mut NfaGraph, lo: u32, hi: u32, start: StateId, end: StateId) {
+fn add_codepoint_range_nfa(
+    fsm: &mut NfaGraph,
+    lo: u32,
+    hi: u32,
+    start: StateId,
+    end: StateId,
+) {
     // ASCII range (1-byte UTF-8)
     let ascii_lo = lo;
     let ascii_hi = hi.min(0x7F);
@@ -605,7 +599,13 @@ fn encode_codepoint_utf8(cp: u32) -> Vec<u8> {
 
 /// Add NFA transitions for a range of codepoints that all have the same UTF-8 byte length.
 /// Uses recursive splitting by byte position for efficient construction.
-fn add_utf8_nfa_range(fsm: &mut NfaGraph, lo: u32, hi: u32, start: StateId, end: StateId) {
+fn add_utf8_nfa_range(
+    fsm: &mut NfaGraph,
+    lo: u32,
+    hi: u32,
+    start: StateId,
+    end: StateId,
+) {
     let lo_bytes = encode_codepoint_utf8(lo);
     let hi_bytes = encode_codepoint_utf8(hi);
     debug_assert_eq!(lo_bytes.len(), hi_bytes.len());
@@ -912,6 +912,8 @@ pub fn build_rule_fsms(grammar: &Grammar) -> Vec<Automaton<NfaGraph>> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+
 
 #[cfg(test)]
 mod tests {

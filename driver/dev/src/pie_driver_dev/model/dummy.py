@@ -13,7 +13,7 @@ from typing import Any
 
 import torch
 
-from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
+from ..config import RuntimeConfig
 
 
 @dataclass
