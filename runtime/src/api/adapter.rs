@@ -1,8 +1,8 @@
 //! pie:core/adapter - Adapter resource for LoRA/fine-tuning weights
 
 use crate::adapter::{self, AdapterId};
-use crate::api::model::Model;
 use crate::api::pie;
+use crate::api::model::Model;
 use crate::instance::InstanceState;
 use anyhow::Result;
 use wasmtime::component::Resource;
@@ -20,20 +20,13 @@ pub struct Adapter {
 impl pie::core::adapter::Host for InstanceState {}
 
 impl pie::core::adapter::HostAdapter for InstanceState {
-    async fn create(
-        &mut self,
-        model: Resource<Model>,
-        name: String,
-    ) -> Result<Result<Resource<Adapter>, String>> {
+    async fn create(&mut self, model: Resource<Model>, name: String) -> Result<Result<Resource<Adapter>, String>> {
         let model = self.ctx().table.get(&model)?;
         let model_idx = model.model_id;
 
         match adapter::create(model_idx, name).await {
             Ok(adapter_id) => {
-                let adapter = Adapter {
-                    adapter_id,
-                    model_idx,
-                };
+                let adapter = Adapter { adapter_id, model_idx };
                 Ok(Ok(self.ctx().table.push(adapter)?))
             }
             Err(e) => Ok(Err(e.to_string())),
@@ -50,20 +43,13 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         Ok(())
     }
 
-    async fn open(
-        &mut self,
-        model: Resource<Model>,
-        name: String,
-    ) -> Result<Option<Resource<Adapter>>> {
+    async fn open(&mut self, model: Resource<Model>, name: String) -> Result<Option<Resource<Adapter>>> {
         let model = self.ctx().table.get(&model)?;
         let model_idx = model.model_id;
 
         match adapter::open(model_idx, name).await {
             Some(adapter_id) => {
-                let adapter = Adapter {
-                    adapter_id,
-                    model_idx,
-                };
+                let adapter = Adapter { adapter_id, model_idx };
                 Ok(Some(self.ctx().table.push(adapter)?))
             }
             None => Ok(None),
@@ -77,10 +63,7 @@ impl pie::core::adapter::HostAdapter for InstanceState {
 
         match adapter::fork(model_idx, adapter_id, name).await {
             Some(new_adapter_id) => {
-                let new_adapter = Adapter {
-                    adapter_id: new_adapter_id,
-                    model_idx,
-                };
+                let new_adapter = Adapter { adapter_id: new_adapter_id, model_idx };
                 Ok(self.ctx().table.push(new_adapter)?)
             }
             None => anyhow::bail!("Failed to fork adapter"),
@@ -92,7 +75,11 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         Ok(())
     }
 
-    async fn load(&mut self, this: Resource<Adapter>, path: String) -> Result<Result<(), String>> {
+    async fn load(
+        &mut self,
+        this: Resource<Adapter>,
+        path: String,
+    ) -> Result<Result<(), String>> {
         let adapter_res = self.ctx().table.get(&this)?;
         let adapter_id = adapter_res.adapter_id;
         let model_idx = adapter_res.model_idx;
@@ -103,7 +90,11 @@ impl pie::core::adapter::HostAdapter for InstanceState {
         }
     }
 
-    async fn save(&mut self, this: Resource<Adapter>, path: String) -> Result<Result<(), String>> {
+    async fn save(
+        &mut self,
+        this: Resource<Adapter>,
+        path: String,
+    ) -> Result<Result<(), String>> {
         let adapter_res = self.ctx().table.get(&this)?;
         let adapter_id = adapter_res.adapter_id;
         let model_idx = adapter_res.model_idx;

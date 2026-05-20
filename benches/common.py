@@ -105,51 +105,6 @@ def print_summary(s: BenchSummary) -> None:
     if s.latency_mean_ms is not None:
         print(f"lat mean/p50:      {s.latency_mean_ms:.1f} / {s.latency_p50_ms:.1f} ms")
         print(f"lat p95/p99:       {s.latency_p95_ms:.1f} / {s.latency_p99_ms:.1f} ms")
-    # Speculation counters live in the config blob, sourced from the
-    # server's `model_status` query. Only printed when present so
-    # baseline runs (no speculation capability) stay quiet.
-    spec_keys = (
-        "spec attempted",
-        "spec hits",
-        "spec misses",
-        "spec rule skipped",
-        "spec budget skipped",
-        "spec dropped orphan",
-        "spec need pages",
-        "spec chain now",
-        "spec chain peak",
-        "spec longest chain",
-        "total batches",
-        "avg batch latency us",
-        "last batch latency us",
-        "bypass hits",
-        "chain submits",
-        "chain drops",
-        "total requests",
-        "max forward requests",
-        "batch size hist",
-    )
-    if any(k in s.config for k in spec_keys):
-        for k in spec_keys:
-            if k in s.config:
-                print(f"{k+':':<18} {s.config[k]}")
-        # Derived efficiency metrics. `hit rate` is the fraction of
-        # the inferlet's execute() calls that short-circuited via
-        # the chain. `chain yield` is how much of the theoretical
-        # max (attempts × depth_cap) we actually captured as hits;
-        # 1.0 means every chain entry the driver fired was matched
-        # by an inferlet call, lower means some entries got
-        # truncated (page boundaries) or orphaned (ctx ended).
-        hits = s.config.get("spec hits", 0)
-        misses = s.config.get("spec misses", 0)
-        attempted = s.config.get("spec attempted", 0)
-        depth_cap = s.config.get("max chain depth")
-        total_calls = hits + misses + attempted
-        if total_calls > 0:
-            print(f"{'spec hit rate:':<18} {hits / total_calls:.1%}")
-        if depth_cap and attempted > 0:
-            theoretical = attempted * depth_cap
-            print(f"{'spec chain yield:':<18} {hits / theoretical:.1%}")
     print("-" * 52)
 
 
@@ -169,7 +124,7 @@ def add_mode_subcommands(parser: argparse.ArgumentParser) -> None:
     latency.add_argument("--requests", type=int, default=16)
     latency.set_defaults(num_requests=0, concurrency=1)
 
-    tput = sub.add_parser("tput", help="many-request throughput")
+    tput = sub.add_parser("tput", help="high-concurrency throughput")
     add_common_args(tput)
     tput.add_argument("--num-requests", type=int, default=512)
     tput.add_argument("--concurrency", type=int, default=128)
@@ -186,30 +141,11 @@ def add_common_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--unique-prompts", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--warmup", type=int, default=2)
-    p.add_argument(
-        "--warmup-max-tokens",
-        type=int,
-        default=None,
-        help="Override max_tokens only for warmup requests.",
-    )
     p.add_argument("--json-out", default=None)
     p.add_argument("--request-timeout", type=float, default=300.0)
     p.add_argument("--tp-size", type=int, default=1)
-    p.add_argument("--gpu-mem-util", type=float, default=0.90)
+    p.add_argument("--gpu-mem-util", type=float, default=0.80)
     p.add_argument("--max-model-len", type=int, default=2048)
-    p.add_argument("--sglang-attention-backend", default=None)
-    p.add_argument("--sglang-sampling-backend", default=None)
-    p.add_argument("--sglang-disable-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument("--sglang-disable-piecewise-cuda-graph", action=argparse.BooleanOptionalAction, default=False)
-    p.add_argument(
-        "--wasm-delay-us",
-        type=int,
-        default=0,
-        help="Busy-spin in the bench inferlet's WASM between every "
-             "execute() call (microseconds). Simulates per-token "
-             "WASM work — useful for measuring the wall-clock benefit "
-             "of async chain firing on W>0 workloads. Default 0.",
-    )
 
 
 def make_prompts(args: argparse.Namespace, n: int) -> list[str]:

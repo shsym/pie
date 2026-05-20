@@ -13,13 +13,16 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from ._bridge.config import RuntimeConfig
+from pie_driver_dev.config import RuntimeConfig
 
 
-# `RuntimeConfig.activation_dtype` is a string identifier; vllm's
-# EngineArgs accepts the same vocabulary. This set gates the supported
-# values.
-_SUPPORTED_DTYPES = {"bfloat16", "float16", "float32"}
+# Map pie's RuntimeConfig.activation_dtype (torch.dtype) to vllm's string form.
+# vllm's EngineArgs wants strings; we work in torch.dtype internally.
+_DTYPE_TO_STR = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+    torch.float32: "float32",
+}
 
 
 def _resolve_hf_snapshot_dir(hf_repo: str) -> str | None:
@@ -71,30 +74,30 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     """Build a VllmConfig from pie's `RuntimeConfig` (universal slice) and
     `VllmDriverConfig` (vllm-native knobs).
 
-    Exposed driver config field names mirror EngineArgs, so we splat policy
-    knobs into EngineArgs as kwargs. Capacity limits are resolved by vLLM and
-    reported later through DriverCapabilities.
+    Driver config field names mirror EngineArgs exactly, so we splat them
+    into EngineArgs as kwargs.
     """
     from dataclasses import asdict
     from ._vllm_compat import EngineArgs
 
-    if config.activation_dtype not in _SUPPORTED_DTYPES:
+    if config.activation_dtype not in _DTYPE_TO_STR:
         raise ValueError(
             f"Unsupported activation_dtype for vllm driver: {config.activation_dtype}. "
-            f"Expected one of {sorted(_SUPPORTED_DTYPES)}."
+            f"Expected one of {list(_DTYPE_TO_STR)}."
         )
+    dtype_str = _DTYPE_TO_STR[config.activation_dtype]
 
     # Universal fields go through pie's RuntimeConfig.
     engine_kwargs = dict(
         model=config.hf_repo,
-        dtype=config.activation_dtype,
+        dtype=dtype_str,
         tensor_parallel_size=config.tensor_parallel_size,
         seed=config.random_seed,
         skip_tokenizer_init=True,        # pie owns tokenization
         download_dir=config.cache_dir,
     )
 
-    # Driver-specific policy fields splat verbatim — names match EngineArgs.
+    # Driver-specific fields splat verbatim — names match EngineArgs.
     # `None` means "leave default" (vllm picks). Pie-only knobs that don't
     # correspond to vllm EngineArgs are filtered out: spec_ngram_* drive
     # pie's NGRAM drafter (engine-side, see VllmEngine.spec_step).
@@ -143,7 +146,7 @@ def _build_vllm_config(config: RuntimeConfig, driver_config) -> Any:
     ):
         import os
 
-        safe_device = config.device.replace(":", "_")
+        safe_device = str(config.device).replace(":", "_")
         vllm_config.compilation_config.cache_dir = (
             f"/tmp/pie_vllm_compile_cache/pid_{os.getpid()}_{safe_device}"
         )
@@ -216,7 +219,7 @@ def load_vllm_model(
 
     # Pin the device for this rank — vllm reads current_device() during
     # model construction.
-    device_str = config.device
+    device_str = str(config.device)
     if device_str.startswith("cuda"):
         torch.cuda.set_device(device_str)
         local_rank = int(device_str.split(":")[1]) if ":" in device_str else 0

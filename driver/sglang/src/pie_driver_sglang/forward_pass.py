@@ -12,7 +12,7 @@ extend-token. To preserve pie's contract we replace the model's
 LogitsProcessor with `_HiddenCapture`, which stashes the full per-token
 hidden state tensor; `sample()` then applies pie's per-output
 `indices_for_logits` gather + the LM head + sampling itself via
-`.common.sample_common`.
+`pie_driver_dev.model.common.sample_common`.
 
 Custom attention masks: this bridge runs SGLang's standard causal attention
 and silently drops any user-supplied mask. The driver advertises that
@@ -26,8 +26,8 @@ from typing import Any
 
 import torch
 
-from ._bridge.config import RuntimeConfig
-from .common import sample_common
+from pie_driver_dev.config import RuntimeConfig
+from pie_driver_dev.model.common import sample_common
 
 from .forward_batch import build_sglang_forward_batch
 
@@ -75,10 +75,6 @@ class SGLangForwardPass:
         self.runtime_config = runtime_config
         self.page_size = page_size
         self.device = torch.device(runtime_config.device)
-        # `runtime_config.activation_dtype` is a string (bridge stays
-        # torch-free); resolve once here so the sampling hot path doesn't
-        # do a getattr per call.
-        self.activation_dtype = getattr(torch, runtime_config.activation_dtype)
 
         # One-shot install: hidden-state capture replaces the LogitsProcessor.
         # User-supplied attention masks are silently dropped — the driver runs
@@ -151,5 +147,5 @@ class SGLangForwardPass:
             sampling_metadata=sampling_metadata,
             lm_head_fn=self._lm_head_fn,
             device=self.device,
-            dtype=self.activation_dtype,
+            dtype=self.runtime_config.activation_dtype,
         )

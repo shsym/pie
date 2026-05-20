@@ -1,9 +1,10 @@
 //! Gemma 3 instruct implementation.
-//!
+//! 
 //! Uses the same ChatML-like format as Gemma 2.
 //! Re-exports implementation from gemma2.rs.
 
 pub use crate::model::instruct::gemma2::*;
+
 
 static TEMPLATE: &str = r#"
 {{ bos_token }}

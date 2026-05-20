@@ -425,26 +425,26 @@ void full_attn_body(
         N, num_q_heads_local, num_kv_heads_local,
         d, rotary_dim, cfg.rope_theta, stream);
 
-    auto kv_view = cache.layer_view(kv_layer);
-    kernels::launch_write_kv_to_pages(
-        kv_view, ws.k.data(), ws.v.data(),
+    kernels::launch_write_kv_to_pages_bf16(
+        cache.k(kv_layer), cache.v(kv_layer), ws.k.data(), ws.v.data(),
         qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-        N, R, stream);
+        N, R, cache.page_size(), num_kv_heads_local, d, stream);
 
     // Decode path: pre-planned (graph-friendly). Prefill: includes host
     // work in the launcher (PrefillPlan), so non-graph-capturable.
     if (decode_plan) {
-        ops::dispatch_attention_flashinfer_decode(
+        ops::dispatch_attention_flashinfer_decode_bf16(
             *decode_plan,
-            ws.q.data(), kv_view, ws.attn_out.data(),
+            ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
             attn_ws, stream);
     } else {
-        ops::launch_attention_flashinfer_prefill(
-            ws.q.data(), kv_view, ws.attn_out.data(),
+        ops::launch_attention_flashinfer_prefill_bf16(
+            ws.q.data(), cache.k(kv_layer), cache.v(kv_layer), ws.attn_out.data(),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             qo_indptr_h, kv_page_indptr_h,
-            N, R, num_q_heads_local, attn_ws, stream);
+            N, R, num_q_heads_local, num_kv_heads_local, d,
+            cache.page_size(), attn_ws, stream);
     }
 
     if (cfg.attn_output_gate) {
@@ -547,7 +547,7 @@ void moe_block(
         //   5. `batched_weighted_sum` collapses [top_k, H] → moe_out[0].
         //
         // Every step has fixed kernel topology and stable device-pointer
-        // arguments, so the executor's graph-capture path can fire
+        // arguments, so the request handler's graph-capture path can fire
         // for the whole forward.
         kernels::launch_build_moe_ptrs_decode_bf16(
             moe_ws.topk_idx.data(),
@@ -722,7 +722,7 @@ void qwen3_5_moe_forward_paged(
     const std::int32_t* slot_ids_d)
 {
     // Pure-Qwen3-MoE (Qwen3-30B-A3B, model_type == "qwen3_moe") has no
-    // linear-attn layers; the per-slot rs_cache is unused. Qwen3.5 /
+    // linear-attn layers; the per-slot state cache is unused. Qwen3.5 /
     // 3.6-MoE additionally fires the linear-attn body — those layers
     // consume slot_ids_h / is_fresh_h to drive per-request state.
     const bool has_linear_attn_layers = std::any_of(

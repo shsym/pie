@@ -24,14 +24,12 @@
 use crate::ForwardPassExt;
 use crate::Result;
 use crate::adapter::Adapter;
-use crate::context::{Context, brle_and, compute_bid};
+use crate::context::{Context, compute_bid, brle_and};
 use crate::forward::{Output, ProbeHandle, SampleHandle};
-use crate::pie::core::inference::Output as RawOutput;
 use crate::pie::core::inference::{ForwardPass, Sampler as WitSampler, SlotOutput};
+use crate::pie::core::inference::Output as RawOutput;
 use crate::sample::{Probe, Sampler};
 use crate::spec::Speculator;
-
-const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
 
 // Re-export so callers don't have to pull from `context` directly.
 pub use crate::context::{Constrain, GrammarConstraint, Schema};
@@ -56,7 +54,6 @@ enum SpecMode {
 /// Builder + iterator for token generation. See module docs.
 pub struct Generator<'ctx> {
     ctx: &'ctx mut Context,
-    pass: ForwardPass,
     sampler: Sampler,
     stop: Vec<u32>,
     max_tokens: Option<usize>,
@@ -86,16 +83,10 @@ impl<'ctx> Generator<'ctx> {
         let dividend = crate::scheduling::dividend(&ctx.model);
         let pages = (ctx.committed_pages + ctx.working_pages).max(1) as f64;
         let page_size = ctx.page_size as f64;
-        ctx.set_bid(compute_bid(
-            balance, pages, 4096.0, 1.0, page_size, dividend,
-        ));
-
-        let pass = ForwardPass::new(&ctx.model);
-        pass.context(&ctx.inner);
+        ctx.set_bid(compute_bid(balance, pages, 4096.0, 1.0, page_size, dividend));
 
         Self {
             ctx,
-            pass,
             sampler,
             stop: Vec::new(),
             max_tokens: None,
@@ -341,7 +332,8 @@ impl<'ctx> Generator<'ctx> {
         let schema = schemars::schema_for!(T);
         let schema_str = serde_json::to_string(&schema)
             .map_err(|e| format!("collect_json: serialize schema: {e}"))?;
-        let constraint = GrammarConstraint::from_json_schema(&schema_str, &self.ctx.model)?;
+        let constraint =
+            GrammarConstraint::from_json_schema(&schema_str, &self.ctx.model)?;
         let text = self.constrain(constraint).collect_text().await?;
         serde_json::from_str(&text).map_err(|e| format!("collect_json: deserialize: {e}"))
     }
@@ -365,35 +357,6 @@ impl<'ctx> Generator<'ctx> {
 
         self.ctx
             .set_bid(compute_bid(balance, pages, mu, cv2, page_size, dividend));
-    }
-
-    fn reservation_lookahead_tokens(&self) -> u32 {
-        let remaining = self
-            .horizon
-            .or(self.max_tokens)
-            .map(|limit| limit.saturating_sub(self.tokens_generated))
-            .unwrap_or(0);
-        remaining.min(GENERATION_RESERVATION_WINDOW_TOKENS as usize) as u32
-    }
-
-    fn release_empty_working_pages(&mut self) {
-        let used_pages = if self.ctx.working_tokens == 0 {
-            0
-        } else {
-            self.ctx.working_tokens.div_ceil(self.ctx.page_size)
-        };
-        let excess = self.ctx.working_pages.saturating_sub(used_pages);
-        if excess == 0 {
-            return;
-        }
-        self.ctx.inner.release_working_pages(excess);
-        self.ctx.working_pages -= excess;
-    }
-}
-
-impl Drop for Generator<'_> {
-    fn drop(&mut self) {
-        self.release_empty_working_pages();
     }
 }
 
@@ -455,21 +418,9 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         let n_pending = pending.len() as u32;
         let n_drafted = drafts.len() as u32;
 
-        if n_pending == 0 && n_drafted == 0 {
-            // No input, no drafts — there are no query positions for a
-            // sampler to land on. Firing in this state would produce a
-            // wire request with `qo_indptr=[0,0]` plus a sampler slot
-            // pointing at a non-existent query position; the driver
-            // would either crash (portable's old behavior) or return
-            // an empty response (cuda's short-circuit), and the SDK
-            // loop would just call us again with the same empty state.
-            //
-            // Mark done so `Generator::next()` returns `None` and the
-            // inferlet's `while let Some(step) = g.next()?` loop
-            // terminates cleanly. Reached when a prior step's response
-            // didn't yield an accepted token (e.g., a driver error
-            // returned an empty slot list), so this also acts as a
-            // fail-stop against a runaway empty-response loop.
+        if n_pending == 0 && n_drafted == 0 && user_cleared_sampler && extra_probes.is_empty() {
+            // Truly nothing to do — no input, no sampler, no probes.
+            // Mark done so collect_* sugars terminate cleanly.
             parent.done = true;
             return Ok(Output::new(RawOutput {
                 slots: Vec::new(),
@@ -484,16 +435,11 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         // the last cached KV position without growing the working tail.
         let n_total_input = n_pending + n_drafted;
         if n_total_input > 0 {
-            let total_after = parent
-                .ctx
-                .working_tokens
-                .saturating_add(n_total_input)
-                .saturating_add(parent.reservation_lookahead_tokens());
+            let total_after = parent.ctx.working_tokens + n_total_input;
             let pages_needed = (total_after + parent.ctx.page_size - 1) / parent.ctx.page_size;
             let additional = pages_needed.saturating_sub(parent.ctx.working_pages);
             if additional > 0 {
-                parent
-                    .ctx
+                parent.ctx
                     .inner
                     .reserve_working_pages(additional)
                     .map_err(|e| format!("GenStep::execute reserve: {e}"))?;
@@ -501,10 +447,9 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             }
         }
 
-        // Build forward pass. A Generator is single-context and
-        // single-step-at-a-time, so reuse the same WIT ForwardPass resource
-        // and let the host reset its request accumulator after execute().
-        let pass = &parent.pass;
+        // Build forward pass.
+        let pass = ForwardPass::new(&parent.ctx.model);
+        pass.context(&parent.ctx.inner);
         if let Some(a) = parent.adapter {
             pass.adapter(a);
         }
@@ -626,9 +571,6 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
                 })
                 .collect()
         };
-        if !user_cleared_sampler && accepted_tokens.is_empty() {
-            return Err("GenStep::execute: auto-sampler returned no token".into());
-        }
 
         // Stash next-iter system drafts (and let custom speculators see
         // accepted tokens).
@@ -673,8 +615,7 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             let new_working = parent.ctx.working_tokens + n_kv_tokens;
             let pages_to_commit = new_working / parent.ctx.page_size;
             if pages_to_commit > 0 {
-                parent
-                    .ctx
+                parent.ctx
                     .inner
                     .commit_working_pages(pages_to_commit)
                     .map_err(|e| format!("GenStep::execute commit: {e}"))?;
@@ -696,9 +637,7 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
         // Advance constraint state with the accepted tokens (read by the
         // next iteration's mask compute).
         if !parent.constraints.is_empty() {
-            parent
-                .constraint_pending
-                .extend_from_slice(&accepted_tokens);
+            parent.constraint_pending.extend_from_slice(&accepted_tokens);
         }
 
         // Truncate at stop / max_tokens, accumulate counters, seed buffer.
