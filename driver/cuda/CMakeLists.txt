@@ -21,6 +21,10 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 
+if(NOT PIE_BRIDGE_INCLUDE_DIR)
+  set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
+endif()
+
 # NCCL for tensor-parallel collectives. Single-GPU runs never load it (the
 # call sites are gated on tp_size > 1), but we always link so a TP-enabled
 # wrapper can talk to the same binary. System NCCL only — vendoring via CPM
@@ -52,6 +56,32 @@ cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
+set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
+foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120")
+    set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce_stub.cpp)
+  endif()
+endforeach()
+if(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE MATCHES "stub")
+  message(STATUS "Disabling FlashInfer custom all-reduce for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+
+set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE src/ops/attention_flashinfer_hopper_stub.cpp)
+foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
+  string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "90")
+    set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE
+      src/ops/attention_flashinfer_hopper.cu
+      src/ops/attention_xqa_gqa8_sm90.cu
+    )
+  endif()
+endforeach()
+if(PIE_CUDA_FLASHINFER_HOPPER_SOURCE MATCHES "stub")
+  message(STATUS "Disabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+else()
+  message(STATUS "Enabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
 
 # pie_driver_cuda — native CUDA backend. Built two ways from the same
 # translation units:
@@ -65,16 +95,23 @@ cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 #     `pie_driver_cuda_native` via subprocess.
 add_library(pie_driver_cuda_lib STATIC
   src/entry.cpp
-  src/persistent_inputs.cpp
-  src/request_handler.cpp
-  src/msgpack_subpass.cpp
+  src/executor/persistent_inputs.cpp
+  src/executor/executor.cpp
+  src/service/inproc_service.cpp
+  src/response_subpass.cpp
   src/sampling_dispatch.cpp
   src/spec_expansion.cpp
-  src/shmem_ipc.cpp
-  src/shmem_schema.cpp
   src/tensor.cpp
-  src/engine.cpp
+  src/model/weight_store.cpp
+  src/model/loaded_model.cpp
+  src/model/bound_model.cpp
+  ../common/src/safetensors_manifest.cpp
   src/loader/hf_config.cpp
+  src/loader/byte_source.cpp
+  src/loader/load_plan.cpp
+  src/loader/materializer.cpp
+  src/loader/model_schema.cpp
+  src/loader/physical_load_plan.cpp
   src/loader/safetensors.cpp
   src/model/qwen3.cpp
   src/model/qwen3_forward.cpp
@@ -86,15 +123,19 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp
   src/model/qwen3_5.cpp
+  src/kv_cache_format.cpp
   src/kv_cache.cpp
   src/ops/gemm.cpp
   src/ops/attention_naive.cu
   src/ops/attention_naive_paged.cu
-  src/response_writer.cpp
+  src/ops/attention_xqa.cu
+  src/ops/attention_xqa_gqa8.cu
   src/kernels/rmsnorm.cu
   src/kernels/embed.cu
   src/kernels/swiglu.cu
   src/kernels/rope.cu
+  src/kernels/split_packed.cu
+  src/kernels/scatter_int32.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu
   src/kernels/sample_temp.cu
@@ -122,17 +163,16 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/causal_conv1d.cu
   src/kernels/gated_delta_net.cu
   src/qwen3_5_state_cache.cpp
-  src/slot_allocator.cpp
   src/model/qwen3_5_forward.cpp
   src/model/qwen3_5_moe.cpp
   src/model/qwen3_5_moe_forward.cpp
   src/attention_workspace.cpp
   src/brle.cpp
-  src/control_socket.cpp
   src/swap_pool.cpp
   src/distributed.cpp
-  src/custom_all_reduce.cu
+  ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/ops/attention_flashinfer.cu
+  ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
 )
 
 add_executable(pie_driver_cuda src/main.cpp)
@@ -148,7 +188,7 @@ target_compile_options(pie_driver_cuda_lib PRIVATE
   >
   $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wno-unused-parameter>
 )
-# Marlin sources are added to the `pie_driver_cuda` executable below
+# Marlin sources are added to the static driver library below
 # (see `PIE_CUDA_BUILD_MARLIN`); they need the same nvcc relaxed-
 # constexpr / extended-lambda flags the lib gets, since vendored
 # kernels mix `__host__ constexpr` helpers into `__device__` paths.
@@ -162,8 +202,11 @@ target_compile_options(pie_driver_cuda PRIVATE
 target_include_directories(pie_driver_cuda_lib
   PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
+    ${PIE_BRIDGE_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
     ${flashinfer_SOURCE_DIR}/include
+    ${flashinfer_SOURCE_DIR}/csrc
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
@@ -180,15 +223,15 @@ if(PIE_CUDA_BUILD_MARLIN)
     # A100; rerun with a different arch to add Hopper / Ada coverage.
     file(GLOB MARLIN_SM_KERNELS
         "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/sm*_kernel_*.cu")
-    target_sources(pie_driver_cuda PRIVATE
+    target_sources(pie_driver_cuda_lib PRIVATE
         third_party/marlin/marlin.cu
         third_party/marlin/gptq_marlin_repack.cu
         third_party/marlin/awq_marlin_repack.cu
         third_party/marlin/marlin_wrapper.cpp
         ${MARLIN_SM_KERNELS})
-    target_include_directories(pie_driver_cuda PRIVATE
+    target_include_directories(pie_driver_cuda_lib PRIVATE
         third_party/marlin)
-    target_compile_definitions(pie_driver_cuda PRIVATE PIE_CUDA_HAS_MARLIN=1)
+    target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
 endif()
 
 # Standalone test for flashinfer sampling debugging.
@@ -203,25 +246,76 @@ target_compile_options(sample_flashinfer_test PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(sample_flashinfer_test PRIVATE CUDA::cudart)
 
+# Qwen3.5 linear-attention conv-state regression. This catches mixed
+# prefill/decode batches where a continuing T=1 request must consume its
+# existing conv window even when the whole fire is not pure decode.
+add_executable(test_causal_conv1d
+  tests/test_causal_conv1d.cu
+  src/kernels/causal_conv1d.cu)
+target_include_directories(test_causal_conv1d PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_causal_conv1d PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_causal_conv1d PRIVATE CUDA::cudart)
+
 # Wire-format unit tests. Pure C++ (no CUDA), short runtime; CTest runs
-# them under `cmake --build build --target test`. The msgpack roundtrip
-# verification is delegated to a sibling pytest that reads the binary's
-# output files.
+# them under `cmake --build build --target test`.
 add_executable(test_brle tests/test_brle.cpp src/brle.cpp)
 target_include_directories(test_brle PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-add_executable(test_response_writer
-  tests/test_response_writer.cpp
-  src/response_writer.cpp)
-target_include_directories(test_response_writer PRIVATE
+add_executable(test_driver_common
+  ../common/tests/test_common.cpp
+  ../common/src/safetensors_manifest.cpp)
+target_include_directories(test_driver_common PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+target_link_libraries(test_driver_common PRIVATE nlohmann_json::nlohmann_json)
+
+add_executable(test_kv_cache_format
+  tests/test_kv_cache_format.cpp
+  src/kv_cache_format.cpp)
+target_include_directories(test_kv_cache_format PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+add_executable(test_kv_cache_quant
+  tests/test_kv_cache_quant.cu
+  src/tensor.cpp
+  src/kv_cache.cpp
+  src/kv_cache_format.cpp
+  src/kernels/kv_paged.cu)
+target_include_directories(test_kv_cache_quant PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_kv_cache_quant PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_kv_cache_quant PRIVATE CUDA::cudart)
+
+add_executable(test_swap_pool
+  tests/test_swap_pool.cpp
+  src/tensor.cpp
+  src/kv_cache.cpp
+  src/kv_cache_format.cpp
+  src/swap_pool.cpp)
+target_include_directories(test_swap_pool PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(test_swap_pool PRIVATE CUDA::cudart)
+
+add_executable(test_load_plan
+  tests/test_load_plan.cpp
+  src/loader/load_plan.cpp
+  src/loader/model_schema.cpp
+  src/loader/physical_load_plan.cpp)
+target_include_directories(test_load_plan PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/../common/include)
+target_link_libraries(test_load_plan PRIVATE tomlplusplus::tomlplusplus)
 
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
-add_test(NAME response_writer
-  COMMAND test_response_writer
-    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_flat.bin
-    ${CMAKE_CURRENT_BINARY_DIR}/_response_writer_msgpack.bin)
+add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
+add_test(NAME driver_common COMMAND test_driver_common)
+add_test(NAME kv_cache_format COMMAND test_kv_cache_format)
+add_test(NAME kv_cache_quant COMMAND test_kv_cache_quant)
+add_test(NAME swap_pool COMMAND test_swap_pool)
+add_test(NAME load_plan COMMAND test_load_plan)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

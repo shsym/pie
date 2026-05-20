@@ -7,7 +7,7 @@
 // (`pie_driver_cuda_native/worker.py`) generates the unique-id, passes it
 // to all ranks via the startup TOML, and only rank 0 of each group exposes
 // a shmem server to the runtime. Followers consume their inputs by NCCL
-// broadcast from rank 0 — see request_handler for the broadcast plumbing.
+// broadcast from rank 0 — see executor for the broadcast plumbing.
 
 #include <cstddef>
 #include <cstdint>
@@ -58,6 +58,11 @@ public:
     // bf16 in-place all-reduce. `count` is element count.
     void all_reduce_bf16(void* sendrecv, std::size_t count, ncclRedOp_t op,
                          cudaStream_t stream);
+
+    // bf16 out-of-place all-reduce. Used by TP hot paths that can consume the
+    // reduced value from a separate scratch buffer.
+    void all_reduce_bf16_out(const void* send, void* recv, std::size_t count,
+                             ncclRedOp_t op, cudaStream_t stream);
 
     // fp32 in-place all-reduce. Used by the runtime-quant absmax MAX
     // reduction (row-parallel weights need cross-rank absmax to compute

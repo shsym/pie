@@ -8,6 +8,8 @@ interface Props {
   trace: DemoTrace;
 }
 
+const LOOP_PAUSE_MS = 1500;
+
 function paneEnd(pane: DemoPane): number {
   if (pane.events.length === 0) return 0;
   return pane.events[pane.events.length - 1].t;
@@ -98,13 +100,9 @@ function renderEvent(ev: DemoEvent, key: number) {
 function Pane({
   pane,
   elapsedMs,
-  isComplete,
-  onReplay,
 }: {
   pane: DemoPane;
   elapsedMs: number;
-  isComplete: boolean;
-  onReplay: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const visible = useMemo(
@@ -128,20 +126,6 @@ function Pane({
         {visible.map((ev, i) => renderEvent(ev, i))}
         <span className={styles.cursor} aria-hidden>▍</span>
       </div>
-      <div
-        className={clsx(styles.paneFooter, isComplete && styles.paneFooterVisible)}
-        aria-hidden={!isComplete}
-      >
-        <button
-          type="button"
-          className={styles.paneReplay}
-          onClick={onReplay}
-          tabIndex={isComplete ? 0 : -1}
-          aria-label="Replay animation"
-        >
-          ↻ Replay
-        </button>
-      </div>
     </div>
   );
 }
@@ -154,6 +138,7 @@ export default function DemoPlayer({ trace }: Props) {
   const startRef = useRef<number | null>(null);
   const rafRef = useRef<number | null>(null);
   const pausedAtRef = useRef<number | null>(null);
+  const loopTimerRef = useRef<number | null>(null);
   const hasStartedRef = useRef(false);
 
   const totalMs = useMemo(
@@ -166,6 +151,10 @@ export default function DemoPlayer({ trace }: Props) {
       cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
     }
+    if (loopTimerRef.current) {
+      window.clearTimeout(loopTimerRef.current);
+      loopTimerRef.current = null;
+    }
   }, []);
 
   const tick = useCallback(
@@ -175,8 +164,11 @@ export default function DemoPlayer({ trace }: Props) {
       if (elapsed >= totalMs) {
         setElapsedMs(totalMs);
         rafRef.current = null;
-        pausedAtRef.current = totalMs;
-        setRunning(false);
+        loopTimerRef.current = window.setTimeout(() => {
+          startRef.current = null;
+          setElapsedMs(0);
+          rafRef.current = requestAnimationFrame(tick);
+        }, LOOP_PAUSE_MS);
         return;
       }
       setElapsedMs(elapsed);
@@ -211,22 +203,6 @@ export default function DemoPlayer({ trace }: Props) {
     rafRef.current = requestAnimationFrame(startTick);
   }, [running, tick]);
 
-  // Latest-callback refs so the IntersectionObserver below always reads
-  // current state instead of the closure from its setup render. Without
-  // this, after completion the observer's `running` view is stuck at
-  // its initial value and any intersection flicker during/after Replay
-  // strands the animation mid-frame.
-  const runningRef = useRef(running);
-  const playRef = useRef(play);
-  const pauseRef = useRef(pause);
-  const resumeRef = useRef(resume);
-  useEffect(() => {
-    runningRef.current = running;
-    playRef.current = play;
-    pauseRef.current = pause;
-    resumeRef.current = resume;
-  });
-
   // Auto-play when scrolled into view; pause when leaving.
   useEffect(() => {
     if (!containerRef.current) return;
@@ -236,18 +212,19 @@ export default function DemoPlayer({ trace }: Props) {
         if (entry.isIntersecting) {
           if (!hasStartedRef.current) {
             hasStartedRef.current = true;
-            playRef.current();
-          } else if (!runningRef.current) {
-            resumeRef.current();
+            play();
+          } else if (!running) {
+            resume();
           }
-        } else if (runningRef.current) {
-          pauseRef.current();
+        } else if (running) {
+          pause();
         }
       },
       { threshold: 0.3 },
     );
     observer.observe(el);
     return () => observer.disconnect();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trace.id]);
 
   // Reset when trace changes.
@@ -273,6 +250,14 @@ export default function DemoPlayer({ trace }: Props) {
           <h3 className={styles.title}>{trace.title}</h3>
           <p className={styles.tagline}>{trace.tagline}</p>
         </div>
+        <button
+          type="button"
+          className={styles.replay}
+          onClick={play}
+          aria-label="Replay animation"
+        >
+          ↻ Replay
+        </button>
       </div>
       <div className={styles.question}>
         <div className={styles.cardHeader}>
@@ -282,18 +267,8 @@ export default function DemoPlayer({ trace }: Props) {
         <p className={styles.questionText}>{trace.question}</p>
       </div>
       <div className={styles.panes}>
-        <Pane
-          pane={trace.naive}
-          elapsedMs={elapsedMs}
-          isComplete={elapsedMs >= totalMs}
-          onReplay={play}
-        />
-        <Pane
-          pane={trace.pie}
-          elapsedMs={elapsedMs}
-          isComplete={elapsedMs >= totalMs}
-          onReplay={play}
-        />
+        <Pane pane={trace.naive} elapsedMs={elapsedMs} />
+        <Pane pane={trace.pie} elapsedMs={elapsedMs} />
       </div>
       {trace.code ? (
         <div className={styles.codeWrap}>
