@@ -63,7 +63,7 @@
 //!
 //! That cohort-cap-plus-bound design is `EagerPolicy` below. Adding
 //! a GPU-busy gate on top — keeping the policy in `Wait` while the
-//! device is occupied — yields `AdaptivePolicy`. The gate has a small
+//! driver is occupied — yields `AdaptivePolicy`. The gate has a small
 //! consistent benefit under churn (~20 ms p50 improvement on average,
 //! up to ~50 ms on saturated bursts) at the cost of a similarly small
 //! steady-state regression. Promoted to default because the workloads
@@ -79,14 +79,14 @@ use super::scheduler::{Decision, SchedulingPolicy};
 //
 // **Firing rule** (in evaluation order):
 //
-//   1. `B >= max_batch_size`              — structural device limit.
-//   2. `last_latency == 0`                — cold start, no measurement
-//                                           yet; fire to make progress.
-//   3. `in_flight`                        — GPU is occupied by the
+//   1. `B >= max_forward_requests`              — structural driver limit.
+//   2. `in_flight`                        — GPU is occupied by the
 //                                           previous batch. Wait.
 //                                           Arrivals during the wait
 //                                           grow this batch.
-//   4. `B >= pinned_count(device)`        — every active peer is in
+//   3. `last_latency == 0`                — cold start, no measurement
+//                                           yet; fire to make progress.
+//   4. `B >= pinned_count(driver_idx)`    — every active peer is in
 //                                           the batch (cohort cap).
 //                                           Fire.
 //   5. `start.elapsed() >= last_latency`  — safety bound. Waiting
@@ -102,8 +102,8 @@ use super::scheduler::{Decision, SchedulingPolicy};
 // has elapsed.
 //
 // **Why the cohort cap is load-bearing.** In iteration-level
-// batching, `pinned_count(device)` is the count of currently-active
-// contexts on that device. After a batch fires, every one of those
+// batching, `pinned_count(driver_idx)` is the count of currently-active
+// contexts on that driver. After a batch fires, every one of those
 // contexts will eventually submit its next forward-pass request.
 // Once we have all of them in the accumulator (`B == pinned_count`),
 // waiting longer can't produce a bigger batch from existing peers —
@@ -117,7 +117,7 @@ use super::scheduler::{Decision, SchedulingPolicy};
 //
 // **Why the GPU-busy gate (vs `EagerPolicy`).** Without the gate,
 // the cohort-full condition can fire while the previous batch is
-// still on the device. The scheduler then enters its `Fire` branch
+// still on the driver. The scheduler then enters its `Fire` branch
 // and blocks on `acquire_owned().await` for the in-flight permit.
 // During that block the scheduler stops draining the request
 // channel, so any arrivals queued during that window fall into the
@@ -144,11 +144,11 @@ use super::scheduler::{Decision, SchedulingPolicy};
 // rapid 2-second bursts. No spiral or runaway observed.
 
 pub(super) struct AdaptivePolicy {
-    max_batch_size: usize,
-    /// Index of the device this policy is scheduling for. Used to
+    max_forward_requests: usize,
+    /// Index of the driver this policy is scheduling for. Used to
     /// read `pinned_count` (lock-free atomic, updated on context
     /// pin/unpin).
-    device_idx: usize,
+    driver_idx: usize,
     /// `Some(t)` while a batch is accumulating; `None` after fire
     /// and before the next first arrival.
     batch_start_time: Option<Instant>,
@@ -162,19 +162,39 @@ pub(super) struct AdaptivePolicy {
     /// unrepresentative).
     batches_completed: usize,
     /// Set in `on_fired` and cleared in `on_complete` — true while
-    /// the device is executing a batch.
+    /// the driver is executing a batch.
     in_flight: bool,
+    /// Maximum `pinned_count` observed since the last fire. The cohort
+    /// cap uses this instead of the instantaneous `pinned_count` so a
+    /// transient drop — every inferlet calls `unpin()` immediately
+    /// after its forward returns and `pin()` again before the next
+    /// step, so `pinned_count` briefly goes through every value in
+    /// `[0, R]` between fires — doesn't cause us to fire with a
+    /// partial cohort. Reset on `on_fired`. Effective only while
+    /// `in_flight == false` (when we're accumulating the next batch).
+    cohort_high_water: usize,
+    /// Highest batch size that has fired since the policy was created.
+    /// Used as the cohort target so the scheduler waits for the
+    /// expected steady-state cohort to assemble even when the first
+    /// inferlet to arrive happens to be the one that just re-pinned
+    /// (a race vs the other 7+ inferlets still going through their
+    /// post-fire CPU step). Without this, the cohort cap fires at
+    /// B=1 because `pinned_count == 1` at that exact moment. Persists
+    /// across fires; only ratchets upward.
+    fired_high_water: usize,
 }
 
 impl AdaptivePolicy {
-    pub fn new(max_batch_size: usize, device_idx: usize) -> Self {
+    pub fn new(max_forward_requests: usize, driver_idx: usize) -> Self {
         Self {
-            max_batch_size,
-            device_idx,
+            max_forward_requests,
+            driver_idx,
             batch_start_time: None,
             last_latency: 0.0,
             batches_completed: 0,
             in_flight: false,
+            cohort_high_water: 0,
+            fired_high_water: 0,
         }
     }
 }
@@ -198,31 +218,68 @@ impl SchedulingPolicy for AdaptivePolicy {
         self.in_flight = false;
     }
 
-    fn on_fired(&mut self) {
+    fn on_fired(&mut self, fired_size: usize) {
         self.batch_start_time = None;
         self.in_flight = true;
+        // Reset per-batch high-water; next batch starts fresh.
+        self.cohort_high_water = 0;
+        // Ratchet the persistent fired-cohort estimate to the actual
+        // observed cohort size. Do not round near-full cohorts up to
+        // `max_forward_requests`: admission can legitimately settle at
+        // R=max-1, and rounding would force every later batch to wait for
+        // a request that cannot arrive.
+        if fired_size > self.fired_high_water {
+            self.fired_high_water = fired_size;
+        }
     }
 
-    fn decide(&self, current_batch_size: usize) -> Decision {
+    fn decide(&mut self, current_forward_requests: usize) -> Decision {
         // (1) Structural cap. Always fires, even when in_flight,
         //     because the batch can't grow further.
-        if current_batch_size >= self.max_batch_size {
+        if current_forward_requests >= self.max_forward_requests {
             return Decision::Fire;
         }
-        // (2) Cold start.
-        if self.last_latency == 0.0 {
-            return Decision::Fire;
-        }
-        // (3) GPU-busy gate. While the GPU is occupied, never fire
+        // (2) GPU-busy gate. While the GPU is occupied, never fire
         //     — let the scheduler stay in its Wait branch and keep
         //     growing this batch with incoming requests.
         if self.in_flight {
             return Decision::Wait(Duration::from_secs(60));
         }
+        // (3) Cold start. Once the GPU is free and there is no
+        //     latency measurement yet, fire to make progress.
+        if self.last_latency == 0.0 {
+            return Decision::Fire;
+        }
         // GPU is free below this point.
-        // (4) Cohort cap.
-        let active = crate::context::pinned_count(self.device_idx);
-        if active > 0 && current_batch_size >= active {
+        // (4) Cohort cap. The target is `max(this-batch high-water,
+        //     last fired R)`:
+        //   - The per-batch high-water absorbs the case where the
+        //     pinned_count climbs through intermediate values as
+        //     inferlets re-pin between fires.
+        //   - `fired_high_water` is the running max across all prior
+        //     fires; it stops us from firing a partial batch when the
+        //     FIRST inferlet to re-pin wins the race against the
+        //     other 7+ inferlets still finishing their post-fire CPU
+        //     step. Without it, `B = pinned_count = 1` at that moment
+        //     trips the cap and we fire at B=1.
+        let pinned = crate::context::pinned_count(self.driver_idx);
+        let (resident_active, resident_pinned) = crate::context::resident_count(self.driver_idx);
+        let resident = resident_active.saturating_add(resident_pinned);
+        let mut active = pinned;
+        // If a dense serving cohort is already mostly assembled, use the
+        // resident count to wait for stragglers. This prevents a first
+        // 440/512 fire from becoming the permanent cohort size, while
+        // sparse agent workloads still fire from the pinned count below.
+        if resident > active
+            && current_forward_requests.saturating_mul(4) >= resident.saturating_mul(3)
+        {
+            active = resident.min(self.max_forward_requests);
+        }
+        if active > self.cohort_high_water {
+            self.cohort_high_water = active;
+        }
+        let target = self.cohort_high_water.max(self.fired_high_water);
+        if target > 0 && current_forward_requests >= target {
             return Decision::Fire;
         }
         // (5) Safety bound — never wait longer than one previous
@@ -232,11 +289,18 @@ impl SchedulingPolicy for AdaptivePolicy {
             // decide is called (set on first on_arrival).
             return Decision::Fire;
         };
+        let dense_resident_cohort =
+            target >= self.max_forward_requests && resident >= target && target > 0;
+        let wait_bound = if dense_resident_cohort {
+            self.last_latency * 2.0
+        } else {
+            self.last_latency
+        };
         let elapsed = start.elapsed().as_secs_f64();
-        if elapsed >= self.last_latency {
+        if elapsed >= wait_bound {
             return Decision::Fire;
         }
-        Decision::Wait(Duration::from_secs_f64(self.last_latency - elapsed))
+        Decision::Wait(Duration::from_secs_f64(wait_bound - elapsed))
     }
 }
 
@@ -246,7 +310,7 @@ impl SchedulingPolicy for AdaptivePolicy {
 //
 // Same firing logic as `AdaptivePolicy` minus the GPU-busy gate:
 // fires as soon as the cohort is ready, even if the previous batch
-// is still on the device. The scheduler's semaphore handles GPU
+// is still on the driver. The scheduler's semaphore handles GPU
 // contention by blocking in the `Fire` branch.
 //
 // Slightly faster than `AdaptivePolicy` in pure steady-state (no
@@ -258,21 +322,23 @@ impl SchedulingPolicy for AdaptivePolicy {
 // skews steady-state rather than bursty.
 
 pub(super) struct EagerPolicy {
-    max_batch_size: usize,
-    device_idx: usize,
+    max_forward_requests: usize,
+    driver_idx: usize,
     batch_start_time: Option<Instant>,
     last_latency: f64,
     batches_completed: usize,
+    cohort_high_water: usize,
 }
 
 impl EagerPolicy {
-    pub fn new(max_batch_size: usize, device_idx: usize) -> Self {
+    pub fn new(max_forward_requests: usize, driver_idx: usize) -> Self {
         Self {
-            max_batch_size,
-            device_idx,
+            max_forward_requests,
+            driver_idx,
             batch_start_time: None,
             last_latency: 0.0,
             batches_completed: 0,
+            cohort_high_water: 0,
         }
     }
 }
@@ -291,16 +357,21 @@ impl SchedulingPolicy for EagerPolicy {
         }
     }
 
-    fn on_fired(&mut self) {
+    fn on_fired(&mut self, _fired_size: usize) {
         self.batch_start_time = None;
+        self.cohort_high_water = 0;
     }
 
-    fn decide(&self, current_batch_size: usize) -> Decision {
-        if current_batch_size >= self.max_batch_size {
+    fn decide(&mut self, current_forward_requests: usize) -> Decision {
+        if current_forward_requests >= self.max_forward_requests {
             return Decision::Fire;
         }
-        let active = crate::context::pinned_count(self.device_idx);
-        if active > 0 && current_batch_size >= active {
+        let active = crate::context::pinned_count(self.driver_idx);
+        if active > self.cohort_high_water {
+            self.cohort_high_water = active;
+        }
+        let target = self.cohort_high_water;
+        if target > 0 && current_forward_requests >= target {
             return Decision::Fire;
         }
         if self.last_latency == 0.0 {
@@ -345,12 +416,12 @@ impl GreedyPolicy {
 impl SchedulingPolicy for GreedyPolicy {
     fn on_arrival(&mut self) {}
     fn on_complete(&mut self, _latency: Duration) {}
-    fn on_fired(&mut self) {}
+    fn on_fired(&mut self, _fired_size: usize) {}
 
-    fn decide(&self, _current_batch_size: usize) -> Decision {
+    fn decide(&mut self, _current_forward_requests: usize) -> Decision {
         // The scheduler only calls `decide` when the batch is
         // non-empty, and the BatchAccumulator already enforces
-        // `max_batch_size` upstream of the policy. So: just fire,
+        // `max_forward_requests` upstream of the policy. So: just fire,
         // every time.
         Decision::Fire
     }
@@ -364,18 +435,18 @@ mod tests {
 
     #[test]
     fn adaptive_cold_start_fires() {
-        let policy = AdaptivePolicy::new(512, 0);
+        let mut policy = AdaptivePolicy::new(512, 0);
         // No batches completed yet — last_latency = 0; fire to make
         // progress.
         assert!(matches!(policy.decide(1), Decision::Fire));
     }
 
     #[test]
-    fn adaptive_fires_at_max_batch_size_even_when_in_flight() {
+    fn adaptive_fires_at_max_forward_requests_even_when_in_flight() {
         let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500)); // skipped
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired();
+        policy.on_fired(0);
         // The structural cap fires unconditionally.
         assert!(matches!(policy.decide(512), Decision::Fire));
     }
@@ -385,10 +456,17 @@ mod tests {
         let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500));
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired();
+        policy.on_fired(0);
         // Even at large B (cohort cap would normally fire), we wait
         // because the GPU is occupied.
         assert!(matches!(policy.decide(100), Decision::Wait(_)));
+    }
+
+    #[test]
+    fn adaptive_waits_while_gpu_busy_even_before_latency_calibration() {
+        let mut policy = AdaptivePolicy::new(512, 0);
+        policy.on_fired(1);
+        assert!(matches!(policy.decide(1), Decision::Wait(_)));
     }
 
     #[test]
@@ -396,7 +474,7 @@ mod tests {
         let mut policy = AdaptivePolicy::new(512, 0);
         policy.on_complete(Duration::from_millis(500));
         policy.on_complete(Duration::from_millis(20));
-        policy.on_fired();
+        policy.on_fired(0);
         assert!(matches!(policy.decide(1), Decision::Wait(_)));
         policy.on_complete(Duration::from_millis(20));
         // GPU free, no batch_start_time → Fire (defensive).
@@ -427,13 +505,13 @@ mod tests {
 
     #[test]
     fn eager_cold_start_fires() {
-        let policy = EagerPolicy::new(512, 0);
+        let mut policy = EagerPolicy::new(512, 0);
         assert!(matches!(policy.decide(1), Decision::Fire));
     }
 
     #[test]
-    fn eager_fires_at_max_batch_size() {
-        let policy = EagerPolicy::new(512, 0);
+    fn eager_fires_at_max_forward_requests() {
+        let mut policy = EagerPolicy::new(512, 0);
         assert!(matches!(policy.decide(512), Decision::Fire));
     }
 
@@ -448,7 +526,7 @@ mod tests {
 
     #[test]
     fn greedy_always_fires() {
-        let policy = GreedyPolicy::new();
+        let mut policy = GreedyPolicy::new();
         assert!(matches!(policy.decide(1), Decision::Fire));
         assert!(matches!(policy.decide(100), Decision::Fire));
         assert!(matches!(policy.decide(512), Decision::Fire));
