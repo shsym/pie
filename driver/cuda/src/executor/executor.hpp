@@ -117,12 +117,14 @@ struct ForwardFn {
         const PrepareInputs&
     )>;
 
-    using GraphLayoutFn = std::function<std::uint8_t()>;
+    using GraphLayoutFn = std::function<std::uint32_t()>;
+    using LogitsModeFn = std::function<void(bool)>;
 
     // Empty by default → executor falls back to "direct call only;
     // no graph capture" mode for this arch.
     PrepareFn prepare;
     GraphLayoutFn graph_layout;
+    LogitsModeFn set_logits_argmax_only;
     BodyFn    body;
 
     // Convenience: `forward_fn = [...]` assigns the lambda as the body.
@@ -187,6 +189,7 @@ struct Executor {
     // view stays valid until the next `build()` call, which is long
     // enough for the `send_response` that immediately follows.
     pie_driver::ResponseBuilder response_builder;
+
 };
 
 // Run the forward pass + sampling pipeline on one forward-pass request

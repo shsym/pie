@@ -48,7 +48,7 @@ pub(super) trait SchedulingPolicy: Send {
     /// Decide whether to fire or wait, given the current batch size.
     /// `&mut self` so policies can ratchet internal state (e.g.,
     /// AdaptivePolicy's `cohort_high_water`) on every poll.
-    fn decide(&mut self, current_batch_size: usize) -> Decision;
+    fn decide(&mut self, current_batch_size: usize, prefill_cohort: bool) -> Decision;
 }
 
 // =============================================================================
@@ -496,6 +496,10 @@ impl BatchAccumulator {
 
     fn total_tokens(&self) -> usize {
         self.total_tokens
+    }
+
+    fn should_prefill_coalesce(&self) -> bool {
+        !self.has_spec_drafts && self.total_tokens > self.requests.len()
     }
 
     fn take(&mut self) -> Vec<PendingRequest> {
@@ -972,7 +976,7 @@ impl BatchScheduler {
             let decision = if next_pending.is_some() {
                 Decision::Fire
             } else {
-                policy.decide(batch.len())
+                policy.decide(batch.len(), batch.should_prefill_coalesce())
             };
             match decision {
                 Decision::Fire => {

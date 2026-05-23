@@ -365,6 +365,165 @@ impl Session {
         }
     }
 
+    pub(super) async fn handle_launch_processes(
+        &mut self,
+        corr_id: u32,
+        inferlet: String,
+        inputs: Vec<String>,
+        capture_outputs: bool,
+        token_budgets: Option<Vec<Option<usize>>>,
+    ) {
+        if let Some(budgets) = token_budgets.as_ref() {
+            if budgets.len() != inputs.len() {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!(
+                        "token_budgets length {} does not match inputs length {}",
+                        budgets.len(),
+                        inputs.len()
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+
+        let program_name = match ProgramName::parse(&inferlet) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
+
+        if !self.installed_programs.contains(&program_name) {
+            if let Err(e) = program::install(&program_name).await {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+            self.installed_programs.insert(program_name.clone());
+        }
+
+        let client_id = if capture_outputs { Some(self.id) } else { None };
+        let mut process_ids = Vec::with_capacity(inputs.len());
+        for (idx, input) in inputs.into_iter().enumerate() {
+            let token_budget = token_budgets
+                .as_ref()
+                .and_then(|budgets| budgets.get(idx).copied().flatten());
+            match process::spawn(
+                self.username.clone(),
+                program_name.clone(),
+                input,
+                client_id,
+                capture_outputs,
+                None,
+                None,
+                token_budget,
+            ) {
+                Ok(process_id) => {
+                    if capture_outputs {
+                        self.attached_processes.push(process_id);
+                    }
+                    process_ids.push(process_id.to_string());
+                }
+                Err(e) => {
+                    self.send_response(corr_id, false, e.to_string()).await;
+                    return;
+                }
+            }
+        }
+
+        match serde_json::to_string(&process_ids) {
+            Ok(json) => self.send_response(corr_id, true, json).await,
+            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
+        }
+    }
+
+    pub(super) async fn handle_run_processes(
+        &mut self,
+        corr_id: u32,
+        inferlet: String,
+        inputs: Vec<String>,
+        token_budgets: Option<Vec<Option<usize>>>,
+    ) {
+        if let Some(budgets) = token_budgets.as_ref() {
+            if budgets.len() != inputs.len() {
+                self.send_response(
+                    corr_id,
+                    false,
+                    format!(
+                        "token_budgets length {} does not match inputs length {}",
+                        budgets.len(),
+                        inputs.len()
+                    ),
+                )
+                .await;
+                return;
+            }
+        }
+
+        let program_name = match ProgramName::parse(&inferlet) {
+            Ok(p) => p,
+            Err(e) => {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+        };
+
+        if !self.installed_programs.contains(&program_name) {
+            if let Err(e) = program::install(&program_name).await {
+                self.send_response(corr_id, false, e.to_string()).await;
+                return;
+            }
+            self.installed_programs.insert(program_name.clone());
+        }
+
+        let mut receivers = Vec::with_capacity(inputs.len());
+        for (idx, input) in inputs.into_iter().enumerate() {
+            let token_budget = token_budgets
+                .as_ref()
+                .and_then(|budgets| budgets.get(idx).copied().flatten());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            match process::spawn(
+                self.username.clone(),
+                program_name.clone(),
+                input,
+                None,
+                false,
+                Some(tx),
+                None,
+                token_budget,
+            ) {
+                Ok(_process_id) => receivers.push(rx),
+                Err(e) => {
+                    self.send_response(corr_id, false, e.to_string()).await;
+                    return;
+                }
+            }
+        }
+
+        let mut outputs = Vec::with_capacity(receivers.len());
+        for rx in receivers {
+            match rx.await {
+                Ok(Ok(output)) => outputs.push(output),
+                Ok(Err(e)) => {
+                    self.send_response(corr_id, false, e).await;
+                    return;
+                }
+                Err(e) => {
+                    self.send_response(corr_id, false, e.to_string()).await;
+                    return;
+                }
+            }
+        }
+
+        match serde_json::to_string(&outputs) {
+            Ok(json) => self.send_response(corr_id, true, json).await,
+            Err(e) => self.send_response(corr_id, false, e.to_string()).await,
+        }
+    }
+
     pub(super) async fn handle_launch_daemon(
         &mut self,
         corr_id: u32,

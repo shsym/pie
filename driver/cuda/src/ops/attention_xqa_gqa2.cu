@@ -9,8 +9,8 @@
 
 #include "cuda_check.hpp"
 
-// FlashInfer XQA specialization for head_group_size=8, used by common large
-// GQA models such as Qwen3-32B and Llama-70B-style shapes.
+// FlashInfer XQA specialization for head_group_size=2, used by small Qwen
+// GQA models such as Qwen3-0.6B and Qwen3-1.7B.
 #define NDEBUG 1
 #define BEAM_WIDTH 1
 #define USE_INPUT_KV 0
@@ -20,14 +20,14 @@
 #define CACHE_ELEM_ENUM 0
 #define TOKENS_PER_PAGE 32
 #define HEAD_ELEMS 128
-#define HEAD_GRP_SIZE 8
+#define HEAD_GRP_SIZE 2
 #define SLIDING_WINDOW 0
 #define LOW_PREC_OUTPUT 0
 #define SPEC_DEC 0
 #define MLA_WRAPPER 0
 #define USE_SM90_MHA 0
-#define launchMHA launchMHA_xqa_gqa8_bf16_p32_h128
-#define launchMHAFlashInfer launchMHAFlashInfer_xqa_gqa8_bf16_p32_h128
+#define launchMHA launchMHA_xqa_gqa2_bf16_p32_h128
+#define launchMHAFlashInfer launchMHAFlashInfer_xqa_gqa2_bf16_p32_h128
 
 #include <xqa/mha.cu>
 
@@ -77,7 +77,7 @@ int current_device_sm_count() {
 
 }  // namespace
 
-void xqa_decode_bf16_gqa8_warmup_current_device() {
+void xqa_decode_bf16_gqa2_warmup_current_device() {
     std::uint32_t size = 0;
     CUDA_CHECK(cudaMemcpyFromSymbol(&size, smemSize, sizeof(smemSize)));
     CUDA_CHECK(cudaFuncSetAttribute(
@@ -86,25 +86,7 @@ void xqa_decode_bf16_gqa8_warmup_current_device() {
         static_cast<int>(size)));
 }
 
-void launch_attention_xqa_decode_bf16_gqa8_sm90(
-    const void* q,
-    void* k_pages,
-    void* v_pages,
-    void* o,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int num_requests,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int page_size,
-    int max_pages_per_seq,
-    AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    float sm_scale);
-
-void launch_attention_xqa_decode_bf16_gqa8_sm90_prepared(
+void launch_attention_xqa_decode_bf16_gqa2_prepared(
     const void* q,
     void* k_pages,
     void* v_pages,
@@ -119,22 +101,7 @@ void launch_attention_xqa_decode_bf16_gqa8_sm90_prepared(
     cudaStream_t stream,
     float sm_scale);
 
-void launch_attention_xqa_decode_bf16_gqa8_prepared(
-    const void* q,
-    void* k_pages,
-    void* v_pages,
-    void* o,
-    int num_requests,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    int page_size,
-    int max_pages_per_seq,
-    AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    float sm_scale);
-
-void launch_attention_xqa_decode_bf16_gqa8(
+void launch_attention_xqa_decode_bf16_gqa2(
     const void* q,
     void* k_pages,
     void* v_pages,
@@ -156,11 +123,11 @@ void launch_attention_xqa_decode_bf16_gqa8(
         num_q_heads / num_kv_heads != kXqaHeadGroupRatio ||
         head_dim != kXqaHeadDim || page_size != kXqaPageSize ||
         current_device_major() < 8) {
-        throw std::runtime_error("xqa gqa8 decode: unsupported shape");
+        throw std::runtime_error("xqa gqa2 decode: unsupported shape");
     }
     const float default_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     if (sm_scale > 0.f && std::abs(sm_scale - default_scale) > 1.0e-6f) {
-        throw std::runtime_error("xqa gqa8 decode: unsupported scale");
+        throw std::runtime_error("xqa gqa2 decode: unsupported scale");
     }
     if (num_requests <= 0) return;
     prepare_attention_xqa_decode_bf16(
@@ -172,7 +139,7 @@ void launch_attention_xqa_decode_bf16_gqa8(
         max_pages_per_seq,
         workspace,
         stream);
-    launch_attention_xqa_decode_bf16_gqa8_prepared(
+    launch_attention_xqa_decode_bf16_gqa2_prepared(
         q,
         k_pages,
         v_pages,
@@ -188,7 +155,7 @@ void launch_attention_xqa_decode_bf16_gqa8(
         sm_scale);
 }
 
-void launch_attention_xqa_decode_bf16_gqa8_prepared(
+void launch_attention_xqa_decode_bf16_gqa2_prepared(
     const void* q,
     void* k_pages,
     void* v_pages,
@@ -207,30 +174,13 @@ void launch_attention_xqa_decode_bf16_gqa8_prepared(
         num_q_heads / num_kv_heads != kXqaHeadGroupRatio ||
         head_dim != kXqaHeadDim || page_size != kXqaPageSize ||
         current_device_major() < 8) {
-        throw std::runtime_error("xqa gqa8 decode: unsupported shape");
+        throw std::runtime_error("xqa gqa2 decode: unsupported shape");
     }
     const float default_scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
     if (sm_scale > 0.f && std::abs(sm_scale - default_scale) > 1.0e-6f) {
-        throw std::runtime_error("xqa gqa8 decode: unsupported scale");
+        throw std::runtime_error("xqa gqa2 decode: unsupported scale");
     }
     if (num_requests <= 0) return;
-    if (current_device_major() >= 9) {
-        launch_attention_xqa_decode_bf16_gqa8_sm90_prepared(
-            q,
-            k_pages,
-            v_pages,
-            o,
-            num_requests,
-            num_q_heads,
-            num_kv_heads,
-            head_dim,
-            page_size,
-            max_pages_per_seq,
-            workspace,
-            stream,
-            sm_scale);
-        return;
-    }
 
     const int page_bucket = xqa_decode_page_bucket(max_pages_per_seq);
     const std::size_t page_table_bytes =
@@ -249,7 +199,7 @@ void launch_attention_xqa_decode_bf16_gqa8_prepared(
         reinterpret_cast<std::uintptr_t>(workspace.float_buffer()) +
         workspace.float_bytes();
     if (p_scratch >= end) {
-        throw std::runtime_error("xqa gqa8 decode: attention workspace too small");
+        throw std::runtime_error("xqa gqa2 decode: attention workspace too small");
     }
 
     auto* page_table = reinterpret_cast<std::int32_t*>(p_page_table);
@@ -259,7 +209,7 @@ void launch_attention_xqa_decode_bf16_gqa8_prepared(
     const int semaphore_count = num_requests * num_kv_heads;
     if (static_cast<std::size_t>(semaphore_count) * sizeof(std::uint32_t) >
         workspace.int_bytes()) {
-        throw std::runtime_error("xqa gqa8 decode: semaphore workspace too small");
+        throw std::runtime_error("xqa gqa2 decode: semaphore workspace too small");
     }
     auto* semaphores =
         reinterpret_cast<std::uint32_t*>(workspace.int_buffer());
@@ -277,7 +227,7 @@ void launch_attention_xqa_decode_bf16_gqa8_prepared(
     const std::uint64_t kv_stride_page =
         static_cast<std::uint64_t>(page_size) * num_kv_heads * head_dim;
 
-    launchMHAFlashInfer_xqa_gqa8_bf16_p32_h128(
+    launchMHAFlashInfer_xqa_gqa2_bf16_p32_h128(
         static_cast<std::uint32_t>(current_device_sm_count()),
         static_cast<std::uint32_t>(num_kv_heads),
         /*slidingWinSize=*/0,

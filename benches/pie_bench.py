@@ -244,6 +244,8 @@ def build_config(args: argparse.Namespace):
         # Surface for the summary's "spec chain yield" derived stat —
         # yield = hits / (attempted × depth).
         config_blob["speculation depth"] = args.speculation_depth
+    if args.warmup_max_tokens is not None:
+        config_blob["warmup max tokens"] = args.warmup_max_tokens
     return cfg, config_blob
 
 
