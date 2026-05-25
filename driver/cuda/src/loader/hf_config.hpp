@@ -142,9 +142,6 @@ struct HfConfig {
     // source layer of the same `layer_types[i]`.
     int gemma_hidden_size_per_layer_input;
     int num_kv_shared_layers;
-    bool gemma4_use_ordered_embeddings = false;
-    int gemma4_num_centroids = 0;
-    int gemma4_centroid_intermediate_top_k = 0;
 
     // Gemma-4 per-layer rope_theta (HF nests under `rope_parameters`),
     // including `partial_rotary_factor` for full-attention layers
@@ -159,6 +156,20 @@ struct HfConfig {
     // is the (always-on) shared expert's MLP width.
     int moe_intermediate_size;
     int shared_expert_intermediate_size;
+
+    // ── DeepSeek/Kimi MLA + MoE specific ────────────────────────────
+    // Kimi K2.6 exposes the language tower as `model_type=kimi_k2` inside
+    // a `kimi_k25` wrapper and uses DeepSeek-V3-style MLA attention.
+    // These are zero/inert for standard MHA/GQA models.
+    int q_lora_rank = 0;
+    int kv_lora_rank = 0;
+    int qk_nope_head_dim = 0;
+    int qk_rope_head_dim = 0;
+    int v_head_dim = 0;
+    int first_k_dense_replace = 0;
+    int n_shared_experts = 0;
+    bool norm_topk_prob = false;
+    float routed_scaling_factor = 1.0f;
 
     // ── Qwen3.5 hybrid (linear-attention SSM + full attention) ──────
     // Per-layer attention type is in `layer_types` (values
@@ -179,10 +190,6 @@ struct HfConfig {
     // Partial RoPE: only the first `partial_rotary_factor * head_dim`
     // dimensions are rotated. Defaults to 1.0 (full rotation).
     float partial_rotary_factor;
-
-    // Qwen3.5 / Qwen3.6 MTP (multi-token prediction) auxiliary head.
-    int  mtp_num_hidden_layers = 0;
-    bool mtp_use_dedicated_embeddings = false;
 
     // Gemma-3n (E2B / E4B "Nano") additions on top of Gemma-4.
     // Gemma-3n is a *different* architecture from Gemma-4 (despite the

@@ -24,7 +24,6 @@
 #include <limits>
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -47,12 +46,13 @@
 #include "kernels/sample_flashinfer.hpp"
 #include "kernels/sample_temp.hpp"
 #include "kv_cache.hpp"
+#include "mla_cache.hpp"
 #include "model/bound_model.hpp"
 #include "model/gemma2.hpp"
 #include "model/gemma3n.hpp"
 #include "model/gemma4.hpp"
-#include "model/gemma4_mtp.hpp"
 #include "model/gpt_oss.hpp"
+#include "model/kimi_forward.hpp"
 #include "model/llama_like.hpp"
 #include "model/mixtral.hpp"
 #include "model/qwen3.hpp"
@@ -101,76 +101,6 @@ void stop_servers() {
     for (auto* server : servers) {
         if (server != nullptr) server->stop();
     }
-}
-
-std::string trim_ascii(std::string s) {
-    while (!s.empty() &&
-           (s.back() == '\n' || s.back() == '\r' || s.back() == ' ' ||
-            s.back() == '\t')) {
-        s.pop_back();
-    }
-    std::size_t start = 0;
-    while (start < s.size() &&
-           (s[start] == ' ' || s[start] == '\t' || s[start] == '\n' ||
-            s[start] == '\r')) {
-        ++start;
-    }
-    if (start > 0) s.erase(0, start);
-    return s;
-}
-
-bool looks_like_hf_snapshot(const std::filesystem::path& path) {
-    return std::filesystem::exists(path / "config.json");
-}
-
-std::optional<std::filesystem::path> resolve_hf_cache_snapshot(
-    const std::filesystem::path& repo_dir) {
-    const auto snapshots_dir = repo_dir / "snapshots";
-    if (!std::filesystem::is_directory(snapshots_dir)) return std::nullopt;
-
-    const auto main_ref = repo_dir / "refs" / "main";
-    if (std::filesystem::is_regular_file(main_ref)) {
-        std::ifstream in(main_ref);
-        std::string sha;
-        std::getline(in, sha);
-        sha = trim_ascii(sha);
-        if (!sha.empty()) {
-            const auto candidate = snapshots_dir / sha;
-            if (looks_like_hf_snapshot(candidate)) return candidate;
-        }
-    }
-
-    std::optional<std::filesystem::path> only_snapshot;
-    int count = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(snapshots_dir)) {
-        if (!entry.is_directory()) continue;
-        if (!looks_like_hf_snapshot(entry.path())) continue;
-        only_snapshot = entry.path();
-        ++count;
-        if (count > 1) return std::nullopt;
-    }
-    return only_snapshot;
-}
-
-std::optional<std::filesystem::path> discover_gemma4_mtp_snapshot_dir(
-    const std::filesystem::path& target_snapshot_dir) {
-    const auto direct = std::filesystem::path(
-        target_snapshot_dir.string() + "-assistant");
-    if (looks_like_hf_snapshot(direct)) return direct;
-
-    for (auto cur = target_snapshot_dir;
-         !cur.empty() && cur != cur.parent_path();
-         cur = cur.parent_path()) {
-        const std::string name = cur.filename().string();
-        if (name.rfind("models--", 0) != 0) continue;
-        const auto assistant_repo =
-            cur.parent_path() / (name + "-assistant");
-        if (auto snapshot = resolve_hf_cache_snapshot(assistant_repo)) {
-            return snapshot;
-        }
-        break;
-    }
-    return std::nullopt;
 }
 
 void on_signal(int) {
@@ -392,7 +322,6 @@ std::size_t workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
     std::size_t bytes = 0;
     bytes += bf16(n * cfg.hidden_size);              // y
     bytes += bf16(n * cfg.hidden_size);              // norm_x
-    bytes += bf16(n * cfg.hidden_size);              // spec_hidden
     bytes += bf16(n * (max_Hq + 2 * max_Hk));        // qkv_fused
     bytes += bf16(n * (2 * max_intermediate));       // gate_up_fused
     bytes += fp32(n * cfg.head_dim);                 // rope_table
@@ -415,6 +344,81 @@ std::size_t workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
         bytes += bf16(n * Hk_pad);
         bytes += bf16(n * Hq_pad);
     }
+    return bytes;
+}
+
+std::size_t kimi_workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
+                                 int N,
+                                 int output_rows,
+                                 int tp_size) {
+    const auto bf16 = [](std::size_t elems) { return elems * 2; };
+    const auto fp32 = [](std::size_t elems) { return elems * 4; };
+    const auto i32 = [](std::size_t elems) { return elems * 4; };
+    const int T = std::max(1, tp_size);
+    const std::size_t n = static_cast<std::size_t>(std::max(1, N));
+    const std::size_t o =
+        static_cast<std::size_t>(std::max(1, output_rows));
+    const std::size_t H = static_cast<std::size_t>(cfg.hidden_size);
+    const std::size_t local_heads =
+        static_cast<std::size_t>(cfg.num_attention_heads / T);
+    const std::size_t q_nope = static_cast<std::size_t>(cfg.qk_nope_head_dim);
+    const std::size_t q_rope = static_cast<std::size_t>(cfg.qk_rope_head_dim);
+    const std::size_t v_dim = static_cast<std::size_t>(cfg.v_head_dim);
+    const std::size_t q_lora = static_cast<std::size_t>(cfg.q_lora_rank);
+    const std::size_t kv_lora = static_cast<std::size_t>(cfg.kv_lora_rank);
+    const std::size_t dense_I =
+        cfg.intermediate_size > 0
+            ? static_cast<std::size_t>(cfg.intermediate_size / T)
+            : 0;
+    const std::size_t routed_I =
+        cfg.moe_intermediate_size > 0
+            ? static_cast<std::size_t>(cfg.moe_intermediate_size / T)
+            : 0;
+    const std::size_t shared_I =
+        cfg.shared_expert_intermediate_size > 0
+            ? static_cast<std::size_t>(cfg.shared_expert_intermediate_size / T)
+            : 0;
+    const std::size_t max_I = std::max<std::size_t>(1, std::max(dense_I, routed_I));
+    const std::size_t topk = static_cast<std::size_t>(
+        std::max(1, cfg.num_experts_per_tok));
+    const std::size_t routes = n * topk;
+
+    std::size_t bytes = 0;
+    bytes += bf16(n * H);                                      // y
+    bytes += bf16(n * H);                                      // norm_x
+    bytes += bf16(n * q_lora);                                 // q_a
+    bytes += bf16(n * local_heads * (q_nope + q_rope));         // q_b
+    bytes += bf16(n * local_heads * q_nope);                    // q_nope
+    bytes += bf16(n * (kv_lora + q_rope));                      // kv_a_mqa
+    bytes += bf16(n * kv_lora);                                 // kv_c
+    bytes += bf16(n * q_rope);                                  // k_pe
+    bytes += bf16(n * local_heads * kv_lora);                   // q_nope_latent
+    bytes += bf16(n * local_heads * q_rope);                    // q_pe
+    bytes += bf16(n * local_heads * kv_lora);                   // attn_latent
+    bytes += bf16(n * local_heads * v_dim);                     // attn_v
+    bytes += bf16(n * H);                                      // attn_out
+    bytes += bf16(n * H);                                      // norm_y
+    bytes += bf16(n * max_I);                                  // gate
+    bytes += bf16(n * max_I);                                  // up
+    bytes += bf16(std::max<std::size_t>(1, routed_I) * H);      // expert_gate_w
+    bytes += bf16(std::max<std::size_t>(1, routed_I) * H);      // expert_up_w
+    bytes += bf16(H * std::max<std::size_t>(1, routed_I));      // expert_down_w
+    bytes += bf16(n * std::max(1, cfg.num_experts));            // router_logits
+    bytes += i32(n * topk);                                    // topk_idx
+    bytes += fp32(n * topk);                                   // topk_weights
+    bytes += i32(routes);                                      // route_idx
+    bytes += fp32(routes);                                     // route_w
+    bytes += bf16(routes * H);                                 // expert_in
+    bytes += bf16(routes * max_I);                             // expert_gate
+    bytes += bf16(routes * max_I);                             // expert_up
+    bytes += bf16(routes * H);                                 // expert_out
+    bytes += bf16(n * H);                                      // moe_out
+    bytes += bf16(n * std::max<std::size_t>(1, shared_I));      // shared_gate
+    bytes += bf16(n * std::max<std::size_t>(1, shared_I));      // shared_up
+    bytes += bf16(n * std::max<std::size_t>(1, shared_I));      // shared_act
+    bytes += bf16(n * H);                                      // shared_out
+    bytes += bf16(o * static_cast<std::size_t>(cfg.vocab_size));
+    bytes += fp32(o * static_cast<std::size_t>(cfg.vocab_size));
     return bytes;
 }
 
@@ -442,8 +446,6 @@ std::size_t qwen3_5_la_workspace_bytes(const pie_cuda_driver::HfConfig& cfg,
     auto u16 = [](std::size_t elems) { return elems * 2; };
     auto fp32 = [](std::size_t elems) { return elems * 4; };
     bytes += u16(n * conv_dim);          // mixed_qkv
-    bytes += u16(n * (conv_dim + v_dim)); // mixed_qkvz
-    bytes += u16(n * 2 * v_h);           // ba
     bytes += u16(n * conv_dim);          // mixed_qkv_post
     bytes += u16(n * v_dim);             // z
     bytes += u16(n * v_h);               // a
@@ -585,15 +587,6 @@ bool xqa_decode_enabled_by_env() {
     const char* v = std::getenv("PIE_CUDA_XQA_DECODE");
     if (v == nullptr || v[0] == '\0') return true;
     return v[0] != '0';
-}
-
-int qwen35_small_spec_graph_tokens() {
-    static const int tokens = [] {
-        const char* v = std::getenv("PIE_QWEN35_SPEC_VERIFY_GRAPH_N");
-        if (v == nullptr || v[0] == '\0') return 17;
-        return std::clamp(std::atoi(v), 0, 64);
-    }();
-    return tokens;
 }
 
 bool has_non_full_attention_layers(const pie_cuda_driver::HfConfig& hf) {
@@ -895,6 +888,7 @@ CudaMemoryPlan plan_cuda_memory(
     bool is_gemma4_arch,
     const std::vector<int>& gemma4_per_layer_head_dim,
     const std::vector<int>& gemma4_kv_source_layer,
+    bool is_kimi_arch,
     bool is_qwen3_5_arch,
     bool is_qwen3_5_moe_arch,
     int qwen3_5_linear_layers,
@@ -942,7 +936,13 @@ CudaMemoryPlan plan_cuda_memory(
         derive_kv_page_size_candidates(cfg, hf, prop);
 
     const std::size_t per_kv_token_bytes =
-        is_gemma4_arch
+        is_kimi_arch
+            ? static_cast<std::size_t>(hf.num_hidden_layers) *
+                  (static_cast<std::size_t>(hf.kv_lora_rank +
+                                            hf.qk_rope_head_dim) *
+                       pie_cuda_driver::dtype_bytes(pie_cuda_driver::DType::BF16) +
+                   kv_cache_device_bytes_per_page(kv_format, 1, 1, 1))
+        : is_gemma4_arch
             ? kv_page_bytes_per_layer(hf, gemma4_per_layer_head_dim,
                                       gemma4_kv_source_layer, tp_size,
                                       kv_format)
@@ -1036,6 +1036,12 @@ CudaMemoryPlan plan_cuda_memory(
         1024,
         512,
     };
+    if (is_kimi_arch) {
+        Ns.push_back(256);
+        Ns.push_back(128);
+        Ns.push_back(64);
+        Ns.push_back(32);
+    }
     if (policy_profile == "throughput") {
         Ns.push_back(4 * prefill_target);
     }
@@ -1061,6 +1067,12 @@ CudaMemoryPlan plan_cuda_memory(
         64,
         32,
     };
+    if (is_kimi_arch) {
+        Rs.push_back(16);
+        Rs.push_back(8);
+        Rs.push_back(4);
+        Rs.push_back(1);
+    }
     if (policy_profile == "throughput" || score_as_auto) {
         Rs.push_back(4 * decode_target);
     }
@@ -1085,8 +1097,10 @@ CudaMemoryPlan plan_cuda_memory(
                                        std::max(1024, R0 * 64) + 7) / 8)));
             const int output_rows = R0;
             std::size_t arena = 0;
-            arena += workspace_bytes(
-                hf, N, output_rows, max_intermediate, max_Hq, max_Hk);
+            arena += is_kimi_arch
+                ? kimi_workspace_bytes(hf, N, output_rows, tp_size)
+                : workspace_bytes(
+                      hf, N, output_rows, max_intermediate, max_Hq, max_Hk);
             if (is_qwen3_5_arch || is_qwen3_5_moe_arch) {
                 arena += qwen3_5_la_workspace_bytes(hf, N, tp_size);
             }
@@ -1149,10 +1163,14 @@ CudaMemoryPlan plan_cuda_memory(
                               : 608.0;
             const double score_kv_horizon =
                 score_as_auto ? (low_horizon_kv_heavy ? 384.0 : 544.0) : 608.0;
-            const std::size_t min_kv_tokens = std::max<std::size_t>(
-                32768,
-                static_cast<std::size_t>(
-                    std::ceil(static_cast<double>(R) * min_kv_horizon)));
+            const std::size_t min_kv_tokens = is_kimi_arch
+                ? std::max<std::size_t>(
+                      policy_profile == "latency" ? 1024 : 4096,
+                      static_cast<std::size_t>(R) * 128)
+                : std::max<std::size_t>(
+                      32768,
+                      static_cast<std::size_t>(
+                          std::ceil(static_cast<double>(R) * min_kv_horizon)));
             if (kv_tokens < min_kv_tokens) continue;
 
             CudaMemoryPlan p;
@@ -1629,8 +1647,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
             q35_state_cache = pie_cuda_driver::Qwen3_5StateCache::allocate(
                 layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
                 cfg_q.linear_num_value_heads,
-                cfg_q.linear_key_head_dim, cfg_q.linear_value_head_dim,
-                cfg_q.hidden_size);
+                cfg_q.linear_key_head_dim, cfg_q.linear_value_head_dim);
             if (is_qwen3_5_moe) {
                 q35_moe_ws = pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace::allocate(
                     N, cfg_q.hidden_size,
@@ -1717,9 +1734,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                 pie_cuda_driver::model::Qwen3_5PlanState q35_plan;
                 pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                     q35_plan, parity_attn_ws, cache, engine.hf_config(),
-                    q35_fwd, h_qo.data(), h_pp.data(), h_lpl.data(),
-                    /*total_tokens=*/total_n, /*num_requests=*/1,
-                    is_decode);
+                    q35_fwd, h_pp.data(), /*num_requests=*/1, is_decode);
                 pie_cuda_driver::model::qwen3_5_forward_paged(
                     weights_qwen3_5, engine.hf_config(), q35_fwd, q35_plan,
                     ws, q35_la_ws, cache, q35_state_cache,
@@ -1739,9 +1754,7 @@ int run_parity(const pie_cuda_driver::Config& cfg,
                 pie_cuda_driver::model::Qwen3_5PlanState q35_plan;
                 pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                     q35_plan, parity_attn_ws, cache, engine.hf_config(),
-                    q35_fwd, h_qo.data(), h_pp.data(), h_lpl.data(),
-                    /*total_tokens=*/total_n, /*num_requests=*/1,
-                    is_decode);
+                    q35_fwd, h_pp.data(), /*num_requests=*/1, is_decode);
                 pie_cuda_driver::model::qwen3_5_moe_forward_paged(
                     weights_qwen3_5_moe, engine.hf_config(), q35_fwd, q35_plan,
                     ws, q35_la_ws, q35_moe_ws,
@@ -2041,7 +2054,8 @@ int run_impl(int argc,
          || mt == "gemma2"
          || mt == "gemma3" || mt == "gemma3_text"
          || mt == "gemma4" || mt == "gemma4_text"
-         || mt == "gemma3n" || mt == "gemma3n_text";
+         || mt == "gemma3n" || mt == "gemma3n_text"
+         || mt == "kimi_k2";
         if (!supported) {
             std::cerr << "[pie-driver-cuda] arch '" << mt
                       << "' not yet supported (Qwen 2/3, Llama-3, "
@@ -2059,6 +2073,7 @@ int run_impl(int argc,
     auto& weights_mixtral = bound_model.mixtral;
     auto& weights_qwen3_5 = bound_model.qwen3_5;
     auto& weights_qwen3_5_moe = bound_model.qwen3_5_moe;
+    auto& weights_kimi = bound_model.kimi;
 
     const bool is_gemma_arch = bound_model.is_gemma();
     const bool is_gemma4_arch = bound_model.is_gemma4();
@@ -2066,6 +2081,7 @@ int run_impl(int argc,
     const bool is_mixtral_arch = bound_model.is_mixtral();
     const bool is_qwen3_5_arch = bound_model.is_qwen3_5();
     const bool is_qwen3_5_moe_arch = bound_model.is_qwen3_5_moe();
+    const bool is_kimi_arch = bound_model.is_kimi();
 
     const std::size_t num_layers_bound = bound_model.num_layers();
     if (verbose) {
@@ -2074,59 +2090,6 @@ int run_impl(int argc,
                   << engine.hf_config().model_type
                   << (engine.hf_config().use_qk_norm ? ", q/k norm" : "")
                   << ")\n";
-    }
-
-    std::optional<pie_cuda_driver::model::Gemma4MtpWeights> gemma4_mtp_weights;
-    pie_cuda_driver::model::Gemma4MtpRuntimeConfig gemma4_mtp_runtime;
-    std::string mtp_snapshot_dir = cfg.model.mtp_assistant_snapshot_dir;
-    std::string mtp_snapshot_source = mtp_snapshot_dir.empty() ? "" : "config";
-    if (mtp_snapshot_dir.empty()) {
-        if (const char* env = std::getenv("PIE_GEMMA4_MTP_SNAPSHOT_DIR")) {
-            mtp_snapshot_dir = env;
-            mtp_snapshot_source = "env";
-        }
-    }
-    if (is_gemma4_arch && cfg.model.mtp_num_drafts > 0 &&
-        mtp_snapshot_dir.empty()) {
-        if (auto discovered = discover_gemma4_mtp_snapshot_dir(
-                std::filesystem::path(cfg.model.snapshot_dir))) {
-            mtp_snapshot_dir = discovered->string();
-            mtp_snapshot_source = "auto";
-            if (verbose && cfg.distributed.tp_rank == 0) {
-                std::cerr << "[pie-driver-cuda] Gemma4 MTP assistant "
-                          << "auto-discovered: " << mtp_snapshot_dir
-                          << "\n";
-            }
-        }
-    }
-    if (is_gemma4_arch && cfg.model.mtp_num_drafts > 0 &&
-        !mtp_snapshot_dir.empty()) {
-        if (cfg.distributed.tp_size > 1) {
-            if (verbose && cfg.distributed.tp_rank == 0) {
-                std::cerr << "[pie-driver-cuda] Gemma4 MTP disabled under "
-                          << "tensor parallelism for this build\n";
-            }
-        } else {
-            gemma4_mtp_weights.emplace(
-                pie_cuda_driver::model::load_gemma4_mtp_weights(
-                    std::filesystem::path(mtp_snapshot_dir),
-                    cfg.model.device,
-                    engine.hf_config(),
-                    weights_gemma4,
-                    gemma4_mtp_runtime,
-                    verbose));
-            if (verbose && cfg.distributed.tp_rank == 0 &&
-                !mtp_snapshot_source.empty()) {
-                std::cerr << "[pie-driver-cuda] Gemma4 MTP assistant source="
-                          << mtp_snapshot_source << "\n";
-            }
-        }
-    } else if (is_gemma4_arch && cfg.model.mtp_num_drafts > 0 &&
-               verbose && cfg.distributed.tp_rank == 0) {
-        std::cerr << "[pie-driver-cuda] Gemma4 MTP system drafter not "
-                  << "enabled: assistant checkpoint not found; set "
-                  << "mtp_assistant_snapshot_dir or "
-                  << "PIE_GEMMA4_MTP_SNAPSHOT_DIR\n";
     }
 
     // Pre-allocate persistent rs_cache state for serving. CUDA-native no longer
@@ -2201,7 +2164,7 @@ int run_impl(int argc,
     const CudaMemoryPlan mem_plan = plan_cuda_memory(
         cfg, engine.hf_config(), max_mlp_intermediate, max_Hq, max_Hk,
         is_gemma4_arch, weights_gemma4.per_layer_head_dim,
-        weights_gemma4.kv_source_layer, is_qwen3_5_arch,
+        weights_gemma4.kv_source_layer, is_kimi_arch, is_qwen3_5_arch,
         is_qwen3_5_moe_arch, qwen3_5_linear_layers,
         kv_format, runtime_quant_scratch_base, verbose);
     const int max_workspace_tokens = mem_plan.max_workspace_tokens;
@@ -2221,8 +2184,24 @@ int run_impl(int argc,
         max_mlp_intermediate, max_Hq, max_Hk,
         mem_plan.capacity.max_logit_rows);
 
+    auto kimi_ws =
+        is_kimi_arch
+            ? pie_cuda_driver::model::KimiWorkspace::allocate(
+                  engine.hf_config(), max_workspace_tokens,
+                  mem_plan.capacity.max_logit_rows,
+                  local_tp_size)
+            : pie_cuda_driver::model::KimiWorkspace{};
+
     auto kv_cache =
-        is_gemma4_arch
+        is_kimi_arch
+            ? pie_cuda_driver::KvCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  1,
+                  1,
+                  kv_format)
+        : is_gemma4_arch
             ? pie_cuda_driver::KvCache::allocate_per_layer(
                   engine.hf_config().num_hidden_layers,
                   physical_kv_pages,
@@ -2240,6 +2219,17 @@ int run_impl(int argc,
                   engine.hf_config().head_dim_kernel,
                   kv_format);
 
+    auto mla_cache =
+        is_kimi_arch
+            ? pie_cuda_driver::MlaCache::allocate(
+                  engine.hf_config().num_hidden_layers,
+                  physical_kv_pages,
+                  mem_plan.kv_page_size,
+                  engine.hf_config().kv_lora_rank,
+                  engine.hf_config().qk_rope_head_dim,
+                  pie_cuda_driver::DType::BF16)
+            : pie_cuda_driver::MlaCache{};
+
     auto attn_ws = pie_cuda_driver::AttentionWorkspace::allocate(
         mem_plan.attn_float_workspace_bytes, 8ull * 1024 * 1024);
 
@@ -2255,8 +2245,6 @@ int run_impl(int argc,
     pie_cuda_driver::model::Qwen3_5LinearAttnWorkspace qwen3_5_la_ws;
     pie_cuda_driver::Qwen3_5StateCache qwen3_5_state_cache;
     pie_cuda_driver::model::Qwen3_5MoeMlpWorkspace qwen3_5_moe_ws;
-    int qwen3_5_runtime_rs_slots = 0;
-    int qwen3_5_scratch_rs_slot = -1;
     if (is_qwen3_5_arch || is_qwen3_5_moe_arch) {
         const auto& cfg_q = engine.hf_config();
         const int q35_tp_size = std::max(1, cfg.distributed.tp_size);
@@ -2276,28 +2264,15 @@ int run_impl(int argc,
             /*hq=*/(cfg_q.num_attention_heads / q35_tp_size) *
                 cfg_q.head_dim);
         // Allocate per-slot state for the linear-attn layers. The memory
-        // planner sizes runtime slots before KV pages and clamps max forward
-        // requests to the resulting slot count. Keep one unadvertised slot as
-        // a rollback scratch for system-spec draft verification, plus a small
-        // prefix-snapshot bank so partial MTP rejection can restore accepted
-        // recurrent state without replaying the target model.
-        const int q35_planned_slots = std::max<int>(1, mem_plan.state_slots);
-        qwen3_5_runtime_rs_slots = std::max<int>(1, q35_planned_slots - 1);
-        qwen3_5_scratch_rs_slot = qwen3_5_runtime_rs_slots;
-        const int q35_spec_snapshot_slots = [] {
-            const char* v = std::getenv("PIE_QWEN35_RS_SNAPSHOT_SLOTS");
-            if (v == nullptr || v[0] == '\0') return 8;
-            return std::clamp(std::atoi(v), 0, 16);
-        }();
-        const int q35_alloc_slots =
-            qwen3_5_runtime_rs_slots + 1 + q35_spec_snapshot_slots;
+        // planner sizes slots before KV pages and clamps max forward
+        // requests to the resulting slot count.
+        const int q35_max_slots = std::max<int>(1, mem_plan.state_slots);
         qwen3_5_state_cache = pie_cuda_driver::Qwen3_5StateCache::allocate(
             qwen3_5_layer_is_linear, conv_dim, cfg_q.linear_conv_kernel_dim,
             local_linear_value_heads,
             cfg_q.linear_key_head_dim,
             cfg_q.linear_value_head_dim,
-            cfg_q.hidden_size,
-            q35_alloc_slots);
+            q35_max_slots);
         const std::size_t per_slot_recurrent_bytes =
             static_cast<std::size_t>(local_linear_value_heads) *
             cfg_q.linear_key_head_dim *
@@ -2307,25 +2282,17 @@ int run_impl(int argc,
             conv_dim * sizeof(std::uint16_t);
         const std::size_t num_linear_layers = qwen3_5_linear_layers;
         const std::size_t total_bytes = num_linear_layers *
-            static_cast<std::size_t>(q35_alloc_slots) *
+            static_cast<std::size_t>(q35_max_slots) *
             (per_slot_recurrent_bytes + per_slot_conv_bytes);
-        const std::size_t mtp_pending_bytes =
-            static_cast<std::size_t>(q35_alloc_slots) *
-            static_cast<std::size_t>(cfg_q.hidden_size) *
-            sizeof(std::uint16_t);
         if (verbose) {
             std::cerr << "[pie-driver-cuda] qwen3.5 rs_cache: "
                       << num_linear_layers << " linear layers, "
-                      << qwen3_5_runtime_rs_slots
-                      << " runtime slots + 1 scratch + "
-                      << q35_spec_snapshot_slots << " prefix snapshots, "
+                      << q35_max_slots << " slots, "
                       << (per_slot_recurrent_bytes + per_slot_conv_bytes)
                       << " B/slot (recurrent="
                       << per_slot_recurrent_bytes << " conv="
-                      << per_slot_conv_bytes << "), mtp_pending="
-                      << (mtp_pending_bytes / (1024 * 1024)) << " MiB, total ~"
-                      << ((total_bytes + mtp_pending_bytes) / (1024 * 1024))
-                      << " MiB\n";
+                      << per_slot_conv_bytes << "), total ~"
+                      << (total_bytes / (1024 * 1024)) << " MiB\n";
         }
 
         if (is_qwen3_5_moe_arch) {
@@ -2375,33 +2342,25 @@ int run_impl(int argc,
         /*max_kv_pages=*/mem_plan.max_page_refs,
         mem_plan.capacity.max_custom_mask_bytes);
 
-    std::optional<pie_cuda_driver::model::Gemma4MtpWorkspace> gemma4_mtp_ws;
-    if (gemma4_mtp_weights) {
-        gemma4_mtp_ws.emplace(
-            pie_cuda_driver::model::Gemma4MtpWorkspace::allocate(
-                *gemma4_mtp_weights,
-                mem_plan.max_requests,
-                mem_plan.max_page_refs,
-                cfg.model.mtp_num_drafts));
-        if (verbose) {
-            std::cerr << "[pie-driver-cuda] Gemma4 MTP system drafter enabled: "
-                      << "drafts=" << cfg.model.mtp_num_drafts
-                      << " max_requests=" << mem_plan.max_requests
-                      << " page_refs=" << mem_plan.max_page_refs << "\n";
-        }
-    }
-
     pie_cuda_driver::CustomAllReduce custom_ar;
-    if (tp_comm_ptr != nullptr && vtable_opt != nullptr &&
-        cfg.distributed.tp_size == 2) {
+    if (tp_comm_ptr != nullptr &&
+        cfg.distributed.tp_size >= 2 && cfg.distributed.tp_size <= 8 &&
+        (cfg.distributed.tp_size % 2) == 0) {
         custom_ar = pie_cuda_driver::CustomAllReduce(
-            *tp_comm_ptr, /*same_process=*/true,
+            *tp_comm_ptr, /*same_process=*/vtable_opt != nullptr,
             /*max_bytes=*/8 * 1024 * 1024,
             /*rank_data_bytes=*/8 * 1024 * 1024,
             /*fusion_max_tokens=*/mem_plan.max_requests,
             /*fusion_hidden=*/engine.hf_config().hidden_size);
-        custom_ar.register_buffer(*tp_comm_ptr, ws.norm_x.data(),
-                                  ws.norm_x.nbytes());
+        if (is_kimi_arch) {
+            custom_ar.register_buffer(*tp_comm_ptr, kimi_ws.norm_x.data(),
+                                      kimi_ws.norm_x.nbytes());
+            custom_ar.register_buffer(*tp_comm_ptr, kimi_ws.moe_out.data(),
+                                      kimi_ws.moe_out.nbytes());
+        } else {
+            custom_ar.register_buffer(*tp_comm_ptr, ws.norm_x.data(),
+                                      ws.norm_x.nbytes());
+        }
         tp_comm_ptr->set_custom_all_reduce(&custom_ar);
     }
 
@@ -2642,6 +2601,7 @@ int run_impl(int argc,
     // the lifetime of the server.
     pie_cuda_driver::ForwardFn forward_fn;
     pie_cuda_driver::model::LlamaLikePlanState llama_plan;
+    pie_cuda_driver::model::KimiPlanState kimi_plan;
     // Gemma-4 26B-A4B's MoE block needs a routed-experts workspace
     // alongside the dense forward state. Inert (zero-byte) on dense
     // E2B / E4B / 31B variants.
@@ -2656,9 +2616,6 @@ int run_impl(int argc,
             hf_cfg.moe_intermediate_size /
                 std::max(1, cfg.distributed.tp_size));
     }
-    if (is_gemma4_arch) {
-        gemma4_moe_ws.allocate_row_decode(max_workspace_tokens);
-    }
     if (is_gemma4_arch &&
         engine.hf_config().gemma_hidden_size_per_layer_input > 0) {
         const auto& hf_cfg = engine.hf_config();
@@ -2667,7 +2624,71 @@ int run_impl(int argc,
             hf_cfg.num_hidden_layers *
                 hf_cfg.gemma_hidden_size_per_layer_input);
     }
-    if (is_gemma4_arch) {
+    if (is_kimi_arch) {
+        const int kimi_tp_size = cfg.distributed.tp_size;
+        const bool kimi_emit_logits = cfg.distributed.tp_rank == 0;
+        pie_cuda_driver::NcclComm* kimi_tp_comm = tp_comm_ptr;
+        forward_fn.supports_tp_greedy_argmax =
+            cfg.distributed.tp_size > 1 &&
+            weights_kimi.lm_head_tp_sharded;
+        forward_fn.supports_compact_logits = true;
+        forward_fn.prepare = [&engine, &mla_cache, &kimi_plan, kimi_tp_size](
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
+            pie_cuda_driver::model::prepare_kimi_mla_plan(
+                kimi_plan, attn_ws, mla_cache, engine.hf_config(),
+                prep.kv_page_indices_d,
+                prep.qo_indptr_h,
+                prep.kv_page_indptr_h,
+                prep.kv_page_indptr_d,
+                prep.kv_last_page_lens_h,
+                prep.kv_last_page_lens_d,
+                prep.total_tokens,
+                prep.num_requests,
+                !prep.is_pure_decode,
+                kimi_tp_size);
+        };
+        forward_fn.body = [&engine, &weights_kimi, &kimi_ws, &mla_cache,
+                           &kimi_plan, kimi_tp_size, kimi_tp_comm,
+                           kimi_emit_logits](
+            pie_cuda_driver::model::Qwen3Workspace& ws,
+            pie_cuda_driver::KvCache& cache,
+            pie_cuda_driver::AttentionWorkspace& attn_ws,
+            pie_cuda_driver::ops::CublasHandle& cublas,
+            const std::int32_t* tok, const std::int32_t* pos,
+            const std::uint32_t* qo_indptr,
+            const std::uint32_t* kv_page_indices,
+            const std::uint32_t* kv_page_indptr,
+            const std::uint32_t* kv_last_page_lens,
+            const std::uint32_t* qo_indptr_h,
+            const std::uint32_t* kv_page_indptr_h,
+            int N, int R, bool is_pure_decode,
+            const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
+            const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
+            const std::int32_t* slot_ids_d,
+            const std::int32_t* logit_row_indices_d,
+            int num_logit_rows,
+            bool tp_greedy_argmax) {
+            (void)ws; (void)cache; (void)mask_d; (void)mask_indptr_d;
+            (void)slot_ids_h; (void)is_fresh_h; (void)slot_ids_d;
+            pie_cuda_driver::model::KimiForwardCfg kimi_fwd{};
+            kimi_fwd.tp_size = kimi_tp_size;
+            kimi_fwd.tp_comm = kimi_tp_comm;
+            kimi_fwd.emit_logits = kimi_emit_logits;
+            kimi_fwd.tp_greedy_argmax = tp_greedy_argmax;
+            kimi_fwd.greedy_pairs = ws.greedy_pairs.data();
+            kimi_fwd.greedy_pairs_all = ws.greedy_pairs_all.data();
+            pie_cuda_driver::model::kimi_forward_paged(
+                weights_kimi, engine.hf_config(), kimi_fwd, kimi_plan,
+                kimi_ws, mla_cache, attn_ws, cublas,
+                ws.logits.data(),
+                tok, pos,
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                qo_indptr_h, kv_page_indptr_h,
+                N, R, is_pure_decode,
+                logit_row_indices_d, num_logit_rows);
+        };
+    } else if (is_gemma4_arch) {
         forward_fn = [&engine, &weights_gemma4, &gemma4_moe_ws, gemma4_fwd_cfg](
             pie_cuda_driver::model::Qwen3Workspace& ws,
             pie_cuda_driver::KvCache& cache,
@@ -2679,9 +2700,7 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
-            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
-            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2694,8 +2713,7 @@ int run_impl(int argc,
                 ws, gemma4_moe_ws, cache, attn_ws, cublas,
                 tok, pos,
                 qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                qo_indptr_h, kv_page_indices_h, kv_page_indptr_h,
-                kv_last_page_lens_h,
+                qo_indptr_h, kv_page_indptr_h,
                 N, R, is_pure_decode, mask_d, mask_indptr_d,
                 logit_row_indices_d, num_logit_rows);
         };
@@ -2704,47 +2722,6 @@ int run_impl(int argc,
             [](bool enabled) {
                 pie_cuda_driver::model::set_gemma4_logits_argmax_only(enabled);
             };
-        forward_fn.set_fused_argmax_output =
-            [](std::int32_t* ptr) {
-                pie_cuda_driver::model::set_gemma4_fused_argmax_output(ptr);
-            };
-        forward_fn.fused_argmax_done =
-            []() {
-                return pie_cuda_driver::model::gemma4_fused_argmax_done();
-            };
-        {
-            const char* fused_env = std::getenv("PIE_FUSED_LMHEAD_ARGMAX");
-            forward_fn.supports_fused_lmhead_argmax =
-                fused_env != nullptr && fused_env[0] != '\0' && fused_env[0] != '0';
-        }
-        forward_fn.prepare = [&engine, &weights_gemma4, &gemma4_moe_ws,
-                              &kv_cache, gemma4_fwd_cfg](
-            pie_cuda_driver::AttentionWorkspace& attn_ws,
-            const pie_cuda_driver::ForwardFn::PrepareInputs& prep) {
-            pie_cuda_driver::model::prepare_gemma4_decode_plans(
-                weights_gemma4, engine.hf_config(), gemma4_fwd_cfg,
-                gemma4_moe_ws, kv_cache, attn_ws,
-                prep.qo_indptr_h,
-                prep.kv_page_indices_h,
-                prep.kv_page_indptr_h,
-                prep.kv_last_page_lens_h,
-                prep.total_tokens,
-                prep.num_requests,
-                prep.is_pure_decode);
-        };
-        const char* gemma4_profile_env = std::getenv("PIE_GEMMA4_FORWARD_PROFILE");
-        forward_fn.graph_safe =
-            kv_cache.format().is_native_bf16() &&
-            !(gemma4_profile_env != nullptr &&
-              gemma4_profile_env[0] != '\0' &&
-              gemma4_profile_env[0] != '0');
-        forward_fn.graph_layout = [&gemma4_moe_ws]() {
-            return pie_cuda_driver::model::gemma4_decode_graph_layout(
-                gemma4_moe_ws);
-        };
-        forward_fn.supports_small_prefill_graph =
-            kv_cache.format().is_native_bf16() &&
-            qwen35_small_spec_graph_tokens() > 0;
     } else if (is_gemma3n_arch) {
         // Loader-only milestone: bind_gemma3n loads every tensor; the
         // forward function (AltUp predict/correct + Laurel + activation
@@ -2765,9 +2742,7 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
-            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
-            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2795,9 +2770,7 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
-            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
-            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2830,9 +2803,7 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
-            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
-            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2862,15 +2833,12 @@ int run_impl(int argc,
                               std::max(1, hf_q.num_key_value_heads);
             q35_fwd.force_prefill_path =
                 !flashinfer_decode_supports_gqa(gqa_q);
-            q35_fwd.small_prefill_naive_attention_max_tokens =
-                qwen35_small_spec_graph_tokens();
             q35_fwd.tp_size = q35_tp_size;
             q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                 qwen3_5_plan_state, attn_ws, kv_cache, engine.hf_config(),
-                q35_fwd, prep.qo_indptr_h, prep.kv_page_indptr_h,
-                prep.kv_last_page_lens_h, prep.total_tokens,
-                prep.num_requests, prep.is_pure_decode);
+                q35_fwd, prep.kv_page_indptr_h, prep.num_requests,
+                prep.is_pure_decode);
         };
         forward_fn.body = [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
                            &qwen3_5_state_cache, &qwen3_5_plan_state,
@@ -2885,9 +2853,7 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
-            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
-            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -2901,8 +2867,6 @@ int run_impl(int argc,
                               std::max(1, hf_q.num_key_value_heads);
             q35_fwd.force_prefill_path =
                 !flashinfer_decode_supports_gqa(gqa_q);
-            q35_fwd.small_prefill_naive_attention_max_tokens =
-                qwen35_small_spec_graph_tokens();
             q35_fwd.tp_size = q35_tp_size;
             q35_fwd.tp_comm = q35_tp_comm;
             pie_cuda_driver::model::qwen3_5_forward_paged(
@@ -2915,67 +2879,6 @@ int run_impl(int argc,
                 N, R, is_pure_decode, mask_d, mask_indptr_d,
                 slot_ids_h, is_fresh_h, slot_ids_d);
         };
-        if (weights_qwen3_5.mtp.has_value() && cfg.model.mtp_num_drafts > 0) {
-            forward_fn.mtp_num_drafts = cfg.model.mtp_num_drafts;
-            forward_fn.mtp_process =
-                [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
-                 &qwen3_5_state_cache, q35_tp_size, q35_tp_comm](
-                pie_cuda_driver::model::Qwen3Workspace& ws,
-                pie_cuda_driver::KvCache& cache,
-                pie_cuda_driver::ops::CublasHandle& cublas,
-                const std::int32_t* tok,
-                const std::int32_t* pos,
-                const std::uint32_t* qo_indptr,
-                const std::uint32_t* kv_page_indices,
-                const std::uint32_t* kv_page_indptr,
-                const std::uint32_t* kv_last_page_lens,
-                const std::int32_t* slot_ids_d,
-                const std::int32_t* source_row_indices,
-                int N,
-                int R) {
-                pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-                q35_fwd.tp_size = q35_tp_size;
-                q35_fwd.tp_comm = q35_tp_comm;
-                pie_cuda_driver::model::qwen3_5_mtp_process_cache(
-                    weights_qwen3_5, engine.hf_config(), q35_fwd,
-                    ws, qwen3_5_la_ws, cache, qwen3_5_state_cache, cublas,
-                    tok, pos, qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens, slot_ids_d, source_row_indices, N, R);
-            };
-            forward_fn.mtp = [&engine, &weights_qwen3_5, &qwen3_5_la_ws,
-                              q35_tp_size, q35_tp_comm](
-                pie_cuda_driver::model::Qwen3Workspace& ws,
-                pie_cuda_driver::KvCache& cache,
-                pie_cuda_driver::ops::CublasHandle& cublas,
-                const std::int32_t* tok,
-                const std::int32_t* pos,
-                const std::int32_t* base_hidden_row_indices,
-                const std::int32_t* request_ids,
-                const std::uint32_t* kv_page_indices,
-                const std::uint32_t* kv_page_indptr,
-                const std::uint32_t* kv_last_page_lens,
-                int N,
-                int draft_step,
-                int max_global_tokens) {
-                pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-                q35_fwd.tp_size = q35_tp_size;
-                q35_fwd.tp_comm = q35_tp_comm;
-                pie_cuda_driver::model::qwen3_5_mtp_forward(
-                    weights_qwen3_5, engine.hf_config(), q35_fwd,
-                    ws, qwen3_5_la_ws, cache, cublas,
-                    tok, pos, base_hidden_row_indices, request_ids,
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    N, draft_step, max_global_tokens);
-            };
-        }
-        forward_fn.graph_safe = kv_cache.format().is_native_bf16();
-        forward_fn.graph_layout = [&qwen3_5_plan_state]() {
-            return pie_cuda_driver::model::qwen3_5_decode_graph_layout(
-                qwen3_5_plan_state);
-        };
-        forward_fn.supports_small_prefill_graph =
-            kv_cache.format().is_native_bf16() && !kv_cache.hnd_layout() &&
-            qwen35_small_spec_graph_tokens() > 0;
     } else if (is_qwen3_5_moe_arch) {
         const int q35moe_tp_size = cfg.distributed.tp_size;
         pie_cuda_driver::NcclComm* q35moe_tp_comm = tp_comm_ptr;
@@ -2989,15 +2892,12 @@ int run_impl(int argc,
                               std::max(1, hf_q.num_key_value_heads);
             q35_fwd.force_prefill_path =
                 !flashinfer_decode_supports_gqa(gqa_q);
-            q35_fwd.small_prefill_naive_attention_max_tokens =
-                qwen35_small_spec_graph_tokens();
             q35_fwd.tp_size = q35moe_tp_size;
             q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::prepare_qwen3_5_decode_plan(
                 qwen3_5_plan_state, attn_ws, kv_cache, engine.hf_config(),
-                q35_fwd, prep.qo_indptr_h, prep.kv_page_indptr_h,
-                prep.kv_last_page_lens_h, prep.total_tokens,
-                prep.num_requests, prep.is_pure_decode);
+                q35_fwd, prep.kv_page_indptr_h, prep.num_requests,
+                prep.is_pure_decode);
         };
         forward_fn.body = [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
                            &qwen3_5_moe_ws, &qwen3_5_state_cache,
@@ -3013,9 +2913,7 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
-            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
-            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -3029,8 +2927,6 @@ int run_impl(int argc,
                               std::max(1, hf_q.num_key_value_heads);
             q35_fwd.force_prefill_path =
                 !flashinfer_decode_supports_gqa(gqa_q);
-            q35_fwd.small_prefill_naive_attention_max_tokens =
-                qwen35_small_spec_graph_tokens();
             q35_fwd.tp_size = q35moe_tp_size;
             q35_fwd.tp_comm = q35moe_tp_comm;
             pie_cuda_driver::model::qwen3_5_moe_forward_paged(
@@ -3046,60 +2942,6 @@ int run_impl(int argc,
                 slot_ids_h, is_fresh_h, slot_ids_d,
                 logit_row_indices_d, num_logit_rows);
         };
-        if (weights_qwen3_5_moe.mtp.has_value() && cfg.model.mtp_num_drafts > 0) {
-            forward_fn.mtp_num_drafts = cfg.model.mtp_num_drafts;
-            forward_fn.mtp_process =
-                [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
-                 &qwen3_5_state_cache, q35moe_tp_size, q35moe_tp_comm](
-                pie_cuda_driver::model::Qwen3Workspace& ws,
-                pie_cuda_driver::KvCache& cache,
-                pie_cuda_driver::ops::CublasHandle& cublas,
-                const std::int32_t* tok,
-                const std::int32_t* pos,
-                const std::uint32_t* qo_indptr,
-                const std::uint32_t* kv_page_indices,
-                const std::uint32_t* kv_page_indptr,
-                const std::uint32_t* kv_last_page_lens,
-                const std::int32_t* slot_ids_d,
-                const std::int32_t* source_row_indices,
-                int N,
-                int R) {
-                pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-                q35_fwd.tp_size = q35moe_tp_size;
-                q35_fwd.tp_comm = q35moe_tp_comm;
-                pie_cuda_driver::model::qwen3_5_moe_mtp_process_cache(
-                    weights_qwen3_5_moe, engine.hf_config(), q35_fwd,
-                    ws, qwen3_5_la_ws, cache, qwen3_5_state_cache, cublas,
-                    tok, pos, qo_indptr, kv_page_indices, kv_page_indptr,
-                    kv_last_page_lens, slot_ids_d, source_row_indices, N, R);
-            };
-            forward_fn.mtp = [&engine, &weights_qwen3_5_moe, &qwen3_5_la_ws,
-                              &qwen3_5_moe_ws,
-                              q35moe_tp_size, q35moe_tp_comm](
-                pie_cuda_driver::model::Qwen3Workspace& ws,
-                pie_cuda_driver::KvCache& cache,
-                pie_cuda_driver::ops::CublasHandle& cublas,
-                const std::int32_t* tok,
-                const std::int32_t* pos,
-                const std::int32_t* base_hidden_row_indices,
-                const std::int32_t* request_ids,
-                const std::uint32_t* kv_page_indices,
-                const std::uint32_t* kv_page_indptr,
-                const std::uint32_t* kv_last_page_lens,
-                int N,
-                int draft_step,
-                int max_global_tokens) {
-                pie_cuda_driver::model::Qwen3_5ForwardCfg q35_fwd{};
-                q35_fwd.tp_size = q35moe_tp_size;
-                q35_fwd.tp_comm = q35moe_tp_comm;
-                pie_cuda_driver::model::qwen3_5_moe_mtp_forward(
-                    weights_qwen3_5_moe, engine.hf_config(), q35_fwd,
-                    ws, qwen3_5_la_ws, qwen3_5_moe_ws, cache, cublas,
-                    tok, pos, base_hidden_row_indices, request_ids,
-                    kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    N, draft_step, max_global_tokens);
-            };
-        }
         const char* q35moe_profile_env = std::getenv("PIE_QWEN35_MOE_PROFILE");
         forward_fn.graph_safe =
             !(q35moe_profile_env != nullptr &&
@@ -3110,9 +2952,6 @@ int run_impl(int argc,
                 qwen3_5_plan_state);
         };
         forward_fn.supports_compact_logits = true;
-        forward_fn.supports_small_prefill_graph =
-            kv_cache.format().is_native_bf16() && !kv_cache.hnd_layout() &&
-            qwen35_small_spec_graph_tokens() > 0;
     } else {
         // Llama-like decode is graph-replay-safe because (a) the body
         // is host-work-free (the prepare hook hoisted DecodePlan out of
@@ -3164,9 +3003,7 @@ int run_impl(int argc,
             const std::uint32_t* kv_page_indptr,
             const std::uint32_t* kv_last_page_lens,
             const std::uint32_t* qo_indptr_h,
-            const std::uint32_t* kv_page_indices_h,
             const std::uint32_t* kv_page_indptr_h,
-            const std::uint32_t* kv_last_page_lens_h,
             int N, int R, bool is_pure_decode,
             const std::uint8_t* mask_d, const std::int32_t* mask_indptr_d,
             const std::int32_t* slot_ids_h, const std::uint8_t* is_fresh_h,
@@ -3187,97 +3024,22 @@ int run_impl(int argc,
         };
     }
 
-    pie_cuda_driver::SystemSpeculatorFn system_speculator;
-    int system_speculator_max_drafts = 0;
-    if (gemma4_mtp_weights && gemma4_mtp_ws) {
-        const bool use_inline_mtp =
-            std::getenv("PIE_GEMMA4_MTP_INLINE") != nullptr &&
-            std::string(std::getenv("PIE_GEMMA4_MTP_INLINE")) != "0";
-        if (use_inline_mtp) {
-            forward_fn.mtp_num_drafts = cfg.model.mtp_num_drafts;
-            forward_fn.mtp =
-                [&weights_gemma4, &mtp_w = *gemma4_mtp_weights,
-                 &mtp_ws = *gemma4_mtp_ws, &kv_cache](
-                    pie_cuda_driver::model::Qwen3Workspace& target_ws,
-                    pie_cuda_driver::KvCache& cache,
-                    pie_cuda_driver::ops::CublasHandle& cublas,
-                    const std::int32_t* token_ids,
-                    const std::int32_t* position_ids,
-                    const std::int32_t* base_hidden_row_indices,
-                    const std::int32_t* request_ids,
-                    const std::uint32_t* kv_page_indices,
-                    const std::uint32_t* kv_page_indptr,
-                    const std::uint32_t* kv_last_page_lens,
-                    int num_tokens, int draft_step,
-                    int max_global_tokens) {
-                    pie_cuda_driver::model::gemma4_mtp_forward_step(
-                        mtp_w, weights_gemma4, mtp_ws, target_ws, cache,
-                        cublas, token_ids, position_ids,
-                        base_hidden_row_indices, request_ids,
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        num_tokens, draft_step, max_global_tokens);
-                };
-            forward_fn.mtp_prepare =
-                [&mtp_w = *gemma4_mtp_weights,
-                 &mtp_ws = *gemma4_mtp_ws,
-                 &weights_gemma4, &kv_cache](
-                    const std::uint32_t* kv_page_indptr_h,
-                    const std::uint32_t* kv_last_page_lens_h,
-                    int num_rows, int page_size,
-                    cudaStream_t stream) {
-                    mtp_ws.kv_last_page_lens.copy_from_host(
-                        std::span<const std::uint32_t>(
-                            kv_last_page_lens_h,
-                            static_cast<std::size_t>(num_rows)));
-                    for (std::size_t li = 0; li < mtp_w.layers.size(); ++li) {
-                        const auto& layer = mtp_w.layers[li];
-                        const int d = layer.head_dim;
-                        const int num_q_heads = mtp_w.cfg.num_attention_heads;
-                        const auto& target_layer =
-                            weights_gemma4.layers[layer.target_kv_layer];
-                        const int num_kv_heads = target_layer.num_kv_heads;
-                        pie_cuda_driver::ops::plan_attention_flashinfer_decode(
-                            *mtp_ws.decode_plans[li],
-                            kv_page_indptr_h,
-                            num_rows, num_q_heads, num_kv_heads, d,
-                            page_size, mtp_ws.attn_workspaces[li], stream,
-                            /*enable_cuda_graph=*/true,
-                            /*full_attention_variant=*/layer.window_left < 0,
-                            kv_cache.hnd_layout());
-                    }
-                };
-        } else {
-            system_speculator_max_drafts = cfg.model.mtp_num_drafts;
-            system_speculator =
-                [&weights_gemma4, &mtp_w = *gemma4_mtp_weights,
-                 &mtp_ws = *gemma4_mtp_ws, gemma4_mtp_runtime](
-                    const pie_cuda_driver::SystemSpecDraftInputs& in,
-                    std::span<pie_driver::PerRequestOutput> per_req) {
-                    pie_cuda_driver::model::gemma4_mtp_draft(
-                        mtp_w, weights_gemma4, mtp_ws, gemma4_mtp_runtime,
-                        in, per_req);
-                };
-        }
-    }
-
     pie_cuda_driver::Executor executor{
         engine, ws, kv_cache, attn_ws, cublas,
         max_workspace_tokens,
         mem_plan.max_requests,
         graph_pad_page,
         persistent_inputs, verbose, std::move(forward_fn),
-        std::move(system_speculator),
-        system_speculator_max_drafts,
         use_cuda_graphs ? &graph_cache : nullptr,
         /*tp_comm=*/tp_comm_ptr,
         /*tp_cpu_gate_key=*/{},
         /*rs_cache=*/((is_qwen3_5_arch || is_qwen3_5_moe_arch) ? &qwen3_5_state_cache : nullptr),
-        /*rs_cache_scratch_slot=*/qwen3_5_scratch_rs_slot,
         /*response_builder=*/{},
     };
     executor.tp_cpu_gate_key = cfg.distributed.nccl_unique_id_hex;
-    // Pass-level speculation is runtime-owned. `.system_speculation()` is
-    // driver-owned when a native drafter (Gemma4 MTP) is configured.
+    // Speculation lives entirely in the runtime. The driver runs
+    // forward passes; the runtime's `scheduler.speculation_depth`
+    // toml knob controls per-ctx chain depth.
     if (verbose && use_cuda_graphs) {
         std::cerr << "[pie-driver-cuda] CUDA graphs enabled (experimental)\n";
     }
@@ -3319,27 +3081,13 @@ int run_impl(int argc,
             (is_qwen3_5_arch || is_qwen3_5_moe_arch) &&
             qwen3_5_state_cache.max_slots() > 0;
         const std::uint64_t rs_cache_slots = rs_cache_required
-            ? static_cast<std::uint64_t>(qwen3_5_runtime_rs_slots)
+            ? static_cast<std::uint64_t>(qwen3_5_state_cache.max_slots())
             : 0;
         const std::uint64_t rs_cache_slot_bytes = rs_cache_required
             ? static_cast<std::uint64_t>(qwen3_5_linear_layers) *
                   (qwen3_5_state_cache.conv_slot_stride_bytes() +
-                   qwen3_5_state_cache.recurrent_slot_stride_bytes()) +
-                  static_cast<std::uint64_t>(
-                      std::max(0, qwen3_5_state_cache.hidden_size())) *
-                      sizeof(std::uint16_t)
+                   qwen3_5_state_cache.recurrent_slot_stride_bytes())
             : 0;
-        const bool rs_cache_spec_rollback =
-            rs_cache_required && cfg.distributed.tp_size <= 1 &&
-            qwen3_5_scratch_rs_slot >= 0;
-        const bool system_speculation_supported =
-            static_cast<bool>(executor.forward_fn.mtp) ||
-            static_cast<bool>(executor.system_speculator);
-        const auto max_forward_requests_caps = rs_cache_required
-            ? std::min<std::uint64_t>(
-                  static_cast<std::uint64_t>(mem_plan.capacity.max_forward_requests),
-                  rs_cache_slots)
-            : static_cast<std::uint64_t>(mem_plan.capacity.max_forward_requests);
         nlohmann::json caps = {
             {"total_pages",            c.total_pages},
             {"kv_page_size",           mem_plan.kv_page_size},
@@ -3347,11 +3095,8 @@ int run_impl(int argc,
             {"rs_cache_required",      rs_cache_required},
             {"rs_cache_slots",         rs_cache_slots},
             {"rs_cache_slot_bytes",    rs_cache_slot_bytes},
-            {"rs_cache_spec_rollback", rs_cache_spec_rollback},
-            {"system_speculation_supported", system_speculation_supported},
-            {"default_system_speculation", system_speculation_supported},
             {"max_forward_tokens",     mem_plan.capacity.max_forward_tokens},
-            {"max_forward_requests",   max_forward_requests_caps},
+            {"max_forward_requests",   mem_plan.capacity.max_forward_requests},
             {"max_page_refs",          mem_plan.capacity.max_page_refs},
             {"max_logit_rows",         mem_plan.capacity.max_logit_rows},
             {"max_prob_rows",          mem_plan.capacity.max_prob_rows},

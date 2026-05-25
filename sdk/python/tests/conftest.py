@@ -85,9 +85,6 @@ class FakeModel:
     def tokenizer(self):
         return self._tokenizer
 
-    def default_system_speculation(self) -> bool:
-        return False
-
     def __enter__(self):
         return self
 

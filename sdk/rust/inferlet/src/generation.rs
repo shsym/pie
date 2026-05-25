@@ -30,7 +30,6 @@ use crate::pie::core::inference::Output as RawOutput;
 use crate::pie::core::inference::{ForwardPass, Sampler as WitSampler, SlotOutput};
 use crate::sample::{Probe, Sampler};
 use crate::spec::Speculator;
-use std::collections::VecDeque;
 
 const GENERATION_RESERVATION_WINDOW_TOKENS: u32 = 512;
 
@@ -72,7 +71,6 @@ pub struct Generator<'ctx> {
     /// Probes added via [`Generator::probe_each_step`] — re-attached every
     /// step. Stored as `(query_index, wit_variant)` pairs.
     step_probes: Vec<(u32, WitSampler)>,
-    output_buffer: VecDeque<u32>,
     tokens_generated: usize,
     rebid_each_step: bool,
     done: bool,
@@ -96,17 +94,7 @@ impl<'ctx> Generator<'ctx> {
         let pass = ForwardPass::new(&ctx.model);
         pass.context(&ctx.inner);
 
-        let default_system_speculation =
-            sampler.is_argmax() && ctx.model.default_system_speculation();
         let wit_sampler = sampler.into();
-        let speculation = if default_system_speculation {
-            SpecMode::System {
-                spec_tokens: Vec::new(),
-                spec_positions: Vec::new(),
-            }
-        } else {
-            SpecMode::None
-        };
 
         Self {
             ctx,
@@ -117,11 +105,10 @@ impl<'ctx> Generator<'ctx> {
             horizon: None,
             constraints: Vec::new(),
             constraint_pending: Vec::new(),
-            speculation,
+            speculation: SpecMode::None,
             adapter: None,
             zo_seed: None,
             step_probes: Vec::new(),
-            output_buffer: VecDeque::new(),
             tokens_generated: 0,
             rebid_each_step: true,
             done: false,
@@ -174,23 +161,12 @@ impl<'ctx> Generator<'ctx> {
 
     /// Enable host-driven speculation: the runtime returns next-iter draft
     /// tokens via the forward-pass output and the Generator stages them
-    /// for the next step. Greedy generators enable this by default on
-    /// models that advertise a default system drafter.
+    /// for the next step.
     pub fn system_speculation(mut self) -> Self {
         self.speculation = SpecMode::System {
             spec_tokens: Vec::new(),
             spec_positions: Vec::new(),
         };
-        self
-    }
-
-    /// Disable host-driven system speculation. This opts out of the
-    /// default greedy-system drafter while leaving custom speculators
-    /// untouched.
-    pub fn disable_system_speculation(mut self) -> Self {
-        if matches!(self.speculation, SpecMode::System { .. }) {
-            self.speculation = SpecMode::None;
-        }
         self
     }
 
@@ -249,23 +225,11 @@ impl<'ctx> Generator<'ctx> {
 
     /// Convenience wrapper for callers that only need the next sampled token.
     pub async fn next_token(&mut self) -> Result<Option<u32>> {
-        if let Some(token) = self.output_buffer.pop_front() {
-            return Ok(Some(token));
-        }
-
-        loop {
-            let Some(step) = self.next()? else {
-                return Ok(None);
-            };
-            let out = step.execute().await?;
-            self.output_buffer.extend(out.tokens);
-            if let Some(token) = self.output_buffer.pop_front() {
-                return Ok(Some(token));
-            }
-            if self.is_done() {
-                return Ok(None);
-            }
-        }
+        let Some(step) = self.next()? else {
+            return Ok(None);
+        };
+        let out = step.execute().await?;
+        Ok(out.tokens.into_iter().next())
     }
 
     /// Begin the next step. Returns `Ok(None)` when generation is finished.
@@ -603,19 +567,12 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
                 pass.input_speculative_tokens(&drafts, &draft_positions);
             }
         }
-        let max_tokens_remaining = parent
-            .max_tokens
-            .map(|max| max.saturating_sub(parent.tokens_generated));
-        if matches!(parent.speculation, SpecMode::System { .. })
-            && max_tokens_remaining.map_or(true, |remaining| remaining > 1)
-        {
+        if matches!(parent.speculation, SpecMode::System { .. }) {
             pass.output_speculative_tokens(true);
         }
-        if max_tokens_remaining
-            .map_or(false, |remaining| {
-                remaining <= (n_drafted as usize).saturating_add(1)
-            })
-        {
+        if parent.max_tokens.map_or(false, |max| {
+            max.saturating_sub(parent.tokens_generated) <= 1
+        }) {
             pass.pass_speculation(false);
         }
         // Sampler attach. Custom-with-drafts attaches (1 + n_drafted)
@@ -726,20 +683,7 @@ impl<'g, 'ctx> GenStep<'g, 'ctx> {
             let n_verified = (accepted_tokens.len() as u32).saturating_sub(1);
             let n_rejected = n_drafted.saturating_sub(n_verified);
             if n_rejected > 0 {
-                // The host API truncates to a retained working-token count,
-                // while n_rejected is a suffix length. At this point the
-                // host has appended pending + all draft tokens, but pages are
-                // not committed yet, so the retained count is the previous
-                // local working tail plus pending and accepted drafts.
-                let working_after_append = parent
-                    .ctx
-                    .working_tokens
-                    .saturating_add(n_pending)
-                    .saturating_add(n_drafted);
-                parent
-                    .ctx
-                    .inner
-                    .truncate_working_page_tokens(working_after_append.saturating_sub(n_rejected));
+                parent.ctx.inner.truncate_working_page_tokens(n_rejected);
             }
             // Roll back custom speculator's own state too.
             if let SpecMode::Custom(s) = &mut parent.speculation {

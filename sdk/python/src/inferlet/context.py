@@ -284,7 +284,7 @@ class Context:
         constrain: Schema | Constraint | list[Schema | Constraint] | None = None,
         logit_mask: list[int] | None = None,
         speculator: Speculator | None = None,
-        system_speculation: bool | None = None,
+        system_speculation: bool = False,
         adapter: Adapter | None = None,
         zo_seed: int | None = None,
         horizon: int | None = None,
@@ -313,9 +313,8 @@ class Context:
             speculator: Custom speculative-decoding drafter implementing
                 the :class:`Speculator` protocol.
             system_speculation: If True, the runtime drives drafts via
-                its built-in system drafter. If omitted, argmax generation
-                enables it by default when the model advertises one.
-                Mutually exclusive with ``speculator``.
+                its built-in NGRAM/etc. drafter. Mutually exclusive with
+                ``speculator``.
             adapter: Adapter to apply on every forward pass.
             zo_seed: Evolution Strategies seed for every forward pass.
             horizon: Expected output length for budget planning.

@@ -73,7 +73,6 @@ struct ForwardFn {
     bool graph_safe = false;
     bool supports_tp_greedy_argmax = false;
     bool supports_compact_logits = false;
-    bool supports_small_prefill_graph = false;
 
     using BodyFn = std::function<void(
         model::Qwen3Workspace&,
@@ -87,9 +86,7 @@ struct ForwardFn {
         const std::uint32_t* /* kv_page_indptr   device */,
         const std::uint32_t* /* kv_last_page_lens device */,
         const std::uint32_t* /* qo_indptr_h        host */,
-        const std::uint32_t* /* kv_page_indices_h  host */,
         const std::uint32_t* /* kv_page_indptr_h   host */,
-        const std::uint32_t* /* kv_last_page_lens_h host */,
         int                  /* total_tokens N */,
         int                  /* num_requests R */,
         bool                 /* is_pure_decode */,
@@ -103,49 +100,8 @@ struct ForwardFn {
         bool                 /* tp_greedy_argmax */
     )>;
 
-    using MtpFn = std::function<void(
-        model::Qwen3Workspace&,
-        KvCache&,
-        ops::CublasHandle&,
-        const std::int32_t*  /* token_ids device */,
-        const std::int32_t*  /* position_ids device */,
-        const std::int32_t*  /* base_hidden_row_indices device */,
-        const std::int32_t*  /* request_ids device */,
-        const std::uint32_t* /* kv_page_indices device */,
-        const std::uint32_t* /* kv_page_indptr device */,
-        const std::uint32_t* /* kv_last_page_lens device */,
-        int                  /* num_tokens */,
-        int                  /* draft_step */,
-        int                  /* max_global_tokens */
-    )>;
-
-    using MtpProcessFn = std::function<void(
-        model::Qwen3Workspace&,
-        KvCache&,
-        ops::CublasHandle&,
-        const std::int32_t*  /* token_ids device */,
-        const std::int32_t*  /* positions device */,
-        const std::uint32_t* /* qo_indptr device */,
-        const std::uint32_t* /* kv_page_indices device */,
-        const std::uint32_t* /* kv_page_indptr device */,
-        const std::uint32_t* /* kv_last_page_lens device */,
-        const std::int32_t*  /* slot_ids device, nullable */,
-        const std::int32_t*  /* source_row_indices device, nullable */,
-        int                  /* total_tokens */,
-        int                  /* num_requests */
-    )>;
-
-    using MtpPrepareFn = std::function<void(
-        const std::uint32_t* /* kv_page_indptr_h */,
-        const std::uint32_t* /* kv_last_page_lens_h */,
-        int                  /* num_rows */,
-        int                  /* page_size */,
-        cudaStream_t         /* stream */
-    )>;
-
     struct PrepareInputs {
         const std::uint32_t* qo_indptr_h = nullptr;
-        const std::uint32_t* kv_page_indices_h = nullptr;
         const std::uint32_t* kv_page_indices_d = nullptr;
         const std::uint32_t* kv_page_indptr_h = nullptr;
         const std::uint32_t* kv_page_indptr_d = nullptr;
@@ -163,22 +119,13 @@ struct ForwardFn {
 
     using GraphLayoutFn = std::function<std::uint32_t()>;
     using LogitsModeFn = std::function<void(bool)>;
-    using SetFusedArgmaxOutputFn = std::function<void(std::int32_t*)>;
-    using FusedArgmaxDoneFn = std::function<bool()>;
 
     // Empty by default → executor falls back to "direct call only;
     // no graph capture" mode for this arch.
     PrepareFn prepare;
     GraphLayoutFn graph_layout;
     LogitsModeFn set_logits_argmax_only;
-    SetFusedArgmaxOutputFn set_fused_argmax_output;
-    FusedArgmaxDoneFn fused_argmax_done;
-    bool supports_fused_lmhead_argmax = false;
     BodyFn    body;
-    MtpFn     mtp;
-    MtpPrepareFn mtp_prepare;
-    MtpProcessFn mtp_process;
-    int mtp_num_drafts = 1;
 
     // Convenience: `forward_fn = [...]` assigns the lambda as the body.
     // entry.cpp uses this terser pattern; the older `forward_fn.body =
@@ -195,32 +142,6 @@ struct ForwardFn {
     ForwardFn& operator=(const ForwardFn&) = default;
     ForwardFn& operator=(ForwardFn&&) noexcept = default;
 };
-
-struct SystemSpecDraftRequest {
-    int request_index = -1;
-    int source_row = -1;
-    std::uint32_t accepted_token = 0;
-    std::uint32_t source_position = 0;
-    std::uint32_t first_draft_position = 0;
-    int last_match = -1;
-    int last_num_drafts = 0;
-};
-
-struct SystemSpecDraftInputs {
-    model::Qwen3Workspace& target_ws;
-    KvCache& kv_cache;
-    AttentionWorkspace& attn_ws;
-    ops::CublasHandle& cublas;
-    std::span<const SystemSpecDraftRequest> requests;
-    std::span<const std::uint32_t> kv_page_indices;
-    std::span<const std::uint32_t> kv_page_indptr;
-    int page_size = 0;
-    int max_drafts = 0;
-};
-
-using SystemSpeculatorFn = std::function<void(
-    const SystemSpecDraftInputs&,
-    std::span<pie_driver::PerRequestOutput>)>;
 
 // Stable references the executor needs across calls. Constructed
 // once after loaded-model/workspace allocation in entry.cpp and held by
@@ -244,9 +165,6 @@ struct Executor {
     // Type-erased forward call. The captured weights / cfg / model
     // function are model-specific; the call site is uniform.
     ForwardFn forward_fn;
-    // Optional driver-native drafter for `.system_speculation()`.
-    SystemSpeculatorFn system_speculator;
-    int system_speculator_max_drafts = 0;
     // Optional CUDA-graph cache. When non-null, decode-only fires
     // attempt graph capture/replay; otherwise the forward runs directly.
     ForwardGraphCache* graph_cache = nullptr;
@@ -265,9 +183,6 @@ struct Executor {
     // Runtime-managed rs_cache storage. Null on models without
     // recurrent-state slots.
     Qwen3_5StateCache* rs_cache = nullptr;
-    // Private rs_cache slot reserved for speculative rollback. This slot is
-    // not advertised to the runtime.
-    int rs_cache_scratch_slot = -1;
 
     // Response-view builder. Reused fire-to-fire — the builder owns the
     // concat scratch the `PieForwardResponseView` slices point into. The
