@@ -123,6 +123,17 @@ int cublaslt_bf16_algo_index_for_shape(int N, int K) {
     // prefers the third returned Lt heuristic. Larger hidden sizes regress
     // on that choice, so keep the old default for them.
     if (K < 2048 && N >= 12288) return 2;
+    // Qwen3.6-35B-A3B's MTP/lm_head shape (K=2048, very wide vocab)
+    // is a small but repeatable win on the second returned heuristic.
+    if (K == 2048 && N >= 200000) return 1;
+    // Qwen3.6-35B-A3B's hidden-size projections (for example GDN qkv and
+    // full-attention q/gate, N≈8k) are faster on the first heuristic. The
+    // old generic index 5 regresses the MTP verifier by several percent.
+    if (K == 2048 && N >= 6144) return 0;
+    // Gemma4 E4B's target lm_head (K=2560, very wide vocab) is slightly
+    // faster with the first returned Lt heuristic; keep this narrow so the
+    // MTP assistant scorer (K=256) and other projection GEMMs stay unchanged.
+    if (K == 2560 && N >= 100000) return 0;
     return 5;
 }
 
@@ -156,6 +167,15 @@ int cublaslt_bf16_max_n() {
         return std::max(0, std::atoi(v));
     }();
     return max_n;
+}
+
+bool use_cublas_grouped_batched_bf16() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_CUBLAS_GROUPED_BATCHED_BF16");
+        if (v == nullptr || v[0] == '\0') return true;
+        return v[0] != '0';
+    }();
+    return enabled;
 }
 
 bool gemm_bf16_lt_impl(
@@ -346,6 +366,32 @@ void gemm_bf16_impl(
     }
 }
 
+void gemm_bf16_cublas_impl(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K,
+    float beta)
+{
+    const float alpha = 1.f;
+    const auto status = cublasGemmEx(
+        handle,
+        /*transa=*/CUBLAS_OP_T, /*transb=*/CUBLAS_OP_N,
+        /*m=*/N, /*n=*/M, /*k=*/K,
+        &alpha,
+        /*A=*/W,   CUDA_R_16BF, /*lda=*/K,
+        /*B=*/act, CUDA_R_16BF, /*ldb=*/K,
+        &beta,
+        /*C=*/y,   CUDA_R_16BF, /*ldc=*/N,
+        CUBLAS_COMPUTE_32F_FAST_16BF,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error(
+            "cuBLAS error (" + std::to_string(static_cast<int>(status)) +
+            "): cublasGemmEx[bf16:cublas] M=" + std::to_string(M) +
+            " N=" + std::to_string(N) + " K=" + std::to_string(K));
+    }
+}
+
 void gemm_batched_bf16_impl(
     cublasHandle_t handle,
     const void* const* act_ptrs_dev,
@@ -357,6 +403,31 @@ void gemm_batched_bf16_impl(
 {
     if (batch_count <= 0) return;
     const float alpha = 1.f;
+    if (use_cublas_grouped_batched_bf16()) {
+        const cublasOperation_t transa_array[1] = {CUBLAS_OP_T};
+        const cublasOperation_t transb_array[1] = {CUBLAS_OP_N};
+        const int m_array[1] = {N};
+        const int n_array[1] = {M};
+        const int k_array[1] = {K};
+        const int lda_array[1] = {K};
+        const int ldb_array[1] = {K};
+        const int ldc_array[1] = {N};
+        const int group_size[1] = {batch_count};
+        const auto status = cublasGemmGroupedBatchedEx(
+            handle,
+            transa_array, transb_array,
+            m_array, n_array, k_array,
+            &alpha,
+            W_ptrs_dev, CUDA_R_16BF, lda_array,
+            act_ptrs_dev, CUDA_R_16BF, ldb_array,
+            &beta,
+            y_ptrs_dev, CUDA_R_16BF, ldc_array,
+            /*group_count=*/1, group_size,
+            CUBLAS_COMPUTE_32F_FAST_16BF);
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            return;
+        }
+    }
     // Same row-major-as-col-major reinterpretation as the unbatched
     // wrapper above: A=W (op_T), B=act (op_N), C=y (col-major NxM).
     const auto status = cublasGemmBatchedEx(
@@ -1019,6 +1090,15 @@ void gemm_act_x_w(
 #endif
     }
     unsupported("gemm_act_x_w", act_dtype, w.dtype, y_dtype);
+}
+
+void gemm_act_x_wt_bf16_cublas(
+    cublasHandle_t handle,
+    const void* act, const void* W, void* y,
+    int M, int N, int K,
+    float beta)
+{
+    gemm_bf16_cublas_impl(handle, act, W, y, M, N, K, beta);
 }
 
 void gemm_batched_act_x_w(
