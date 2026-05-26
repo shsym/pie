@@ -55,7 +55,6 @@ struct PersistentInputs {
     // pattern as the rest of the per-fire payload.
     DeviceBuffer<std::int32_t>  slot_ids;
     DeviceBuffer<std::uint8_t>  is_fresh;
-    DeviceBuffer<std::int32_t>  mtp_request_ids;
 
     // Sampler per-row parameters. Capacity = max_workspace_tokens.
     // Refreshed per fire by `executor::handle_fire_batch`.
@@ -80,14 +79,5 @@ struct PersistentInputs {
         int max_kv_pages,
         std::size_t max_custom_mask_bytes);
 };
-
-// Memory-planner helper. Returns the byte budget for one PersistentInputs
-// arena at the given (N tokens, R requests, max_page_refs, custom-mask)
-// shape. Stays separate from `allocate` because the planner uses it
-// repeatedly while sweeping bucket candidates.
-std::size_t persistent_input_bytes(int N,
-                                   int R,
-                                   int max_page_refs,
-                                   int max_custom_mask_bytes);
 
 }  // namespace pie_cuda_driver

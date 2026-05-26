@@ -32,13 +32,11 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     Qwen3Workspace ws;
     ws.y             = DeviceTensor::allocate(DType::BF16, {N, H});
     ws.norm_x        = DeviceTensor::allocate(DType::BF16, {N, H});
-    ws.spec_hidden   = DeviceTensor::allocate(DType::BF16, {N, H});
     // Fused QKV / gate-up matmul outputs. Always allocated — costs ~12 MiB
     // at N=10240 for Qwen3 dims and lets the forward dispatch decide per
     // layer whether to use the fused or unfused projection.
     ws.qkv_fused     = DeviceTensor::allocate(DType::BF16, {N, Hq + 2 * Hk});
     ws.gate_up_fused = DeviceTensor::allocate(DType::BF16, {N, 2 * I});
-    ws.mtp_concat    = DeviceTensor::allocate(DType::BF16, {N, 2 * H});
     ws.rope_table    = DeviceTensor::allocate(DType::FP32, {N, cfg.head_dim});
     ws.q             = DeviceTensor::allocate(DType::BF16, {N, Hq});
     ws.k             = DeviceTensor::allocate(DType::BF16, {N, Hk});
@@ -55,6 +53,7 @@ Qwen3Workspace Qwen3Workspace::allocate_full(
     ws.greedy_tokens_all = DeviceTensor::allocate(DType::INT32, {8, N});
     ws.greedy_pairs = DeviceTensor::allocate(DType::INT64, {N});
     ws.greedy_pairs_all = DeviceTensor::allocate(DType::INT64, {8, N});
+
     // Padded q/k/v/attn_out only when head_dim != head_dim_kernel
     // (currently only Phi-3 at 96 → 128). Empty allocations otherwise
     // — the forward path detects the empty-state and aliases the
@@ -367,45 +366,6 @@ void qwen3_forward_paged(
     ops::gemm_act_x_w(cublas.handle(),
         ws.norm_x.data(), *w.lm_head, ws.logits.data(),
         N, V, H);
-}
-
-std::size_t qwen3_workspace_bytes(const HfConfig& cfg,
-                                  int N,
-                                  int output_rows,
-                                  int max_intermediate,
-                                  int max_Hq,
-                                  int max_Hk) {
-    const auto bf16 = [](std::size_t elems) { return elems * 2; };
-    const auto fp32 = [](std::size_t elems) { return elems * 4; };
-    const std::size_t n = static_cast<std::size_t>(N);
-    const std::size_t o = static_cast<std::size_t>(std::max(1, output_rows));
-    std::size_t bytes = 0;
-    bytes += bf16(n * cfg.hidden_size);
-    bytes += bf16(n * cfg.hidden_size);
-    bytes += bf16(n * cfg.hidden_size);
-    bytes += bf16(n * (max_Hq + 2 * max_Hk));
-    bytes += bf16(n * (2 * max_intermediate));
-    bytes += fp32(n * cfg.head_dim);
-    bytes += bf16(n * max_Hq);
-    bytes += bf16(n * max_Hk);
-    bytes += bf16(n * max_Hk);
-    bytes += bf16(n * max_Hq);
-    bytes += bf16(n * cfg.hidden_size);
-    bytes += bf16(n * max_intermediate);
-    bytes += bf16(n * max_intermediate);
-    bytes += bf16(o * cfg.vocab_size);
-    bytes += fp32(o * cfg.vocab_size);
-    if (cfg.head_dim != cfg.head_dim_kernel) {
-        const int q_heads = max_Hq / std::max(1, cfg.head_dim);
-        const int kv_heads = max_Hk / std::max(1, cfg.head_dim);
-        const int Hq_pad = q_heads * cfg.head_dim_kernel;
-        const int Hk_pad = kv_heads * cfg.head_dim_kernel;
-        bytes += bf16(n * Hq_pad);
-        bytes += bf16(n * Hk_pad);
-        bytes += bf16(n * Hk_pad);
-        bytes += bf16(n * Hq_pad);
-    }
-    return bytes;
 }
 
 }  // namespace pie_cuda_driver::model

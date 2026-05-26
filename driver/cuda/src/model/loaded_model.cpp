@@ -11,10 +11,8 @@
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
-#include "ops/gemm.hpp"
 #include "loader/rust_loader_bridge.hpp"
 #include "loader/rust_storage_executor.hpp"
-#include "tensor.hpp"
 
 namespace pie_cuda_driver {
 
@@ -39,7 +37,7 @@ bool supports_tp(const std::string& mt) {
         || mt == "qwen3_5" || mt == "qwen3_5_text"
         || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
         || mt == "qwen3_moe"
-        || mt == "nemotron_h";
+        || mt == "kimi_k2";
 }
 
 // True for any MoE model whose forward path lives in qwen3_5_moe_forward.
@@ -82,53 +80,6 @@ Mxfp4MoeLowering select_mxfp4_moe_lowering(
         "{auto,routed_dequant,packed,bf16,dequant,eager_bf16,native}");
 }
 
-struct LoadMemorySampler {
-    LoadExecutionStats* stats = nullptr;
-
-    static void sample(void* context) noexcept {
-        auto* self = static_cast<LoadMemorySampler*>(context);
-        if (self == nullptr || self->stats == nullptr) return;
-        std::size_t free_bytes = 0;
-        std::size_t total_bytes = 0;
-        if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess) return;
-        auto& s = *self->stats;
-        if (s.cuda_memory_samples == 0) {
-            s.cuda_free_before_bytes = free_bytes;
-            s.cuda_min_free_bytes = free_bytes;
-            s.cuda_total_bytes = total_bytes;
-        } else {
-            s.cuda_min_free_bytes = std::min<std::uint64_t>(
-                s.cuda_min_free_bytes, free_bytes);
-        }
-        s.cuda_total_bytes = total_bytes;
-        s.cuda_memory_samples += 1;
-    }
-};
-
-class ScopedDeviceTensorMemoryCallback {
-public:
-    explicit ScopedDeviceTensorMemoryCallback(LoadMemorySampler* sampler)
-        : enabled_(sampler != nullptr)
-    {
-        if (enabled_) {
-            set_device_tensor_memory_callback(&LoadMemorySampler::sample, sampler);
-        }
-    }
-
-    ScopedDeviceTensorMemoryCallback(const ScopedDeviceTensorMemoryCallback&) = delete;
-    ScopedDeviceTensorMemoryCallback& operator=(
-        const ScopedDeviceTensorMemoryCallback&) = delete;
-
-    ~ScopedDeviceTensorMemoryCallback() {
-        if (enabled_) {
-            set_device_tensor_memory_callback(nullptr, nullptr);
-        }
-    }
-
-private:
-    bool enabled_ = false;
-};
-
 }  // namespace
 
 LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
@@ -143,9 +94,21 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     LoadedModel e;
     e.boot_ = boot_cfg;
     const bool verbose = boot_cfg.runtime.verbose;
+    const auto load_start = std::chrono::steady_clock::now();
+    auto log_stage = [&](const char* stage) {
+        if (!verbose) return;
+        const auto now = std::chrono::steady_clock::now();
+        const double ms =
+            std::chrono::duration<double, std::milli>(now - load_start).count();
+        std::cerr << "[pie-driver-cuda] load stage rank="
+                  << boot_cfg.distributed.tp_rank << " +" << static_cast<int>(ms)
+                  << "ms: " << stage << "\n";
+    };
 
     const std::filesystem::path snapshot{boot_cfg.model.snapshot_dir};
+    log_stage("parse hf config begin");
     e.hf_ = parse_hf_config(snapshot / "config.json");
+    log_stage("parse hf config done");
 
     // Bind to the requested CUDA device before we allocate anything.
     int dev_id = 0;
@@ -194,7 +157,9 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
     e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
 
+    log_stage("open safetensors begin");
     auto loader = SafetensorsCheckpointSource::open(snapshot);
+    log_stage("open safetensors done");
 
     const int tp_size = boot_cfg.distributed.tp_size;
     const int tp_rank = boot_cfg.distributed.tp_rank;
@@ -226,10 +191,19 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         // MLP lives entirely in `moe_intermediate_size` (+ `shared_expert_
         // intermediate_size` for the 3.5/3.6 family — Qwen3-MoE has no
         // shared expert).
+        const bool is_kimi_k2 = hf.model_type == "kimi_k2";
         const bool is_q35_moe = is_qwen3_5_moe_arch(hf.model_type);
-        const bool is_nemotron_h = hf.model_type == "nemotron_h";
-        if (!is_q35_moe) {
+        if (!is_q35_moe && !is_kimi_k2) {
             require_divisible(hf.intermediate_size, "intermediate_size");
+        }
+        if (is_kimi_k2) {
+            require_divisible(hf.q_lora_rank, "q_lora_rank");
+            require_divisible(hf.kv_lora_rank, "kv_lora_rank");
+            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
+            if (hf.shared_expert_intermediate_size > 0) {
+                require_divisible(hf.shared_expert_intermediate_size,
+                                  "shared_expert_intermediate_size");
+            }
         }
         // Qwen3.5 / 3.6-MoE: linear-attention head counts must shard too.
         // Qwen3-MoE has no linear-attn layers, so this check is skipped.
@@ -241,7 +215,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             require_divisible(hf.linear_num_key_heads, "linear_num_key_heads");
             require_divisible(hf.linear_num_value_heads, "linear_num_value_heads");
         }
-        if (is_q35_moe || is_nemotron_h) {
+        if (is_q35_moe) {
             require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
             // shared_expert_intermediate_size is 0 for Qwen3-MoE (no shared
             // expert); only enforce divisibility when the family actually
@@ -270,12 +244,14 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     if (runtime_quant == "fp8" && !fp8_native) {
         runtime_quant.clear();
     }
+    log_stage("compile rust loader plan begin");
     RustLoaderCompileResult rust_plan =
         compile_rust_loader_plan_from_metadata(
             e.hf_, loader, runtime_quant, tp_rank, tp_size,
             64ull * 1024ull * 1024ull,
             /*preferred_alignment=*/256,
             backend_target);
+    log_stage("compile rust loader plan done");
     const auto rust_view = rust_plan.program.view();
     if (const char* dump_path =
             std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
@@ -319,43 +295,10 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         rust_builder,
         std::move(rust_plan.source_tensor_names),
         std::move(rust_plan.quant_attachments));
-    LoadExecutionStats load_memory_stats;
-    const bool sample_load_memory =
-        verbose || std::getenv("PIE_CUDA_PROFILE_LOAD_MEMORY") != nullptr;
-    LoadMemorySampler load_memory_sampler{.stats = &load_memory_stats};
-    if (sample_load_memory) {
-        LoadMemorySampler::sample(&load_memory_sampler);
-    }
-    LoadExecutionStats materialized;
-    {
-        ScopedDeviceTensorMemoryCallback callback(
-            sample_load_memory ? &load_memory_sampler : nullptr);
-        materialized = rust_executor.execute(rust_view);
-    }
+    log_stage("materialize storage program begin");
+    LoadExecutionStats materialized = rust_executor.execute(rust_view);
     CUDA_CHECK(cudaDeviceSynchronize());
-    if (sample_load_memory) {
-        std::size_t free_after = 0;
-        std::size_t total_after = 0;
-        CUDA_CHECK(cudaMemGetInfo(&free_after, &total_after));
-        load_memory_stats.cuda_free_after_bytes = free_after;
-        load_memory_stats.cuda_total_bytes = total_after;
-        if (load_memory_stats.cuda_memory_samples > 0 &&
-            load_memory_stats.cuda_free_before_bytes >=
-                load_memory_stats.cuda_min_free_bytes) {
-            load_memory_stats.cuda_actual_peak_delta_bytes =
-                load_memory_stats.cuda_free_before_bytes -
-                load_memory_stats.cuda_min_free_bytes;
-        }
-        materialized.cuda_total_bytes = load_memory_stats.cuda_total_bytes;
-        materialized.cuda_free_before_bytes =
-            load_memory_stats.cuda_free_before_bytes;
-        materialized.cuda_min_free_bytes = load_memory_stats.cuda_min_free_bytes;
-        materialized.cuda_free_after_bytes =
-            load_memory_stats.cuda_free_after_bytes;
-        materialized.cuda_actual_peak_delta_bytes =
-            load_memory_stats.cuda_actual_peak_delta_bytes;
-        materialized.cuda_memory_samples = load_memory_stats.cuda_memory_samples;
-    }
+    log_stage("materialize storage program done");
 
     if (verbose && materialized.runtime_quantized_weights > 0) {
         const double mib_before =
@@ -397,6 +340,36 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                   << to_mib(materialized.cuda_free_after_bytes)
                   << " MiB across "
                   << materialized.cuda_memory_samples << " samples\n";
+    }
+    if (const char* profile = std::getenv("PIE_WEIGHT_LOADER_PROFILE");
+        profile != nullptr && profile[0] != '\0' && profile[0] != '0') {
+        const auto to_mib = [](std::uint64_t bytes) {
+            return bytes / (1024ull * 1024ull);
+        };
+        std::cerr << "[pie-driver-cuda] weight loader profile: h2d_copies="
+                  << materialized.h2d_copy_count
+                  << " bulk_copies=" << materialized.h2d_bulk_copy_count
+                  << " pinned_copies="
+                  << materialized.h2d_pinned_copy_count
+                  << " slab_scatter="
+                  << materialized.slab_scatter_count
+                  << " slab_placements="
+                  << materialized.slab_scatter_placements
+                  << " h2d_bytes=" << to_mib(materialized.h2d_copy_bytes)
+                  << " MiB bulk_bytes="
+                  << to_mib(materialized.h2d_bulk_copy_bytes)
+                  << " MiB pinned_bytes="
+                  << to_mib(materialized.h2d_pinned_copy_bytes)
+                  << " MiB slab_source_bytes="
+                  << to_mib(materialized.slab_scatter_source_bytes)
+                  << " MiB slab_payload_bytes="
+                  << to_mib(materialized.slab_scatter_payload_bytes)
+                  << " MiB copy_flushes="
+                  << materialized.copy_stream_flushes
+                  << " batch_calls="
+                  << materialized.h2d_batch_calls
+                  << " max_pending="
+                  << materialized.max_pending_copies_seen << "\n";
     }
 
     e.weights_.validate_quant_metadata();
@@ -452,46 +425,8 @@ const DeviceTensor& LoadedModel::get(const std::string& name) const {
     return weights_.get(name);
 }
 
-std::size_t LoadedModel::erase_runtime_weight(const std::string& name) {
-    return weights_.erase_runtime_weight(name);
-}
-
 std::optional<QuantMeta> LoadedModel::quant_meta(const std::string& name) const {
     return weights_.quant_meta(name);
-}
-
-ops::RuntimeQuantScratchSpec runtime_quant_scratch_spec(const LoadedModel& engine,
-                                                       std::size_t max_tokens) {
-    ops::RuntimeQuantScratchSpec spec;
-    spec.max_tokens = max_tokens;
-
-    const auto& store = engine.weight_store();
-    for (const auto& item : store.quant_meta_map()) {
-        const auto& name = item.first;
-        auto it = store.find(name);
-        if (it == store.end()) continue;
-        const auto& tensor = it->second.tensor;
-        if (tensor.shape().size() != 2) continue;
-
-        if (tensor.dtype() == DType::FP8_E4M3) {
-            spec.has_fp8 = true;
-        } else if (tensor.dtype() == DType::INT8) {
-            spec.has_int8 = true;
-        } else {
-            continue;
-        }
-
-        spec.max_weight_rows = std::max<std::size_t>(
-            spec.max_weight_rows,
-            static_cast<std::size_t>(std::max<std::int64_t>(
-                0, tensor.shape()[0])));
-        spec.max_weight_cols = std::max<std::size_t>(
-            spec.max_weight_cols,
-            static_cast<std::size_t>(std::max<std::int64_t>(
-                0, tensor.shape()[1])));
-    }
-
-    return spec;
 }
 
 }  // namespace pie_cuda_driver

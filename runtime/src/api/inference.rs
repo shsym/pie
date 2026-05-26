@@ -22,7 +22,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
-use tokio::sync::oneshot::error::TryRecvError;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 use wasmtime_wasi::async_trait;
@@ -215,8 +214,7 @@ impl FutureOutput {
             }
         }
         if !all_fill_tokens.is_empty() {
-            let driver_repaired_spec_tail = self.spec_tokens_for_fill.len() as u32;
-            context::append_working_page_tokens_with_repaired_spec_tail(
+            context::append_working_page_tokens(
                 self.model_id,
                 context_id,
                 all_fill_tokens,
@@ -224,7 +222,6 @@ impl FutureOutput {
                 all_fill_masks,
                 self.adapter_id,
                 self.adapter_seed,
-                driver_repaired_spec_tail,
             );
         }
     }
@@ -285,7 +282,9 @@ impl Pollable for FutureOutput {
             let output = rx.await;
             self.rx = None;
             match output {
-                Ok(Ok(resp)) => self.finish_ok(resp),
+                Ok(Ok(resp)) => {
+                    self.finish_ok(resp);
+                }
                 Ok(Err(e)) => {
                     tracing::warn!("future output failed: {e:#}");
                     self.finish_empty();
@@ -295,9 +294,7 @@ impl Pollable for FutureOutput {
                 }
             }
         } else {
-            // Another readiness probe may have already drained rx and
-            // be finishing lineage/result population. Treat rx=None while
-            // done=false as in-progress rather than completing empty.
+            self.done = true;
         }
     }
 }
@@ -319,20 +316,26 @@ fn build_wit_output(
 ) -> pie::core::inference::Output {
     use pie::core::inference::SlotOutput as WitSlot;
 
+    // Spec channel: pie historically returned `spec_tokens` /
+    // `spec_positions` inline; the schema's ForwardResponse doesn't
+    // surface them as separate fields, so they default to empty.
+    let spec_tokens: Vec<u32> = Vec::new();
+    let spec_positions: Vec<u32> = Vec::new();
+
     match output {
         ForwardOutput::Token(token) => {
             return pie::core::inference::Output {
                 slots: vec![WitSlot::Token(token)],
-                spec_tokens: Vec::new(),
-                spec_positions: Vec::new(),
+                spec_tokens,
+                spec_positions,
             };
         }
         ForwardOutput::Tokens(tokens) => {
             let slots = tokens.into_iter().map(WitSlot::Token).collect();
             return pie::core::inference::Output {
                 slots,
-                spec_tokens: Vec::new(),
-                spec_positions: Vec::new(),
+                spec_tokens,
+                spec_positions,
             };
         }
         ForwardOutput::Response(resp) => build_wit_output_from_response(resp, samplers),
@@ -346,16 +349,8 @@ fn build_wit_output_from_response(
     use pie::core::inference::SlotOutput as WitSlot;
     use pie_bridge::Sampler;
 
-    let (spec_tokens, spec_positions): (Vec<u32>, Vec<u32>) = if resp.spec_indptr.len() >= 2 {
-        let lo = resp.spec_indptr[0] as usize;
-        let hi = resp.spec_indptr[1] as usize;
-        (
-            resp.spec_tokens.get(lo..hi).unwrap_or(&[]).to_vec(),
-            resp.spec_positions.get(lo..hi).unwrap_or(&[]).to_vec(),
-        )
-    } else {
-        (resp.spec_tokens.clone(), resp.spec_positions.clone())
-    };
+    let spec_tokens: Vec<u32> = Vec::new();
+    let spec_positions: Vec<u32> = Vec::new();
 
     let token_payload_only = resp.dists_ids.is_empty()
         && resp.dists_probs.is_empty()
@@ -670,7 +665,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         // can append the verified-prefix to the working-page lineage once
         // the response tells us how many drafts were accepted.
         let num_input_tokens = req.token_ids.len();
-        let num_spec_tokens = req.spec_token_ids.len();
         let fill_tokens = req.token_ids.clone();
         let fill_positions = req.position_ids.clone();
         let fill_masks = if has_user_mask {
@@ -702,7 +696,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
         let try_hit_start = profiling.then(Instant::now);
         let staged_rx = spec_handle
             .as_ref()
-            .filter(|_| use_pass_speculation)
+            .filter(|_| use_pass_speculation && req.spec_token_ids.is_empty())
             .and_then(|s| inference::try_hit(s, context_id, &req, allow_pass_speculation));
         if let Some(start) = try_hit_start {
             profile_sample.try_hit_us = elapsed_us(start.elapsed());
@@ -741,8 +735,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
 
             // Cold path: pin, validate page capacity, submit.
             let pin_start = profiling.then(Instant::now);
-            let writable_tokens = num_input_tokens.saturating_add(num_spec_tokens);
-            let pinned = match context::pin(model_id, context_id, writable_tokens as u32).await {
+            let pinned = match context::pin(model_id, context_id, num_input_tokens as u32).await {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!("pin failed for ctx {context_id}: {e:#}");
@@ -753,6 +746,7 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 profile_sample.pin_us = elapsed_us(start.elapsed());
             }
             let kv_len = pinned.kv_len;
+            let last_page_len = pinned.last_page_len;
             let driver_id = pinned.driver;
             let physical_page_ids = pinned.pages;
             let extra_pages = pinned.extra_pages;
@@ -763,38 +757,21 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                         "rs_cache models do not support speculative draft tokens yet".to_string(),
                     ));
                 }
-                // Recurrent-state-cache models cannot currently use the
-                // driver-provided speculative-token side channel. Leaving the
-                // request flag set only forces dense-logit scheduling and
-                // fragments prompt batching.
-                req.output_spec_flags = vec![false];
                 req.rs_slot_ids = vec![rs_slot];
                 req.rs_slot_flags = vec![pinned.rs_flags];
             }
 
             let num_pages = physical_page_ids.len() as u32;
             let page_size = context::tokens_per_page(model_id);
-            let post_input_total_kv = kv_len + num_input_tokens as u32;
-            let writable_total_kv = kv_len + writable_tokens as u32;
-            let last_page_len = if num_pages == 0 {
-                0
-            } else {
-                let r = post_input_total_kv % page_size;
-                if r == 0 { page_size } else { r }
-            };
-            let active_page_idx = post_input_total_kv
-                .saturating_add(page_size.saturating_sub(1))
-                .checked_div(page_size)
-                .and_then(|pages| pages.checked_sub(1))
-                .map(|idx| idx as usize);
+            let total_kv = kv_len + num_input_tokens as u32;
 
             // INVARIANT: total_kv must fit within the allocated pages.
             let page_capacity = num_pages * page_size;
-            if writable_total_kv > page_capacity || num_pages == 0 {
+            if total_kv > page_capacity || num_pages == 0 {
                 let msg = format!(
-                    "KV_INVARIANT_VIOLATION ctx={context_id} total_kv={writable_total_kv} \
+                    "KV_INVARIANT_VIOLATION ctx={context_id} total_kv={total_kv} \
                      page_capacity={page_capacity} num_pages={num_pages} \
-                     kv_len={kv_len} num_input={num_input_tokens} num_spec={num_spec_tokens} page_size={page_size} \
+                     kv_len={kv_len} num_input={num_input_tokens} page_size={page_size} \
                      phys_ids={physical_page_ids:?}"
                 );
                 eprintln!("{msg}");
@@ -811,7 +788,6 @@ impl pie::core::inference::HostForwardPass for InstanceState {
                 physical_page_ids,
                 extra_pages,
                 last_page_len,
-                active_page_idx,
                 allow_pass_speculation,
             );
             if let Some(start) = submit_start {
@@ -875,26 +851,6 @@ impl pie::core::inference::HostFutureOutput for InstanceState {
         this: Resource<FutureOutput>,
     ) -> Result<Option<pie::core::inference::Output>> {
         let result = self.ctx().table.get_mut(&this)?;
-        if !result.done {
-            if let Some(rx) = result.rx.as_mut() {
-                match rx.try_recv() {
-                    Ok(Ok(resp)) => {
-                        result.rx = None;
-                        result.finish_ok(resp);
-                    }
-                    Ok(Err(e)) => {
-                        result.rx = None;
-                        tracing::warn!("future output failed: {e:#}");
-                        result.finish_empty();
-                    }
-                    Err(TryRecvError::Closed) => {
-                        result.rx = None;
-                        result.finish_empty();
-                    }
-                    Err(TryRecvError::Empty) => {}
-                }
-            }
-        }
         if result.done {
             Ok(take(&mut result.result))
         } else {

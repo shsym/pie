@@ -103,6 +103,38 @@ impl RuntimeAbi {
             tensors: Vec::new(),
         };
         builder.build()?;
+        let sharded = builder
+            .tensors
+            .iter()
+            .filter(|contract| contract.shard_axis.is_some())
+            .count();
+        let (total_bytes, sharded_bytes) =
+            builder.tensors.iter().fold((0_u64, 0_u64), |(total, sharded), contract| {
+                let bytes = metadata
+                    .tensor(match contract.source {
+                        RuntimeTensorSource::DirectTensor(id) => id,
+                        RuntimeTensorSource::Repack { tensor, .. } => tensor,
+                        _ => TensorId(u32::MAX),
+                    })
+                    .map(|raw| raw.span_bytes)
+                    .unwrap_or(0);
+                (
+                    total.saturating_add(bytes),
+                    sharded.saturating_add(if contract.shard_axis.is_some() { bytes } else { 0 }),
+                )
+            });
+        if std::env::var_os("PIE_WEIGHT_LOADER_DEBUG").is_some() {
+            eprintln!(
+                "[pie-weight-loader] default ABI model_type={} tp={}/{} tensors={} sharded={} bytes={} sharded_bytes={}",
+                cfg.model_type,
+                target.tp_rank,
+                target.tp_size,
+                builder.tensors.len(),
+                sharded,
+                total_bytes,
+                sharded_bytes
+            );
+        }
         Ok(Self {
             name: match target.backend {
                 crate::types::BackendKind::Cuda => "pie-cuda".to_string(),
@@ -113,6 +145,275 @@ impl RuntimeAbi {
             tensors: builder.tensors,
         })
     }
+
+    pub fn coalesce_direct_row_shards(
+        &self,
+        metadata: &CheckpointMetadata,
+        target: &StorageTarget,
+    ) -> Result<Self, CompileError> {
+        if target.tp_size <= 1 {
+            return Ok(self.clone());
+        }
+
+        const MIN_GROUP_TENSORS: usize = 16;
+        const DEFAULT_MAX_BANK_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+        let max_bank_bytes = std::env::var("PIE_WEIGHT_LOADER_MAX_BANK_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_MAX_BANK_BYTES);
+
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct GroupKey {
+            shape: Vec<i64>,
+            encoding: Encoding,
+            dtype: DType,
+            layout: Layout,
+            alignment: u32,
+        }
+
+        let mut buckets: Vec<(GroupKey, Vec<usize>)> = Vec::new();
+        let mut local_bytes_by_index = vec![0_u64; self.tensors.len()];
+        for (index, contract) in self.tensors.iter().enumerate() {
+            if contract.shard_axis != Some(Axis(0))
+                || !contract.metadata.is_empty()
+                || contract.shape.len() != 2
+                || contract.shape[0] <= 0
+                || contract.shape[1] <= 0
+            {
+                continue;
+            }
+            let RuntimeTensorSource::DirectTensor(tensor_id) = contract.source else {
+                continue;
+            };
+            let Some(raw) = metadata.tensor(tensor_id) else {
+                continue;
+            };
+            if raw.shape != contract.shape || raw.encoding != contract.encoding {
+                continue;
+            }
+            let elem = match dense_element_bytes(raw, "direct row shard coalescing") {
+                Ok(elem) => elem,
+                Err(_) => continue,
+            };
+            let (_, local_rows) = local_range(contract.shape[0], target)?;
+            let row_bytes = checked_mul_i64(
+                contract.shape[1],
+                elem,
+                "direct row shard coalescing row bytes",
+            )?;
+            local_bytes_by_index[index] = checked_mul_i64(
+                local_rows,
+                row_bytes,
+                "direct row shard coalescing local bytes",
+            )?;
+            let key = GroupKey {
+                shape: contract.shape.clone(),
+                encoding: contract.encoding.clone(),
+                dtype: contract.dtype,
+                layout: contract.layout.clone(),
+                alignment: contract.alignment,
+            };
+            if let Some((_, indices)) = buckets
+                .iter_mut()
+                .find(|(candidate, _)| *candidate == key)
+            {
+                indices.push(index);
+            } else {
+                buckets.push((key, vec![index]));
+            }
+        }
+
+        let mut group_for = vec![None; self.tensors.len()];
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (_, indices) in &buckets {
+            let mut chunk = Vec::new();
+            let mut chunk_bytes = 0_u64;
+            for &index in indices {
+                let tensor_bytes = local_bytes_by_index[index];
+                if !chunk.is_empty()
+                    && chunk_bytes.saturating_add(tensor_bytes) > max_bank_bytes
+                    && chunk.len() >= MIN_GROUP_TENSORS
+                {
+                    let group_id = groups.len();
+                    for &member in &chunk {
+                        group_for[member] = Some(group_id);
+                    }
+                    groups.push(std::mem::take(&mut chunk));
+                    chunk_bytes = 0;
+                }
+                chunk.push(index);
+                chunk_bytes = chunk_bytes.saturating_add(tensor_bytes);
+            }
+            if chunk.len() >= MIN_GROUP_TENSORS {
+                let group_id = groups.len();
+                for &member in &chunk {
+                    group_for[member] = Some(group_id);
+                }
+                groups.push(chunk);
+            }
+        }
+
+        if groups.is_empty() {
+            return Ok(self.clone());
+        }
+
+        if std::env::var_os("PIE_WEIGHT_LOADER_DEBUG").is_some() {
+            let coalesced = groups.iter().map(Vec::len).sum::<usize>();
+            eprintln!(
+                "[pie-weight-loader] row-shard coalescing groups={} tensors={} max_bank_bytes={}",
+                groups.len(),
+                coalesced,
+                max_bank_bytes
+            );
+        }
+
+        let mut emitted_groups = vec![false; groups.len()];
+        let mut old_to_new = vec![usize::MAX; self.tensors.len()];
+        let mut new_tensors = Vec::with_capacity(self.tensors.len() + groups.len());
+
+        for old_index in 0..self.tensors.len() {
+            if let Some(group_id) = group_for[old_index] {
+                if emitted_groups[group_id] {
+                    continue;
+                }
+                emitted_groups[group_id] = true;
+                self.emit_row_shard_bank(
+                    metadata,
+                    target,
+                    group_id,
+                    &groups[group_id],
+                    &mut old_to_new,
+                    &mut new_tensors,
+                )?;
+                continue;
+            }
+
+            let mut contract = self.tensors[old_index].clone();
+            remap_select_contract(&mut contract.source, &old_to_new)?;
+            old_to_new[old_index] = new_tensors.len();
+            new_tensors.push(contract);
+        }
+
+        Ok(Self {
+            name: self.name.clone(),
+            version: self.version,
+            tensors: new_tensors,
+        })
+    }
+
+    fn emit_row_shard_bank(
+        &self,
+        metadata: &CheckpointMetadata,
+        target: &StorageTarget,
+        group_id: usize,
+        indices: &[usize],
+        old_to_new: &mut [usize],
+        new_tensors: &mut Vec<RuntimeTensorContract>,
+    ) -> Result<(), CompileError> {
+        let first = &self.tensors[indices[0]];
+        let rows = first.shape[0];
+        let cols = first.shape[1];
+        let first_raw = direct_raw(metadata, first)?;
+        let elem = dense_element_bytes(first_raw, "direct row shard coalescing")?;
+        let (local_start, local_rows) = local_range(rows, target)?;
+        let row_bytes = checked_mul_i64(cols, elem, "direct row shard coalescing row bytes")?;
+        let local_bytes = checked_mul_i64(
+            local_rows,
+            row_bytes,
+            "direct row shard coalescing local bytes",
+        )?;
+
+        let mut spans = Vec::with_capacity(indices.len());
+        for (slot, &old_index) in indices.iter().enumerate() {
+            let raw = direct_raw(metadata, &self.tensors[old_index])?;
+            spans.push(RuntimeByteSpan {
+                tensor: raw.id,
+                source_offset_bytes: checked_mul_i64(
+                    local_start,
+                    row_bytes,
+                    "direct row shard coalescing source offset",
+                )?,
+                dest_offset_bytes: checked_mul_u64(
+                    slot as u64,
+                    local_bytes,
+                    "direct row shard coalescing destination offset",
+                )?,
+                span_bytes: local_bytes,
+            });
+        }
+
+        let bank_index = new_tensors.len();
+        new_tensors.push(RuntimeTensorContract {
+            output_name: format!("__pie.row_shard_bank.{group_id}"),
+            source: RuntimeTensorSource::ByteSpans(spans),
+            metadata: Vec::new(),
+            dtype: first.dtype,
+            encoding: first.encoding.clone(),
+            shape: vec![local_rows * indices.len() as i64, cols],
+            layout: first.layout.clone(),
+            sharding: Sharding::replicated(),
+            alignment: first.alignment,
+            shard_axis: None,
+        });
+
+        for (slot, &old_index) in indices.iter().enumerate() {
+            let original = &self.tensors[old_index];
+            old_to_new[old_index] = new_tensors.len();
+            new_tensors.push(RuntimeTensorContract {
+                output_name: original.output_name.clone(),
+                source: RuntimeTensorSource::SelectContract {
+                    contract: bank_index,
+                    axis: Axis(0),
+                    start: slot as i64 * local_rows,
+                    length: local_rows,
+                },
+                metadata: Vec::new(),
+                dtype: original.dtype,
+                encoding: original.encoding.clone(),
+                shape: vec![local_rows, cols],
+                layout: original.layout.clone(),
+                sharding: Sharding::replicated(),
+                alignment: original.alignment,
+                shard_axis: None,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn remap_select_contract(
+    source: &mut RuntimeTensorSource,
+    old_to_new: &[usize],
+) -> Result<(), CompileError> {
+    if let RuntimeTensorSource::SelectContract { contract, .. } = source {
+        let mapped = old_to_new.get(*contract).copied().unwrap_or(usize::MAX);
+        if mapped == usize::MAX {
+            return Err(CompileError::InvalidInput(format!(
+                "SelectContract references contract {contract} before it has been lowered"
+            )));
+        }
+        *contract = mapped;
+    }
+    Ok(())
+}
+
+fn direct_raw<'a>(
+    metadata: &'a CheckpointMetadata,
+    contract: &RuntimeTensorContract,
+) -> Result<&'a RawTensor, CompileError> {
+    let RuntimeTensorSource::DirectTensor(tensor_id) = contract.source else {
+        return Err(CompileError::InvalidInput(format!(
+            "runtime tensor '{}' is not a direct tensor",
+            contract.output_name
+        )));
+    };
+    metadata.tensor(tensor_id).ok_or_else(|| {
+        CompileError::InvalidInput(format!(
+            "runtime tensor '{}' references missing source tensor {}",
+            contract.output_name, tensor_id.0
+        ))
+    })
 }
 
 struct DefaultAbiBuilder<'a> {
@@ -137,10 +438,13 @@ impl DefaultAbiBuilder<'_> {
         self.add_phi3_fused_splits()?;
         self.add_gpt_oss_mxfp4_groups()?;
         self.add_fused_moe_gate_up_tp_slices()?;
-        self.add_nemotron_h_packed_expert_views()?;
         self.add_dense_fused_projection_joins(runtime_quant.is_some())?;
+        self.add_mla_fused_projection_joins()?;
         for raw in &self.metadata.tensors {
             if self.consumed.contains(&raw.id) {
+                continue;
+            }
+            if !self.source_name_allowed(&raw.name) {
                 continue;
             }
             if let Some(scheme) = runtime_quant
@@ -148,10 +452,33 @@ impl DefaultAbiBuilder<'_> {
             {
                 self.push_runtime_quant(raw, raw.name.clone(), scheme)?;
             } else {
-                self.push_direct(raw, raw.name.clone(), self.shard_axis(&raw.name));
+                self.push_direct(raw, self.output_name(&raw.name), self.shard_axis(&raw.name));
             }
         }
         Ok(())
+    }
+
+    fn source_name_allowed(&self, raw_name: &str) -> bool {
+        if let Some(prefix) = self.primary_source_prefix() {
+            return raw_name.starts_with(prefix);
+        }
+        true
+    }
+
+    fn primary_source_prefix(&self) -> Option<&'static str> {
+        match self.cfg.model_type.as_str() {
+            "kimi_k2" | "kimi_k25" => Some("language_model."),
+            _ => None,
+        }
+    }
+
+    fn output_name(&self, raw_name: &str) -> String {
+        if matches!(self.cfg.model_type.as_str(), "kimi_k2" | "kimi_k25")
+            && let Some(stripped) = raw_name.strip_prefix("language_model.")
+        {
+            return stripped.to_string();
+        }
+        raw_name.to_string()
     }
 
     fn add_dense_fused_projection_joins(
@@ -251,6 +578,66 @@ impl DefaultAbiBuilder<'_> {
             });
         }
 
+        Ok(())
+    }
+
+    fn add_mla_fused_projection_joins(&mut self) -> Result<(), CompileError> {
+        if self.target.backend != BackendKind::Cuda {
+            return Ok(());
+        }
+        let is_mla = matches!(
+            self.cfg.model_type.as_str(),
+            "kimi_k2" | "kimi_k25" | "deepseek_v2" | "deepseek_v3"
+        );
+        if !is_mla {
+            return Ok(());
+        }
+
+        let mut candidates = Vec::new();
+        for layer in 0..self.cfg.num_hidden_layers {
+            let p = format!("model.layers.{layer}.");
+            // Fuse q_a_proj + kv_a_proj_with_mqa (same input: norm_x, unsharded)
+            if let Some(c) = self.fused_join_candidate(
+                &(p.clone() + "self_attn.q_kv_a_proj.fused.weight"),
+                &[
+                    p.clone() + "self_attn.q_a_proj.weight",
+                    p.clone() + "self_attn.kv_a_proj_with_mqa.weight",
+                ],
+            )? {
+                candidates.push(c);
+            }
+            // Fuse shared gate + up (same input: norm_y)
+            if let Some(c) = self.fused_join_candidate(
+                &(p.clone() + "mlp.shared_experts.gate_up_proj.fused.weight"),
+                &[
+                    p.clone() + "mlp.shared_experts.gate_proj.weight",
+                    p.clone() + "mlp.shared_experts.up_proj.weight",
+                ],
+            )? {
+                candidates.push(c);
+            }
+        }
+
+        for candidate in candidates {
+            for tensor in &candidate.tensors {
+                self.consumed.insert(*tensor);
+            }
+            self.tensors.push(RuntimeTensorContract {
+                output_name: candidate.output_name,
+                source: RuntimeTensorSource::Join {
+                    tensors: candidate.tensors,
+                    axis: Axis(0),
+                },
+                metadata: Vec::new(),
+                dtype: DType::BF16,
+                encoding: Encoding::Raw(DType::BF16),
+                shape: vec![candidate.rows, candidate.cols],
+                layout: Layout::dense(self.alignment()),
+                sharding: Sharding::replicated(),
+                alignment: self.alignment(),
+                shard_axis: None,
+            });
+        }
         Ok(())
     }
 
@@ -590,213 +977,6 @@ impl DefaultAbiBuilder<'_> {
         Ok(())
     }
 
-    fn add_nemotron_h_packed_expert_views(&mut self) -> Result<(), CompileError> {
-        if self.target.backend != BackendKind::Cuda
-            || !self.cfg.model_type.eq_ignore_ascii_case("nemotron_h")
-            || self.cfg.num_experts == 0
-        {
-            return Ok(());
-        }
-
-        for layer in 0..self.cfg.num_hidden_layers {
-            let base = format!("language_model.backbone.layers.{layer}.mixer.experts");
-            let up_name = format!("{base}.up_proj.packed.weight");
-            let down_name = format!("{base}.down_proj.packed.weight");
-            if self.metadata.tensors.iter().any(|raw| raw.name == up_name)
-                || self
-                    .metadata
-                    .tensors
-                    .iter()
-                    .any(|raw| raw.name == down_name)
-            {
-                continue;
-            }
-
-            let mut up = Vec::with_capacity(self.cfg.num_experts as usize);
-            let mut down = Vec::with_capacity(self.cfg.num_experts as usize);
-            let mut complete = true;
-            for expert in 0..self.cfg.num_experts {
-                let prefix = format!("{base}.{expert}.");
-                let Some(up_raw) = self
-                    .metadata
-                    .tensors
-                    .iter()
-                    .find(|raw| raw.name == prefix.clone() + "up_proj.weight")
-                else {
-                    complete = false;
-                    break;
-                };
-                let Some(down_raw) = self
-                    .metadata
-                    .tensors
-                    .iter()
-                    .find(|raw| raw.name == prefix.clone() + "down_proj.weight")
-                else {
-                    complete = false;
-                    break;
-                };
-                up.push(up_raw);
-                down.push(down_raw);
-            }
-            if !complete {
-                continue;
-            }
-
-            self.add_nemotron_h_layer_packed_experts(&base, &up, &down)?;
-        }
-        Ok(())
-    }
-
-    fn add_nemotron_h_layer_packed_experts(
-        &mut self,
-        base: &str,
-        up: &[&RawTensor],
-        down: &[&RawTensor],
-    ) -> Result<(), CompileError> {
-        let Some(first_up) = up.first().copied() else {
-            return Ok(());
-        };
-        let Some(first_down) = down.first().copied() else {
-            return Ok(());
-        };
-        if first_up.shape.len() != 2
-            || first_down.shape.len() != 2
-            || first_up.encoding != Encoding::Raw(DType::BF16)
-            || first_down.encoding != Encoding::Raw(DType::BF16)
-        {
-            return Ok(());
-        }
-
-        let full_intermediate = first_up.shape[0];
-        let hidden = first_up.shape[1];
-        if first_down.shape[0] != hidden || first_down.shape[1] != full_intermediate {
-            return Ok(());
-        }
-        for raw in up {
-            if raw.shape != first_up.shape || raw.encoding != first_up.encoding {
-                return Ok(());
-            }
-        }
-        for raw in down {
-            if raw.shape != first_down.shape || raw.encoding != first_down.encoding {
-                return Ok(());
-            }
-        }
-
-        let elem = dense_element_bytes(first_up, "Nemotron-H expert")?;
-        let (local_start, local_intermediate) = local_range(full_intermediate, self.target)?;
-        let local_up_bytes = span_for_rows(local_intermediate, hidden, elem)?;
-        let expert_count = i64::try_from(up.len()).map_err(|_| {
-            CompileError::InvalidInput("Nemotron-H expert count does not fit i64".to_string())
-        })?;
-
-        let up_contract = self.tensors.len();
-        let mut up_spans = Vec::with_capacity(up.len());
-        for (expert, raw) in up.iter().enumerate() {
-            let expert = i64::try_from(expert).map_err(|_| {
-                CompileError::InvalidInput("Nemotron-H expert index does not fit i64".to_string())
-            })?;
-            up_spans.push(RuntimeByteSpan {
-                tensor: raw.id,
-                source_offset_bytes: span_for_rows(local_start, hidden, elem)?,
-                dest_offset_bytes: checked_mul_i64(
-                    expert,
-                    local_up_bytes,
-                    "Nemotron-H packed up destination offset",
-                )?,
-                span_bytes: local_up_bytes,
-            });
-        }
-        self.tensors.push(RuntimeTensorContract {
-            output_name: format!("{base}.up_proj.packed.weight"),
-            source: RuntimeTensorSource::ByteSpans(up_spans),
-            metadata: Vec::new(),
-            dtype: DType::BF16,
-            encoding: Encoding::Raw(DType::BF16),
-            shape: vec![expert_count * local_intermediate, hidden],
-            layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
-            alignment: self.alignment(),
-            shard_axis: None,
-        });
-
-        let down_contract = self.tensors.len();
-        self.tensors.push(RuntimeTensorContract {
-            output_name: format!("{base}.down_proj.packed.weight"),
-            source: RuntimeTensorSource::Join {
-                tensors: down.iter().map(|raw| raw.id).collect(),
-                axis: Axis(0),
-            },
-            metadata: Vec::new(),
-            dtype: DType::BF16,
-            encoding: Encoding::Raw(DType::BF16),
-            shape: vec![expert_count * hidden, full_intermediate],
-            layout: Layout::dense(self.alignment()),
-            sharding: Sharding::replicated(),
-            alignment: self.alignment(),
-            shard_axis: (self.target.tp_size > 1).then_some(Axis(1)),
-        });
-
-        for (expert, raw) in up.iter().enumerate() {
-            let expert = i64::try_from(expert).map_err(|_| {
-                CompileError::InvalidInput("Nemotron-H expert index does not fit i64".to_string())
-            })?;
-            self.tensors.push(RuntimeTensorContract {
-                output_name: raw.name.clone(),
-                source: RuntimeTensorSource::SelectContract {
-                    contract: up_contract,
-                    axis: Axis(0),
-                    start: expert * local_intermediate,
-                    length: local_intermediate,
-                },
-                metadata: Vec::new(),
-                dtype: DType::BF16,
-                encoding: Encoding::Raw(DType::BF16),
-                shape: vec![local_intermediate, hidden],
-                layout: Layout::dense(self.alignment()),
-                sharding: Sharding::replicated(),
-                alignment: self.alignment(),
-                shard_axis: None,
-            });
-            self.consumed.insert(raw.id);
-        }
-
-        for (expert, raw) in down.iter().enumerate() {
-            let expert = i64::try_from(expert).map_err(|_| {
-                CompileError::InvalidInput("Nemotron-H expert index does not fit i64".to_string())
-            })?;
-            let sharding = if self.target.tp_size > 1 {
-                Sharding {
-                    axis: Some(Axis(1)),
-                    world: self.target.tp_size,
-                    rank: self.target.tp_rank,
-                }
-            } else {
-                Sharding::replicated()
-            };
-            self.tensors.push(RuntimeTensorContract {
-                output_name: raw.name.clone(),
-                source: RuntimeTensorSource::SelectContract {
-                    contract: down_contract,
-                    axis: Axis(0),
-                    start: expert * hidden,
-                    length: hidden,
-                },
-                metadata: Vec::new(),
-                dtype: DType::BF16,
-                encoding: Encoding::Raw(DType::BF16),
-                shape: vec![hidden, local_intermediate],
-                layout: Layout::dense(self.alignment()),
-                sharding,
-                alignment: self.alignment(),
-                shard_axis: None,
-            });
-            self.consumed.insert(raw.id);
-        }
-
-        Ok(())
-    }
-
     fn add_gpt_oss_mxfp4_groups(&mut self) -> Result<(), CompileError> {
         if !self.cfg.model_type.eq_ignore_ascii_case("gpt_oss")
             && !self.cfg.model_type.eq_ignore_ascii_case("gpt-oss")
@@ -1067,6 +1247,16 @@ impl DefaultAbiBuilder<'_> {
         if self.target.tp_size <= 1 {
             return None;
         }
+        if matches!(self.cfg.model_type.as_str(), "kimi_k2" | "kimi_k25")
+            && name.ends_with(".embed_tokens.weight")
+        {
+            return Some(Axis(0));
+        }
+        if matches!(self.cfg.model_type.as_str(), "kimi_k2" | "kimi_k25")
+            && name.ends_with(".lm_head.weight")
+        {
+            return Some(Axis(0));
+        }
         llama_like_shard_axis(name)
     }
 
@@ -1197,6 +1387,28 @@ fn checked_mul_u64(lhs: u64, rhs: u64, context: &str) -> Result<u64, CompileErro
 }
 
 fn llama_like_shard_axis(name: &str) -> Option<Axis> {
+    if name.contains(".mlp.experts.") {
+        if ends_with_any(
+            name,
+            &[
+                ".gate_proj.weight_packed",
+                ".gate_proj.weight_scale",
+                ".up_proj.weight_packed",
+                ".up_proj.weight_scale",
+            ],
+        ) {
+            return Some(Axis(0));
+        }
+        if ends_with_any(
+            name,
+            &[
+                ".down_proj.weight_packed",
+                ".down_proj.weight_scale",
+            ],
+        ) {
+            return Some(Axis(1));
+        }
+    }
     if ends_with_any(
         name,
         &[
@@ -1228,6 +1440,8 @@ fn llama_like_shard_axis(name: &str) -> Option<Axis> {
             ".linear_attn.in_proj_a.weight",
             ".linear_attn.dt_bias",
             ".linear_attn.A_log",
+            ".self_attn.q_b_proj.weight",
+            ".self_attn.kv_b_proj.weight",
         ],
     ) {
         Some(Axis(0))

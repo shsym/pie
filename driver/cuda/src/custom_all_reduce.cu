@@ -28,27 +28,34 @@ namespace {
 void enable_peer_access(int self_device, int world_size) {
     for (int peer = 0; peer < world_size; ++peer) {
         if (peer == self_device) continue;
-        int can_access = 0;
-        const auto can_err = cudaDeviceCanAccessPeer(
-            &can_access, self_device, peer);
-        if (can_err != cudaSuccess || !can_access) {
-            throw std::runtime_error(
-                std::string("custom_all_reduce: peer access unavailable from ") +
-                std::to_string(self_device) + " to " + std::to_string(peer) +
-                (can_err == cudaSuccess
-                     ? ""
-                     : std::string(": ") + cudaGetErrorString(can_err)));
-        }
         const auto err = cudaDeviceEnablePeerAccess(peer, 0);
         if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
-            throw std::runtime_error(
-                std::string("custom_all_reduce: cudaDeviceEnablePeerAccess ") +
-                std::to_string(self_device) + "->" + std::to_string(peer) +
-                " failed: " + cudaGetErrorString(err));
+            // Fail open — the constructor will throw at the IPC step if
+            // peer access truly isn't available.
+            std::cerr << "[custom_all_reduce] cudaDeviceEnablePeerAccess "
+                      << self_device << "→" << peer
+                      << " failed: " << cudaGetErrorString(err) << "\n";
         }
         // Reset the sticky error.
         (void)cudaGetLastError();
     }
+}
+
+bool has_full_peer_access(int world_size) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess) return false;
+    if (device_count < world_size) return false;
+    for (int src = 0; src < world_size; ++src) {
+        for (int dst = 0; dst < world_size; ++dst) {
+            if (src == dst) continue;
+            int can_access = 0;
+            if (cudaDeviceCanAccessPeer(&can_access, src, dst) != cudaSuccess) {
+                return false;
+            }
+            if (!can_access) return false;
+        }
+    }
+    return true;
 }
 
 // Look up the base allocation address for `ptr`. The vllm kernel needs
@@ -89,95 +96,6 @@ std::size_t align_up(std::size_t n, std::size_t a) {
     return ((n + a - 1) / a) * a;
 }
 
-int env_int_clamped(const char* name, int fallback, int lo, int hi) {
-    const char* v = std::getenv(name);
-    if (v == nullptr || *v == '\0') return fallback;
-    char* end = nullptr;
-    const long parsed = std::strtol(v, &end, 10);
-    if (end == v) return fallback;
-    if (parsed < lo) return lo;
-    if (parsed > hi) return hi;
-    return static_cast<int>(parsed);
-}
-
-int env_warp_multiple_clamped(const char* name, int fallback, int lo, int hi) {
-    int value = env_int_clamped(name, fallback, lo, hi);
-    value = (value / 32) * 32;
-    if (value < lo) value = lo;
-    return value;
-}
-
-bool env_bool_default(const char* name, bool fallback) {
-    const char* v = std::getenv(name);
-    if (v == nullptr || *v == '\0') return fallback;
-    if (std::strcmp(v, "0") == 0 || std::strcmp(v, "false") == 0 ||
-        std::strcmp(v, "FALSE") == 0) {
-        return false;
-    }
-    return true;
-}
-
-template <int BLOCK>
-__global__ __launch_bounds__(BLOCK, 1)
-void cross_device_reduce_residual_rmsnorm_1stage_exact_bf16(
-    vllm::RankData* rank_data,
-    vllm::RankSignals signals,
-    vllm::Signal* self_signal,
-    __nv_bfloat16* __restrict__ hidden,
-    const __nv_bfloat16* __restrict__ gamma,
-    __nv_bfloat16* __restrict__ norm_out,
-    int rank,
-    int tokens,
-    int hidden_size,
-    float eps)
-{
-    const auto ptrs = *rank_data;
-    vllm::multi_gpu_barrier<2, true>(signals, self_signal, rank);
-
-    __shared__ float buf[BLOCK];
-    for (int row = blockIdx.x; row < tokens; row += gridDim.x) {
-        __nv_bfloat16* hr = hidden + row * hidden_size;
-        __nv_bfloat16* nr = norm_out + row * hidden_size;
-        const __nv_bfloat16* g = gamma;
-        const __nv_bfloat16* rank0 =
-            static_cast<const __nv_bfloat16*>(ptrs.ptrs[0]) +
-            row * hidden_size;
-        const __nv_bfloat16* rank1 =
-            static_cast<const __nv_bfloat16*>(ptrs.ptrs[1]) +
-            row * hidden_size;
-
-        float local = 0.f;
-        for (int i = threadIdx.x; i < hidden_size; i += BLOCK) {
-            const float reduced =
-                __bfloat162float(rank0[i]) + __bfloat162float(rank1[i]);
-            const __nv_bfloat16 reduced_bf16 = __float2bfloat16(reduced);
-            const float sum =
-                __bfloat162float(hr[i]) + __bfloat162float(reduced_bf16);
-            const __nv_bfloat16 rounded = __float2bfloat16(sum);
-            hr[i] = rounded;
-            const float v = __bfloat162float(rounded);
-            local += v * v;
-        }
-
-        buf[threadIdx.x] = local;
-        __syncthreads();
-        for (int off = BLOCK / 2; off > 0; off >>= 1) {
-            if (threadIdx.x < off) buf[threadIdx.x] += buf[threadIdx.x + off];
-            __syncthreads();
-        }
-
-        const float inv_rms =
-            rsqrtf(buf[0] / static_cast<float>(hidden_size) + eps);
-        for (int i = threadIdx.x; i < hidden_size; i += BLOCK) {
-            nr[i] = __float2bfloat16(
-                __bfloat162float(hr[i]) * inv_rms * __bfloat162float(g[i]));
-        }
-        __syncthreads();
-    }
-
-    vllm::multi_gpu_barrier<2, false>(signals, self_signal, rank);
-}
-
 }  // namespace
 
 // Default ctor defined here (not = default in header) so the compiler
@@ -196,8 +114,10 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     world_size_ = comm.world_size();
     same_process_ = same_process;
     max_bytes_ = max_bytes;
-    const char* disabled = std::getenv("PIE_CUDA_DISABLE_CUSTOM_ALL_REDUCE");
-    if (disabled != nullptr && std::strcmp(disabled, "1") == 0) {
+    const char* custom_ar_disabled =
+        std::getenv("PIE_CUDA_DISABLE_CUSTOM_ALL_REDUCE");
+    if (custom_ar_disabled != nullptr &&
+        std::strcmp(custom_ar_disabled, "1") == 0) {
         return;
     }
     if (world_size_ < 2 || world_size_ > 8 || (world_size_ % 2) != 0) {
@@ -211,10 +131,9 @@ CustomAllReduce::CustomAllReduce(NcclComm& comm,
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
     enable_peer_access(dev, world_size_);
-    // We only construct this wrapper for TP=2 today. vLLM allows custom
-    // all-reduce on two PCIe GPUs; the fully-connected flag only affects
-    // world sizes above two.
-    fully_connected_ = false;
+    // vLLM's custom all-reduce can handle larger TP groups only when every
+    // rank has direct peer access to every other rank.
+    fully_connected_ = world_size_ <= 2 || has_full_peer_access(world_size_);
 
     // Allocate the local Signal struct plus the temporary region needed by
     // flashinfer's 2-stage algorithm. TP=2 uses the 1-stage kernel, but
@@ -574,16 +493,12 @@ void CustomAllReduce::all_reduce_bf16(const void* input, void* output,
     // sub-pointer works as long as the *base* was registered. We pass
     // the input pointer directly (kernel does its own offset math on
     // the registered RankData).
-    static const int block_limit =
-        env_int_clamped("PIE_CUDA_CUSTOM_AR_BLOCK_LIMIT", 36, 1, vllm::kMaxBlocks);
-    static const int threads =
-        env_warp_multiple_clamped("PIE_CUDA_CUSTOM_AR_THREADS", 512, 32, 512);
     impl_->allreduce<__nv_bfloat16>(
         stream,
         const_cast<__nv_bfloat16*>(static_cast<const __nv_bfloat16*>(input)),
         static_cast<__nv_bfloat16*>(output),
         static_cast<int>(count),
-        block_limit, threads);
+        /*block_limit=*/36, /*threads=*/512);
 }
 
 void CustomAllReduce::all_reduce_residual_rmsnorm_bf16(
@@ -622,66 +537,8 @@ void CustomAllReduce::all_reduce_residual_rmsnorm_bf16(
     params.stream = stream;
     params.pattern = AllReduceFusionPattern::kARResidualRMSNorm;
     params.trigger_completion_at_end = false;
-    static const bool use_fp32_acc =
-        env_bool_default("PIE_CUDA_FUSED_AR_NORM_FP32_ACC", true);
     CUDA_CHECK((allreduce_fusion_op<__nv_bfloat16>(
-        params, /*launch_with_pdl=*/false, use_fp32_acc)));
-}
-
-void CustomAllReduce::all_reduce_residual_rmsnorm_bf16_exact(
-    const void* input,
-    void* residual_inout,
-    const void* rms_gamma,
-    void* norm_out,
-    int tokens,
-    int hidden,
-    float eps,
-    cudaStream_t stream)
-{
-    if (!can_fuse_residual_rmsnorm(tokens, hidden, stream)) {
-        throw std::runtime_error(
-            "custom_all_reduce: exact fused residual RMSNorm is unavailable");
-    }
-    if (world_size_ != 2) {
-        throw std::runtime_error(
-            "custom_all_reduce: exact fused residual RMSNorm requires TP=2");
-    }
-    if (input == norm_out) {
-        throw std::runtime_error(
-            "custom_all_reduce: exact fused residual RMSNorm requires "
-            "distinct input and norm output buffers");
-    }
-
-    vllm::RankData* ptrs = nullptr;
-    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
-    CUDA_CHECK(cudaStreamIsCapturing(stream, &status));
-    if (status == cudaStreamCaptureStatusActive) {
-        ptrs = impl_->d_rank_data_base_ + impl_->graph_unreg_buffers_.size();
-        impl_->graph_unreg_buffers_.push_back(const_cast<void*>(input));
-    } else {
-        auto it = impl_->buffers_.find(const_cast<void*>(input));
-        if (it == impl_->buffers_.end()) {
-            throw std::runtime_error(
-                "custom_all_reduce: exact fused residual RMSNorm input "
-                "buffer is not registered");
-        }
-        ptrs = it->second;
-    }
-
-    constexpr int kBlock = 256;
-    const int blocks = std::max(1, std::min(vllm::kMaxBlocks, tokens));
-    cross_device_reduce_residual_rmsnorm_1stage_exact_bf16<kBlock>
-        <<<blocks, kBlock, 0, stream>>>(
-            ptrs,
-            impl_->sg_,
-            impl_->self_sg_,
-            static_cast<__nv_bfloat16*>(residual_inout),
-            static_cast<const __nv_bfloat16*>(rms_gamma),
-            static_cast<__nv_bfloat16*>(norm_out),
-            rank_,
-            tokens,
-            hidden,
-            eps);
+        params, /*launch_with_pdl=*/false, /*use_fp32_acc=*/true)));
 }
 
 }  // namespace pie_cuda_driver
