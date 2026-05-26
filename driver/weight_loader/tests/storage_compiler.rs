@@ -109,14 +109,7 @@ fn direct_copy_lowers_to_identity_extent_write() {
         .instrs
         .iter()
         .filter_map(|instr| match instr {
-            StorageInstr::ExtentWrite { id, source, dest } => {
-                Some((id, source, dest.offset))
-            }
-            StorageInstr::BulkExtentWrite {
-                id,
-                source,
-                dest_offset,
-            } => Some((id, source, *dest_offset)),
+            StorageInstr::ExtentWrite { id, source, dest } => Some((id, source, dest)),
             _ => None,
         })
         .collect();
@@ -125,7 +118,7 @@ fn direct_copy_lowers_to_identity_extent_write() {
     assert_eq!(source.tensor_id, TensorId(6));
     assert_eq!(source.file_offset, 512);
     assert_eq!(source.span_bytes, 8);
-    assert_eq!(dest, 0);
+    assert_eq!(dest.offset, 0);
     assert_eq!(
         program.schedule,
         program.instrs.iter().map(instr_id).collect::<Vec<_>>()
@@ -175,7 +168,6 @@ fn packed_quant_row_select_uses_byte_exact_offsets() {
         .iter()
         .find_map(|instr| match instr {
             StorageInstr::ExtentWrite { source, .. } => Some(source),
-            StorageInstr::BulkExtentWrite { source, .. } => Some(source),
             _ => None,
         })
         .unwrap();
@@ -496,6 +488,97 @@ fn gpt_oss_native_mxfp4_tp_uses_row_and_column_offset_repack_contracts() {
     assert_eq!(program.memory.checkpoint_read_bytes, 23_040);
 }
 
+#[test]
+fn nemotron_h_default_abi_packs_experts_and_exposes_views() {
+    let cfg = pie_weight_loader::config::ModelConfig {
+        model_type: "nemotron_h".to_string(),
+        quant_method: String::new(),
+        runtime_quant: String::new(),
+        num_hidden_layers: 1,
+        num_experts: 2,
+        num_experts_per_tok: 2,
+    };
+    let target = StorageTarget {
+        backend: BackendKind::Cuda,
+        tp_rank: 1,
+        tp_size: 2,
+        ..StorageTarget::default()
+    };
+    let metadata = nemotron_h_expert_metadata();
+    let abi =
+        pie_weight_loader::abi::RuntimeAbi::default_for_target(&metadata, &cfg, &target).unwrap();
+
+    assert!(abi.tensors.iter().any(|contract| {
+        contract.output_name
+            == "language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight"
+            && contract.shape == vec![4, 3]
+    }));
+    assert!(abi.tensors.iter().any(|contract| {
+        contract.output_name
+            == "language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight"
+            && contract.shape == vec![6, 4]
+            && contract.shard_axis == Some(Axis(1))
+    }));
+    assert!(abi.tensors.iter().any(|contract| {
+        contract.output_name == "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight"
+            && contract.shape == vec![2, 3]
+    }));
+    assert!(abi.tensors.iter().any(|contract| {
+        contract.output_name == "language_model.backbone.layers.0.mixer.experts.1.down_proj.weight"
+            && contract.shape == vec![3, 2]
+    }));
+
+    let program = compile_storage_program(&metadata, &cfg, &abi, target).unwrap();
+    let names = program
+        .tensors
+        .iter()
+        .map(|tensor| tensor.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        names.contains(&"language_model.backbone.layers.0.mixer.experts.up_proj.packed.weight")
+    );
+    assert!(
+        names.contains(&"language_model.backbone.layers.0.mixer.experts.down_proj.packed.weight")
+    );
+    assert!(names.contains(&"language_model.backbone.layers.0.mixer.experts.0.up_proj.weight"));
+    assert!(names.contains(&"language_model.backbone.layers.0.mixer.experts.1.down_proj.weight"));
+
+    let writes = program
+        .instrs
+        .iter()
+        .filter_map(|instr| match instr {
+            StorageInstr::ExtentWrite { source, dest, .. } => {
+                Some((source.tensor_id, source.span_bytes, dest.offset))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(writes.len(), 4);
+    assert!(
+        writes
+            .iter()
+            .any(|(id, bytes, offset)| { *id == TensorId(0) && *bytes == 12 && *offset == 0 })
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(id, bytes, offset)| { *id == TensorId(1) && *bytes == 12 && *offset == 12 })
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(id, bytes, offset)| { *id == TensorId(2) && *bytes == 12 && *offset == 0 })
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|(id, bytes, offset)| { *id == TensorId(3) && *bytes == 12 && *offset == 12 })
+    );
+    assert_eq!(program.memory.checkpoint_read_bytes, 48);
+    assert_eq!(program.memory.device_write_bytes, 48);
+    assert_eq!(program.memory.persistent_bytes, 48);
+}
+
 fn metadata() -> CheckpointMetadata {
     CheckpointMetadata {
         files: vec![CheckpointFile {
@@ -508,6 +591,56 @@ fn metadata() -> CheckpointMetadata {
             raw(0, "a", 0, &[2], DType::F32),
             raw(1, "b", 8, &[2], DType::F32),
         ],
+    }
+}
+
+fn nemotron_h_expert_metadata() -> CheckpointMetadata {
+    let mut offset = 0u64;
+    let mut tensors = Vec::new();
+    let specs = [
+        (
+            0,
+            "language_model.backbone.layers.0.mixer.experts.0.up_proj.weight",
+            vec![4, 3],
+        ),
+        (
+            1,
+            "language_model.backbone.layers.0.mixer.experts.1.up_proj.weight",
+            vec![4, 3],
+        ),
+        (
+            2,
+            "language_model.backbone.layers.0.mixer.experts.0.down_proj.weight",
+            vec![3, 4],
+        ),
+        (
+            3,
+            "language_model.backbone.layers.0.mixer.experts.1.down_proj.weight",
+            vec![3, 4],
+        ),
+    ];
+    for (id, name, shape) in specs {
+        let bytes = tensor_bytes(&shape, DType::BF16);
+        tensors.push(RawTensor {
+            id: TensorId(id),
+            name: name.to_string(),
+            file_id: FileId(0),
+            file_offset: offset,
+            span_bytes: bytes,
+            shape,
+            encoding: Encoding::Raw(DType::BF16),
+            layout: Layout::dense(1),
+        });
+        offset += bytes;
+    }
+    CheckpointMetadata {
+        files: vec![CheckpointFile {
+            id: FileId(0),
+            path: "nemotron.safetensors".to_string(),
+            size_bytes: offset,
+            format: CheckpointFormat::Safetensors,
+        }],
+        tensors,
     }
 }
 
@@ -672,210 +805,10 @@ fn tensor_bytes(shape: &[i64], dtype: DType) -> u64 {
         .fold(dtype.bytes(), |acc, dim| acc * u64::try_from(*dim).unwrap())
 }
 
-// ── SlabScatter lowering tests ──────────────────────────────────────
-
-#[test]
-fn slab_scatter_merges_nearby_bulk_extent_writes() {
-    // Three tensors with small gaps in the file. The gaps prevent
-    // coalesce_persistent_arena_writes from merging them into a single
-    // BulkExtentWrite, but they're close enough for slab_scatter to
-    // group them (gap < 64 MiB, overread < 5/4).
-    let chunk = 2 * 1024 * 1024; // 2 MiB per tensor
-    let gap = 1024; // 1 KiB gap between tensors in the file
-    let file_size = chunk * 3 + gap * 2 + 4096;
-    let meta = CheckpointMetadata {
-        files: vec![CheckpointFile {
-            id: FileId(0),
-            path: "big.safetensors".to_string(),
-            size_bytes: file_size,
-            format: CheckpointFormat::Safetensors,
-        }],
-        tensors: vec![
-            raw_big(0, "t0", 0, chunk, DType::BF16),
-            raw_big(1, "t1", chunk + gap, chunk, DType::BF16),
-            raw_big(2, "t2", 2 * (chunk + gap), chunk, DType::BF16),
-        ],
-    };
-    let mut plan = LayoutPlan::new();
-    let mut ids = Vec::new();
-    for i in 0..3u32 {
-        let cols = (chunk / 2) as i64; // BF16 = 2 bytes
-        let src = plan.push(LayoutExpr::Source {
-            tensor: TensorId(i),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        let r = plan.push(LayoutExpr::Realize {
-            input: src,
-            runtime_name: format!("t{i}"),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        ids.push(r);
-    }
-    plan.outputs = ids;
-
-    let target = StorageTarget {
-        backend: BackendKind::Cuda,
-        ..StorageTarget::default()
-    };
-    let program = lower_layout_plan(&meta, &plan, target).unwrap();
-
-    let slabs: Vec<_> = program
-        .instrs
-        .iter()
-        .filter(|i| matches!(i, StorageInstr::SlabScatter { .. }))
-        .collect();
-    assert!(
-        !slabs.is_empty(),
-        "expected at least one SlabScatter, got none; instrs: {:#?}",
-        program.instrs,
-    );
-    if let StorageInstr::SlabScatter { placements, span_bytes, .. } = slabs[0] {
-        assert!(
-            placements.len() >= 2,
-            "slab must have at least 2 placements, got {}",
-            placements.len()
-        );
-        assert!(
-            *span_bytes >= chunk * 2,
-            "slab span_bytes {} should cover at least two chunks",
-            span_bytes,
-        );
-        for p in placements {
-            assert!(
-                p.bytes > 0,
-                "placement bytes must be non-zero"
-            );
-        }
-    }
-}
-
-#[test]
-fn slab_scatter_rejects_excessive_overread() {
-    // Two small tensors with a huge gap — overread exceeds 5/4 threshold.
-    let small = 1024 * 1024; // 1 MiB each
-    let gap = 256 * 1024 * 1024; // 256 MiB gap
-    let file_size = small + gap + small;
-    let meta = CheckpointMetadata {
-        files: vec![CheckpointFile {
-            id: FileId(0),
-            path: "sparse.safetensors".to_string(),
-            size_bytes: file_size,
-            format: CheckpointFormat::Safetensors,
-        }],
-        tensors: vec![
-            raw_big(0, "near", 0, small, DType::BF16),
-            raw_big(1, "far", small + gap, small, DType::BF16),
-        ],
-    };
-    let mut plan = LayoutPlan::new();
-    for i in 0..2u32 {
-        let cols = (small / 2) as i64;
-        let src = plan.push(LayoutExpr::Source {
-            tensor: TensorId(i),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        let r = plan.push(LayoutExpr::Realize {
-            input: src,
-            runtime_name: format!("t{i}"),
-            decl: decl(i, &format!("t{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        plan.outputs.push(r);
-    }
-    let target = StorageTarget {
-        backend: BackendKind::Cuda,
-        ..StorageTarget::default()
-    };
-    let program = lower_layout_plan(&meta, &plan, target).unwrap();
-    let slabs: Vec<_> = program
-        .instrs
-        .iter()
-        .filter(|i| matches!(i, StorageInstr::SlabScatter { .. }))
-        .collect();
-    assert!(
-        slabs.is_empty(),
-        "should NOT merge into SlabScatter when overread is excessive; got {:#?}",
-        slabs,
-    );
-}
-
-#[test]
-fn slab_scatter_placement_offsets_are_within_span() {
-    let chunk = 4 * 1024 * 1024;
-    let gap = 512 * 1024; // small gap
-    let file_size = chunk * 3 + gap * 2;
-    let meta = CheckpointMetadata {
-        files: vec![CheckpointFile {
-            id: FileId(0),
-            path: "layout.safetensors".to_string(),
-            size_bytes: file_size,
-            format: CheckpointFormat::Safetensors,
-        }],
-        tensors: vec![
-            raw_big(0, "a", 0, chunk, DType::BF16),
-            raw_big(1, "b", chunk + gap, chunk, DType::BF16),
-            raw_big(2, "c", 2 * (chunk + gap), chunk, DType::BF16),
-        ],
-    };
-    let mut plan = LayoutPlan::new();
-    for i in 0..3u32 {
-        let cols = (chunk / 2) as i64;
-        let src = plan.push(LayoutExpr::Source {
-            tensor: TensorId(i),
-            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        let r = plan.push(LayoutExpr::Realize {
-            input: src,
-            runtime_name: format!("p{i}"),
-            decl: decl(i, &format!("p{i}"), &[cols], Encoding::Raw(DType::BF16)),
-        });
-        plan.outputs.push(r);
-    }
-    let target = StorageTarget {
-        backend: BackendKind::Cuda,
-        ..StorageTarget::default()
-    };
-    let program = lower_layout_plan(&meta, &plan, target).unwrap();
-    for instr in &program.instrs {
-        if let StorageInstr::SlabScatter {
-            span_bytes,
-            placements,
-            ..
-        } = instr
-        {
-            for (idx, p) in placements.iter().enumerate() {
-                assert!(
-                    p.src_offset + p.bytes <= *span_bytes,
-                    "placement {idx}: src_offset {} + bytes {} exceeds span_bytes {}",
-                    p.src_offset,
-                    p.bytes,
-                    span_bytes,
-                );
-            }
-        }
-    }
-}
-
-fn raw_big(id: u32, name: &str, offset: u64, span_bytes: u64, dtype: DType) -> RawTensor {
-    let elem = dtype.bytes();
-    let count = (span_bytes / elem) as i64;
-    RawTensor {
-        id: TensorId(id),
-        name: name.to_string(),
-        file_id: FileId(0),
-        file_offset: offset,
-        span_bytes,
-        shape: vec![count],
-        encoding: Encoding::Raw(dtype),
-        layout: Layout::dense(1),
-    }
-}
-
 fn instr_id(instr: &StorageInstr) -> pie_weight_loader::types::InstrId {
     match instr {
         StorageInstr::Allocate { id, .. }
         | StorageInstr::ExtentWrite { id, .. }
-        | StorageInstr::BulkExtentWrite { id, .. }
-        | StorageInstr::SlabScatter { id, .. }
         | StorageInstr::TileMap { id, .. }
         | StorageInstr::CreateView { id, .. }
         | StorageInstr::Attach { id, .. }

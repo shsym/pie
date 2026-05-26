@@ -150,8 +150,6 @@ pub enum PieLoaderStorageInstrKind {
     Attach = 4,
     Release = 5,
     Finalize = 6,
-    BulkExtentWrite = 7,
-    SlabScatter = 8,
 }
 
 #[repr(C)]
@@ -471,29 +469,12 @@ pub struct PieLoaderBufferDeclView {
     pub bytes: u64,
     pub alignment: u32,
     pub temporary: bool,
-    pub has_persistent_offset: bool,
-    pub persistent_offset: u64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PieLoaderBufferDeclSlice {
     pub ptr: *const PieLoaderBufferDeclView,
-    pub len: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PieLoaderSlabPlacementView {
-    pub src_offset: u64,
-    pub dest_offset: u64,
-    pub bytes: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct PieLoaderSlabPlacementSlice {
-    pub ptr: *const PieLoaderSlabPlacementView,
     pub len: usize,
 }
 
@@ -526,10 +507,6 @@ pub struct PieLoaderStorageInstrView {
     pub transform_target_cols: u32,
     pub transform_scratch_bytes: u64,
     pub name: PieLoaderBytes,
-    pub slab_file_id: u32,
-    pub slab_file_offset: u64,
-    pub slab_span_bytes: u64,
-    pub slab_placements: PieLoaderSlabPlacementSlice,
 }
 
 #[repr(C)]

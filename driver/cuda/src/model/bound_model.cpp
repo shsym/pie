@@ -13,12 +13,12 @@ std::size_t BoundCudaModel::num_layers() const noexcept {
     case Kind::Mixtral: return mixtral.layers.size();
     case Kind::Qwen3_5: return qwen3_5.layers.size();
     case Kind::Qwen3_5Moe: return qwen3_5_moe.layers.size();
-    case Kind::Kimi: return kimi.layers.size();
+    case Kind::NemotronH: return nemotron_h.layers.size();
     }
     return 0;
 }
 
-BoundCudaModel bind_cuda_model(const LoadedModel& engine, bool verbose) {
+BoundCudaModel bind_cuda_model(LoadedModel& engine, bool verbose) {
     const std::string& mt = engine.hf_config().model_type;
     BoundCudaModel bound;
 
@@ -31,11 +31,9 @@ BoundCudaModel bind_cuda_model(const LoadedModel& engine, bool verbose) {
         (mt == "qwen3_5" || mt == "qwen3_5_text");
     const bool is_qwen3_5_moe =
         (mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text" || mt == "qwen3_moe");
+    const bool is_nemotron_h = (mt == "nemotron_h");
 
-    if (mt == "kimi_k2") {
-        bound.kind = BoundCudaModel::Kind::Kimi;
-        bound.kimi = bind_kimi(engine);
-    } else if (mt == "phi3") {
+    if (mt == "phi3") {
         bound.kind = BoundCudaModel::Kind::LlamaLike;
         bound.llama = bind_phi3(engine);
     } else if (mt == "olmo2" || mt == "olmo3") {
@@ -68,6 +66,9 @@ BoundCudaModel bind_cuda_model(const LoadedModel& engine, bool verbose) {
     } else if (is_qwen3_5_moe) {
         bound.kind = BoundCudaModel::Kind::Qwen3_5Moe;
         bound.qwen3_5_moe = bind_qwen3_5_moe(engine);
+    } else if (is_nemotron_h) {
+        bound.kind = BoundCudaModel::Kind::NemotronH;
+        bound.nemotron_h = bind_nemotron_h(engine);
     } else {
         bound.kind = BoundCudaModel::Kind::LlamaLike;
         bound.llama = bind_llama_like(engine, verbose);
