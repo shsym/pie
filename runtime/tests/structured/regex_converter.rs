@@ -150,7 +150,11 @@ fn test_digit_shorthand() {
 #[test]
 fn test_word_shorthand() {
     let body = ebnf_body(r"\w");
-    assert!(body.contains("[a-zA-Z0-9_]"), "body: {}", body);
+    assert!(
+        body.contains("[a-zA-Z0-9_]"),
+        "body: {}",
+        body
+    );
 }
 
 #[test]
@@ -167,11 +171,7 @@ fn test_whitespace_shorthand() {
 #[test]
 fn test_non_greedy_star() {
     let body = ebnf_body("a*?");
-    assert!(
-        body.contains("*"),
-        "non-greedy should still produce *: {}",
-        body
-    );
+    assert!(body.contains("*"), "non-greedy should still produce *: {}", body);
 }
 
 #[test]
@@ -199,11 +199,7 @@ fn test_non_greedy_repetition() {
 #[test]
 fn test_empty_regex_conversion() {
     let body = ebnf_body("");
-    assert!(
-        body.contains("\"\""),
-        "empty regex should produce empty string: {}",
-        body
-    );
+    assert!(body.contains("\"\""), "empty regex should produce empty string: {}", body);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +270,11 @@ fn test_escaped_dot_conversion() {
 #[test]
 fn test_escaped_backslash_conversion() {
     let body = ebnf_body(r"\\");
-    assert!(body.contains("\\\\"), "body: {}", body);
+    assert!(
+        body.contains("\\\\"),
+        "body: {}",
+        body
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +299,10 @@ fn test_datetime_pattern_converts() {
 
 #[test]
 fn test_email_pattern_converts() {
-    let _ = regex_to_ebnf(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}").unwrap();
+    let _ = regex_to_ebnf(
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,4}",
+    )
+    .unwrap();
 }
 
 // ---------------------------------------------------------------------------

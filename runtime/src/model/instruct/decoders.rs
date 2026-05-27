@@ -3,11 +3,13 @@
 //! Provides reusable `ChatDecoder`, `ReasoningDecoder`, and no-op stubs
 //! so individual model files don't duplicate the same logic.
 
+use std::sync::Arc;
 use crate::model::instruct::{
-    ChatDecoder, ChatEvent, ReasoningDecoder, ReasoningEvent, ToolDecoder, ToolEvent,
+    ChatDecoder, ChatEvent,
+    ReasoningDecoder, ReasoningEvent,
+    ToolDecoder, ToolEvent,
 };
 use crate::model::tokenizer::Tokenizer;
-use std::sync::Arc;
 
 // ─── GenericChatDecoder ──────────────────────────────────────
 
@@ -135,7 +137,9 @@ impl ReasoningDecoder for ThinkingDecoder {
     fn feed(&mut self, tokens: &[u32]) -> ReasoningEvent {
         if !self.inside {
             for &t in tokens {
-                if self.match_pos < self.start_ids.len() && t == self.start_ids[self.match_pos] {
+                if self.match_pos < self.start_ids.len()
+                    && t == self.start_ids[self.match_pos]
+                {
                     self.match_pos += 1;
                     if self.match_pos == self.start_ids.len() {
                         self.inside = true;
@@ -151,7 +155,9 @@ impl ReasoningDecoder for ThinkingDecoder {
             ReasoningEvent::Delta(String::new())
         } else {
             for &t in tokens {
-                if self.match_pos < self.end_ids.len() && t == self.end_ids[self.match_pos] {
+                if self.match_pos < self.end_ids.len()
+                    && t == self.end_ids[self.match_pos]
+                {
                     self.match_pos += 1;
                     if self.match_pos == self.end_ids.len() {
                         // Closing match — flush the full accumulated decode
@@ -217,8 +223,8 @@ impl ToolDecoder for NoopToolDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tokenizer::Tokenizer;
     use std::sync::Arc;
+    use crate::model::tokenizer::Tokenizer;
 
     fn make_tok(vocab: &[&str]) -> Arc<Tokenizer> {
         let v: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();

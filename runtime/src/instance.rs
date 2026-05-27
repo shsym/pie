@@ -7,6 +7,7 @@ mod output;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use wasmtime::component::{ResourceAny, ResourceTable};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
@@ -16,6 +17,19 @@ use self::output::LogStream;
 use crate::context;
 use crate::linker::InstancePolicy;
 use crate::process::ProcessId;
+
+/// Where an instance's stdout/stderr are routed.
+pub enum OutputMode {
+    /// Discard outputs (wasmtime's default sink). Used for snapshot init,
+    /// where guest output is noise.
+    Discard,
+    /// Route to the per-process actor channel, drained by an attached client.
+    Process,
+    /// Route to pie-server's `tracing` log, tagged with `program`. Used by the
+    /// daemon request path, which serves HTTP directly and has no client to
+    /// attach — without this, guest stderr falls through to the default sink.
+    Server { program: String },
+}
 
 pub struct InstanceState {
     // Wasm states
@@ -70,10 +84,17 @@ impl InstanceState {
     pub async fn new(
         id: ProcessId,
         username: String,
-        capture_outputs: bool,
+        output: OutputMode,
         policy: &InstancePolicy,
+        token_budget: Option<usize>,
         py_runtime_dir: Option<&Path>,
     ) -> anyhow::Result<Self> {
+        // Register the process with all model context managers. Fails if the
+        // admission gate (Σ endowment ≤ capacity × overbook) refuses.
+        // Partial failures are rolled back inside register_process, so Drop
+        // does not need to care about double-unregistration.
+        context::register_process(id, token_budget).await?;
+
         let mut builder = WasiCtx::builder();
 
         // Network capability. `inherit_network` exposes the host network;
@@ -90,19 +111,31 @@ impl InstanceState {
             }
         }
 
-        if capture_outputs {
-            builder.stdout(LogStream::new_stdout(id));
-            builder.stderr(LogStream::new_stderr(id));
+        match output {
+            OutputMode::Discard => {}
+            OutputMode::Process => {
+                builder.stdout(LogStream::new_stdout(id));
+                builder.stderr(LogStream::new_stderr(id));
+            }
+            OutputMode::Server { program } => {
+                let program: Arc<str> = Arc::from(program);
+                builder.stdout(LogStream::new_server_stdout(program.clone()));
+                builder.stderr(LogStream::new_server_stderr(program));
+            }
         }
 
         let scratch_dir = policy.fs.base_dir.join(id.to_string());
 
         if policy.fs.allow {
-            std::fs::create_dir_all(&scratch_dir).expect("failed to create scratch dir");
+            std::fs::create_dir_all(&scratch_dir)
+                .expect("failed to create scratch dir");
 
-            builder
-                .preopened_dir(&scratch_dir, "/scratch", DirPerms::all(), FilePerms::all())
-                .expect("failed to preopen scratch dir");
+            builder.preopened_dir(
+                &scratch_dir,
+                "/scratch",
+                DirPerms::all(),
+                FilePerms::all(),
+            ).expect("failed to preopen scratch dir");
         }
 
         // Set up Python runtime environment if py-runtime directory is available.

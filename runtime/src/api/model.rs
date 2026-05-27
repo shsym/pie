@@ -1,10 +1,10 @@
 //! pie:core/model - Model and Tokenizer resources
 
+use std::sync::Arc;
 use crate::api::pie;
 use crate::instance::InstanceState;
 use crate::model;
 use anyhow::Result;
-use std::sync::Arc;
 use wasmtime::component::Resource;
 use wasmtime_wasi::WasiView;
 
@@ -48,11 +48,6 @@ impl pie::core::model::HostModel for InstanceState {
         Ok(self.ctx().table.push(tokenizer)?)
     }
 
-    async fn default_system_speculation(&mut self, this: Resource<Model>) -> Result<bool> {
-        let model = self.ctx().table.get(&this)?;
-        Ok(model.model.default_system_speculation())
-    }
-
     async fn drop(&mut self, this: Resource<Model>) -> Result<()> {
         self.ctx().table.delete(this)?;
         Ok(())
@@ -84,13 +79,11 @@ impl pie::core::model::HostTokenizer for InstanceState {
         Ok(tokenizer.model.get_split_regex())
     }
 
-    async fn special_tokens(
-        &mut self,
-        this: Resource<Tokenizer>,
-    ) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
+    async fn special_tokens(&mut self, this: Resource<Tokenizer>) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
         let tokenizer = self.ctx().table.get(&this)?;
         Ok(tokenizer.model.get_special_tokens())
     }
+
 
     async fn drop(&mut self, this: Resource<Tokenizer>) -> Result<()> {
         self.ctx().table.delete(this)?;

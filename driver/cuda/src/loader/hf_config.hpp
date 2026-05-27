@@ -41,7 +41,6 @@ struct HfConfig {
     // ── Norm / activation ─────────────────────────────────────────────
     float rms_norm_eps;
     std::string hidden_act;    // "silu" — only one supported for now.
-    std::string mlp_hidden_act; // Nemotron-H uses "relu2".
 
     // ── RoPE ──────────────────────────────────────────────────────────
     float rope_theta;
@@ -143,9 +142,6 @@ struct HfConfig {
     // source layer of the same `layer_types[i]`.
     int gemma_hidden_size_per_layer_input;
     int num_kv_shared_layers;
-    bool gemma4_use_ordered_embeddings = false;
-    int gemma4_num_centroids = 0;
-    int gemma4_centroid_intermediate_top_k = 0;
 
     // Gemma-4 per-layer rope_theta (HF nests under `rope_parameters`),
     // including `partial_rotary_factor` for full-attention layers
@@ -160,21 +156,6 @@ struct HfConfig {
     // is the (always-on) shared expert's MLP width.
     int moe_intermediate_size;
     int shared_expert_intermediate_size;
-    float routed_scaling_factor = 1.f;
-    int n_group = 1;
-    int topk_group = 1;
-    bool norm_topk_prob = true;
-
-    // ── Nemotron-H hybrid Mamba2/attention/MoE ─────────────────────
-    // `layer_types` stores "mamba", "attention", or "moe" for this
-    // architecture. These dimensions are zero on non-Nemotron models.
-    int mamba_num_heads = 0;
-    int mamba_head_dim = 0;
-    int mamba_state_size = 0;
-    int mamba_n_groups = 0;
-    int mamba_conv_kernel = 0;
-    int mamba_chunk_size = 0;
-    float mamba_time_step_min = 0.f;
 
     // ── Qwen3.5 hybrid (linear-attention SSM + full attention) ──────
     // Per-layer attention type is in `layer_types` (values
@@ -195,10 +176,6 @@ struct HfConfig {
     // Partial RoPE: only the first `partial_rotary_factor * head_dim`
     // dimensions are rotated. Defaults to 1.0 (full rotation).
     float partial_rotary_factor;
-
-    // Qwen3.5 / Qwen3.6 MTP (multi-token prediction) auxiliary head.
-    int  mtp_num_hidden_layers = 0;
-    bool mtp_use_dedicated_embeddings = false;
 
     // Gemma-3n (E2B / E4B "Nano") additions on top of Gemma-4.
     // Gemma-3n is a *different* architecture from Gemma-4 (despite the

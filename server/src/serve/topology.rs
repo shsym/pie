@@ -59,7 +59,6 @@ pub fn resolve_flavor(kind: DriverKind, model_name: &str) -> Result<ResolvedFlav
         DriverKind::Dev => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::Dev)),
         DriverKind::Vllm => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::Vllm)),
         DriverKind::Sglang => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::Sglang)),
-        DriverKind::TensorRtLlm => Ok(ResolvedFlavor::Subprocess(SubprocessFlavor::TensorRtLlm)),
     }
 }
 
@@ -87,7 +86,7 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
         }
         #[cfg(feature = "driver-cuda")]
         Flavor::Cuda => {
-            let mut c: CudaNativeDriverOptions = m
+            let c: CudaNativeDriverOptions = m
                 .driver
                 .options
                 .clone()
@@ -99,8 +98,11 @@ pub fn build_embedded_options(m: &config::ModelConfig, flavor: Flavor) -> Result
                     m.name
                 )
             })?;
-            c.device = device.clone();
-            Ok(DriverOptions::CudaNative(c))
+            Ok(DriverOptions::CudaNative {
+                opts: c,
+                device: device.clone(),
+                hf_repo: m.hf_repo.clone(),
+            })
         }
         Flavor::Dummy => {
             let d: DummyDriverOptions = m

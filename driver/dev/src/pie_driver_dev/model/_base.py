@@ -29,10 +29,9 @@ import torch.nn.functional as F
 
 import pie_kernels as ops
 
-from . import ModelConfig
-from . import common
+from . import ModelConfig, common
 from ..adapter import AdapterSubpass
-from pie_driver_dev.config import NativeRuntimeConfig as RuntimeConfig
+from ..config import RuntimeConfig
 from ..schema import WeightStore
 
 if TYPE_CHECKING:

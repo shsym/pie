@@ -5,11 +5,11 @@
 //! Unlike a Process (one-shot execution), a Daemon runs indefinitely.
 
 use std::net::SocketAddr;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::LazyLock;
 use std::time::Instant;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use hyper::server::conn::http1;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -22,9 +22,10 @@ use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
 
+use crate::instance::OutputMode;
 use crate::linker;
 use crate::program::ProgramName;
-use crate::service::{ServiceHandler, ServiceMap};
+use crate::service::{ServiceMap, ServiceHandler};
 
 // =============================================================================
 // Daemon Registry
@@ -35,14 +36,20 @@ type DaemonId = usize;
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
 
 /// Global registry mapping DaemonId to daemon actors.
-static SERVICES: LazyLock<ServiceMap<DaemonId, Message>> = LazyLock::new(ServiceMap::new);
+static SERVICES: LazyLock<ServiceMap<DaemonId, Message>> =
+    LazyLock::new(ServiceMap::new);
 
 // =============================================================================
 // Public API
 // =============================================================================
 
 /// Spawn a new daemon and register it in the global registry.
-pub fn spawn(username: String, program: ProgramName, port: u16, input: String) -> Result<DaemonId> {
+pub fn spawn(
+    username: String,
+    program: ProgramName,
+    port: u16,
+    input: String,
+) -> Result<DaemonId> {
     let daemon = Daemon::new(username, program, port, input);
     let id = daemon.daemon_id;
     SERVICES.spawn(id, || daemon)?;
@@ -57,9 +64,7 @@ pub fn terminate(daemon_id: DaemonId) {
 /// Get info about a running daemon.
 pub async fn get_info(daemon_id: DaemonId) -> Option<DaemonInfo> {
     let (tx, rx) = oneshot::channel();
-    SERVICES
-        .send(&daemon_id, Message::GetInfo { response: tx })
-        .ok()?;
+    SERVICES.send(&daemon_id, Message::GetInfo { response: tx }).ok()?;
     rx.await.ok()
 }
 
@@ -107,12 +112,21 @@ struct Daemon {
 
 impl Daemon {
     /// Creates a new Daemon and spawns its HTTP listener task.
-    fn new(username: String, program: ProgramName, port: u16, input: String) -> Self {
+    fn new(
+        username: String,
+        program: ProgramName,
+        port: u16,
+        input: String,
+    ) -> Self {
         let daemon_id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
 
-        let listener_handle =
-            tokio::spawn(Self::serve(addr, username.clone(), program.clone(), input));
+        let listener_handle = tokio::spawn(Self::serve(
+            addr,
+            username.clone(),
+            program.clone(),
+            input,
+        ));
 
         Daemon {
             daemon_id,
@@ -125,7 +139,12 @@ impl Daemon {
     }
 
     /// Binds the TCP port and serves HTTP requests indefinitely.
-    async fn serve(addr: SocketAddr, username: String, program: ProgramName, input: String) {
+    async fn serve(
+        addr: SocketAddr,
+        username: String,
+        program: ProgramName,
+        input: String,
+    ) {
         let result: Result<()> = async {
             let socket = tokio::net::TcpSocket::new_v4()?;
             socket.set_reuseaddr(!cfg!(windows))?;
@@ -196,9 +215,13 @@ impl Daemon {
         let req = hyper::Request::from_parts(parts, buffered_body);
 
         // Instantiate a fresh WASM component (store + instance) per request.
-        // Daemons don't capture outputs — they serve HTTP responses directly.
+        // Daemons serve HTTP responses directly, so there is no client to attach
+        // their stdout/stderr to. Route guest output to pie-server's tracing log
+        // (tagged with the program name) so inferlet diagnostics stay visible to
+        // operators instead of falling through to wasmtime's default sink.
+        let output = OutputMode::Server { program: program.to_string() };
         let (mut store, instance) =
-            linker::instantiate(uuid::Uuid::new_v4(), username, &program, false, None).await?;
+            linker::instantiate(uuid::Uuid::new_v4(), username, &program, output, None).await?;
 
         // Convert the hyper request into WASI HTTP resources
         let (sender, receiver) = oneshot::channel();

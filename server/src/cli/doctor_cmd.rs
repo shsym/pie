@@ -58,7 +58,6 @@ pub fn doctor() -> Result<()> {
         SubprocessFlavor::Dev,
         SubprocessFlavor::Vllm,
         SubprocessFlavor::Sglang,
-        SubprocessFlavor::TensorRtLlm,
     ] {
         let key = flavor.as_str();
         match python_resolve::resolve_python(flavor, &empty, Some(&global)) {

@@ -5,13 +5,16 @@
 //!
 //! Reference: Qwen3 Jinja chat template with tool-calling support.
 
-use crate::inference::structured::grammar::Grammar;
-use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, ThinkingDecoder};
-use crate::model::instruct::{
-    ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder, ToolEvent, ToolGrammar,
-};
-use crate::model::tokenizer::Tokenizer;
 use std::sync::Arc;
+use crate::inference::structured::grammar::Grammar;
+use crate::model::instruct::{
+    ChatDecoder,
+    Instruct,
+    ReasoningDecoder,
+    ToolDecoder, ToolEvent, ToolGrammar,
+};
+use crate::model::instruct::decoders::{GenericChatDecoder, ThinkingDecoder, NoopReasoningDecoder};
+use crate::model::tokenizer::Tokenizer;
 
 // =============================================================================
 // Configuration
@@ -118,11 +121,11 @@ static TEMPLATE: &str = r#"
 {%- endif %}
 "#;
 
+
 /// Feature flags for ChatML-family models.
 pub struct ChatMLConfig {
     pub has_thinking: bool,
     pub has_tools: bool,
-    pub generation_suffix: &'static str,
     /// Stop token strings (vary per sub-architecture)
     pub stop_tokens: &'static [&'static str],
 }
@@ -153,8 +156,7 @@ impl QwenInstruct {
     /// Create with full config.
     pub fn new(tokenizer: Arc<Tokenizer>, config: ChatMLConfig) -> Self {
         let encode = |s: &str| tokenizer.encode(s);
-        let stop_ids: Vec<u32> = config
-            .stop_tokens
+        let stop_ids: Vec<u32> = config.stop_tokens
             .iter()
             .filter_map(|s| tokenizer.token_to_id(s))
             .collect();
@@ -181,14 +183,11 @@ impl QwenInstruct {
         let mut tool_resp_suffix = newline.clone();
         tool_resp_suffix.extend(encode("</tool_response>"));
 
-        let mut generation_header = make_prefix("assistant");
-        generation_header.extend(encode(config.generation_suffix));
-
         Self {
             system_prefix: make_prefix("system"),
             user_prefix: make_prefix("user"),
             assistant_prefix: make_prefix("assistant"),
-            generation_header,
+            generation_header: make_prefix("assistant"),
             turn_suffix,
             stop_ids,
             think_prefix_ids: think_prefix,
@@ -231,7 +230,7 @@ impl QwenInstruct {
             " # Tools\n\n\
              You may call one or more functions to assist with the user query.\n\n\
              You are provided with function signatures within <tools></tools> XML tags:\n\
-             <tools>",
+             <tools>"
         );
         for tool in tools {
             prompt.push('\n');
@@ -243,7 +242,7 @@ impl QwenInstruct {
              within <tool_call></tool_call> XML tags:\n\
              <tool_call>\n\
              {\"name\": <function-name>, \"arguments\": <args-json-object>}\n\
-             </tool_call>",
+             </tool_call>"
         );
         prompt
     }
@@ -253,8 +252,7 @@ impl QwenInstruct {
         let mut names: Vec<String> = Vec::new();
         for tool in tools {
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(tool) {
-                let name = parsed
-                    .get("function")
+                let name = parsed.get("function")
                     .and_then(|f| f.get("name"))
                     .or_else(|| parsed.get("name"))
                     .and_then(|n| n.as_str());
@@ -341,10 +339,7 @@ impl Instruct for QwenInstruct {
     }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(
-            self.tokenizer.clone(),
-            self.stop_ids.clone(),
-        ))
+        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
@@ -373,10 +368,7 @@ impl Instruct for QwenInstruct {
         }
         let source = Self::build_tool_call_grammar(tools)?;
         let grammar = Grammar::from_ebnf(&source, "root").ok()?;
-        Some(ToolGrammar {
-            source,
-            grammar: Arc::new(grammar),
-        })
+        Some(ToolGrammar { source, grammar: Arc::new(grammar) })
     }
 }
 
@@ -428,72 +420,42 @@ impl ToolDecoder for QwenToolDecoder {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::tokenizer::Tokenizer;
     use std::sync::Arc;
+    use crate::model::tokenizer::Tokenizer;
 
     fn make_tok() -> Arc<Tokenizer> {
         let v: Vec<String> = vec![
-            "<|im_start|>",
-            "<|im_end|>",
-            "<|endoftext|>",
-            "system",
-            "\n",
-            "user",
-            "assistant",
-            "Hello",
-            " world",
-            "<think>",
-            "</think>",
-            "<tool_call>",
-            "</tool_call>",
-            "<tool_response>",
-            "</tool_response>",
-            "<tools>",
-            "</tools>",
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
+            "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+            "system", "\n", "user", "assistant", "Hello", " world",
+            "<think>", "</think>", "<tool_call>", "</tool_call>",
+            "<tool_response>", "</tool_response>", "<tools>", "</tools>",
+        ].into_iter().map(String::from).collect();
         Arc::new(Tokenizer::from_vocab(&v))
     }
 
     fn qwen3() -> QwenInstruct {
-        QwenInstruct::new(
-            make_tok(),
-            ChatMLConfig {
-                has_thinking: true,
-                has_tools: true,
-                generation_suffix: "",
-                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
-            },
-        )
+        QwenInstruct::new(make_tok(), ChatMLConfig {
+            has_thinking: true, has_tools: true,
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+        })
     }
 
     fn qwen2() -> QwenInstruct {
-        QwenInstruct::new(
-            make_tok(),
-            ChatMLConfig {
-                has_thinking: false,
-                has_tools: true,
-                generation_suffix: "",
-                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
-            },
-        )
+        QwenInstruct::new(make_tok(), ChatMLConfig {
+            has_thinking: false, has_tools: true,
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+        })
     }
 
     fn olmo3() -> QwenInstruct {
-        QwenInstruct::new(
-            make_tok(),
-            ChatMLConfig {
-                has_thinking: true,
-                has_tools: false,
-                generation_suffix: "",
-                stop_tokens: &["<|im_end|>"],
-            },
-        )
+        QwenInstruct::new(make_tok(), ChatMLConfig {
+            has_thinking: true, has_tools: false,
+            stop_tokens: &["<|im_end|>"],
+        })
     }
 
     #[test]
@@ -609,42 +571,21 @@ mod tests {
     fn tool_decoder_parses_call() {
         // Build vocab with the JSON content as a single entry
         let mut v: Vec<String> = vec![
-            "<|im_start|>",
-            "<|im_end|>",
-            "<|endoftext|>",
-            "system",
-            "\n",
-            "user",
-            "assistant",
-            "Hello",
-            " world",
-            "<think>",
-            "</think>",
-            "<tool_call>",
-            "</tool_call>",
-            "<tool_response>",
-            "</tool_response>",
-            "<tools>",
-            "</tools>",
+            "<|im_start|>", "<|im_end|>", "<|endoftext|>",
+            "system", "\n", "user", "assistant", "Hello", " world",
+            "<think>", "</think>", "<tool_call>", "</tool_call>",
+            "<tool_response>", "</tool_response>", "<tools>", "</tools>",
             r#"{"name": "f", "arguments": {}}"#,
-        ]
-        .into_iter()
-        .map(String::from)
-        .collect();
+        ].into_iter().map(String::from).collect();
         let tok = Arc::new(Tokenizer::from_vocab(&v));
-        let inst = QwenInstruct::new(
-            tok,
-            ChatMLConfig {
-                has_thinking: true,
-                has_tools: true,
-                generation_suffix: "",
-                stop_tokens: &["<|im_end|>", "<|endoftext|>"],
-            },
-        );
+        let inst = QwenInstruct::new(tok, ChatMLConfig {
+            has_thinking: true, has_tools: true,
+            stop_tokens: &["<|im_end|>", "<|endoftext|>"],
+        });
         let mut dec = inst.tool_decoder();
         // Feed: <tool_call> \n JSON \n </tool_call>
         dec.feed(&[11]); // <tool_call> → enters inside, returns Start
-        dec.feed(&[4]); // \n
+        dec.feed(&[4]);  // \n
         let event = dec.feed(&[17, 4, 12]); // JSON + \n + </tool_call>
         match event {
             ToolEvent::Call(name, args) => {
