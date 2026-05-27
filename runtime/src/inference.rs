@@ -21,14 +21,13 @@ use crate::context::pagestore::PhysicalPageId;
 use crate::driver::{DriverId, SchedulerLimits};
 use crate::service::{ServiceArray, ServiceHandler};
 use anyhow::Result;
+use dashmap::DashMap;
 use scheduler::BatchScheduler;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
-pub use scheduler::SchedulerStats;
+pub use scheduler::{SchedulerStats, SYSTEM_SPEC_DRAFT_POS_BUCKETS};
 pub use speculator::{
     BYPASS_HIT_COUNT, CHAIN_DROP_COUNT, CHAIN_SUBMIT_COUNT, StagedBatch, lookup_for_ctx, try_hit,
 };
@@ -36,9 +35,12 @@ pub use speculator::{
 use speculator::StagedBatchMap;
 
 pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
-    let pinned = crate::context::pinned_count(driver_idx);
-    let (active, cached_pinned) = crate::context::resident_count(driver_idx);
-    pinned.max(active.saturating_add(cached_pinned)) > 1
+    // The chain extender is already gated by scheduler.speculation_depth and
+    // request shape. If a staged entry exists, claim it even for a single
+    // resident context; otherwise the API path pays pin/actor overhead and
+    // the pre-fired chain only gets discovered later inside InferenceService.
+    let _ = driver_idx;
+    true
 }
 
 /// Aggregated inference stats for a single model (across all drivers).
@@ -61,6 +63,13 @@ pub struct InferenceStats {
     pub avg_response_dispatch_us: u64,
     pub avg_context_tick_submit_us: u64,
     pub avg_stats_update_us: u64,
+    pub avg_inter_fire_us: u64,
+    pub avg_post_dispatch_to_fire_us: u64,
+    pub avg_accum_loop_us: u64,
+    pub system_spec_draft_tokens_proposed: u64,
+    pub system_spec_draft_tokens_accepted: u64,
+    pub system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    pub system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
 }
 
 // =============================================================================
@@ -134,6 +143,7 @@ pub async fn submit(
         physical_page_ids,
         extra_pages,
         last_page_len,
+        None,
         true,
     )?;
     rx.await
@@ -147,6 +157,7 @@ pub fn submit_async(
     physical_page_ids: Vec<PhysicalPageId>,
     extra_pages: Vec<PhysicalPageId>,
     last_page_len: u32,
+    active_page_idx: Option<usize>,
     allow_pass_speculation: bool,
 ) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
     let (tx, rx) = oneshot::channel();
@@ -158,6 +169,7 @@ pub fn submit_async(
             physical_page_ids,
             extra_pages,
             last_page_len,
+            active_page_idx,
             allow_pass_speculation,
             response: tx,
         },
@@ -272,7 +284,7 @@ impl InferenceService {
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
         let staged_batch: Vec<StagedBatchMap> = (0..num_drivers)
-            .map(|_| Arc::new(Mutex::new(HashMap::new())))
+            .map(|_| Arc::new(DashMap::new()))
             .collect();
         speculator::register_model(model_idx, &staged_batch, speculation_depth);
 
@@ -303,6 +315,15 @@ impl InferenceService {
         let mut cumulative_response_dispatch = 0u64;
         let mut cumulative_context_tick_submit = 0u64;
         let mut cumulative_stats_update = 0u64;
+        let mut cumulative_inter_fire = 0u64;
+        let mut cumulative_post_dispatch_to_fire = 0u64;
+        let mut cumulative_accum_loop = 0u64;
+        let mut system_spec_draft_tokens_proposed = 0u64;
+        let mut system_spec_draft_tokens_accepted = 0u64;
+        let mut system_spec_draft_tokens_proposed_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
+        let mut system_spec_draft_tokens_accepted_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
 
         for s in &self.scheduler_stats {
             total_batches += s.total_batches.load(Relaxed);
@@ -323,6 +344,23 @@ impl InferenceService {
             cumulative_response_dispatch += s.cumulative_response_dispatch_us.load(Relaxed);
             cumulative_context_tick_submit += s.cumulative_context_tick_submit_us.load(Relaxed);
             cumulative_stats_update += s.cumulative_stats_update_us.load(Relaxed);
+            cumulative_inter_fire += s.cumulative_inter_fire_us.load(Relaxed);
+            cumulative_post_dispatch_to_fire += s.cumulative_post_dispatch_to_fire_us.load(Relaxed);
+            cumulative_accum_loop += s.cumulative_accum_loop_us.load(Relaxed);
+            system_spec_draft_tokens_proposed += s.system_spec_draft_tokens_proposed.load(Relaxed);
+            system_spec_draft_tokens_accepted += s.system_spec_draft_tokens_accepted.load(Relaxed);
+            for (dst, src) in system_spec_draft_tokens_proposed_per_pos
+                .iter_mut()
+                .zip(s.system_spec_draft_tokens_proposed_per_pos.iter())
+            {
+                *dst += src.load(Relaxed);
+            }
+            for (dst, src) in system_spec_draft_tokens_accepted_per_pos
+                .iter_mut()
+                .zip(s.system_spec_draft_tokens_accepted_per_pos.iter())
+            {
+                *dst += src.load(Relaxed);
+            }
         }
 
         let avg = |value: u64| {
@@ -349,6 +387,24 @@ impl InferenceService {
             avg_response_dispatch_us: avg(cumulative_response_dispatch),
             avg_context_tick_submit_us: avg(cumulative_context_tick_submit),
             avg_stats_update_us: avg(cumulative_stats_update),
+            // Inter-fire is sampled starting at the 2nd batch (first one has
+            // no prior to diff against), so divide by max(total_batches-1, 1)
+            // to get a stable mean.
+            avg_inter_fire_us: if total_batches > 1 {
+                cumulative_inter_fire / (total_batches - 1)
+            } else {
+                0
+            },
+            avg_post_dispatch_to_fire_us: if total_batches > 1 {
+                cumulative_post_dispatch_to_fire / (total_batches - 1)
+            } else {
+                0
+            },
+            avg_accum_loop_us: avg(cumulative_accum_loop),
+            system_spec_draft_tokens_proposed,
+            system_spec_draft_tokens_accepted,
+            system_spec_draft_tokens_proposed_per_pos,
+            system_spec_draft_tokens_accepted_per_pos,
         }
     }
 }
@@ -371,6 +427,7 @@ enum Message {
         /// full reserved range without re-allocating.
         extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
+        active_page_idx: Option<usize>,
         allow_pass_speculation: bool,
         response: oneshot::Sender<Result<ForwardOutput>>,
     },
@@ -394,6 +451,7 @@ impl ServiceHandler for InferenceService {
                 physical_page_ids,
                 extra_pages,
                 last_page_len,
+                active_page_idx,
                 allow_pass_speculation,
                 response,
             } => {
@@ -414,15 +472,10 @@ impl ServiceHandler for InferenceService {
                 // cold or post-miss (the api layer's try_hit
                 // returned None).
                 let staged_entry = {
-                    let mut sb = self.staged_batch[idx].lock().ok();
-                    sb.as_mut().and_then(|sb| {
-                        let deque = sb.get_mut(&ctx_id)?;
+                    let mut deque = self.staged_batch[idx].get_mut(&ctx_id);
+                    deque.as_deref_mut().and_then(|deque| {
                         if let Some(front) = deque.front() {
-                            let req_token = request.token_ids.first().copied();
-                            let req_pos = request.position_ids.first().copied();
-                            if Some(front.anchor_token) == req_token
-                                && Some(front.anchor_pos) == req_pos
-                            {
+                            if speculator::entry_matches_request(front, &request) {
                                 let entry = deque.pop_front();
                                 if let Some(entry) = entry.as_ref() {
                                     if !allow_pass_speculation {
@@ -441,11 +494,7 @@ impl ServiceHandler for InferenceService {
 
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();
-                let request_clone = request.clone();
-                let speculation_depth = if allow_pass_speculation
-                    && request_clone.rs_slot_ids.is_empty()
-                    && request_clone.spec_token_ids.is_empty()
-                {
+                let speculation_depth = if allow_pass_speculation {
                     self.speculation_depth
                 } else {
                     0
@@ -464,27 +513,20 @@ impl ServiceHandler for InferenceService {
                     return;
                 }
 
-                // No hit: cold submit + start a fresh chain.
-                let (sched_tx, sched_rx) = oneshot::channel();
-                if let Err(e) = self.schedulers[idx].submit(
-                    request,
-                    sched_tx,
-                    physical_page_ids.clone(),
-                    last_page_len,
-                ) {
-                    tracing::error!("submit failed: {e}");
-                    return;
-                }
-                let cur_page_idx = physical_page_ids.len().saturating_sub(1);
-                let mut all_pages = physical_page_ids;
+                // No hit: cold submit + start a fresh chain. The pool's
+                // dispatch-side hook will route this fire's output to a
+                // pool worker; no per-context task is spawned here.
+                let cur_page_idx =
+                    active_page_idx.unwrap_or_else(|| physical_page_ids.len().saturating_sub(1));
+                let mut all_pages = physical_page_ids.clone();
                 all_pages.extend(extra_pages);
-                speculator::spawn_extend_chain(
-                    sched_rx,
+                speculator::start_chain(
                     response,
                     scheduler_handle,
                     staged_batch_arc,
                     self.model_idx,
-                    request_clone,
+                    request,
+                    physical_page_ids,
                     all_pages,
                     cur_page_idx,
                     last_page_len,

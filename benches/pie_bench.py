@@ -19,6 +19,8 @@ from common import (
     ROOT,
     RequestResult,
     add_mode_subcommands,
+    cuda_profiler_start,
+    cuda_profiler_stop,
     finish,
     hf_chat_token_ids_and_counts,
     make_prompts,
@@ -100,12 +102,17 @@ def build_config(args: argparse.Namespace):
             "gpu_mem_utilization": args.gpu_mem_util,
             "memory_profile": args.memory_profile,
             "kv_cache_dtype": args.kv_cache_dtype,
-            "ready_timeout_s": float(args.server_startup_timeout),
         }
         if args.runtime_quant:
             driver_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
             driver_options["mxfp4_moe"] = args.mxfp4_moe
+        if args.mtp_assistant_snapshot_dir:
+            driver_options["mtp_assistant_snapshot_dir"] = (
+                args.mtp_assistant_snapshot_dir
+            )
+        if args.mtp_num_drafts is not None:
+            driver_options["mtp_num_drafts"] = args.mtp_num_drafts
     elif args.driver == "portable":
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
@@ -433,7 +440,11 @@ async def run(args: argparse.Namespace):
                 "wasm_delay_us": args.wasm_delay_us,
                 "return_text": args.dump_first_text,
                 "wait_for_start": args.defer_start,
-                "system_speculation": args.system_speculation,
+                **(
+                    {"system_speculation": args.system_speculation}
+                    if args.system_speculation is not None
+                    else {}
+                ),
             }
 
         async def launch_one(i: int, *, max_tokens: int | None = None):
@@ -485,6 +496,8 @@ async def run(args: argparse.Namespace):
                 "prompt": prompts[indices[0]] if indices else args.prompt,
                 "prompts": [prompts[i] for i in indices],
             }
+            if args.concurrency and args.concurrency > 0:
+                inp["batch_concurrency"] = args.concurrency
             if prompt_token_ids is not None:
                 inp["prompt_tokens_batch"] = [prompt_token_ids[i] for i in indices]
             start = time.perf_counter()
@@ -611,12 +624,20 @@ async def run(args: argparse.Namespace):
                     await one(i, max_tokens=warmup_max_tokens)
 
         start_idx = args.warmup
+        cuda_profiler_start(args.cuda_profiler_capture)
         start = time.perf_counter()
-        if args.mode == "latency":
-            results = [await one(start_idx + i) for i in range(n)]
-        else:
-            results = await many(range(start_idx, start_idx + n))
-        wall = time.perf_counter() - start
+        try:
+            if args.mode == "latency":
+                results = [await one(start_idx + i) for i in range(n)]
+            else:
+                results = await many(range(start_idx, start_idx + n))
+        finally:
+            wall = time.perf_counter() - start
+            cuda_profiler_stop(args.cuda_profiler_capture)
+        if args.mode == "tput" and args.defer_start:
+            measured = [r.latency_s for r in results if r.ok]
+            if measured:
+                wall = max(measured)
 
         # Pull speculation counters out of the server's model status
         # so the bench output reflects what actually happened. Zero
@@ -647,9 +668,30 @@ async def run(args: argparse.Namespace):
                     ("default.avg_response_dispatch_us", "avg response dispatch us"),
                     ("default.avg_context_tick_submit_us", "avg context tick submit us"),
                     ("default.avg_stats_update_us", "avg stats update us"),
+                    ("default.avg_inter_fire_us", "avg inter fire us"),
+                    ("default.avg_post_dispatch_to_fire_us", "avg post dispatch to fire us"),
+                    ("default.avg_accum_loop_us", "avg accum loop us"),
+                    (
+                        "default.system_spec_draft_tokens_proposed",
+                        "system spec draft tokens proposed",
+                    ),
+                    (
+                        "default.system_spec_draft_tokens_accepted",
+                        "system spec draft tokens accepted",
+                    ),
+                    (
+                        "default.system_spec_draft_tokens_proposed_per_pos",
+                        "system spec draft tokens proposed per pos",
+                    ),
+                    (
+                        "default.system_spec_draft_tokens_accepted_per_pos",
+                        "system spec draft tokens accepted per pos",
+                    ),
                     ("default.last_batch_latency_us", "last batch latency us"),
                     ("default.bypass_hits", "bypass hits"),
                     ("default.chain_submits", "chain submits"),
+                    ("default.chain_ext_avg_wake_us", "chain ext avg wake us"),
+                    ("default.chain_ext_avg_work_us", "chain ext avg work us"),
                     ("default.chain_drops", "chain drops"),
                     ("default.total_requests_processed", "total requests"),
                     ("default.max_forward_requests_observed", "max forward requests"),
@@ -682,6 +724,7 @@ async def run(args: argparse.Namespace):
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
+            "cuda profiler capture": args.cuda_profiler_capture,
             **engine_config,
         },
     )
@@ -757,8 +800,21 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--system-speculation",
             action=argparse.BooleanOptionalAction,
-            default=True,
-            help="Ask the benchmark inferlet to request driver-provided speculative drafts.",
+            default=None,
+            help="Override system speculation. Omit to use the model default; "
+                 "--no-system-speculation forces the no-spec baseline.",
+        )
+        sp.add_argument(
+            "--mtp-assistant-snapshot-dir",
+            default=None,
+            help="cuda_native Gemma4 MTP assistant snapshot path used by .system_speculation(); "
+                 "auto-discovered from the HF cache when omitted.",
+        )
+        sp.add_argument(
+            "--mtp-num-drafts",
+            type=int,
+            default=None,
+            help="Number of native MTP draft tokens per accepted token.",
         )
         sp.add_argument(
             "--batch-policy",

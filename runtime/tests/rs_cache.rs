@@ -51,6 +51,9 @@ impl Behavior for RecordingBehavior {
             logprobs_values: Vec::new(),
             entropies_indptr: vec![0; (n + 1) as usize],
             entropies: Vec::new(),
+            spec_indptr: vec![0; (n + 1) as usize],
+            spec_tokens: Vec::new(),
+            spec_positions: Vec::new(),
         }
     }
 }
@@ -74,7 +77,8 @@ async fn spawn_pair(rs_slots: usize, restore_pause_at_utilization: f64) -> usize
         vec![32],
         4,
         vec![rs_slots],
-        64,
+        vec![false],
+        4,
         None,
         32.0,
         restore_pause_at_utilization,

@@ -63,8 +63,6 @@ fn infer_role(raw: &RawTensor) -> SemanticRole {
         SemanticRole::MlpDown
     } else if contains_any(name, &["router.weight", "gate.weight"]) {
         SemanticRole::ExpertRouter
-    } else if name.contains("e_score_correction_bias") {
-        SemanticRole::ExpertBias
     } else if name.contains(".experts.") && contains_any(name, &["w1", "gate_proj"]) {
         SemanticRole::ExpertGate
     } else if name.contains(".experts.") && contains_any(name, &["w3", "up_proj"]) {

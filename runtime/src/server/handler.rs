@@ -18,6 +18,15 @@ use crate::workflow::WorkflowId;
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
 
+fn trim_trailing_zeros(values: &[u64]) -> Vec<u64> {
+    let end = values
+        .iter()
+        .rposition(|&value| value != 0)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    values[..end].to_vec()
+}
+
 // =============================================================================
 // Query Handlers
 // =============================================================================
@@ -122,6 +131,48 @@ impl Session {
                         format!("{}.avg_stats_update_us", model_name),
                         serde_json::Value::from(inf.avg_stats_update_us),
                     );
+                    stats.insert(
+                        format!("{}.avg_inter_fire_us", model_name),
+                        serde_json::Value::from(inf.avg_inter_fire_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_post_dispatch_to_fire_us", model_name),
+                        serde_json::Value::from(inf.avg_post_dispatch_to_fire_us),
+                    );
+                    stats.insert(
+                        format!("{}.avg_accum_loop_us", model_name),
+                        serde_json::Value::from(inf.avg_accum_loop_us),
+                    );
+                    stats.insert(
+                        format!("{}.system_spec_draft_tokens_proposed", model_name),
+                        serde_json::Value::from(inf.system_spec_draft_tokens_proposed),
+                    );
+                    stats.insert(
+                        format!("{}.system_spec_draft_tokens_accepted", model_name),
+                        serde_json::Value::from(inf.system_spec_draft_tokens_accepted),
+                    );
+                    stats.insert(
+                        format!(
+                            "{}.system_spec_draft_tokens_proposed_per_pos",
+                            model_name
+                        ),
+                        serde_json::json!(
+                            trim_trailing_zeros(
+                                &inf.system_spec_draft_tokens_proposed_per_pos
+                            )
+                        ),
+                    );
+                    stats.insert(
+                        format!(
+                            "{}.system_spec_draft_tokens_accepted_per_pos",
+                            model_name
+                        ),
+                        serde_json::json!(
+                            trim_trailing_zeros(
+                                &inf.system_spec_draft_tokens_accepted_per_pos
+                            )
+                        ),
+                    );
                     // Speculation hit counters — observability for
                     // `try_hit`/chain submissions/drops.
                     stats.insert(
@@ -143,6 +194,26 @@ impl Session {
                             inference::CHAIN_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                     );
+                    {
+                        let n = inference::speculator::CHAIN_EXT_JOBS_SAMPLED
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let wake = inference::speculator::CHAIN_EXT_WAKE_LATENCY_US
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let work = inference::speculator::CHAIN_EXT_WORK_LATENCY_US
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        stats.insert(
+                            format!("{}.chain_ext_avg_wake_us", model_name),
+                            serde_json::Value::from(if n > 0 { wake / n } else { 0 }),
+                        );
+                        stats.insert(
+                            format!("{}.chain_ext_avg_work_us", model_name),
+                            serde_json::Value::from(if n > 0 { work / n } else { 0 }),
+                        );
+                        stats.insert(
+                            format!("{}.chain_ext_jobs_sampled", model_name),
+                            serde_json::Value::from(n),
+                        );
+                    }
                     if let Some(exec) = crate::api::inference::execute_profile_snapshot() {
                         let mean_value = |total_us: u64, denom: u64| -> serde_json::Value {
                             serde_json::Value::from(if denom > 0 { total_us / denom } else { 0 })

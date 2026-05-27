@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -21,6 +22,20 @@ use super::{ForwardOutput, request};
 mod chunked;
 
 use chunked::ChunkContinuation;
+
+fn scheduler_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PIE_SCHED_TRACE").is_some())
+}
+
+fn sched_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn now_micros() -> u64 {
+    sched_epoch().elapsed().as_micros() as u64
+}
 
 // =============================================================================
 // Scheduling Policy Trait
@@ -67,6 +82,8 @@ pub(super) enum Decision {
 // SchedulerStats (lock-free snapshot for monitoring)
 // =============================================================================
 
+pub const SYSTEM_SPEC_DRAFT_POS_BUCKETS: usize = 32;
+
 /// Cumulative stats exposed for monitoring. Updated atomically after each batch.
 #[derive(Debug, Default)]
 pub struct SchedulerStats {
@@ -91,6 +108,28 @@ pub struct SchedulerStats {
     pub cumulative_response_dispatch_us: AtomicU64,
     pub cumulative_context_tick_submit_us: AtomicU64,
     pub cumulative_stats_update_us: AtomicU64,
+    /// Time between consecutive `tokio::spawn(execute_batch)` calls.
+    /// Sum is excluding the first batch; divide by (total_batches-1) for mean.
+    pub cumulative_inter_fire_us: AtomicU64,
+    /// Time from end of response dispatch (fire N) to spawn of fire N+1.
+    /// This is the "rendezvous gap": chain extender wake + main loop drain
+    /// + cohort fill.
+    pub cumulative_post_dispatch_to_fire_us: AtomicU64,
+    /// Time spent in the main run loop's non-blocking accumulator pass —
+    /// per-iter try_recv + prepare + would_exceed + push, until the first
+    /// `try_recv` returns Empty (or batch full / stashed). Sums across
+    /// every batch.
+    pub cumulative_accum_loop_us: AtomicU64,
+    /// Internal: micros since `sched_epoch()` at last fire spawn.
+    pub last_fire_spawn_micros: AtomicU64,
+    /// Internal: micros since `sched_epoch()` at end of response dispatch.
+    pub last_dispatch_end_micros: AtomicU64,
+    pub system_spec_draft_tokens_proposed: AtomicU64,
+    pub system_spec_draft_tokens_accepted: AtomicU64,
+    pub system_spec_draft_tokens_proposed_per_pos:
+        [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    pub system_spec_draft_tokens_accepted_per_pos:
+        [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -99,6 +138,10 @@ struct BatchExecutionTiming {
     batch_build_us: u64,
     driver_fire_us: u64,
     response_dispatch_us: u64,
+    system_spec_draft_tokens_proposed: u64,
+    system_spec_draft_tokens_accepted: u64,
+    system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
 }
 
 // =============================================================================
@@ -118,6 +161,14 @@ enum Completion {
     Chunk {
         continuation: ChunkContinuation,
         sampler_slots: Vec<usize>,
+    },
+    /// Self-perpetuating speculation chain. The dispatch loop routes
+    /// these to the per-driver `ChainExtPool` instead of waking 256
+    /// individual per-context tokio tasks; the pool worker then forwards
+    /// this fire's output to `state.response` and submits the next stage
+    /// (if eligible) via `state.scheduler_handle`.
+    Chain {
+        state: Box<super::speculator::ChainState>,
     },
 }
 
@@ -148,6 +199,7 @@ struct RequestCapacityUsage {
     user_custom_mask_bytes: usize,
     spec_custom_mask_bytes: usize,
     has_spec_drafts: bool,
+    has_rs_spec_drafts: bool,
     has_dense_logit_requirement: bool,
     has_prob_sampling: bool,
     is_single_token_decode: bool,
@@ -172,11 +224,9 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
             has_prob_sampling = true;
         }
     }
-    let has_output_spec = req.request.output_spec_flags.iter().any(|&enabled| enabled);
     let has_dense_logit_requirement = req.request.has_user_mask
         || !req.request.logit_masks.is_empty()
         || spec_tokens > 0
-        || has_output_spec
         || !all_samplers_token;
     let is_single_token_decode = input_tokens == 1
         && spec_tokens == 0
@@ -201,6 +251,7 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
         user_custom_mask_bytes,
         spec_custom_mask_bytes,
         has_spec_drafts: spec_tokens > 0,
+        has_rs_spec_drafts: spec_tokens > 0 && !req.request.rs_slot_ids.is_empty(),
         has_dense_logit_requirement,
         has_prob_sampling,
         is_single_token_decode,
@@ -276,6 +327,7 @@ struct BatchAccumulator {
     total_user_custom_mask_bytes: usize,
     total_spec_custom_mask_bytes: usize,
     has_spec_drafts: bool,
+    has_rs_spec_drafts: bool,
     has_dense_logit_requirement: bool,
     has_prob_sampling: bool,
     all_single_token_decode: bool,
@@ -297,6 +349,7 @@ impl BatchAccumulator {
             total_user_custom_mask_bytes: 0,
             total_spec_custom_mask_bytes: 0,
             has_spec_drafts: false,
+            has_rs_spec_drafts: false,
             has_dense_logit_requirement: false,
             has_prob_sampling: false,
             all_single_token_decode: true,
@@ -350,7 +403,11 @@ impl BatchAccumulator {
     }
 
     fn push(&mut self, req: PendingRequest) {
-        let mut usage = request_capacity_usage(&req, self.page_size);
+        let usage = request_capacity_usage(&req, self.page_size);
+        self.push_with(req, usage);
+    }
+
+    fn push_with(&mut self, req: PendingRequest, mut usage: RequestCapacityUsage) {
         let (logit_rows, prob_rows, _, _, _) = self.projected_rows(Some(&usage));
         usage.logit_rows = logit_rows;
         usage.prob_rows = prob_rows;
@@ -369,6 +426,7 @@ impl BatchAccumulator {
             .total_spec_custom_mask_bytes
             .saturating_add(usage.spec_custom_mask_bytes);
         self.has_spec_drafts |= usage.has_spec_drafts;
+        self.has_rs_spec_drafts |= usage.has_rs_spec_drafts;
         self.has_dense_logit_requirement |= usage.has_dense_logit_requirement;
         self.has_prob_sampling |= usage.has_prob_sampling;
         self.all_single_token_decode &= usage.is_single_token_decode;
@@ -446,6 +504,16 @@ impl BatchAccumulator {
             return false;
         }
         let usage = request_capacity_usage(req, self.page_size);
+        self.would_exceed_with(&usage)
+    }
+
+    fn would_exceed_with(&self, usage: &RequestCapacityUsage) -> bool {
+        if self.requests.is_empty() {
+            return false;
+        }
+        if self.has_rs_spec_drafts || usage.has_rs_spec_drafts {
+            return true;
+        }
         let next_has_spec = self.has_spec_drafts || usage.has_spec_drafts;
         let next_custom_mask_bytes = if next_has_spec {
             self.total_spec_custom_mask_bytes
@@ -454,7 +522,7 @@ impl BatchAccumulator {
             self.total_user_custom_mask_bytes
                 .saturating_add(usage.user_custom_mask_bytes)
         };
-        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(&usage));
+        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(usage));
         self.requests.len() + 1 > self.limits.max_forward_requests
             || self.total_tokens.saturating_add(usage.forward_tokens)
                 > self.limits.max_forward_tokens
@@ -470,6 +538,71 @@ impl BatchAccumulator {
             || next_custom_mask_bytes > self.limits.max_custom_mask_bytes
     }
 
+    fn would_exceed_reason(&self, req: &PendingRequest) -> Option<String> {
+        if self.requests.is_empty() {
+            return None;
+        }
+        let usage = request_capacity_usage(req, self.page_size);
+        let next_has_spec = self.has_spec_drafts || usage.has_spec_drafts;
+        let next_custom_mask_bytes = if next_has_spec {
+            self.total_spec_custom_mask_bytes
+                .saturating_add(usage.spec_custom_mask_bytes)
+        } else {
+            self.total_user_custom_mask_bytes
+                .saturating_add(usage.user_custom_mask_bytes)
+        };
+        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(&usage));
+        let checks = [
+            (
+                "requests",
+                self.requests.len().saturating_add(1),
+                self.limits.max_forward_requests,
+            ),
+            (
+                "tokens",
+                self.total_tokens.saturating_add(usage.forward_tokens),
+                self.limits.max_forward_tokens,
+            ),
+            (
+                "pages",
+                self.total_pages.saturating_add(usage.page_refs),
+                self.limits.max_page_refs,
+            ),
+            ("logit_rows", next_logit_rows, self.limits.max_logit_rows),
+            ("prob_rows", next_prob_rows, self.limits.max_prob_rows),
+            (
+                "sampler_rows",
+                self.total_sampler_rows.saturating_add(usage.sampler_rows),
+                self.limits.max_sampler_rows,
+            ),
+            (
+                "logprob_labels",
+                self.total_logprob_labels
+                    .saturating_add(usage.logprob_labels),
+                self.limits.max_logprob_labels,
+            ),
+            (
+                "custom_mask_bytes",
+                next_custom_mask_bytes,
+                self.limits.max_custom_mask_bytes,
+            ),
+        ];
+        checks
+            .into_iter()
+            .find(|(_, have, limit)| have > limit)
+            .map(|(name, have, limit)| {
+                format!(
+                    "{name} {have}>{limit} pending_tokens={} pending_pages={} pending_sampler_rows={} pending_has_spec={} pending_dense={} pending_prob={}",
+                    usage.forward_tokens,
+                    usage.page_refs,
+                    usage.sampler_rows,
+                    usage.has_spec_drafts,
+                    usage.has_dense_logit_requirement,
+                    usage.has_prob_sampling,
+                )
+            })
+    }
+
     fn is_full(&self) -> bool {
         let active_custom_mask_bytes = if self.has_spec_drafts {
             self.total_spec_custom_mask_bytes
@@ -477,6 +610,7 @@ impl BatchAccumulator {
             self.total_user_custom_mask_bytes
         };
         self.requests.len() >= self.limits.max_forward_requests
+            || self.has_rs_spec_drafts
             || self.total_tokens >= self.limits.max_forward_tokens
             || self.total_pages >= self.limits.max_page_refs
             || self.total_logit_rows >= self.limits.max_logit_rows
@@ -512,6 +646,7 @@ impl BatchAccumulator {
         self.total_user_custom_mask_bytes = 0;
         self.total_spec_custom_mask_bytes = 0;
         self.has_spec_drafts = false;
+        self.has_rs_spec_drafts = false;
         self.has_dense_logit_requirement = false;
         self.has_prob_sampling = false;
         self.all_single_token_decode = true;
@@ -524,6 +659,38 @@ fn prepare_pending_for_batch(
     batch: &BatchAccumulator,
     pending: PendingRequest,
 ) -> Option<PendingRequest> {
+    prepare_pending_with_usage(batch, pending).map(|(p, _)| p)
+}
+
+/// Same as `prepare_pending_for_batch` but also returns the computed
+/// `RequestCapacityUsage`, avoiding a recompute when the caller will
+/// immediately consult `would_exceed_with` + `push_with`.
+///
+/// The pure-decode fast path skips `maybe_start_chunking` and
+/// `single_request_limit_error`: for `single_token_mode` requests with
+/// 1 token, no spec drafts, no user mask, and no logit masks, both are
+/// no-ops (chunk_size is never reached; per-request limits hold trivially
+/// given the BatchAccumulator's `would_exceed_with` check will still gate
+/// page_refs / sampler_rows etc. when batching).
+fn prepare_pending_with_usage(
+    batch: &BatchAccumulator,
+    pending: PendingRequest,
+) -> Option<(PendingRequest, RequestCapacityUsage)> {
+    if is_pure_decode_pending(&pending) {
+        let usage = request_capacity_usage(&pending, batch.page_size);
+        let limits = batch.limits;
+        // Fields that COULD still trip the single-request limit for decode:
+        // page_refs (long-context decode) and logprob_labels. Token/sampler/
+        // mask limits hold trivially for 1-token single_token_mode requests.
+        if usage.page_refs <= limits.max_page_refs
+            && usage.logprob_labels <= limits.max_logprob_labels
+            && limits.max_forward_requests > 0
+        {
+            return Some((pending, usage));
+        }
+        // Fall through to the slow path so the proper error message is
+        // surfaced via `single_request_limit_error`.
+    }
     let pending = match pending.maybe_start_chunking(batch.limits, batch.page_size) {
         Ok(pending) => pending,
         Err((pending, msg)) => {
@@ -535,7 +702,18 @@ fn prepare_pending_for_batch(
         pending.send_error(msg);
         return None;
     }
-    Some(pending)
+    let usage = request_capacity_usage(&pending, batch.page_size);
+    Some((pending, usage))
+}
+
+#[inline]
+fn is_pure_decode_pending(p: &PendingRequest) -> bool {
+    matches!(&p.completion, Completion::Direct(_))
+        && p.request.token_ids.len() == 1
+        && p.request.spec_token_ids.is_empty()
+        && p.request.single_token_mode
+        && !p.request.has_user_mask
+        && p.request.logit_masks.is_empty()
 }
 
 #[cfg(test)]
@@ -812,6 +990,25 @@ impl SchedulerHandle {
         ))?;
         Ok(())
     }
+
+    /// Submit a forward pass that participates in a speculation chain.
+    /// The dispatch loop routes the output to the per-driver pool worker
+    /// instead of waking a dedicated chain-extender task.
+    pub fn submit_chain(
+        &self,
+        request: pie_bridge::ForwardRequest,
+        state: Box<super::speculator::ChainState>,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+    ) -> Result<()> {
+        self.tx.send(PendingRequest {
+            request,
+            completion: Completion::Chain { state },
+            physical_page_ids,
+            last_page_len,
+        })?;
+        Ok(())
+    }
 }
 
 // =============================================================================
@@ -825,7 +1022,16 @@ impl SchedulerHandle {
 pub(crate) struct BatchScheduler {
     tx: mpsc::UnboundedSender<PendingRequest>,
     stats: Arc<SchedulerStats>,
+    chain_pool: Arc<super::speculator::ChainExtPool>,
 }
+
+/// Default size of the chain-extender pool per driver. Sweep on L40
+/// (30 tokio workers) found 30 optimal: 8/16/24 starve per-worker by
+/// serializing too many jobs; 36/40/64/128 over-fan out and contend
+/// for runtime workers. The sweet spot is one pool task per runtime
+/// worker — dispatch's notify burst resolves in a single scheduling
+/// round.
+const CHAIN_EXT_POOL_SIZE: usize = 30;
 
 impl BatchScheduler {
     /// Spawn a new batch scheduler for a single driver.
@@ -843,6 +1049,7 @@ impl BatchScheduler {
         let (tx, rx) = mpsc::unbounded_channel();
         let submit_tx = tx.downgrade();
         let stats = Arc::new(SchedulerStats::default());
+        let chain_pool = Arc::new(super::speculator::ChainExtPool::new(CHAIN_EXT_POOL_SIZE));
         tokio::spawn(Self::run(
             driver_id,
             driver_idx,
@@ -853,9 +1060,17 @@ impl BatchScheduler {
             request_timeout_secs,
             batch_policy,
             stats.clone(),
+            chain_pool.clone(),
         ));
 
-        Self { tx, stats }
+        Self { tx, stats, chain_pool }
+    }
+
+    /// Get the chain extender pool handle. Cold submits use this to
+    /// route the first fire's output through the pool instead of spawning
+    /// a per-context chain-extender task.
+    pub fn chain_pool(&self) -> Arc<super::speculator::ChainExtPool> {
+        self.chain_pool.clone()
     }
 
     /// Get a handle to the cumulative scheduler stats (lock-free).
@@ -903,6 +1118,7 @@ impl BatchScheduler {
         request_timeout_secs: u64,
         batch_policy: String,
         stats: Arc<SchedulerStats>,
+        chain_pool: Arc<super::speculator::ChainExtPool>,
     ) {
         let request_timeout = Duration::from_secs(request_timeout_secs);
 
@@ -954,23 +1170,40 @@ impl BatchScheduler {
             // already stashed for the next batch, fire the current batch
             // before reading more; overwriting the stash would drop that
             // request's response channel.
+            let accum_start = Instant::now();
             while next_pending.is_none() {
                 let Ok(pending) = req_rx.try_recv() else {
                     break;
                 };
-                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
+                let Some((pending, usage)) = prepare_pending_with_usage(&batch, pending)
+                else {
                     continue;
                 };
-                if batch.would_exceed(&pending) {
+                if batch.would_exceed_with(&usage) {
+                    if scheduler_trace_enabled() {
+                        let reason = batch
+                            .would_exceed_reason(&pending)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        eprintln!(
+                            "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                            driver_idx,
+                            batch.len(),
+                            batch.total_tokens(),
+                            reason,
+                        );
+                    }
                     next_pending = Some(pending);
                     break;
                 }
                 policy.on_arrival();
-                batch.push(pending);
+                batch.push_with(pending, usage);
                 if batch.is_full() {
                     break;
                 }
             }
+            stats
+                .cumulative_accum_loop_us
+                .fetch_add(accum_start.elapsed().as_micros() as u64, Relaxed);
 
             // Ask the policy what to do
             let decision = if next_pending.is_some() {
@@ -1004,6 +1237,18 @@ impl BatchScheduler {
                             continue;
                         }
                         if batch.would_exceed(&pending) {
+                            if scheduler_trace_enabled() {
+                                let reason = batch
+                                    .would_exceed_reason(&pending)
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                eprintln!(
+                                    "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                                    driver_idx,
+                                    batch.len(),
+                                    batch.total_tokens(),
+                                    reason,
+                                );
+                            }
                             next_pending = Some(pending);
                             break;
                         }
@@ -1012,6 +1257,16 @@ impl BatchScheduler {
                     }
 
                     let total_tokens = batch.total_tokens();
+                    if scheduler_trace_enabled() {
+                        eprintln!(
+                            "[pie-sched-trace] driver={} fire requests={} tokens={} prefill_like={} stashed={}",
+                            driver_idx,
+                            batch.len(),
+                            total_tokens,
+                            batch.should_prefill_coalesce(),
+                            next_pending.is_some(),
+                        );
+                    }
                     let requests_to_fire = batch.take();
                     policy.on_fired(requests_to_fire.len());
 
@@ -1031,12 +1286,30 @@ impl BatchScheduler {
                         .cumulative_fire_prepare_us
                         .fetch_add(fire_prepare_us, Relaxed);
 
+                    // Inter-fire instrumentation: time between consecutive spawns,
+                    // and the post-dispatch-to-next-fire gap (rendezvous window).
+                    let now_us = now_micros();
+                    let last_spawn = stats.last_fire_spawn_micros.swap(now_us, Relaxed);
+                    if last_spawn != 0 {
+                        stats
+                            .cumulative_inter_fire_us
+                            .fetch_add(now_us.saturating_sub(last_spawn), Relaxed);
+                    }
+                    let last_dispatch_end = stats.last_dispatch_end_micros.load(Relaxed);
+                    if last_dispatch_end != 0 {
+                        stats
+                            .cumulative_post_dispatch_to_fire_us
+                            .fetch_add(now_us.saturating_sub(last_dispatch_end), Relaxed);
+                    }
+
                     // Spawn batch execution
                     let latency_tx_clone = latency_tx.clone();
                     let stats_clone = stats.clone();
                     let timeout = request_timeout;
                     let submit_tx_clone = submit_tx.clone();
 
+                    let stats_for_probe = stats_clone.clone();
+                    let chain_pool_clone = chain_pool.clone();
                     tokio::spawn(async move {
                         let start = Instant::now();
                         let timing = Self::execute_batch(
@@ -1047,6 +1320,8 @@ impl BatchScheduler {
                             timeout,
                             Some(permit),
                             Some(submit_tx_clone),
+                            Some(stats_for_probe),
+                            Some(chain_pool_clone),
                         )
                         .await;
                         let latency = start.elapsed();
@@ -1105,6 +1380,30 @@ impl BatchScheduler {
                             .cumulative_context_tick_submit_us
                             .fetch_add(tick_submit_us, Relaxed);
                         stats_clone
+                            .system_spec_draft_tokens_proposed
+                            .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
+                        stats_clone
+                            .system_spec_draft_tokens_accepted
+                            .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
+                        for (counter, value) in stats_clone
+                            .system_spec_draft_tokens_proposed_per_pos
+                            .iter()
+                            .zip(timing.system_spec_draft_tokens_proposed_per_pos)
+                        {
+                            if value != 0 {
+                                counter.fetch_add(value, Relaxed);
+                            }
+                        }
+                        for (counter, value) in stats_clone
+                            .system_spec_draft_tokens_accepted_per_pos
+                            .iter()
+                            .zip(timing.system_spec_draft_tokens_accepted_per_pos)
+                        {
+                            if value != 0 {
+                                counter.fetch_add(value, Relaxed);
+                            }
+                        }
+                        stats_clone
                             .cumulative_stats_update_us
                             .fetch_add(stats_update_start.elapsed().as_micros() as u64, Relaxed);
                     });
@@ -1118,6 +1417,18 @@ impl BatchScheduler {
                                     continue;
                                 };
                                 if batch.would_exceed(&pending) {
+                                    if scheduler_trace_enabled() {
+                                        let reason = batch
+                                            .would_exceed_reason(&pending)
+                                            .unwrap_or_else(|| "unknown".to_string());
+                                        eprintln!(
+                                            "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                                            driver_idx,
+                                            batch.len(),
+                                            batch.total_tokens(),
+                                            reason,
+                                        );
+                                    }
                                     next_pending = Some(pending);
                                     continue;
                                 }
@@ -1148,6 +1459,8 @@ impl BatchScheduler {
                 request_timeout,
                 None,
                 None,
+                None,
+                None,
             )
             .await;
         }
@@ -1162,9 +1475,38 @@ impl BatchScheduler {
         _timeout: Duration,
         mut permit: Option<OwnedSemaphorePermit>,
         submit_tx: Option<mpsc::WeakUnboundedSender<PendingRequest>>,
+        stats_for_probe: Option<Arc<SchedulerStats>>,
+        chain_pool: Option<Arc<super::speculator::ChainExtPool>>,
     ) -> BatchExecutionTiming {
         let batch_start = Instant::now();
         let build_start = Instant::now();
+        // Detect if ANY request carries system spec drafts. The
+        // common case (256-conc decode) has none, so we skip the
+        // per-request Vec build + position-histogram loop.
+        let any_spec = requests.iter().any(|req| !req.request.spec_token_ids.is_empty());
+        let system_spec_proposed_per_req: Vec<usize> = if any_spec {
+            requests
+                .iter()
+                .map(|req| req.request.spec_token_ids.len())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let system_spec_draft_tokens_proposed =
+            system_spec_proposed_per_req.iter().sum::<usize>() as u64;
+        let mut system_spec_draft_tokens_accepted = 0u64;
+        let mut system_spec_draft_tokens_proposed_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
+        let mut system_spec_draft_tokens_accepted_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
+        if any_spec {
+            for proposed in &system_spec_proposed_per_req {
+                for pos in 0..(*proposed).min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                    system_spec_draft_tokens_proposed_per_pos[pos] += 1;
+                }
+            }
+        }
+
         // Build batched request — a single `pie_bridge::ForwardRequest`
         // populated by folding each per-request shape into the batch.
         let elide_decode_masks = requests.iter().all(|req| {
@@ -1173,7 +1515,7 @@ impl BatchScheduler {
                 && req.request.token_ids.len() <= 1
                 && req.request.spec_token_ids.is_empty()
         });
-        let mut batch_req = request::new_batched_forward_request();
+        let mut batch_req = request::new_batched_forward_request_with_capacity(requests.len());
         for req in &requests {
             request::append_request_with_options(
                 &mut batch_req,
@@ -1225,32 +1567,132 @@ impl BatchScheduler {
                         && batch_resp.logits_bytes.is_empty()
                         && batch_resp.logprobs_values.is_empty()
                         && batch_resp.entropies.is_empty()
+                        && batch_resp.spec_tokens.is_empty()
                         && batch_resp.tokens_indptr.len() >= requests.len() + 1;
 
+                    // Send oneshot replies first, defer drop of the
+                    // request husks. Each PendingRequest's drop is
+                    // ~3-4 µs (22-Vec ForwardRequest), and doing it
+                    // inline pushes the 256th chain extender's wake
+                    // out by ~1.2 ms — directly extending the gap.
+                    let mut deferred_drop: Vec<(
+                        pie_bridge::ForwardRequest,
+                        Vec<PhysicalPageId>,
+                    )> = Vec::with_capacity(n_results);
                     if token_payload_only {
                         for (r, req) in requests.into_iter().enumerate() {
                             let lo = batch_resp.tokens_indptr[r] as usize;
                             let hi = batch_resp.tokens_indptr[r + 1] as usize;
+                            if system_spec_proposed_per_req
+                                .get(r)
+                                .copied()
+                                .unwrap_or_default()
+                                > 0
+                            {
+                                let accepted = hi.saturating_sub(lo).saturating_sub(1);
+                                system_spec_draft_tokens_accepted += accepted as u64;
+                                for pos in 0..accepted.min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                                    system_spec_draft_tokens_accepted_per_pos[pos] += 1;
+                                }
+                            }
                             let output = if hi == lo + 1 {
                                 ForwardOutput::Token(batch_resp.tokens[lo])
                             } else {
                                 ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
                             };
-                            req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                            let PendingRequest {
+                                request,
+                                completion,
+                                physical_page_ids,
+                                last_page_len: _,
+                            } = req;
+                            match completion {
+                                Completion::Direct(tx) => {
+                                    tx.send(Ok(output)).ok();
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                                Completion::Chunk { .. } => {
+                                    let req = PendingRequest {
+                                        request,
+                                        completion,
+                                        physical_page_ids,
+                                        last_page_len: 0,
+                                    };
+                                    req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                                }
+                                Completion::Chain { state } => {
+                                    if let Some(pool) = chain_pool.as_ref() {
+                                        let ctx_id = state.prev_request.context_ids
+                                            .first().copied().unwrap_or(0);
+                                        pool.submit(ctx_id, super::speculator::ChainExtJob {
+                                            state,
+                                            output: Ok(output),
+                                            enqueued_us: super::speculator::now_micros(),
+                                        });
+                                    }
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                            }
                         }
                     } else {
                         for (r, req) in requests.into_iter().enumerate() {
-                            // Extract this request's slice from the batched
-                            // response. The api layer (build_wit_output)
-                            // walks samplers + the single-request response
-                            // to construct the WIT Output.
                             let per_req = request::extract_per_request(&batch_resp, r);
-                            req.send_result(
-                                Ok(ForwardOutput::Response(per_req)),
-                                submit_tx.as_ref(),
-                                page_size,
-                            );
+                            if system_spec_proposed_per_req
+                                .get(r)
+                                .copied()
+                                .unwrap_or_default()
+                                > 0
+                            {
+                                let accepted = per_req.tokens.len().saturating_sub(1);
+                                system_spec_draft_tokens_accepted += accepted as u64;
+                                for pos in 0..accepted.min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                                    system_spec_draft_tokens_accepted_per_pos[pos] += 1;
+                                }
+                            }
+                            let output = ForwardOutput::Response(per_req);
+                            let PendingRequest {
+                                request,
+                                completion,
+                                physical_page_ids,
+                                last_page_len: _,
+                            } = req;
+                            match completion {
+                                Completion::Direct(tx) => {
+                                    tx.send(Ok(output)).ok();
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                                Completion::Chunk { .. } => {
+                                    let req = PendingRequest {
+                                        request,
+                                        completion,
+                                        physical_page_ids,
+                                        last_page_len: 0,
+                                    };
+                                    req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                                }
+                                Completion::Chain { state } => {
+                                    if let Some(pool) = chain_pool.as_ref() {
+                                        let ctx_id = state.prev_request.context_ids
+                                            .first().copied().unwrap_or(0);
+                                        pool.submit(ctx_id, super::speculator::ChainExtJob {
+                                            state,
+                                            output: Ok(output),
+                                            enqueued_us: super::speculator::now_micros(),
+                                        });
+                                    }
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                            }
                         }
+                    }
+                    if let Some(s) = stats_for_probe.as_ref() {
+                        s.last_dispatch_end_micros.store(now_micros(), Relaxed);
+                    }
+                    if !deferred_drop.is_empty() {
+                        // Dedicated blocking pool so the chain-extender
+                        // wake-up wave doesn't compete with this dealloc
+                        // task for a worker thread.
+                        tokio::task::spawn_blocking(move || drop(deferred_drop));
                     }
                 }
             }
@@ -1272,6 +1714,10 @@ impl BatchScheduler {
             batch_build_us,
             driver_fire_us,
             response_dispatch_us: response_start.elapsed().as_micros() as u64,
+            system_spec_draft_tokens_proposed,
+            system_spec_draft_tokens_accepted,
+            system_spec_draft_tokens_proposed_per_pos,
+            system_spec_draft_tokens_accepted_per_pos,
         }
     }
 }
