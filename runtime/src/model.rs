@@ -15,8 +15,7 @@ use instruct::Instruct;
 use tokenizer::Tokenizer;
 
 /// Global cache for models (keyed by ModelId).
-static MODELS: LazyLock<boxcar::Vec<Arc<Model>>> =
-    LazyLock::new(|| boxcar::Vec::new());
+static MODELS: LazyLock<boxcar::Vec<Arc<Model>>> = LazyLock::new(|| boxcar::Vec::new());
 
 /// Type alias for model identifiers.
 pub type ModelId = usize;
@@ -36,6 +35,7 @@ pub fn register(
     arch_name: &str,
     kv_page_size: u32,
     tokenizer_path: PathBuf,
+    default_system_speculation: bool,
 ) -> Result<()> {
     let tokenizer = Arc::new(Tokenizer::from_file(&tokenizer_path)?);
     let instruct = instruct::create(arch_name, tokenizer.clone());
@@ -45,6 +45,7 @@ pub fn register(
         instruct,
         kv_page_size,
         tokenizer,
+        default_system_speculation,
     });
     MODELS.push(model);
     Ok(())
@@ -52,7 +53,10 @@ pub fn register(
 
 /// Returns a list of all registered model names.
 pub fn models() -> Vec<String> {
-    MODELS.iter().map(|(_, model)| model.name().to_string()).collect()
+    MODELS
+        .iter()
+        .map(|(_, model)| model.name().to_string())
+        .collect()
 }
 
 /// Gets cached model by model ID.
@@ -69,13 +73,12 @@ pub struct Model {
     instruct: Arc<dyn Instruct>,
     kv_page_size: u32,
     tokenizer: Arc<Tokenizer>,
+    default_system_speculation: bool,
 }
 
 impl std::fmt::Debug for Model {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Model")
-            .field("name", &self.name)
-            .finish()
+        f.debug_struct("Model").field("name", &self.name).finish()
     }
 }
 
@@ -132,5 +135,11 @@ impl Model {
     /// Gets the KV page size.
     pub fn kv_page_size(&self) -> u32 {
         self.kv_page_size
+    }
+
+    /// Whether greedy SDK generation should request the driver's system
+    /// drafter by default for this model.
+    pub fn default_system_speculation(&self) -> bool {
+        self.default_system_speculation
     }
 }
