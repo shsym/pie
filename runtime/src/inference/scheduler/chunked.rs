@@ -128,7 +128,7 @@ impl PendingRequest {
     pub(super) fn send_result<T>(
         self,
         result: Result<T>,
-        submit_tx: Option<&crossbeam::channel::Sender<PendingRequest>>,
+        submit_tx: Option<&mpsc::WeakUnboundedSender<PendingRequest>>,
         page_size: u32,
     ) where
         T: Into<ForwardOutput>,
@@ -168,12 +168,6 @@ impl PendingRequest {
                     continuation.response_tx.send(Err(e)).ok();
                 }
             },
-            Completion::Chain { state } => {
-                // Error path: the chain never had a healthy reply, so just
-                // forward the error to the inferlet / staged-entry holder
-                // and let the chain terminate (no next stage submitted).
-                let _ = state.response.send(result);
-            }
         }
     }
 }
@@ -184,7 +178,7 @@ impl ChunkContinuation {
         resp: pie_bridge::ForwardResponse,
         chunk_samplers: Vec<pie_bridge::Sampler>,
         chunk_sampler_slots: Vec<usize>,
-        submit_tx: Option<&crossbeam::channel::Sender<PendingRequest>>,
+        submit_tx: Option<&mpsc::WeakUnboundedSender<PendingRequest>>,
         page_size: u32,
     ) {
         if let Err(msg) =
@@ -213,7 +207,7 @@ impl ChunkContinuation {
             return;
         }
 
-        let Some(submit_tx) = submit_tx else {
+        let Some(submit_tx) = submit_tx.and_then(mpsc::WeakUnboundedSender::upgrade) else {
             self.response_tx
                 .send(Err(anyhow::anyhow!(
                     "chunked prefill continuation could not be requeued: scheduler shutting down"
@@ -1020,7 +1014,6 @@ fn chunk_capacity_usage(
         user_custom_mask_bytes,
         spec_custom_mask_bytes,
         has_spec_drafts: false,
-        has_rs_spec_drafts: false,
         has_dense_logit_requirement,
         has_prob_sampling,
         is_single_token_decode: chunk_len == 1
@@ -1250,7 +1243,7 @@ mod tests {
     fn chunk_sampler_slots(req: &PendingRequest) -> &[usize] {
         match &req.completion {
             Completion::Chunk { sampler_slots, .. } => sampler_slots,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) => panic!("expected chunk continuation"),
         }
     }
 
@@ -1277,7 +1270,7 @@ mod tests {
                 assert_eq!(cont.physical_page_ids, vec![100, 101, 102]);
                 assert_eq!(cont.final_last_page_len, 2);
             }
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) => panic!("expected chunk continuation"),
         }
     }
 
@@ -1292,7 +1285,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) => panic!("expected chunk continuation"),
         };
 
         let next = match cont.into_next_pending(4) {
@@ -1307,7 +1300,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => assert_eq!(cont.chunk_end, 8),
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+            Completion::Direct(_) => panic!("expected chunk continuation"),
         }
     }
 
@@ -1390,8 +1383,8 @@ mod tests {
         assert_eq!(first.request.sampling_indices, vec![1]);
         assert_eq!(chunk_sampler_slots(&first), &[1]);
 
-        let (submit_tx, submit_rx) = crossbeam::channel::unbounded();
-        let weak_submit_tx = submit_tx.clone();
+        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
+        let weak_submit_tx = submit_tx.downgrade();
         first.send_result(Ok(token_response(11)), Some(&weak_submit_tx), 4);
 
         let second = submit_rx.try_recv().expect("second chunk");
@@ -1531,7 +1524,7 @@ mod tests {
                         seen.extend_from_slice(&current.request.token_ids);
 
                         match current.completion {
-                            Completion::Direct(_) | Completion::Chain { .. } => {
+                            Completion::Direct(_) => {
                                 assert!(tokens <= max_tokens);
                                 break;
                             }
@@ -1571,7 +1564,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected continuation"),
+            Completion::Direct(_) => panic!("expected continuation"),
         };
         let second = match cont.into_next_pending(4) {
             Ok(p) => p,
@@ -1585,7 +1578,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected continuation"),
+            Completion::Direct(_) => panic!("expected continuation"),
         };
         let final_chunk = match cont.into_next_pending(4) {
             Ok(p) => p,
@@ -1625,7 +1618,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected continuation"),
+            Completion::Direct(_) => panic!("expected continuation"),
         };
         let second = match cont.into_next_pending(page_size) {
             Ok(p) => p,
@@ -1643,7 +1636,7 @@ mod tests {
             Completion::Chunk {
                 continuation: cont, ..
             } => cont,
-            Completion::Direct(_) | Completion::Chain { .. } => panic!("expected continuation"),
+            Completion::Direct(_) => panic!("expected continuation"),
         };
         let final_chunk = match cont.into_next_pending(page_size) {
             Ok(p) => p,
@@ -1699,7 +1692,7 @@ mod tests {
 
                             offset += chunk_len;
                             match current.completion {
-                                Completion::Direct(_) | Completion::Chain { .. } => panic!("expected chunk continuation"),
+                                Completion::Direct(_) => panic!("expected chunk continuation"),
                                 Completion::Chunk {
                                     continuation: cont, ..
                                 } => {
@@ -1727,8 +1720,8 @@ mod tests {
             Ok(p) => p,
             Err((_, msg)) => panic!("{msg}"),
         };
-        let (submit_tx, submit_rx) = crossbeam::channel::unbounded();
-        let weak_submit_tx = submit_tx.clone();
+        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
+        let weak_submit_tx = submit_tx.downgrade();
 
         let mut current = first;
         loop {
@@ -1761,17 +1754,13 @@ mod tests {
             Ok(p) => p,
             Err((_, msg)) => panic!("{msg}"),
         };
-        // Simulate "scheduler gone" by dropping the receiver — the
-        // clone held below will then fail to send. With the prior tokio
-        // mpsc + Weak design the test simulated this by dropping the
-        // strong sender; crossbeam doesn't have weak senders so we now
-        // close the channel from the receiver side instead.
-        let (submit_tx, submit_rx) = crossbeam::channel::unbounded();
-        drop(submit_rx);
+        let (submit_tx, _submit_rx) = mpsc::unbounded_channel();
+        let weak_submit_tx = submit_tx.downgrade();
+        drop(submit_tx);
 
         chunked.send_result(
             Ok(pie_bridge::ForwardResponse::default()),
-            Some(&submit_tx),
+            Some(&weak_submit_tx),
             4,
         );
 
@@ -1779,10 +1768,7 @@ mod tests {
             .try_recv()
             .expect("response error")
             .expect_err("expected requeue error");
-        assert!(
-            err.to_string().contains("scheduler channel closed")
-                || err.to_string().contains("scheduler shutting down")
-        );
+        assert!(err.to_string().contains("scheduler shutting down"));
     }
 
     #[test]
@@ -1860,8 +1846,8 @@ mod tests {
             Ok(p) => p,
             Err((_, msg)) => panic!("{msg}"),
         };
-        let (submit_tx, submit_rx) = crossbeam::channel::unbounded();
-        let weak_submit_tx = submit_tx.clone();
+        let (submit_tx, mut submit_rx) = mpsc::unbounded_channel();
+        let weak_submit_tx = submit_tx.downgrade();
         let mut current = first;
         let mut chunks = 0usize;
 
@@ -1961,8 +1947,8 @@ mod tests {
             Ok(p) => p,
             Err((_, msg)) => panic!("{msg}"),
         };
-        let (tx, rx) = crossbeam::channel::unbounded();
-        let weak_tx = tx.clone();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let weak_tx = tx.downgrade();
         chunked.send_result(
             Ok(pie_bridge::ForwardResponse::default()),
             Some(&weak_tx),
@@ -1994,7 +1980,7 @@ mod tests {
             chunks += 1;
             total_seen += current.request.token_ids.len();
             match current.completion {
-                Completion::Direct(_) | Completion::Chain { .. } => break,
+                Completion::Direct(_) => break,
                 Completion::Chunk {
                     continuation: cont, ..
                 } => {

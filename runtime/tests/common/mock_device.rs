@@ -62,7 +62,6 @@ fn build_token_response(tokens: Vec<u32>) -> pie_bridge::ForwardResponse {
         logprobs_values: Vec::new(),
         entropies_indptr: vec![0; (n + 1) as usize],
         entropies: Vec::new(),
-        ..Default::default()
     }
 }
 
@@ -218,8 +217,9 @@ fn status_response(status: i32) -> DriverResponse {
     }
 }
 
-impl MockChannel {
-    fn submit_impl(&self, req: DriverRequest) -> Result<DriverResponse> {
+#[async_trait]
+impl DriverChannel for MockChannel {
+    async fn submit(&self, req: DriverRequest) -> Result<DriverResponse> {
         if *self.aborted.lock().unwrap() {
             anyhow::bail!("mock channel {}: aborted", self.device_idx);
         }
@@ -242,17 +242,6 @@ impl MockChannel {
             | pie_bridge::RequestPayload::Adapter(_)
             | pie_bridge::RequestPayload::Health => Ok(status_response(0)),
         }
-    }
-}
-
-#[async_trait]
-impl DriverChannel for MockChannel {
-    async fn submit(&self, req: DriverRequest) -> Result<DriverResponse> {
-        self.submit_impl(req)
-    }
-
-    fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse> {
-        self.submit_impl(req)
     }
 
     fn notify(&self, _req: DriverRequest) -> Result<()> {

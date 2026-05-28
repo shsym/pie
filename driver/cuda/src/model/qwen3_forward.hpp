@@ -6,7 +6,6 @@
 
 #include <cstdint>
 
-#include "device_buffer.hpp"
 #include "model/loaded_model.hpp"
 #include "model/qwen3.hpp"
 #include "ops/gemm.hpp"
@@ -20,7 +19,6 @@ namespace pie_cuda_driver::model {
 struct Qwen3Workspace {
     DeviceTensor y;          // [max_tokens, hidden]
     DeviceTensor norm_x;     // [max_tokens, hidden]
-    DeviceTensor spec_hidden; // [max_tokens, hidden] saved verifier hidden rows
     DeviceTensor qkv_fused;  // [max_tokens, Hq + 2*Hk]   — only allocated when fused
                              // QKV path is in use; empty otherwise.
     DeviceTensor rope_table; // [max_tokens, head_dim] FP32; first half of
@@ -32,7 +30,6 @@ struct Qwen3Workspace {
     DeviceTensor norm_y;     // [max_tokens, hidden]
     DeviceTensor gate_up_fused; // [max_tokens, 2*I] — fused gate+up output, empty
                                 // when unfused
-    DeviceTensor mtp_concat;    // [max_tokens, 2*hidden] — Qwen3.6 MTP fc input
     DeviceTensor gate;       // [max_tokens, intermediate]
     DeviceTensor up;         // [max_tokens, intermediate]
     DeviceTensor logits;     // [max_tokens, vocab]
@@ -128,15 +125,5 @@ void qwen3_forward_paged(
     // flashinfer's MaskMode::kCustom; ignored on the decode path.
     const std::uint8_t*  custom_mask_d = nullptr,
     const std::int32_t*  custom_mask_indptr_d = nullptr);
-
-// Byte budget for the per-fire Qwen3Workspace tensors, parameterized by
-// the HF config and the per-fire token/output shape. Used by the memory
-// planner to size the persistent workspace arena.
-std::size_t qwen3_workspace_bytes(const HfConfig& cfg,
-                                  int N,
-                                  int output_rows,
-                                  int max_intermediate,
-                                  int max_Hq,
-                                  int max_Hk);
 
 }  // namespace pie_cuda_driver::model

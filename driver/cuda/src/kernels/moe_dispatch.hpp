@@ -73,28 +73,6 @@ void launch_token_batched_weighted_sum_bf16(
     int hidden,
     cudaStream_t stream);
 
-void launch_token_batched_weighted_sum_add_bf16(
-    void*       out,
-    const void* src,
-    const float* weights,
-    int num_tokens,
-    int top_k,
-    int hidden,
-    cudaStream_t stream);
-
-// Fused combine for aligned MoE output. `route_to_aligned_row[route]`
-// maps the original route id (`token * top_k + k`) to its row in
-// `aligned_out`; accumulation still proceeds in top-k order for each token.
-void launch_token_batched_weighted_sum_aligned_bf16(
-    void* out,
-    const void* aligned_out,
-    const float* weights,
-    const std::int32_t* route_to_aligned_row,
-    int num_tokens,
-    int top_k,
-    int hidden,
-    cudaStream_t stream);
-
 // On-device construction of the per-expert cuBLAS pointer arrays for the
 // N=1 MoE decode path. Replaces the host-side build_routing + 6
 // cudaMemcpyAsync's that the original implementation used; produces the
@@ -159,46 +137,6 @@ void launch_build_moe_ptrs_decode_batched_bf16(
     int H, int I_moe,
     cudaStream_t stream);
 
-// Tensor-core decode kernels for the sparse MoE hot path. Each routed
-// token/expert pair is treated as a 1-row GEMM, but computed with BF16 WMMA
-// tiles to avoid the overhead of many tiny cuBLAS batched GEMMs.
-void launch_moe_gate_up_decode_wmma_bf16(
-    const std::int32_t* topk_idx,
-    const void* norm_x,
-    const void* gate_up_base,
-    void* expert_gate_up,
-    int num_tokens,
-    int top_k,
-    int H,
-    int I_moe,
-    cudaStream_t stream);
-
-void launch_moe_down_decode_wmma_bf16(
-    const std::int32_t* topk_idx,
-    const void* expert_act,
-    const void* down_base,
-    void* expert_out,
-    int num_tokens,
-    int top_k,
-    int H,
-    int I_moe,
-    cudaStream_t stream);
-
-// Builds a two-entry pointer table for running two same-shaped BF16 GEMMs as
-// one cublasGemmBatchedEx call:
-//   out0 = act @ w0^T
-//   out1 = act @ w1^T
-void launch_build_dual_bf16_gemm_ptrs(
-    const void* act,
-    const void* w0,
-    const void* w1,
-    void* out0,
-    void* out1,
-    const void** act_ptrs,
-    const void** w_ptrs,
-    void** out_ptrs,
-    cudaStream_t stream);
-
 // vLLM/SGL-style decode alignment. Sorts route ids [0, num_routes) by expert
 // into fixed-size blocks; padded entries are filled with sentinel num_routes.
 // `expert_ids[b]` is the expert for block b or -1 for inactive padding blocks.
@@ -206,28 +144,10 @@ void launch_moe_align_decode(
     const std::int32_t* topk_idx,
     std::int32_t* sorted_route_ids,
     std::int32_t* expert_ids,
-    // Optional output: maps original route id (`token * top_k + k`) to the
-    // padded sorted-row position. Pass nullptr if the caller does not need
-    // this inverse map. Used by the fused `_aligned_bf16` combine kernel.
-    std::int32_t* route_to_aligned_row,
     int num_routes,
     int num_experts,
     int block_size,
     int max_blocks,
-    cudaStream_t stream);
-
-// `launch_moe_bucket_exact` is the same expert-bucketing setup as
-// `launch_moe_align_decode`, this does not pad to fixed-size expert blocks.
-// It writes sorted route ids, the inverse route->sorted-row map, and exact
-// per-expert counts. The host may copy only `counts_out[num_experts]` to build
-// cuBLAS grouped shapes while route metadata stays on device.
-void launch_moe_bucket_exact(
-    const std::int32_t* topk_idx,
-    std::int32_t* sorted_route_ids,
-    std::int32_t* route_to_sorted_row,
-    std::int32_t* counts_out,
-    int num_routes,
-    int num_experts,
     cudaStream_t stream);
 
 // Gather `norm_x[route / top_k]` into aligned rows. Sentinel route ids become

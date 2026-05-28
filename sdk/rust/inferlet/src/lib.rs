@@ -132,13 +132,9 @@ impl ForwardPassExt for inference::ForwardPass {
         }
         let pollable = future_output.pollable();
         AsyncPollable::new(pollable).wait_for().await;
-        for _ in 0..256 {
-            if let Some(output) = future_output.get() {
-                return Ok(output);
-            }
-            wstd::task::sleep(wstd::time::Duration::from_micros(1)).await;
-        }
-        Err("No output available".to_string())
+        future_output
+            .get()
+            .ok_or_else(|| "No output available".to_string())
     }
 }
 

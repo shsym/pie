@@ -60,7 +60,6 @@ public:
         return weights_.find(name) != weights_.end();
     }
     const DeviceTensor& get(const std::string& name) const;
-    std::size_t erase_runtime_weight(const std::string& name);
 
     // Lookup quantization metadata for a weight. Returns std::nullopt if
     // the weight is plain bf16/fp16/fp32 (the common case).
@@ -75,14 +74,5 @@ private:
     WeightStore weights_;
     Mxfp4MoeLowering mxfp4_moe_lowering_ = Mxfp4MoeLowering::Bf16Dequant;
 };
-
-namespace ops { struct RuntimeQuantScratchSpec; }
-
-// Derive the runtime-quant scratch spec by scanning the loaded model's
-// quantized weights and recording the widest FP8/INT8 weight shape we'd
-// need to dequantize on the fly. `max_tokens` is the row dimension for
-// the on-the-fly dequant scratch.
-ops::RuntimeQuantScratchSpec runtime_quant_scratch_spec(const LoadedModel& engine,
-                                                       std::size_t max_tokens);
 
 }  // namespace pie_cuda_driver

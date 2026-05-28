@@ -226,8 +226,6 @@ impl InProcChannel {
         if state.aborted.load(Ordering::Acquire) {
             return Err(anyhow!("InProcChannel aborted"));
         }
-        // Phase: ipc_submit
-        let submit_start = std::time::Instant::now();
         let req_id = state.next_id.fetch_add(1, Ordering::Relaxed);
         let slot = Arc::new(ResponseSlot::new());
         let frame = Box::new(pie_bridge::Frame {
@@ -268,13 +266,8 @@ impl InProcChannel {
             inbox.push_back(req_id);
             state.inbox_cv.notify_one();
         }
-        crate::probe::driver_cuda::record_ipc_submit(submit_start.elapsed());
 
-        // Phase: gpu_wait + ipc_recv (slot.wait combines both)
-        let wait_start = std::time::Instant::now();
-        let result = slot.wait(state.spin_budget_us);
-        crate::probe::driver_cuda::record_gpu_wait(wait_start.elapsed());
-        result
+        slot.wait(state.spin_budget_us)
     }
 }
 
@@ -291,10 +284,6 @@ impl DriverChannel for InProcChannel {
                 .map_err(|e| anyhow!("InProcChannel blocking submit task failed: {e}"))?,
             Err(_) => Self::submit_sync_for_state(&state, req),
         }
-    }
-
-    fn submit_sync(&self, req: DriverRequest) -> Result<DriverResponse> {
-        Self::submit_sync_for_state(&self.state, req)
     }
 
     fn notify(&self, req: DriverRequest) -> Result<()> {

@@ -19,8 +19,6 @@ from common import (
     ROOT,
     RequestResult,
     add_mode_subcommands,
-    cuda_profiler_start,
-    cuda_profiler_stop,
     finish,
     hf_chat_token_ids_and_counts,
     make_prompts,
@@ -100,21 +98,14 @@ def build_config(args: argparse.Namespace):
     elif args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
+            "memory_profile": args.memory_profile,
+            "kv_cache_dtype": args.kv_cache_dtype,
+            "ready_timeout_s": float(args.server_startup_timeout),
         }
-        if args.memory_profile != "auto":
-            driver_options["memory_profile"] = args.memory_profile
-        if args.kv_cache_dtype != "auto":
-            driver_options["kv_cache_dtype"] = args.kv_cache_dtype
         if args.runtime_quant:
             driver_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
             driver_options["mxfp4_moe"] = args.mxfp4_moe
-        if args.mtp_assistant_snapshot_dir:
-            driver_options["mtp_assistant_snapshot_dir"] = (
-                args.mtp_assistant_snapshot_dir
-            )
-        if args.mtp_num_drafts is not None:
-            driver_options["mtp_num_drafts"] = args.mtp_num_drafts
     elif args.driver == "portable":
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
@@ -442,11 +433,7 @@ async def run(args: argparse.Namespace):
                 "wasm_delay_us": args.wasm_delay_us,
                 "return_text": args.dump_first_text,
                 "wait_for_start": args.defer_start,
-                **(
-                    {"system_speculation": args.system_speculation}
-                    if args.system_speculation is not None
-                    else {}
-                ),
+                "system_speculation": args.system_speculation,
             }
 
         async def launch_one(i: int, *, max_tokens: int | None = None):
@@ -498,8 +485,6 @@ async def run(args: argparse.Namespace):
                 "prompt": prompts[indices[0]] if indices else args.prompt,
                 "prompts": [prompts[i] for i in indices],
             }
-            if args.concurrency and args.concurrency > 0:
-                inp["batch_concurrency"] = args.concurrency
             if prompt_token_ids is not None:
                 inp["prompt_tokens_batch"] = [prompt_token_ids[i] for i in indices]
             start = time.perf_counter()
@@ -626,29 +611,12 @@ async def run(args: argparse.Namespace):
                     await one(i, max_tokens=warmup_max_tokens)
 
         start_idx = args.warmup
-        # Snapshot cumulative stats after warmup so the final diff
-        # reflects only the measured window, not warmup fires.
-        pre_stats: dict[str, Any] = {}
-        try:
-            ok, body = await client.query("model_status", "")
-            if ok:
-                pre_stats = json.loads(body)
-        except Exception:
-            pass
-        cuda_profiler_start(args.cuda_profiler_capture)
         start = time.perf_counter()
-        try:
-            if args.mode == "latency":
-                results = [await one(start_idx + i) for i in range(n)]
-            else:
-                results = await many(range(start_idx, start_idx + n))
-        finally:
-            wall = time.perf_counter() - start
-            cuda_profiler_stop(args.cuda_profiler_capture)
-        if args.mode == "tput" and args.defer_start:
-            measured = [r.latency_s for r in results if r.ok]
-            if measured:
-                wall = max(measured)
+        if args.mode == "latency":
+            results = [await one(start_idx + i) for i in range(n)]
+        else:
+            results = await many(range(start_idx, start_idx + n))
+        wall = time.perf_counter() - start
 
         # Pull speculation counters out of the server's model status
         # so the bench output reflects what actually happened. Zero
@@ -657,18 +625,7 @@ async def run(args: argparse.Namespace):
         try:
             ok, body = await client.query("model_status", "")
             if ok:
-                model_status_raw = json.loads(body)
-                # Diff cumulative counters against pre-warmup snapshot
-                # so the output only reflects the measured window.
-                model_status: dict[str, Any] = {}
-                for k, v in model_status_raw.items():
-                    pre = pre_stats.get(k)
-                    if isinstance(v, (int, float)) and isinstance(pre, (int, float)):
-                        model_status[k] = v - pre
-                    elif isinstance(v, list) and isinstance(pre, list) and len(v) == len(pre):
-                        model_status[k] = [a - b for a, b in zip(v, pre)]
-                    else:
-                        model_status[k] = v
+                model_status = json.loads(body)
                 for key, label in (
                     ("default.spec_attempted", "spec attempted"),
                     ("default.spec_hits", "spec hits"),
@@ -682,55 +639,17 @@ async def run(args: argparse.Namespace):
                     ("default.spec_longest_chain", "spec longest chain"),
                     ("default.total_batches", "total batches"),
                     ("default.avg_batch_latency_us", "avg batch latency us"),
-                    # Fire-domain probes. Mirror runtime/src/probe/fire.rs
-                    # hierarchy. All-zero unless server built with
-                    # --features profile-fire (or profile-hot-path / profile-all).
-                    ("default.fire.inter_fire_us", "fire.inter_fire_us"),
-                    ("default.fire.post_dispatch_to_fire_us", "fire.post_dispatch_to_fire_us"),
-                    ("default.fire.accumulate.accum_loop_us", "fire.accumulate.accum_loop_us"),
-                    ("default.fire.pre_dispatch.fire_prepare_us", "fire.pre_dispatch.fire_prepare_us"),
-                    ("default.fire.execute.total_us", "fire.execute.total_us"),
-                    ("default.fire.execute.batch_build_us", "fire.execute.batch_build_us"),
-                    ("default.fire.execute.driver_fire_us", "fire.execute.driver_fire_us"),
-                    ("default.fire.execute.response_dispatch.total_us", "fire.execute.response_dispatch.total_us"),
-                    ("default.fire.execute.response_dispatch.direct_count", "fire.execute.response_dispatch.direct_count"),
-                    ("default.fire.execute.response_dispatch.chain_count", "fire.execute.response_dispatch.chain_count"),
-                    ("default.fire.execute.response_dispatch.chunk_count", "fire.execute.response_dispatch.chunk_count"),
-                    ("default.fire.execute.driver_cuda.ipc_submit_us", "fire.execute.driver_cuda.ipc_submit_us"),
-                    ("default.fire.execute.driver_cuda.gpu_wait_us", "fire.execute.driver_cuda.gpu_wait_us"),
-                    ("default.fire.execute.driver_cuda.ipc_recv_us", "fire.execute.driver_cuda.ipc_recv_us"),
-                    ("default.fire.execute.driver_cuda.wire_parse_us", "fire.execute.driver_cuda.wire_parse_us"),
-                    ("default.fire.execute.driver_cuda.plan_us", "fire.execute.driver_cuda.plan_us"),
-                    ("default.fire.execute.driver_cuda.h2d_us", "fire.execute.driver_cuda.h2d_us"),
-                    ("default.fire.execute.driver_cuda.kernel_launch_us", "fire.execute.driver_cuda.kernel_launch_us"),
-                    ("default.fire.execute.driver_cuda.sync_us", "fire.execute.driver_cuda.sync_us"),
-                    ("default.fire.execute.driver_cuda.response_build_us", "fire.execute.driver_cuda.response_build_us"),
-                    ("default.fire.execute.driver_cuda.sum_sync_us", "fire.execute.driver_cuda.sum_sync_us"),
-                    ("default.fire.execute.driver_cuda.sum_kernel_launch_us", "fire.execute.driver_cuda.sum_kernel_launch_us"),
-                    ("default.cumulative_batch_latency_us", "cumulative_batch_latency_us"),
-                    ("default.fire.post_dispatch.context_tick_us", "fire.post_dispatch.context_tick_us"),
-                    ("default.fire.post_dispatch.stats_update_us", "fire.post_dispatch.stats_update_us"),
-                    (
-                        "default.system_spec_draft_tokens_proposed",
-                        "system spec draft tokens proposed",
-                    ),
-                    (
-                        "default.system_spec_draft_tokens_accepted",
-                        "system spec draft tokens accepted",
-                    ),
-                    (
-                        "default.system_spec_draft_tokens_proposed_per_pos",
-                        "system spec draft tokens proposed per pos",
-                    ),
-                    (
-                        "default.system_spec_draft_tokens_accepted_per_pos",
-                        "system spec draft tokens accepted per pos",
-                    ),
+                    ("default.avg_permit_wait_us", "avg permit wait us"),
+                    ("default.avg_fire_prepare_us", "avg fire prepare us"),
+                    ("default.avg_execute_batch_us", "avg execute batch us"),
+                    ("default.avg_batch_build_us", "avg batch build us"),
+                    ("default.avg_driver_fire_us", "avg driver fire us"),
+                    ("default.avg_response_dispatch_us", "avg response dispatch us"),
+                    ("default.avg_context_tick_submit_us", "avg context tick submit us"),
+                    ("default.avg_stats_update_us", "avg stats update us"),
                     ("default.last_batch_latency_us", "last batch latency us"),
                     ("default.bypass_hits", "bypass hits"),
                     ("default.chain_submits", "chain submits"),
-                    ("default.chain_ext_avg_wake_us", "chain ext avg wake us"),
-                    ("default.chain_ext_avg_work_us", "chain ext avg work us"),
                     ("default.chain_drops", "chain drops"),
                     ("default.total_requests_processed", "total requests"),
                     ("default.max_forward_requests_observed", "max forward requests"),
@@ -763,7 +682,6 @@ async def run(args: argparse.Namespace):
             "top_p": args.top_p,
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
-            "cuda profiler capture": args.cuda_profiler_capture,
             **engine_config,
         },
     )
@@ -839,21 +757,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--system-speculation",
             action=argparse.BooleanOptionalAction,
-            default=None,
-            help="Override system speculation. Omit to use the model default; "
-                 "--no-system-speculation forces the no-spec baseline.",
-        )
-        sp.add_argument(
-            "--mtp-assistant-snapshot-dir",
-            default=None,
-            help="cuda_native Gemma4 MTP assistant snapshot path used by .system_speculation(); "
-                 "auto-discovered from the HF cache when omitted.",
-        )
-        sp.add_argument(
-            "--mtp-num-drafts",
-            type=int,
-            default=None,
-            help="Number of native MTP draft tokens per accepted token.",
+            default=True,
+            help="Ask the benchmark inferlet to request driver-provided speculative drafts.",
         )
         sp.add_argument(
             "--batch-policy",

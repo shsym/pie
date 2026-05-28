@@ -26,6 +26,9 @@ void launch_rope_standard_table(
     float theta,
     cudaStream_t stream);
 
+// `interleaved=false` uses the half/half (NeoX) pairing (dim i with i+d/2),
+// used by Llama/Qwen/DeepSeek/Kimi. `interleaved=true` uses the GPT-J pairing
+// (adjacent dims 2i, 2i+1), required by GLM (config `rope_interleave=true`).
 void launch_rope_bf16(
     void* q, void* k,
     const std::int32_t* positions,  // [num_tokens]
@@ -34,30 +37,13 @@ void launch_rope_bf16(
     int num_kv_heads,
     int head_dim,
     float theta,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool interleaved = false);
 
 // Fused per-head Q/K RMSNorm + standard RoPE. This matches models such as
 // Qwen3 where q_norm/k_norm have shape [head_dim] and RoPE is the standard
 // first-half/second-half pairing.
 void launch_qk_rmsnorm_rope_bf16(
-    void* q,
-    void* k,
-    const void* q_weight,
-    const void* k_weight,
-    const std::int32_t* positions,
-    int num_tokens,
-    int num_q_heads,
-    int num_kv_heads,
-    int head_dim,
-    float theta,
-    float eps,
-    cudaStream_t stream);
-
-// Same fused Q/K RMSNorm + standard RoPE, but preserves the bf16
-// materialization point of the unfused sequence:
-//   q = bf16(rmsnorm(q)); k = bf16(rmsnorm(k)); rope(q, k)
-// Gemma-4 parity is sensitive to this rounding boundary.
-void launch_qk_rmsnorm_rope_bf16_rounded(
     void* q,
     void* k,
     const void* q_weight,
@@ -143,16 +129,20 @@ void launch_rope_partial_bf16(
     float theta,
     cudaStream_t stream);
 
-void launch_rope_partial_bf16_position_delta(
+// Partial rotary embedding on the LAST `rotary_dim` dimensions of each head.
+// Used by DeepSeek V4 where RoPE is applied to the trailing 64 dims of
+// head_dim=512. Pair convention: (offset+i, offset+i+rotary_dim/2)
+// where offset = head_dim - rotary_dim.
+void launch_rope_partial_last_bf16(
     void* q, void* k,
     const std::int32_t* positions,
-    int position_delta,
     int num_tokens,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
     int rotary_dim,
     float theta,
-    cudaStream_t stream);
+    cudaStream_t stream,
+    bool inverse = false);
 
 }  // namespace pie_cuda_driver::kernels

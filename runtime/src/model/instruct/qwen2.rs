@@ -78,7 +78,6 @@ pub fn new(tokenizer: Arc<Tokenizer>) -> QwenInstruct {
         ChatMLConfig {
             has_thinking: false,
             has_tools: true,
-            generation_suffix: "",
             stop_tokens: &["<|im_end|>", "<|endoftext|>"],
         },
     )

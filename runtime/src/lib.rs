@@ -14,7 +14,6 @@ pub mod messaging;
 pub mod model;
 pub mod path;
 pub mod policy;
-pub mod probe;
 pub mod process;
 pub mod program;
 pub mod server;

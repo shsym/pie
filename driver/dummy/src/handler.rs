@@ -103,7 +103,6 @@ impl Handler {
             logprobs_values,
             entropies_indptr,
             entropies,
-            ..Default::default()
         };
         let frame = ResponseFrame {
             driver_id,
