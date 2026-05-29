@@ -1,10 +1,9 @@
 #pragma once
 
-// Forward executor for the `fire_batch` inproc method. Lifted from
-// entry.cpp so the entry point stays focused on startup and service
-// wiring. Body is unchanged from its lambda incarnation; follow-up
-// refactors (spec expansion, sampling dispatch, sub-passes) split this
-// further.
+// Forward executor for the `fire_batch` inproc method. Owns the per-
+// device persistent state (workspaces, KV cache, attention scratch,
+// graph cache) and dispatches each fire through ForwardFn onto the
+// active IModel implementation.
 
 #include <cstddef>
 #include <cstdint>
@@ -27,11 +26,12 @@ namespace pie_cuda_driver {
 class LoadedModel;
 class KvCache;
 class AttentionWorkspace;
-class Qwen3_5StateCache;
+class RecurrentStateCache;
 
 namespace model {
 struct Qwen3Weights;
 struct Qwen3Workspace;
+class IModel;
 }  // namespace model
 
 namespace ops {
@@ -73,35 +73,61 @@ struct ForwardFn {
     bool graph_safe = false;
     bool supports_tp_greedy_argmax = false;
     bool supports_compact_logits = false;
+    bool supports_small_prefill_graph = false;
 
-    using BodyFn = std::function<void(
-        model::Qwen3Workspace&,
-        KvCache&,
-        AttentionWorkspace&,
-        ops::CublasHandle&,
-        const std::int32_t*  /* token_ids        device */,
-        const std::int32_t*  /* positions        device */,
-        const std::uint32_t* /* qo_indptr        device */,
-        const std::uint32_t* /* kv_page_indices  device */,
-        const std::uint32_t* /* kv_page_indptr   device */,
-        const std::uint32_t* /* kv_last_page_lens device */,
-        const std::uint32_t* /* qo_indptr_h        host */,
-        const std::uint32_t* /* kv_page_indptr_h   host */,
-        int                  /* total_tokens N */,
-        int                  /* num_requests R */,
-        bool                 /* is_pure_decode */,
-        const std::uint8_t*  /* custom_mask_d  (nullable) */,
-        const std::int32_t*  /* custom_mask_indptr_d (nullable) */,
-        const std::int32_t*  /* slot_ids_h     host, len R, nullable */,
-        const std::uint8_t*  /* is_fresh_h     host, len R, nullable */,
-        const std::int32_t*  /* slot_ids_d     device, len R, nullable */,
-        const std::int32_t*  /* logit_row_indices_d device, nullable */,
-        int                  /* num_logit_rows */,
-        bool                 /* tp_greedy_argmax */
-    )>;
+    // All metadata needed to execute one forward body call. Bundled as a
+    // struct so adding a new field is a one-site addition rather than a
+    // signature change touching every arch's body.
+    struct ForwardInputs {
+        // Per-token device buffers
+        const std::int32_t*  token_ids            = nullptr;
+        const std::int32_t*  positions            = nullptr;
+
+        // CSR-style indptrs (device + host where required)
+        const std::uint32_t* qo_indptr_d          = nullptr;
+        const std::uint32_t* kv_page_indices_d    = nullptr;
+        const std::uint32_t* kv_page_indptr_d     = nullptr;
+        const std::uint32_t* kv_last_page_lens_d  = nullptr;
+        const std::uint32_t* qo_indptr_h          = nullptr;
+        const std::uint32_t* kv_page_indices_h    = nullptr;
+        const std::uint32_t* kv_page_indptr_h     = nullptr;
+        const std::uint32_t* kv_last_page_lens_h  = nullptr;
+
+        // Shape
+        int total_tokens   = 0;     // N
+        int num_requests   = 0;     // R
+        bool is_pure_decode = false;
+
+        // Optional: custom attention mask (BRLE-packed)
+        const std::uint8_t*  custom_mask_d        = nullptr;
+        const std::int32_t*  custom_mask_indptr_d = nullptr;
+
+        // Optional: per-request rs-cache slot info
+        const std::int32_t*  slot_ids_h           = nullptr;
+        const std::uint8_t*  is_fresh_h           = nullptr;
+        const std::int32_t*  slot_ids_d           = nullptr;
+
+        // Optional: logit row gather indices (for compact-logit modes)
+        const std::int32_t*  logit_row_indices_d  = nullptr;
+        int                  num_logit_rows       = 0;
+
+        // Sampling hint: if the executor only needs argmax, body may skip
+        // dense logits and write straight into the fused-argmax output.
+        bool tp_greedy_argmax = false;
+
+        // Recurrent-only commit-advance: when non-null, the forward runs ONLY
+        // the linear-attn block of each linear layer (conv + recurrence,
+        // write_state=true) over `total_tokens` accepted tokens, gathering each
+        // layer's input from the verify-stashed hidden via these row indices
+        // (into the verify token layout). Attention, MLP, non-linear layers,
+        // and lm_head are skipped. Used to advance rs_cache state after a
+        // frozen verify without re-running the whole backbone.
+        const std::int32_t*  commit_advance_gather_d = nullptr;
+    };
 
     struct PrepareInputs {
         const std::uint32_t* qo_indptr_h = nullptr;
+        const std::uint32_t* kv_page_indices_h = nullptr;
         const std::uint32_t* kv_page_indices_d = nullptr;
         const std::uint32_t* kv_page_indptr_h = nullptr;
         const std::uint32_t* kv_page_indptr_d = nullptr;
@@ -112,35 +138,121 @@ struct ForwardFn {
         bool is_pure_decode = false;
     };
 
-    using PrepareFn = std::function<void(
-        AttentionWorkspace&,
-        const PrepareInputs&
+    // The arch implementation. entry.cpp sets this once at construction;
+    // the executor dispatches every per-fire call through these methods.
+    model::IModel* model = nullptr;
+    bool supports_fused_lmhead_argmax = false;
+
+    // Wire `m` as the active arch and copy its capability bits onto the
+    // ForwardFn caps that the executor consults each fire. Subsumes the
+    // ~5-line "graph_safe/supports_*/model" boilerplate every arch was
+    // repeating in entry.cpp.
+    void attach_model(model::IModel* m);
+
+    // Dispatch helpers — null-safe so an executor with no model attached
+    // is harmless rather than a segfault.
+    void invoke_prepare(AttentionWorkspace& aws, const PrepareInputs& in);
+    void invoke_body(model::Qwen3Workspace& ws,
+                     KvCache& kv,
+                     AttentionWorkspace& aws,
+                     ops::CublasHandle& cublas,
+                     const ForwardInputs& in);
+    std::uint32_t invoke_graph_layout();
+    void invoke_set_logits_argmax_only(bool enabled);
+    void invoke_set_fused_argmax_output(std::int32_t* ptr);
+    bool invoke_fused_argmax_done();
+};
+
+struct SystemSpecDraftRequest {
+    int request_index = -1;
+    int source_row = -1;
+    std::uint32_t accepted_token = 0;
+    std::uint32_t source_position = 0;
+    std::uint32_t first_draft_position = 0;
+    int last_match = -1;
+    int last_num_drafts = 0;
+};
+
+struct SystemSpecDraftInputs {
+    model::Qwen3Workspace& target_ws;
+    KvCache& kv_cache;
+    AttentionWorkspace& attn_ws;
+    ops::CublasHandle& cublas;
+    std::span<const SystemSpecDraftRequest> requests;
+    std::span<const std::uint32_t> kv_page_indices;
+    std::span<const std::uint32_t> kv_page_indptr;
+    int page_size = 0;
+    int max_drafts = 0;
+};
+
+using NativeSystemDraftNextFn = std::function<void(
+    const SystemSpecDraftInputs&,
+    std::span<pie_driver::PerRequestOutput>)>;
+
+struct NativeSystemCommitInputs {
+    model::Qwen3Workspace& target_ws;
+    KvCache& kv_cache;
+    ops::CublasHandle& cublas;
+    const std::int32_t* token_ids = nullptr;
+    const std::int32_t* positions = nullptr;
+    const std::uint32_t* qo_indptr = nullptr;
+    const std::uint32_t* kv_page_indices = nullptr;
+    const std::uint32_t* kv_page_indptr = nullptr;
+    const std::uint32_t* kv_last_page_lens = nullptr;
+    const std::int32_t* slot_ids = nullptr;
+    const std::int32_t* source_row_indices = nullptr;
+    int total_tokens = 0;
+    int num_requests = 0;
+};
+
+struct NativeSystemDrafter {
+    using CommitVerifiedPrefixFn = std::function<void(
+        const NativeSystemCommitInputs&)>;
+
+    using DraftStepFn = std::function<void(
+        model::Qwen3Workspace&,
+        KvCache&,
+        ops::CublasHandle&,
+        const std::int32_t*  /* token_ids device */,
+        const std::int32_t*  /* position_ids device */,
+        const std::int32_t*  /* base_hidden_row_indices device */,
+        const std::int32_t*  /* request_ids device */,
+        const std::uint32_t* /* kv_page_indices device */,
+        const std::uint32_t* /* kv_page_indptr device */,
+        const std::uint32_t* /* kv_last_page_lens device */,
+        std::int32_t*        /* sampled_token_ids device, optional */,
+        int                  /* num_tokens */,
+        int                  /* draft_step */,
+        int                  /* max_global_tokens */
     )>;
 
-    using GraphLayoutFn = std::function<std::uint32_t()>;
-    using LogitsModeFn = std::function<void(bool)>;
+    int max_drafts = 0;
+    // Position passed to the first low-level draft step is
+    // source_position + draft_position_offset; later steps advance by one.
+    int draft_position_offset = 1;
+    // Some native drafters keep the just-generated draft chain in local
+    // history instead of writing it into their paged cache. For those,
+    // global-cache attention length is the fixed prefix position, not the
+    // current draft position.
+    bool draft_global_cache_uses_prefix_position = false;
+    // When true, draft_step writes sampled token ids directly to the supplied
+    // output buffer and the executor skips the generic logits argmax.
+    bool draft_step_writes_sampled_tokens = false;
+    // Optional phase used by drafters that maintain native cache/recurrent
+    // state for the prefix that target verification accepted.
+    CommitVerifiedPrefixFn commit_verified_prefix;
+    // Generic model-owned drafter. Gemma4 MTP implements the whole draft loop
+    // behind this callback.
+    NativeSystemDraftNextFn draft_next;
+    // Lower-level single-step drafter. The executor can chain this on GPU while
+    // keeping shared response plumbing model-neutral.
+    DraftStepFn draft_step;
 
-    // Empty by default → executor falls back to "direct call only;
-    // no graph capture" mode for this arch.
-    PrepareFn prepare;
-    GraphLayoutFn graph_layout;
-    LogitsModeFn set_logits_argmax_only;
-    BodyFn    body;
-
-    // Convenience: `forward_fn = [...]` assigns the lambda as the body.
-    // entry.cpp uses this terser pattern; the older `forward_fn.body =
-    // [...]` form continues to work because we leave `body` public.
-    template <class F>
-        requires(!std::is_same_v<std::decay_t<F>, ForwardFn>)
-    ForwardFn& operator=(F&& f) {
-        body = std::forward<F>(f);
-        return *this;
+    explicit operator bool() const noexcept {
+        return max_drafts > 0 &&
+               (static_cast<bool>(draft_next) ||
+                static_cast<bool>(draft_step));
     }
-    ForwardFn() = default;
-    ForwardFn(const ForwardFn&) = default;
-    ForwardFn(ForwardFn&&) noexcept = default;
-    ForwardFn& operator=(const ForwardFn&) = default;
-    ForwardFn& operator=(ForwardFn&&) noexcept = default;
 };
 
 // Stable references the executor needs across calls. Constructed
@@ -158,6 +270,10 @@ struct Executor {
     // This page is not reported in DriverCapabilities.total_pages, so the
     // runtime never assigns it to a context.
     int graph_pad_page = -1;
+    // Private recurrent-state slot used only for CUDA-graph padding rows.
+    // Like graph_pad_page, it is allocated in CUDA storage but hidden from
+    // runtime capabilities.
+    int graph_pad_slot = -1;
     // Pre-allocated input buffers — refreshed per fire via memcpy
     // rather than re-allocated. See `persistent_inputs.hpp`.
     PersistentInputs& inputs;
@@ -165,6 +281,8 @@ struct Executor {
     // Type-erased forward call. The captured weights / cfg / model
     // function are model-specific; the call site is uniform.
     ForwardFn forward_fn;
+    // Optional driver-native drafter for `.system_speculation()`.
+    NativeSystemDrafter system_drafter;
     // Optional CUDA-graph cache. When non-null, decode-only fires
     // attempt graph capture/replay; otherwise the forward runs directly.
     ForwardGraphCache* graph_cache = nullptr;
@@ -182,7 +300,7 @@ struct Executor {
 
     // Runtime-managed rs_cache storage. Null on models without
     // recurrent-state slots.
-    Qwen3_5StateCache* rs_cache = nullptr;
+    RecurrentStateCache* rs_cache = nullptr;
 
     // Response-view builder. Reused fire-to-fire — the builder owns the
     // concat scratch the `PieForwardResponseView` slices point into. The

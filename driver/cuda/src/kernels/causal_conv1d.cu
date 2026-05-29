@@ -131,14 +131,21 @@ __global__ void causal_conv1d_prefill_batched_kernel(
     const int*       __restrict__ slot_ids,        // [R]
     const std::uint32_t* __restrict__ qo_indptr,   // [R+1]
     long long slot_stride_elems,
-    int C, int K)
+    int C, int K, bool write_state,
+    const int* commit_len)
 {
     const int c = blockIdx.x;
     const int r = blockIdx.y;
     if (c >= C) return;
 
     const int t0 = static_cast<int>(qo_indptr[r]);
-    const int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
+    int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
+    // Boundary-write (commit-advance): fold only the confirmed prefix into the
+    // conv state; the trailing-K window then lands at the accepted boundary.
+    if (commit_len != nullptr) {
+        const int c = commit_len[r];
+        if (c < Nr) Nr = c;
+    }
     if (Nr <= 0) return;
 
     const int slot = slot_ids[r];
@@ -171,8 +178,85 @@ __global__ void causal_conv1d_prefill_batched_kernel(
 
     __syncthreads();
 
-    if (state_out_base && tid == 0) {
+    // Frozen verify (write_state=false): leave the committed conv state at its
+    // pre-verify value; the repair forward advances it through [input|accepted].
+    if (state_out_base && write_state && tid == 0) {
         for (int s = 0; s < K; ++s) {
+            const int src_t = Nr - K + s;
+            const float v = (src_t < 0)
+                ? __bfloat162float(state[(K + src_t) * C + c])
+                : __bfloat162float(x_r[src_t * C + c]);
+            state[s * C + c] = __float2bfloat16(v);
+        }
+    }
+}
+
+// Multi-request batched prefill optimized for large request cohorts with
+// short prompts. One block covers a contiguous channel tile for one request;
+// each thread owns one channel and walks that request's tokens serially. This
+// avoids launching one tiny block per (request, channel) while keeping the
+// per-channel recurrence and state update identical to the reference kernel.
+__global__ void causal_conv1d_prefill_batched_channel_tile_kernel(
+    const __nv_bfloat16* __restrict__ x,           // [N_total, C]
+    const __nv_bfloat16* __restrict__ weight,      // [C, K]
+    const __nv_bfloat16* __restrict__ bias,        // [C]
+    __nv_bfloat16* __restrict__ y,                 // [N_total, C]
+    __nv_bfloat16* __restrict__ state_out_base,    // [num_slots, K, C]
+    const int*       __restrict__ slot_ids,        // [R]
+    const std::uint32_t* __restrict__ qo_indptr,   // [R+1]
+    long long slot_stride_elems,
+    int C, int K, bool write_state,
+    const int* commit_len)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    const int r = blockIdx.y;
+    if (c >= C) return;
+
+    const int t0 = static_cast<int>(qo_indptr[r]);
+    int Nr = static_cast<int>(qo_indptr[r + 1]) - t0;
+    // Boundary-write (commit-advance): fold only the confirmed prefix into the
+    // conv state; the trailing-K window then lands at the accepted boundary.
+    if (commit_len != nullptr) {
+        const int c = commit_len[r];
+        if (c < Nr) Nr = c;
+    }
+    if (Nr <= 0) return;
+
+    const int slot = slot_ids[r];
+    const __nv_bfloat16* x_r = x + static_cast<long long>(t0) * C;
+    __nv_bfloat16* y_r = y + static_cast<long long>(t0) * C;
+    __nv_bfloat16* state =
+        state_out_base + static_cast<long long>(slot) * slot_stride_elems;
+
+    const float bias_v = bias ? __bfloat162float(bias[c]) : 0.f;
+    float wv[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        wv[k] = (k < K) ? __bfloat162float(weight[c * K + k]) : 0.f;
+    }
+
+    for (int t = 0; t < Nr; ++t) {
+        float acc = bias_v;
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            if (k >= K) break;
+            const int src_t = t - (K - 1) + k;
+            float xv = 0.f;
+            if (src_t < 0) {
+                xv = __bfloat162float(state[(K + src_t) * C + c]);
+            } else {
+                xv = __bfloat162float(x_r[src_t * C + c]);
+            }
+            acc += wv[k] * xv;
+        }
+        y_r[static_cast<long long>(t) * C + c] = __float2bfloat16(silu_f(acc));
+    }
+
+    // Frozen verify (write_state=false): see the reference kernel above.
+    if (state_out_base && write_state) {
+        #pragma unroll
+        for (int s = 0; s < 8; ++s) {
+            if (s >= K) break;
             const int src_t = Nr - K + s;
             const float v = (src_t < 0)
                 ? __bfloat162float(state[(K + src_t) * C + c])
@@ -298,9 +382,25 @@ void launch_causal_conv1d_prefill_batched_bf16(
     const std::int32_t* slot_ids,
     const std::uint32_t* qo_indptr,
     long long slot_stride_elems,
-    int R, int C, int K, cudaStream_t stream)
+    int R, int C, int K, cudaStream_t stream, bool write_state,
+    const int* commit_len)
 {
     if (R <= 0 || C <= 0 || K <= 0) return;
+    if (R >= 8) {
+        constexpr int TILE = 128;
+        dim3 grid((C + TILE - 1) / TILE, R);
+        dim3 block(TILE);
+        causal_conv1d_prefill_batched_channel_tile_kernel<<<grid, block, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x),
+            static_cast<const __nv_bfloat16*>(weight),
+            static_cast<const __nv_bfloat16*>(bias),
+            static_cast<__nv_bfloat16*>(y),
+            static_cast<__nv_bfloat16*>(state_out_base),
+            slot_ids, qo_indptr,
+            slot_stride_elems,
+            C, K, write_state, commit_len);
+        return;
+    }
     constexpr int BLOCK = 64;
     dim3 grid(C, R);
     dim3 block(BLOCK);
@@ -312,7 +412,8 @@ void launch_causal_conv1d_prefill_batched_bf16(
         static_cast<__nv_bfloat16*>(state_out_base),
         slot_ids, qo_indptr,
         slot_stride_elems,
-        C, K);
+        C, K, write_state, commit_len);
 }
 
 }  // namespace pie_cuda_driver::kernels
+

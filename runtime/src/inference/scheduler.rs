@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -21,6 +22,20 @@ use super::{ForwardOutput, request};
 mod chunked;
 
 use chunked::ChunkContinuation;
+
+fn scheduler_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("PIE_SCHED_TRACE").is_some())
+}
+
+fn sched_epoch() -> Instant {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    *EPOCH.get_or_init(Instant::now)
+}
+
+fn now_micros() -> u64 {
+    sched_epoch().elapsed().as_micros() as u64
+}
 
 // =============================================================================
 // Scheduling Policy Trait
@@ -46,9 +61,9 @@ pub(super) trait SchedulingPolicy: Send {
     fn on_fired(&mut self, fired_size: usize);
 
     /// Decide whether to fire or wait, given the current batch size.
-    /// `&mut self` so policies can ratchet internal state (e.g.,
-    /// AdaptivePolicy's `cohort_high_water`) on every poll.
-    fn decide(&mut self, current_batch_size: usize, prefill_cohort: bool) -> Decision;
+    /// `&mut self` so policies can update internal state on every poll
+    /// (e.g., `EagerPolicy`'s `cohort_high_water` ratchet).
+    fn decide(&mut self, current_batch_size: usize) -> Decision;
 }
 
 // =============================================================================
@@ -67,9 +82,12 @@ pub(super) enum Decision {
 // SchedulerStats (lock-free snapshot for monitoring)
 // =============================================================================
 
+pub const SYSTEM_SPEC_DRAFT_POS_BUCKETS: usize = 32;
+
 /// Cumulative stats exposed for monitoring. Updated atomically after each batch.
 #[derive(Debug, Default)]
 pub struct SchedulerStats {
+    // ── Always-on counters (no Instant::now needed). ────────────────────────
     pub total_batches: AtomicU64,
     pub total_tokens_processed: AtomicU64,
     /// Total request count across all batches (sum of batch sizes).
@@ -83,22 +101,41 @@ pub struct SchedulerStats {
     pub batch_size_hist: [AtomicU64; 8],
     pub last_batch_latency_us: AtomicU64,
     pub cumulative_latency_us: AtomicU64,
-    pub cumulative_permit_wait_us: AtomicU64,
-    pub cumulative_fire_prepare_us: AtomicU64,
-    pub cumulative_execute_batch_us: AtomicU64,
-    pub cumulative_batch_build_us: AtomicU64,
-    pub cumulative_driver_fire_us: AtomicU64,
-    pub cumulative_response_dispatch_us: AtomicU64,
-    pub cumulative_context_tick_submit_us: AtomicU64,
-    pub cumulative_stats_update_us: AtomicU64,
+    pub system_spec_draft_tokens_proposed: AtomicU64,
+    pub system_spec_draft_tokens_accepted: AtomicU64,
+    pub system_spec_draft_tokens_proposed_per_pos:
+        [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    pub system_spec_draft_tokens_accepted_per_pos:
+        [AtomicU64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+
+    // ── Fire-domain probes (gated behind `profile-fire` feature). ───────────
+    //
+    // Hierarchy + invariants documented in `crate::probe::fire`. Writers
+    // use the `probe_fire!` macro from that module so the fetch_add
+    // disappears when the feature is off. The struct itself is always
+    // defined so callers and readers compile uniformly.
+    pub fire: crate::probe::fire::FireProbes,
+
+    // ── Driver-fire phase breakdown (gated behind `profile-driver-cuda`). ──
+    //
+    // Decomposes the `fire.execute.driver_fire_us` bucket into Rust
+    // (ipc_submit / gpu_wait / ipc_recv) and C++ host phases (wire_parse
+    // / plan / h2d / kernel_launch / sync / response_build). See
+    // `crate::probe::driver_cuda` for the plumbing.
+    pub driver_cuda: crate::probe::driver_cuda::DriverCudaProbes,
 }
 
+/// Out-of-band data execute_batch reports back to the run loop. Per-fire
+/// *timing* probes are no longer in this struct — they're recorded
+/// directly into `stats.fire.*` via `probe_fire!`. What's left here is
+/// genuine fire-output data (spec-decoding draft counters) that the run
+/// loop then folds into the spec-domain atomics.
 #[derive(Debug, Default, Clone, Copy)]
 struct BatchExecutionTiming {
-    total_us: u64,
-    batch_build_us: u64,
-    driver_fire_us: u64,
-    response_dispatch_us: u64,
+    system_spec_draft_tokens_proposed: u64,
+    system_spec_draft_tokens_accepted: u64,
+    system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
 }
 
 // =============================================================================
@@ -118,6 +155,14 @@ enum Completion {
     Chunk {
         continuation: ChunkContinuation,
         sampler_slots: Vec<usize>,
+    },
+    /// Self-perpetuating speculation chain. The dispatch loop routes
+    /// these to the per-driver `ChainExtPool` instead of waking 256
+    /// individual per-context tokio tasks; the pool worker then forwards
+    /// this fire's output to `state.response` and submits the next stage
+    /// (if eligible) via `state.scheduler_handle`.
+    Chain {
+        state: Box<super::speculator::ChainState>,
     },
 }
 
@@ -172,11 +217,9 @@ fn request_capacity_usage(req: &PendingRequest, page_size: u32) -> RequestCapaci
             has_prob_sampling = true;
         }
     }
-    let has_output_spec = req.request.output_spec_flags.iter().any(|&enabled| enabled);
     let has_dense_logit_requirement = req.request.has_user_mask
         || !req.request.logit_masks.is_empty()
         || spec_tokens > 0
-        || has_output_spec
         || !all_samplers_token;
     let is_single_token_decode = input_tokens == 1
         && spec_tokens == 0
@@ -350,7 +393,11 @@ impl BatchAccumulator {
     }
 
     fn push(&mut self, req: PendingRequest) {
-        let mut usage = request_capacity_usage(&req, self.page_size);
+        let usage = request_capacity_usage(&req, self.page_size);
+        self.push_with(req, usage);
+    }
+
+    fn push_with(&mut self, req: PendingRequest, mut usage: RequestCapacityUsage) {
         let (logit_rows, prob_rows, _, _, _) = self.projected_rows(Some(&usage));
         usage.logit_rows = logit_rows;
         usage.prob_rows = prob_rows;
@@ -446,6 +493,19 @@ impl BatchAccumulator {
             return false;
         }
         let usage = request_capacity_usage(req, self.page_size);
+        self.would_exceed_with(&usage)
+    }
+
+    fn would_exceed_with(&self, usage: &RequestCapacityUsage) -> bool {
+        if self.requests.is_empty() {
+            return false;
+        }
+        // rs_cache spec-decode (MTP for hybrid GDN models) no longer needs a
+        // per-batch cap: the driver runs a frozen verify (committed slot stays
+        // at its pre-verify value) and a single batched repair forward over
+        // [input | accepted] to advance state. There is no per-request snapshot
+        // buffer, so rs-spec batches grow to the normal forward limits below,
+        // exactly like non-spec batches.
         let next_has_spec = self.has_spec_drafts || usage.has_spec_drafts;
         let next_custom_mask_bytes = if next_has_spec {
             self.total_spec_custom_mask_bytes
@@ -454,7 +514,7 @@ impl BatchAccumulator {
             self.total_user_custom_mask_bytes
                 .saturating_add(usage.user_custom_mask_bytes)
         };
-        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(&usage));
+        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(usage));
         self.requests.len() + 1 > self.limits.max_forward_requests
             || self.total_tokens.saturating_add(usage.forward_tokens)
                 > self.limits.max_forward_tokens
@@ -470,6 +530,71 @@ impl BatchAccumulator {
             || next_custom_mask_bytes > self.limits.max_custom_mask_bytes
     }
 
+    fn would_exceed_reason(&self, req: &PendingRequest) -> Option<String> {
+        if self.requests.is_empty() {
+            return None;
+        }
+        let usage = request_capacity_usage(req, self.page_size);
+        let next_has_spec = self.has_spec_drafts || usage.has_spec_drafts;
+        let next_custom_mask_bytes = if next_has_spec {
+            self.total_spec_custom_mask_bytes
+                .saturating_add(usage.spec_custom_mask_bytes)
+        } else {
+            self.total_user_custom_mask_bytes
+                .saturating_add(usage.user_custom_mask_bytes)
+        };
+        let (next_logit_rows, next_prob_rows, _, _, _) = self.projected_rows(Some(&usage));
+        let checks = [
+            (
+                "requests",
+                self.requests.len().saturating_add(1),
+                self.limits.max_forward_requests,
+            ),
+            (
+                "tokens",
+                self.total_tokens.saturating_add(usage.forward_tokens),
+                self.limits.max_forward_tokens,
+            ),
+            (
+                "pages",
+                self.total_pages.saturating_add(usage.page_refs),
+                self.limits.max_page_refs,
+            ),
+            ("logit_rows", next_logit_rows, self.limits.max_logit_rows),
+            ("prob_rows", next_prob_rows, self.limits.max_prob_rows),
+            (
+                "sampler_rows",
+                self.total_sampler_rows.saturating_add(usage.sampler_rows),
+                self.limits.max_sampler_rows,
+            ),
+            (
+                "logprob_labels",
+                self.total_logprob_labels
+                    .saturating_add(usage.logprob_labels),
+                self.limits.max_logprob_labels,
+            ),
+            (
+                "custom_mask_bytes",
+                next_custom_mask_bytes,
+                self.limits.max_custom_mask_bytes,
+            ),
+        ];
+        checks
+            .into_iter()
+            .find(|(_, have, limit)| have > limit)
+            .map(|(name, have, limit)| {
+                format!(
+                    "{name} {have}>{limit} pending_tokens={} pending_pages={} pending_sampler_rows={} pending_has_spec={} pending_dense={} pending_prob={}",
+                    usage.forward_tokens,
+                    usage.page_refs,
+                    usage.sampler_rows,
+                    usage.has_spec_drafts,
+                    usage.has_dense_logit_requirement,
+                    usage.has_prob_sampling,
+                )
+            })
+    }
+
     fn is_full(&self) -> bool {
         let active_custom_mask_bytes = if self.has_spec_drafts {
             self.total_spec_custom_mask_bytes
@@ -477,6 +602,9 @@ impl BatchAccumulator {
             self.total_user_custom_mask_bytes
         };
         self.requests.len() >= self.limits.max_forward_requests
+            // rs-spec batches (frozen verify + batched repair) carry no
+            // per-request buffer, so they fill to the normal forward limits
+            // like any other batch — no rs-spec-specific early fire.
             || self.total_tokens >= self.limits.max_forward_tokens
             || self.total_pages >= self.limits.max_page_refs
             || self.total_logit_rows >= self.limits.max_logit_rows
@@ -524,6 +652,38 @@ fn prepare_pending_for_batch(
     batch: &BatchAccumulator,
     pending: PendingRequest,
 ) -> Option<PendingRequest> {
+    prepare_pending_with_usage(batch, pending).map(|(p, _)| p)
+}
+
+/// Same as `prepare_pending_for_batch` but also returns the computed
+/// `RequestCapacityUsage`, avoiding a recompute when the caller will
+/// immediately consult `would_exceed_with` + `push_with`.
+///
+/// The pure-decode fast path skips `maybe_start_chunking` and
+/// `single_request_limit_error`: for `single_token_mode` requests with
+/// 1 token, no spec drafts, no user mask, and no logit masks, both are
+/// no-ops (chunk_size is never reached; per-request limits hold trivially
+/// given the BatchAccumulator's `would_exceed_with` check will still gate
+/// page_refs / sampler_rows etc. when batching).
+fn prepare_pending_with_usage(
+    batch: &BatchAccumulator,
+    pending: PendingRequest,
+) -> Option<(PendingRequest, RequestCapacityUsage)> {
+    if is_pure_decode_pending(&pending) {
+        let usage = request_capacity_usage(&pending, batch.page_size);
+        let limits = batch.limits;
+        // Fields that COULD still trip the single-request limit for decode:
+        // page_refs (long-context decode) and logprob_labels. Token/sampler/
+        // mask limits hold trivially for 1-token single_token_mode requests.
+        if usage.page_refs <= limits.max_page_refs
+            && usage.logprob_labels <= limits.max_logprob_labels
+            && limits.max_forward_requests > 0
+        {
+            return Some((pending, usage));
+        }
+        // Fall through to the slow path so the proper error message is
+        // surfaced via `single_request_limit_error`.
+    }
     let pending = match pending.maybe_start_chunking(batch.limits, batch.page_size) {
         Ok(pending) => pending,
         Err((pending, msg)) => {
@@ -535,7 +695,28 @@ fn prepare_pending_for_batch(
         pending.send_error(msg);
         return None;
     }
-    Some(pending)
+    let usage = request_capacity_usage(&pending, batch.page_size);
+    Some((pending, usage))
+}
+
+#[inline]
+fn is_pure_decode_pending(p: &PendingRequest) -> bool {
+    // Chain-ext continuations (Completion::Chain) at conc=256 hit this path
+    // 256x per fire. Their request body is structurally identical to a
+    // pure-decode Direct request — build_next_request emits 1 token,
+    // single_token_mode=true, no user mask, no logit masks, no spec drafts
+    // in the non-spec hot path. Accepting Chain here skips the redundant
+    // `request_capacity_usage` call inside `maybe_start_chunking` for every
+    // chain continuation, trimming ~100ns × 256 = ~25 µs per fire off the
+    // accum-loop critical path.
+    matches!(
+        &p.completion,
+        Completion::Direct(_) | Completion::Chain { .. }
+    ) && p.request.token_ids.len() == 1
+        && p.request.spec_token_ids.is_empty()
+        && p.request.single_token_mode
+        && !p.request.has_user_mask
+        && p.request.logit_masks.is_empty()
 }
 
 #[cfg(test)]
@@ -791,9 +972,14 @@ mod tests {
 /// Cloneable submit handle. Used by the speculator's chain extender
 /// (spawned outside the scheduler's `run` loop) to resubmit
 /// pre-staged forward passes.
+///
+/// Backed by a sync crossbeam_channel rather than tokio mpsc so the
+/// receiving main loop (sync OS thread) can recv with futex-level
+/// wake latency (~5-15 µs) instead of tokio's task-wake roundtrip
+/// (~100-200 µs).
 #[derive(Clone)]
 pub(crate) struct SchedulerHandle {
-    tx: mpsc::UnboundedSender<PendingRequest>,
+    tx: crossbeam::channel::Sender<PendingRequest>,
 }
 
 impl SchedulerHandle {
@@ -804,12 +990,35 @@ impl SchedulerHandle {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
-        self.tx.send(PendingRequest::direct(
-            request,
-            response_tx,
-            physical_page_ids,
-            last_page_len,
-        ))?;
+        self.tx
+            .send(PendingRequest::direct(
+                request,
+                response_tx,
+                physical_page_ids,
+                last_page_len,
+            ))
+            .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
+        Ok(())
+    }
+
+    /// Submit a forward pass that participates in a speculation chain.
+    /// The dispatch loop routes the output to the per-driver pool worker
+    /// instead of waking a dedicated chain-extender task.
+    pub fn submit_chain(
+        &self,
+        request: pie_bridge::ForwardRequest,
+        state: Box<super::speculator::ChainState>,
+        physical_page_ids: Vec<PhysicalPageId>,
+        last_page_len: u32,
+    ) -> Result<()> {
+        self.tx
+            .send(PendingRequest {
+                request,
+                completion: Completion::Chain { state },
+                physical_page_ids,
+                last_page_len,
+            })
+            .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
         Ok(())
     }
 }
@@ -823,8 +1032,39 @@ impl SchedulerHandle {
 /// Owns an RPC client, a scheduling policy, and a tokio task that
 /// runs the batch accumulation and firing loop.
 pub(crate) struct BatchScheduler {
-    tx: mpsc::UnboundedSender<PendingRequest>,
+    tx: crossbeam::channel::Sender<PendingRequest>,
     stats: Arc<SchedulerStats>,
+    chain_pool: Arc<super::speculator::ChainExtPool>,
+}
+
+/// Default size of the chain-extender pool per driver. Re-swept on L40
+/// (gemma-4-E4B, conc=256, n=5 trials each):
+///   pool=2:  6633 ± 14 tok/s
+///   pool=4:  6633 ± 36 tok/s  (best single run 6710)
+///   pool=6:  6613 ±  5 tok/s
+///   pool=8:  6602 ± 25 tok/s
+///   pool=16: 6597 ± 21 tok/s  (previous default)
+///   pool=32: 6590 ± 32 tok/s
+///
+/// Smaller pools win because each chain job is ~25us of cheap work;
+/// the per-task tokio wake/schedule overhead dominates over the
+/// parallelism benefit beyond ~4 workers. With 256 jobs across 4
+/// workers, each handles ~64 jobs serially in <2ms — well under the
+/// ~25ms GPU compute window of the previous fire.
+///
+/// Override via `PIE_CHAIN_EXT_POOL_SIZE` env var to sweep without
+/// rebuilding.
+const CHAIN_EXT_POOL_SIZE_DEFAULT: usize = 4;
+
+fn chain_ext_pool_size() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("PIE_CHAIN_EXT_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|&n: &usize| n > 0)
+            .unwrap_or(CHAIN_EXT_POOL_SIZE_DEFAULT)
+    })
 }
 
 impl BatchScheduler {
@@ -840,22 +1080,50 @@ impl BatchScheduler {
         request_timeout_secs: u64,
         batch_policy: String,
     ) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let submit_tx = tx.downgrade();
+        let (tx, rx) = crossbeam::channel::unbounded::<PendingRequest>();
+        let submit_tx = tx.clone();
         let stats = Arc::new(SchedulerStats::default());
-        tokio::spawn(Self::run(
-            driver_id,
-            driver_idx,
-            rx,
-            submit_tx,
-            page_size,
-            limits,
-            request_timeout_secs,
-            batch_policy,
-            stats.clone(),
-        ));
+        let chain_pool = Arc::new(super::speculator::ChainExtPool::new(chain_ext_pool_size()));
 
-        Self { tx, stats }
+        // Run the main scheduling loop on a dedicated OS thread with
+        // crossbeam channels. Why: tokio's mpsc/select! wake-pickup
+        // path takes ~100-200 µs because the receiver's waker has to be
+        // scheduled onto a runtime worker. crossbeam's recv/select uses
+        // futex parking directly — wake latency drops to ~5-15 µs.
+        // execute_batch tasks still spawn on the shared tokio runtime
+        // (captured via Handle) so they keep multi-worker parallelism
+        // for the GPU/IPC and response dispatch.
+        let rt_handle = tokio::runtime::Handle::current();
+        let stats_for_loop = stats.clone();
+        let chain_pool_for_loop = chain_pool.clone();
+        let batch_policy_for_loop = batch_policy.clone();
+        std::thread::Builder::new()
+            .name(format!("pie-sched-{driver_idx}"))
+            .spawn(move || {
+                Self::run(
+                    driver_id,
+                    driver_idx,
+                    rx,
+                    submit_tx,
+                    page_size,
+                    limits,
+                    request_timeout_secs,
+                    batch_policy_for_loop,
+                    stats_for_loop,
+                    chain_pool_for_loop,
+                    rt_handle,
+                );
+            })
+            .expect("spawn pie-sched thread");
+
+        Self { tx, stats, chain_pool }
+    }
+
+    /// Get the chain extender pool handle. Cold submits use this to
+    /// route the first fire's output through the pool instead of spawning
+    /// a per-context chain-extender task.
+    pub fn chain_pool(&self) -> Arc<super::speculator::ChainExtPool> {
+        self.chain_pool.clone()
     }
 
     /// Get a handle to the cumulative scheduler stats (lock-free).
@@ -871,12 +1139,14 @@ impl BatchScheduler {
         physical_page_ids: Vec<PhysicalPageId>,
         last_page_len: u32,
     ) -> Result<()> {
-        self.tx.send(PendingRequest::direct(
-            request,
-            response_tx,
-            physical_page_ids,
-            last_page_len,
-        ))?;
+        self.tx
+            .send(PendingRequest::direct(
+                request,
+                response_tx,
+                physical_page_ids,
+                last_page_len,
+            ))
+            .map_err(|_| anyhow::anyhow!("scheduler channel closed"))?;
         Ok(())
     }
 
@@ -892,17 +1162,20 @@ impl BatchScheduler {
     // Internal: Scheduling Loop
     // =========================================================================
 
-    /// Main scheduling loop for a single driver.
-    async fn run(
+    /// Main scheduling loop for a single driver. Sync OS thread —
+    /// recv/select use futex parking (no tokio waker overhead).
+    fn run(
         driver_id: DriverId,
         driver_idx: usize,
-        mut req_rx: mpsc::UnboundedReceiver<PendingRequest>,
-        submit_tx: mpsc::WeakUnboundedSender<PendingRequest>,
+        req_rx: crossbeam::channel::Receiver<PendingRequest>,
+        submit_tx: crossbeam::channel::Sender<PendingRequest>,
         page_size: u32,
         limits: SchedulerLimits,
         request_timeout_secs: u64,
         batch_policy: String,
         stats: Arc<SchedulerStats>,
+        chain_pool: Arc<super::speculator::ChainExtPool>,
+        rt_handle: tokio::runtime::Handle,
     ) {
         let request_timeout = Duration::from_secs(request_timeout_secs);
 
@@ -920,11 +1193,16 @@ impl BatchScheduler {
                 'adaptive' | 'eager' | 'greedy'"
             ),
         };
-        // Only one in-flight batch at a time to prevent pipelined KV cache corruption.
-        let in_flight = Arc::new(Semaphore::new(1));
+        // No cross-thread in-flight gate needed: the scheduler is the
+        // only firer and runs `execute_batch` synchronously, so a
+        // second fire physically cannot start before the previous one
+        // completes. AdaptivePolicy still tracks its own internal
+        // `in_flight` bool (via on_fired/on_complete) for its decide()
+        // heuristics; that's a policy concern, not a scheduling-safety
+        // concern, and stays as-is.
 
         // Channel for batch completion latency feedback to the policy.
-        let (latency_tx, mut latency_rx) = mpsc::unbounded_channel::<Duration>();
+        let (latency_tx, latency_rx) = crossbeam::channel::unbounded::<Duration>();
         let mut next_pending: Option<PendingRequest> = None;
 
         'run_loop: loop {
@@ -933,15 +1211,17 @@ impl BatchScheduler {
                 policy.on_complete(latency);
             }
 
-            // Wait for first request if batch is empty
+            // Wait for first request if batch is empty. crossbeam's
+            // recv() parks via futex — far lower wake latency than
+            // tokio's mpsc waker path.
             while batch.is_empty() {
                 let pending = if let Some(pending) = next_pending.take() {
                     pending
                 } else {
-                    let Some(pending) = req_rx.recv().await else {
-                        break 'run_loop;
-                    };
-                    pending
+                    match req_rx.recv() {
+                        Ok(p) => p,
+                        Err(_) => break 'run_loop,
+                    }
                 };
                 let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
                     continue;
@@ -954,46 +1234,62 @@ impl BatchScheduler {
             // already stashed for the next batch, fire the current batch
             // before reading more; overwriting the stash would drop that
             // request's response channel.
+            let accum_start = Instant::now();
             while next_pending.is_none() {
-                let Ok(pending) = req_rx.try_recv() else {
-                    break;
+                let pending = match req_rx.try_recv() {
+                    Ok(p) => p,
+                    Err(crossbeam::channel::TryRecvError::Empty) => break,
+                    Err(crossbeam::channel::TryRecvError::Disconnected) => {
+                        break 'run_loop;
+                    }
                 };
-                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
+                let Some((pending, usage)) = prepare_pending_with_usage(&batch, pending)
+                else {
                     continue;
                 };
-                if batch.would_exceed(&pending) {
+                if batch.would_exceed_with(&usage) {
+                    if scheduler_trace_enabled() {
+                        let reason = batch
+                            .would_exceed_reason(&pending)
+                            .unwrap_or_else(|| "unknown".to_string());
+                        eprintln!(
+                            "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                            driver_idx,
+                            batch.len(),
+                            batch.total_tokens(),
+                            reason,
+                        );
+                    }
                     next_pending = Some(pending);
                     break;
                 }
                 policy.on_arrival();
-                batch.push(pending);
+                batch.push_with(pending, usage);
                 if batch.is_full() {
                     break;
                 }
             }
+            crate::probe_fire_record!(
+                stats.fire.accumulate.accum_loop_us,
+                accum_start.elapsed()
+            );
 
             // Ask the policy what to do
             let decision = if next_pending.is_some() {
                 Decision::Fire
             } else {
-                policy.decide(batch.len(), batch.should_prefill_coalesce())
+                policy.decide(batch.len())
             };
             match decision {
                 Decision::Fire => {
-                    // Acquire a permit (may wait if at in-flight limit).
-                    let permit_wait_start = Instant::now();
-                    let permit = in_flight
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .expect("semaphore closed");
-                    let permit_wait_us = permit_wait_start.elapsed().as_micros() as u64;
+                    // No in-flight gate to acquire: the scheduler runs
+                    // execute_batch synchronously, so we can only reach
+                    // here when the previous fire has fully completed.
 
-                    // The policy may decide to fire while the previous GPU
-                    // batch is still in flight. Do one last non-blocking
-                    // drain after the permit opens so requests that arrived
-                    // during that wait are coalesced into this batch instead
-                    // of being stranded behind a tiny stale fire.
+                    // Do one last non-blocking drain so requests that
+                    // arrived between the recv loop and here are
+                    // coalesced into this batch instead of being
+                    // stranded behind it.
                     let fire_prepare_start = Instant::now();
                     while next_pending.is_none() && !batch.is_full() {
                         let Ok(pending) = req_rx.try_recv() else {
@@ -1004,6 +1300,18 @@ impl BatchScheduler {
                             continue;
                         }
                         if batch.would_exceed(&pending) {
+                            if scheduler_trace_enabled() {
+                                let reason = batch
+                                    .would_exceed_reason(&pending)
+                                    .unwrap_or_else(|| "unknown".to_string());
+                                eprintln!(
+                                    "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                                    driver_idx,
+                                    batch.len(),
+                                    batch.total_tokens(),
+                                    reason,
+                                );
+                            }
                             next_pending = Some(pending);
                             break;
                         }
@@ -1012,6 +1320,16 @@ impl BatchScheduler {
                     }
 
                     let total_tokens = batch.total_tokens();
+                    if scheduler_trace_enabled() {
+                        eprintln!(
+                            "[pie-sched-trace] driver={} fire requests={} tokens={} prefill_like={} stashed={}",
+                            driver_idx,
+                            batch.len(),
+                            total_tokens,
+                            batch.should_prefill_coalesce(),
+                            next_pending.is_some(),
+                        );
+                    }
                     let requests_to_fire = batch.take();
                     policy.on_fired(requests_to_fire.len());
 
@@ -1023,53 +1341,83 @@ impl BatchScheduler {
                         .map(|r| r.request.context_ids[0])
                         .collect();
                     let batch_size = batch_ctx_ids.len() as u64;
-                    let fire_prepare_us = fire_prepare_start.elapsed().as_micros() as u64;
-                    stats
-                        .cumulative_permit_wait_us
-                        .fetch_add(permit_wait_us, Relaxed);
-                    stats
-                        .cumulative_fire_prepare_us
-                        .fetch_add(fire_prepare_us, Relaxed);
+                    crate::probe_fire_record!(
+                        stats.fire.pre_dispatch.fire_prepare_us,
+                        fire_prepare_start.elapsed()
+                    );
 
-                    // Spawn batch execution
-                    let latency_tx_clone = latency_tx.clone();
-                    let stats_clone = stats.clone();
+                    // Inter-fire instrumentation: time between consecutive fires,
+                    // and the post-dispatch-to-next-fire gap (rendezvous window).
+                    // The timestamps themselves (last_fire_spawn_micros,
+                    // last_dispatch_end_micros) are always-on — cheap atomic
+                    // swap/load. The accumulators are probe-gated.
+                    let now_us = now_micros();
+                    let last_spawn = stats.fire.last_fire_spawn_micros.swap(now_us, Relaxed);
+                    if last_spawn != 0 {
+                        crate::probe_fire_record!(
+                            stats.fire.inter_fire_us,
+                            std::time::Duration::from_micros(now_us.saturating_sub(last_spawn))
+                        );
+                    }
+                    let last_dispatch_end = stats.fire.last_dispatch_end_micros.load(Relaxed);
+                    if last_dispatch_end != 0 {
+                        crate::probe_fire_record!(
+                            stats.fire.post_dispatch_to_fire_us,
+                            std::time::Duration::from_micros(
+                                now_us.saturating_sub(last_dispatch_end)
+                            )
+                        );
+                    }
+
+                    // Fire synchronously on the scheduler thread.
+                    // `execute_batch` parks on a futex inside
+                    // `fire_batch_sync` while the GPU runs (the same
+                    // wait the prior `block_in_place(submit_sync)` did
+                    // under the old `async fn`). The ~800 µs
+                    // `deferred_drop` work is still punted via
+                    // `rt_handle.spawn_blocking` inside execute_batch.
+                    //
+                    // execute.total_us probe wraps execute_batch end-to-end;
+                    // its children (batch_build, driver_fire, response_dispatch)
+                    // probe inside execute_batch and should sum to total within
+                    // a few µs.
                     let timeout = request_timeout;
-                    let submit_tx_clone = submit_tx.clone();
-
-                    tokio::spawn(async move {
-                        let start = Instant::now();
-                        let timing = Self::execute_batch(
+                    let start = Instant::now();
+                    let timing = crate::probe_fire!(stats.fire.execute.total_us, {
+                        Self::execute_batch(
                             driver_idx,
                             requests_to_fire,
                             driver_id,
                             page_size,
                             timeout,
-                            Some(permit),
-                            Some(submit_tx_clone),
+                            &rt_handle,
+                            Some(submit_tx.clone()),
+                            &stats,
+                            Some(chain_pool.clone()),
                         )
-                        .await;
-                        let latency = start.elapsed();
-                        latency_tx_clone.send(latency).ok();
+                    });
+                    let latency = start.elapsed();
+                    let _ = latency_tx.send(latency);
 
-                        // Advance market clock for this driver: prices, rent, dividends.
-                        // Pass batch context IDs so tick only charges contexts
-                        // that were in this batch (not stale pinned contexts).
-                        let tick_submit_start = Instant::now();
+                    // Advance market clock for this driver: prices, rent, dividends.
+                    // Pass batch context IDs so tick only charges contexts
+                    // that were in this batch (not stale pinned contexts).
+                    crate::probe_fire!(stats.fire.post_dispatch.context_tick_us, {
                         crate::context::tick(driver_idx, latency.as_secs_f64(), batch_ctx_ids);
-                        let tick_submit_us = tick_submit_start.elapsed().as_micros() as u64;
+                    });
 
-                        // Update cumulative atomic counters (consumed by external
-                        // monitoring; ignored by the policy).
-                        let stats_update_start = Instant::now();
-                        stats_clone.total_batches.fetch_add(1, Relaxed);
-                        stats_clone
+                    // Always-on counters + spec-domain accumulation.
+                    // Wrapped in stats_update_us probe so we can see how
+                    // much the bookkeeping costs.
+                    crate::probe_fire!(stats.fire.post_dispatch.stats_update_us, {
+                        stats.total_batches.fetch_add(1, Relaxed);
+                        stats
                             .total_tokens_processed
                             .fetch_add(total_tokens as u64, Relaxed);
-                        stats_clone
+                        stats
                             .total_requests_processed
                             .fetch_add(batch_size, Relaxed);
-                        stats_clone
+                        stats
                             .max_forward_requests_observed
                             .fetch_max(batch_size, Relaxed);
                         let bucket = match batch_size {
@@ -1082,89 +1430,150 @@ impl BatchScheduler {
                             64..=127 => 6,
                             _ => 7,
                         };
-                        stats_clone.batch_size_hist[bucket].fetch_add(1, Relaxed);
-                        stats_clone
+                        stats.batch_size_hist[bucket].fetch_add(1, Relaxed);
+                        stats
                             .last_batch_latency_us
                             .store(latency.as_micros() as u64, Relaxed);
-                        stats_clone
+                        stats
                             .cumulative_latency_us
                             .fetch_add(latency.as_micros() as u64, Relaxed);
-                        stats_clone
-                            .cumulative_execute_batch_us
-                            .fetch_add(timing.total_us, Relaxed);
-                        stats_clone
-                            .cumulative_batch_build_us
-                            .fetch_add(timing.batch_build_us, Relaxed);
-                        stats_clone
-                            .cumulative_driver_fire_us
-                            .fetch_add(timing.driver_fire_us, Relaxed);
-                        stats_clone
-                            .cumulative_response_dispatch_us
-                            .fetch_add(timing.response_dispatch_us, Relaxed);
-                        stats_clone
-                            .cumulative_context_tick_submit_us
-                            .fetch_add(tick_submit_us, Relaxed);
-                        stats_clone
-                            .cumulative_stats_update_us
-                            .fetch_add(stats_update_start.elapsed().as_micros() as u64, Relaxed);
+                        stats
+                            .system_spec_draft_tokens_proposed
+                            .fetch_add(timing.system_spec_draft_tokens_proposed, Relaxed);
+                        stats
+                            .system_spec_draft_tokens_accepted
+                            .fetch_add(timing.system_spec_draft_tokens_accepted, Relaxed);
+                        for (counter, value) in stats
+                            .system_spec_draft_tokens_proposed_per_pos
+                            .iter()
+                            .zip(timing.system_spec_draft_tokens_proposed_per_pos)
+                        {
+                            if value != 0 {
+                                counter.fetch_add(value, Relaxed);
+                            }
+                        }
+                        for (counter, value) in stats
+                            .system_spec_draft_tokens_accepted_per_pos
+                            .iter()
+                            .zip(timing.system_spec_draft_tokens_accepted_per_pos)
+                        {
+                            if value != 0 {
+                                counter.fetch_add(value, Relaxed);
+                            }
+                        }
                     });
                 }
                 Decision::Wait(wait_duration) => {
-                    tokio::select! {
-                        _ = tokio::time::sleep(wait_duration) => {},
-                        maybe_req = req_rx.recv() => {
-                            if let Some(pending) = maybe_req {
-                                let Some(pending) = prepare_pending_for_batch(&batch, pending) else {
-                                    continue;
-                                };
-                                if batch.would_exceed(&pending) {
-                                    next_pending = Some(pending);
-                                    continue;
+                    crossbeam::channel::select! {
+                        recv(req_rx) -> maybe_req => {
+                            match maybe_req {
+                                Ok(pending) => {
+                                    let Some(pending) = prepare_pending_for_batch(&batch, pending)
+                                    else {
+                                        continue;
+                                    };
+                                    if batch.would_exceed(&pending) {
+                                        if scheduler_trace_enabled() {
+                                            let reason = batch
+                                                .would_exceed_reason(&pending)
+                                                .unwrap_or_else(|| "unknown".to_string());
+                                            eprintln!(
+                                                "[pie-sched-trace] driver={} stash current_requests={} current_tokens={} reason={}",
+                                                driver_idx,
+                                                batch.len(),
+                                                batch.total_tokens(),
+                                                reason,
+                                            );
+                                        }
+                                        next_pending = Some(pending);
+                                        continue;
+                                    }
+                                    policy.on_arrival();
+                                    batch.push(pending);
                                 }
-                                policy.on_arrival();
-                                batch.push(pending);
-                            } else {
-                                break; // channel closed
+                                Err(_) => break 'run_loop, // channel closed
                             }
-                        },
-                        latency = latency_rx.recv() => {
-                            if let Some(l) = latency {
+                        }
+                        recv(latency_rx) -> latency => {
+                            if let Ok(l) = latency {
                                 policy.on_complete(l);
                             }
-                        },
+                        }
+                        default(wait_duration) => {}
                     }
                 }
             }
         }
 
-        // Shutdown: fire remaining batch
+        // Shutdown: fire the remaining batch synchronously so any
+        // inferlets still awaiting responses get them before we exit.
+        // ~10 ms of additional shutdown latency in the worst case.
         if !batch.is_empty() {
             let requests = batch.take();
-            Self::execute_batch(
+            let _ = Self::execute_batch(
                 driver_idx,
                 requests,
                 driver_id,
                 page_size,
                 request_timeout,
+                &rt_handle,
                 None,
+                &stats,
                 None,
-            )
-            .await;
+            );
         }
     }
 
     /// Execute a batch of forward pass requests via the driver service.
-    async fn execute_batch(
+    ///
+    /// Runs synchronously on the caller's thread. The scheduler invokes
+    /// this directly from its OS-thread `run` loop instead of spawning
+    /// a tokio task per fire — `driver::fire_batch_sync` parks on a
+    /// futex inside the channel, which is all the "async" the prior
+    /// `async fn` ever did (the async wrappers all bottomed out in
+    /// `block_in_place(submit_sync_for_state)`). The only off-thread
+    /// work this function still does is the `deferred_drop` punt, which
+    /// `rt_handle.spawn_blocking` routes to tokio's dedicated blocking
+    /// pool so the chain-extender wake-up wave doesn't compete with it
+    /// for CPU.
+    fn execute_batch(
         driver_idx: usize,
         requests: Vec<PendingRequest>,
         driver_id: DriverId,
         page_size: u32,
         _timeout: Duration,
-        mut permit: Option<OwnedSemaphorePermit>,
-        submit_tx: Option<mpsc::WeakUnboundedSender<PendingRequest>>,
+        rt_handle: &tokio::runtime::Handle,
+        submit_tx: Option<crossbeam::channel::Sender<PendingRequest>>,
+        stats: &SchedulerStats,
+        chain_pool: Option<Arc<super::speculator::ChainExtPool>>,
     ) -> BatchExecutionTiming {
-        let batch_start = Instant::now();
-        let build_start = Instant::now();
+        // Detect if ANY request carries system spec drafts. The
+        // common case (256-conc decode) has none, so we skip the
+        // per-request Vec build + position-histogram loop.
+        let any_spec = requests.iter().any(|req| !req.request.spec_token_ids.is_empty());
+        let system_spec_proposed_per_req: Vec<usize> = if any_spec {
+            requests
+                .iter()
+                .map(|req| req.request.spec_token_ids.len())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let system_spec_draft_tokens_proposed =
+            system_spec_proposed_per_req.iter().sum::<usize>() as u64;
+        let mut system_spec_draft_tokens_accepted = 0u64;
+        let mut system_spec_draft_tokens_proposed_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
+        let mut system_spec_draft_tokens_accepted_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
+        if any_spec {
+            for proposed in &system_spec_proposed_per_req {
+                for pos in 0..(*proposed).min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                    system_spec_draft_tokens_proposed_per_pos[pos] += 1;
+                }
+            }
+        }
+
         // Build batched request — a single `pie_bridge::ForwardRequest`
         // populated by folding each per-request shape into the batch.
         let elide_decode_masks = requests.iter().all(|req| {
@@ -1173,28 +1582,80 @@ impl BatchScheduler {
                 && req.request.token_ids.len() <= 1
                 && req.request.spec_token_ids.is_empty()
         });
-        let mut batch_req = request::new_batched_forward_request();
-        for req in &requests {
-            request::append_request_with_options(
-                &mut batch_req,
-                &req.request,
-                &req.physical_page_ids,
-                req.last_page_len,
-                page_size,
-                elide_decode_masks,
-            );
-        }
-        let batch_build_us = build_start.elapsed().as_micros() as u64;
+        let batch_req = crate::probe_fire!(stats.fire.execute.batch_build_us, {
+            let mut batch_req =
+                request::new_batched_forward_request_with_capacity(requests.len());
+            for req in &requests {
+                request::append_request_with_options(
+                    &mut batch_req,
+                    &req.request,
+                    &req.physical_page_ids,
+                    req.last_page_len,
+                    page_size,
+                    elide_decode_masks,
+                );
+            }
+            batch_req
+        });
 
-        // Send via driver service (typed call handles serialization + timeout)
-        let driver_fire_start = Instant::now();
-        let result = driver::fire_batch(driver_idx, batch_req).await;
-        let driver_fire_us = driver_fire_start.elapsed().as_micros() as u64;
-        drop(permit.take());
+        // Send via driver service (typed call handles serialization + timeout).
+        // Sync call: parks on a futex inside the channel's response
+        // slot. This is the entire reason `execute_batch` used to be
+        // `async` — the prior `fire_batch().await` bottomed out in
+        // `block_in_place(submit_sync_for_state)` with no actual
+        // suspension points. Since the scheduler is the only firer,
+        // there's also no in-flight gate to release.
+        let result = crate::probe_fire!(stats.fire.execute.driver_fire_us, {
+            let r = driver::fire_batch_sync(driver_idx, batch_req);
+            // Drain the per-call IPC-phase timings recorded by the
+            // channel into driver_cuda atomics. With `profile-driver-cuda`
+            // off, the `take_*` calls return 0 and `fetch_add(0)` is a
+            // no-op — same compiled output as if these lines weren't here.
+            let ipc_submit_us = crate::probe::driver_cuda::take_ipc_submit_us();
+            let gpu_wait_us = crate::probe::driver_cuda::take_gpu_wait_us();
+            let ipc_recv_us = crate::probe::driver_cuda::take_ipc_recv_us();
+            if ipc_submit_us > 0 {
+                stats
+                    .driver_cuda
+                    .ipc_submit_us
+                    .fetch_add(ipc_submit_us, Relaxed);
+            }
+            if gpu_wait_us > 0 {
+                stats.driver_cuda.gpu_wait_us.fetch_add(gpu_wait_us, Relaxed);
+            }
+            if ipc_recv_us > 0 {
+                stats.driver_cuda.ipc_recv_us.fetch_add(ipc_recv_us, Relaxed);
+            }
+            r
+        });
 
-        let response_start = Instant::now();
+        // Response dispatch: per-request oneshot fires, chain-pool submits,
+        // and queueing the deferred_drop Vec. Probe scope ends at the
+        // close of the `match result { ... }` block below.
+        //
+        // Per-completion-type counts are accumulated into these locals
+        // inside the match arms and fetch_add'd once after the loop, so
+        // we don't pay a per-request atomic op on the hot path.
+        let response_dispatch_start = Instant::now();
+        let mut direct_count: u64 = 0;
+        let mut chain_count: u64 = 0;
+        let mut chunk_count: u64 = 0;
         match result {
             Ok(batch_resp) => {
+                let wp = batch_resp.probe_wire_parse_us as u64;
+                let pl = batch_resp.probe_plan_us as u64;
+                let hd = batch_resp.probe_h2d_us as u64;
+                let kl = batch_resp.probe_kernel_launch_us as u64;
+                let sy = batch_resp.probe_sync_us as u64;
+                let rb = batch_resp.probe_response_build_us as u64;
+                if wp | pl | hd | kl | sy | rb != 0 {
+                    stats.driver_cuda.wire_parse_us.fetch_add(wp, Relaxed);
+                    stats.driver_cuda.plan_us.fetch_add(pl, Relaxed);
+                    stats.driver_cuda.h2d_us.fetch_add(hd, Relaxed);
+                    stats.driver_cuda.kernel_launch_us.fetch_add(kl, Relaxed);
+                    stats.driver_cuda.sync_us.fetch_add(sy, Relaxed);
+                    stats.driver_cuda.response_build_us.fetch_add(rb, Relaxed);
+                }
                 let n_results = batch_resp.num_requests as usize;
                 if n_results != requests.len() {
                     let msg = format!(
@@ -1225,32 +1686,140 @@ impl BatchScheduler {
                         && batch_resp.logits_bytes.is_empty()
                         && batch_resp.logprobs_values.is_empty()
                         && batch_resp.entropies.is_empty()
+                        && batch_resp.spec_tokens.is_empty()
                         && batch_resp.tokens_indptr.len() >= requests.len() + 1;
 
+                    // Send oneshot replies first, defer drop of the
+                    // request husks. Each PendingRequest's drop is
+                    // ~3-4 µs (22-Vec ForwardRequest), and doing it
+                    // inline pushes the 256th chain extender's wake
+                    // out by ~1.2 ms — directly extending the gap.
+                    let mut deferred_drop: Vec<(
+                        pie_bridge::ForwardRequest,
+                        Vec<PhysicalPageId>,
+                    )> = Vec::with_capacity(n_results);
                     if token_payload_only {
                         for (r, req) in requests.into_iter().enumerate() {
                             let lo = batch_resp.tokens_indptr[r] as usize;
                             let hi = batch_resp.tokens_indptr[r + 1] as usize;
+                            if system_spec_proposed_per_req
+                                .get(r)
+                                .copied()
+                                .unwrap_or_default()
+                                > 0
+                            {
+                                let accepted = hi.saturating_sub(lo).saturating_sub(1);
+                                system_spec_draft_tokens_accepted += accepted as u64;
+                                for pos in 0..accepted.min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                                    system_spec_draft_tokens_accepted_per_pos[pos] += 1;
+                                }
+                            }
                             let output = if hi == lo + 1 {
                                 ForwardOutput::Token(batch_resp.tokens[lo])
                             } else {
                                 ForwardOutput::Tokens(batch_resp.tokens[lo..hi].to_vec())
                             };
-                            req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                            let PendingRequest {
+                                request,
+                                completion,
+                                physical_page_ids,
+                                last_page_len: _,
+                            } = req;
+                            match completion {
+                                Completion::Direct(tx) => {
+                                    direct_count += 1;
+                                    tx.send(Ok(output)).ok();
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                                Completion::Chunk { .. } => {
+                                    chunk_count += 1;
+                                    let req = PendingRequest {
+                                        request,
+                                        completion,
+                                        physical_page_ids,
+                                        last_page_len: 0,
+                                    };
+                                    req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                                }
+                                Completion::Chain { state } => {
+                                    chain_count += 1;
+                                    if let Some(pool) = chain_pool.as_ref() {
+                                        let ctx_id = state.prev_request.context_ids
+                                            .first().copied().unwrap_or(0);
+                                        pool.submit(ctx_id, super::speculator::ChainExtJob {
+                                            state,
+                                            output: Ok(output),
+                                            enqueued_us: super::speculator::now_micros(),
+                                        });
+                                    }
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                            }
                         }
                     } else {
                         for (r, req) in requests.into_iter().enumerate() {
-                            // Extract this request's slice from the batched
-                            // response. The api layer (build_wit_output)
-                            // walks samplers + the single-request response
-                            // to construct the WIT Output.
                             let per_req = request::extract_per_request(&batch_resp, r);
-                            req.send_result(
-                                Ok(ForwardOutput::Response(per_req)),
-                                submit_tx.as_ref(),
-                                page_size,
-                            );
+                            if system_spec_proposed_per_req
+                                .get(r)
+                                .copied()
+                                .unwrap_or_default()
+                                > 0
+                            {
+                                let accepted = per_req.tokens.len().saturating_sub(1);
+                                system_spec_draft_tokens_accepted += accepted as u64;
+                                for pos in 0..accepted.min(SYSTEM_SPEC_DRAFT_POS_BUCKETS) {
+                                    system_spec_draft_tokens_accepted_per_pos[pos] += 1;
+                                }
+                            }
+                            let output = ForwardOutput::Response(per_req);
+                            let PendingRequest {
+                                request,
+                                completion,
+                                physical_page_ids,
+                                last_page_len: _,
+                            } = req;
+                            match completion {
+                                Completion::Direct(tx) => {
+                                    direct_count += 1;
+                                    tx.send(Ok(output)).ok();
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                                Completion::Chunk { .. } => {
+                                    chunk_count += 1;
+                                    let req = PendingRequest {
+                                        request,
+                                        completion,
+                                        physical_page_ids,
+                                        last_page_len: 0,
+                                    };
+                                    req.send_result(Ok(output), submit_tx.as_ref(), page_size);
+                                }
+                                Completion::Chain { state } => {
+                                    chain_count += 1;
+                                    if let Some(pool) = chain_pool.as_ref() {
+                                        let ctx_id = state.prev_request.context_ids
+                                            .first().copied().unwrap_or(0);
+                                        pool.submit(ctx_id, super::speculator::ChainExtJob {
+                                            state,
+                                            output: Ok(output),
+                                            enqueued_us: super::speculator::now_micros(),
+                                        });
+                                    }
+                                    deferred_drop.push((request, physical_page_ids));
+                                }
+                            }
                         }
+                    }
+                    stats.fire.last_dispatch_end_micros.store(now_micros(), Relaxed);
+                    if !deferred_drop.is_empty() {
+                        // Dedicated blocking pool so the chain-extender
+                        // wake-up wave doesn't compete with this dealloc
+                        // task for a worker thread. Use the captured
+                        // `rt_handle` because we're now on the scheduler
+                        // OS thread, not a tokio task — `tokio::task::
+                        // spawn_blocking` would panic without an ambient
+                        // runtime context.
+                        rt_handle.spawn_blocking(move || drop(deferred_drop));
                     }
                 }
             }
@@ -1267,11 +1836,42 @@ impl BatchScheduler {
                 }
             }
         }
+        crate::probe_fire_record!(
+            stats.fire.execute.response_dispatch.total_us,
+            response_dispatch_start.elapsed()
+        );
+        // Per-completion-type counts. Counters, not durations — three
+        // atomic ops per fire regardless of batch size, so always-on
+        // (no feature gate).
+        if direct_count > 0 {
+            stats
+                .fire
+                .execute
+                .response_dispatch
+                .direct_count
+                .fetch_add(direct_count, Relaxed);
+        }
+        if chain_count > 0 {
+            stats
+                .fire
+                .execute
+                .response_dispatch
+                .chain_count
+                .fetch_add(chain_count, Relaxed);
+        }
+        if chunk_count > 0 {
+            stats
+                .fire
+                .execute
+                .response_dispatch
+                .chunk_count
+                .fetch_add(chunk_count, Relaxed);
+        }
         BatchExecutionTiming {
-            total_us: batch_start.elapsed().as_micros() as u64,
-            batch_build_us,
-            driver_fire_us,
-            response_dispatch_us: response_start.elapsed().as_micros() as u64,
+            system_spec_draft_tokens_proposed,
+            system_spec_draft_tokens_accepted,
+            system_spec_draft_tokens_proposed_per_pos,
+            system_spec_draft_tokens_accepted_per_pos,
         }
     }
 }

@@ -41,6 +41,7 @@ struct HfConfig {
     // ── Norm / activation ─────────────────────────────────────────────
     float rms_norm_eps;
     std::string hidden_act;    // "silu" — only one supported for now.
+    std::string mlp_hidden_act; // Nemotron-H uses "relu2".
 
     // ── RoPE ──────────────────────────────────────────────────────────
     float rope_theta;
@@ -142,6 +143,9 @@ struct HfConfig {
     // source layer of the same `layer_types[i]`.
     int gemma_hidden_size_per_layer_input;
     int num_kv_shared_layers;
+    bool gemma4_use_ordered_embeddings = false;
+    int gemma4_num_centroids = 0;
+    int gemma4_centroid_intermediate_top_k = 0;
 
     // Gemma-4 per-layer rope_theta (HF nests under `rope_parameters`),
     // including `partial_rotary_factor` for full-attention layers
@@ -156,35 +160,21 @@ struct HfConfig {
     // is the (always-on) shared expert's MLP width.
     int moe_intermediate_size;
     int shared_expert_intermediate_size;
+    float routed_scaling_factor = 1.f;
+    int n_group = 1;
+    int topk_group = 1;
+    bool norm_topk_prob = true;
 
-    // ── DeepSeek/Kimi MLA + MoE specific ────────────────────────────
-    // Kimi K2.6 exposes the language tower as `model_type=kimi_k2` inside
-    // a `kimi_k25` wrapper and uses DeepSeek-V3-style MLA attention.
-    // These are zero/inert for standard MHA/GQA models.
-    int q_lora_rank = 0;
-    int kv_lora_rank = 0;
-    int qk_nope_head_dim = 0;
-    int qk_rope_head_dim = 0;
-    int v_head_dim = 0;
-    int first_k_dense_replace = 0;
-    int n_shared_experts = 0;
-    bool norm_topk_prob = false;
-    float routed_scaling_factor = 1.0f;
-
-    // ── DeepSeek V4 specific ────────────────────────────────────────
-    int dsv4_o_lora_rank = 0;
-    int dsv4_o_groups = 0;
-    int dsv4_index_head_dim = 0;
-    int dsv4_index_n_heads = 0;
-    int dsv4_index_topk = 0;
-    int dsv4_hc_mult = 0;
-    int dsv4_num_hash_layers = 0;
-    int dsv4_sliding_window = 0;
-    float dsv4_hc_eps = 1e-6f;
-    float dsv4_compress_rope_theta = 0.f;
-    std::vector<int> dsv4_compress_ratios;
-    std::string dsv4_scoring_func;
-    std::string dsv4_expert_dtype;
+    // ── Nemotron-H hybrid Mamba2/attention/MoE ─────────────────────
+    // `layer_types` stores "mamba", "attention", or "moe" for this
+    // architecture. These dimensions are zero on non-Nemotron models.
+    int mamba_num_heads = 0;
+    int mamba_head_dim = 0;
+    int mamba_state_size = 0;
+    int mamba_n_groups = 0;
+    int mamba_conv_kernel = 0;
+    int mamba_chunk_size = 0;
+    float mamba_time_step_min = 0.f;
 
     // ── Qwen3.5 hybrid (linear-attention SSM + full attention) ──────
     // Per-layer attention type is in `layer_types` (values
@@ -205,6 +195,10 @@ struct HfConfig {
     // Partial RoPE: only the first `partial_rotary_factor * head_dim`
     // dimensions are rotated. Defaults to 1.0 (full rotation).
     float partial_rotary_factor;
+
+    // Qwen3.5 / Qwen3.6 MTP (multi-token prediction) auxiliary head.
+    int  mtp_num_hidden_layers = 0;
+    bool mtp_use_dedicated_embeddings = false;
 
     // Gemma-3n (E2B / E4B "Nano") additions on top of Gemma-4.
     // Gemma-3n is a *different* architecture from Gemma-4 (despite the
@@ -235,16 +229,6 @@ struct HfConfig {
     float gemma3n_rope_local_base_freq; // sliding-layer rope theta
     std::vector<int>   gemma3n_per_layer_intermediate;
     std::vector<float> gemma3n_activation_sparsity;
-
-    // ── GLM-5.1 DSA (Differential Sparse Attention) indexer ────────
-    // Per-layer indexer selects top-k tokens for sparse attention.
-    // Zero/empty on non-GLM models.
-    int index_topk = 0;         // 2048 on GLM-5.1
-    int index_head_dim = 0;     // 128 on GLM-5.1
-    int index_n_heads = 0;      // 32 on GLM-5.1
-    // Per-layer indexer type: "full" (computes indices from scratch)
-    // or "shared" (reuses previous layer's indices). Empty on non-GLM.
-    std::vector<std::string> indexer_types;
 
     // ── Storage dtype as declared on disk (for the safetensors loader).
     std::string torch_dtype;   // "bfloat16", "float16", "float32".

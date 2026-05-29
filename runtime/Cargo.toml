@@ -15,7 +15,7 @@ path = "src/lib.rs"
 [dependencies]
 pie-bridge = { path = "../driver/bridge" }
 pie-client = { path = "../client/rust" }
-tokio = { version = "1.38", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 tokio-util = "0.7"
 anyhow = "1.0"
 futures-util = { version = "0.3", features = ["sink"] }
@@ -77,6 +77,20 @@ smallvec = "1"
 lru = "0.16.3"
 ahash = "0.8.12"
 ipnet = "2"
+
+[features]
+default = []
+# Host-side performance probes. Each scenario is a separate flag so you
+# only pay for the probes you ask for — different domains have different
+# sample rates and different audiences. The `probe_<domain>!` macros in
+# `src/probe/` expand to zero code when their feature is off.
+#
+# Adding a new domain: define `src/probe/<domain>.rs` with its probe-holder
+# struct + `probe_<domain>!` macro pair, then add a feature flag here.
+profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
+profile-driver-cuda = []   # driver_fire phase breakdown (Rust IPC + C++ host)
+profile-hot-path = ["profile-fire", "profile-driver-cuda"]  # convenience bundle
+profile-all = ["profile-fire", "profile-driver-cuda"]       # everything
 
 [dev-dependencies]
 tempfile = "3"

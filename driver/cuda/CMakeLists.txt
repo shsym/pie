@@ -21,6 +21,23 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 find_package(CUDAToolkit REQUIRED)
 find_package(Threads REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+# CUDA 13+ ships libcudacxx/CUB/Thrust under a `cccl/` prefix in the
+# toolkit include tree.  CUTLASS (and vendored Marlin) still includes
+# `<cuda/std/…>`, `<cub/…>`, `<thrust/…>` without that prefix.  When
+# the non-prefixed headers don't exist, add the CCCL directory so the
+# old-style includes resolve.
+if(CUDAToolkit_INCLUDE_DIRS)
+  foreach(_cuda_inc IN LISTS CUDAToolkit_INCLUDE_DIRS)
+    if(EXISTS "${_cuda_inc}/cccl" AND NOT EXISTS "${_cuda_inc}/cuda/std")
+      list(APPEND PIE_CCCL_INCLUDE_DIRS "${_cuda_inc}/cccl")
+    endif()
+  endforeach()
+  if(PIE_CCCL_INCLUDE_DIRS)
+    message(STATUS "Adding CCCL include dirs for CUDA 13+: ${PIE_CCCL_INCLUDE_DIRS}")
+  endif()
+endif()
 
 if(NOT PIE_BRIDGE_INCLUDE_DIR)
   set(PIE_BRIDGE_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../bridge/include")
@@ -40,6 +57,13 @@ message(STATUS "Using NCCL: ${NCCL_LIBRARY} (header: ${NCCL_INCLUDE_DIR})")
 
 include(cmake/CPM.cmake)
 
+# Use a persistent CPM cache when the env var is set so incremental
+# builds (and cargo build-hash changes) don't re-clone from GitHub.
+# CI sets this via GITHUB_ENV; local builds can export it in .bashrc.
+if(DEFINED ENV{CPM_SOURCE_CACHE} AND NOT CPM_SOURCE_CACHE)
+  set(CPM_SOURCE_CACHE $ENV{CPM_SOURCE_CACHE})
+endif()
+
 # NOTE: flashinfer dropped its top-level CMakeLists.txt after v0.2.7. From
 # v0.3.0+ the build is Python-driven (per-arch JIT cubins via build_backend.py).
 # We still fetch the source tree for headers and `csrc/`. Kernel integration
@@ -50,17 +74,37 @@ cpmaddpackage(
   NAME flashinfer
   GITHUB_REPOSITORY flashinfer-ai/flashinfer
   GIT_TAG v0.6.9
+  GIT_SHALLOW TRUE
   DOWNLOAD_ONLY YES)
+
+# FlashInfer v0.6.9 has a narrowing-conversion warning that nvcc
+# escalates to an error: `state_stride_batch` (signed long) is brace-
+# initialized into a `uint64_t` field. Patch the source once after
+# fetch so we don't have to re-patch every fresh build hash dir.
+set(_FI_PATCH_SENTINEL "${flashinfer_SOURCE_DIR}/.pie_narrowing_patched")
+if(EXISTS "${flashinfer_SOURCE_DIR}" AND NOT EXISTS "${_FI_PATCH_SENTINEL}")
+  set(_FI_PATCH_FILE
+    "${flashinfer_SOURCE_DIR}/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh")
+  if(EXISTS "${_FI_PATCH_FILE}")
+    file(READ  "${_FI_PATCH_FILE}" _fi_src)
+    string(REPLACE
+      "DSTATE * DIM, params.state_stride_batch}"
+      "DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)}"
+      _fi_src "${_fi_src}")
+    file(WRITE "${_FI_PATCH_FILE}" "${_fi_src}")
+    file(WRITE "${_FI_PATCH_SENTINEL}" "patched")
+    message(STATUS "Patched FlashInfer narrowing conversion in ${_FI_PATCH_FILE}")
+  endif()
+endif()
 
 cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
 cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
-cpmaddpackage(URI "gh:facebook/zstd@1.5.7")
 
 set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
 foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
-  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120" OR PIE_CUDA_ARCH_NUMBER STREQUAL "100")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120")
     set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce_stub.cpp)
   endif()
 endforeach()
@@ -69,6 +113,7 @@ if(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE MATCHES "stub")
 endif()
 
 set(PIE_CUDA_FLASHINFER_HOPPER_SOURCE src/ops/attention_flashinfer_hopper_stub.cpp)
+set(PIE_CUDA_FLASHINFER_MAMBA_SM90 OFF)
 foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
   if(PIE_CUDA_ARCH_NUMBER STREQUAL "90")
@@ -76,12 +121,26 @@ foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
       src/ops/attention_flashinfer_hopper.cu
       src/ops/attention_xqa_gqa8_sm90.cu
     )
+    set(PIE_CUDA_FLASHINFER_MAMBA_SM90 ON)
+  endif()
+  # FlashInfer's Mamba SSU vertical/horizontal kernels use TMA +
+  # memcpy_async_tx, which Blackwell also supports. The runtime
+  # algorithm auto-selector in selective_state_update prefers the
+  # horizontal kernel for sm >= 10 with bf16/fp16 state — so the same
+  # FLASHINFER_MAMBA_ENABLE_SM90 compile gate should be on for sm_100.
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "100")
+    set(PIE_CUDA_FLASHINFER_MAMBA_SM90 ON)
   endif()
 endforeach()
 if(PIE_CUDA_FLASHINFER_HOPPER_SOURCE MATCHES "stub")
   message(STATUS "Disabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
 else()
   message(STATUS "Enabling FlashInfer Hopper/FA3 attention for CUDA architecture ${CMAKE_CUDA_ARCHITECTURES}")
+endif()
+if(PIE_CUDA_FLASHINFER_MAMBA_SM90)
+  message(STATUS "Enabling FlashInfer Mamba SM90 vertical/horizontal SSU kernels")
+else()
+  message(STATUS "FlashInfer Mamba SM90 vertical/horizontal SSU kernels disabled (legacy + simple algorithm only)")
 endif()
 
 # pie_driver_cuda — native CUDA backend. Built two ways from the same
@@ -104,7 +163,6 @@ add_library(pie_driver_cuda_lib STATIC
   src/spec_expansion.cpp
   src/tensor.cpp
   src/model/weight_store.cpp
-  src/mla_cache.cpp
   src/model/loaded_model.cpp
   src/model/bound_model.cpp
   ../common/src/safetensors_manifest.cpp
@@ -117,17 +175,12 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/mixtral.cpp
   src/model/gemma2.cpp
   src/model/gemma4.cpp
+  src/model/gemma4_mtp.cpp
   src/model/gemma3n.cpp
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp
-  src/model/kimi.cpp
-  src/model/kimi_forward.cpp
-  src/model/deepseek_v4.cpp
-  src/model/deepseek_v4_forward.cpp
-  src/model/glm5.cpp
-  src/model/glm5_forward.cpp
-  src/dsa_cache.cpp
   src/model/qwen3_5.cpp
+  src/model/nemotron_h.cpp
   src/kv_cache_format.cpp
   src/kv_cache.cpp
   src/ops/gemm.cpp
@@ -144,15 +197,8 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/rope.cu
   src/kernels/split_packed.cu
   src/kernels/scatter_int32.cu
-  src/kernels/slab_scatter.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu
-  src/kernels/mla_paged.cu
-  src/kernels/kimi_mla.cu
-  src/kernels/dsv4_routing.cu
-  src/kernels/dsv4_hc.cu
-  src/kernels/dsv4_compress.cu
-  src/kernels/dsa_indexer.cu
   src/kernels/sample_temp.cu
   src/kernels/sample_flashinfer.cu
   src/kernels/entropy.cu
@@ -166,12 +212,10 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/softcap.cu
   src/kernels/scalar_mul.cu
   src/kernels/dequant_fp4.cu
-  src/kernels/dequant_wna16.cu
   src/kernels/mxfp4_marlin.cu
   src/kernels/dequant_fp8.cu
   src/kernels/dtype_cast.cu
   src/kernels/quant_bf16_to_fp8.cu
-  src/kernels/quant_bf16_to_mxfp4.cu
   src/kernels/head_dim_pad.cu
   src/kernels/attn_sink.cu
   src/kernels/deinterleave.cu
@@ -180,17 +224,32 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/altup_aux.cu
   src/kernels/causal_conv1d.cu
   src/kernels/gated_delta_net.cu
-  src/qwen3_5_state_cache.cpp
+  src/kernels/nemotron_h.cu
+  src/recurrent_state_cache.cpp
+  src/cuda_memory_planner.cpp
+  src/driver_startup.cpp
+  src/parity_harness.cpp
+  src/hf_snapshot.cpp
+  src/model/qwen3_5_config.cpp
   src/model/qwen3_5_forward.cpp
   src/model/qwen3_5_moe.cpp
   src/model/qwen3_5_moe_forward.cpp
+  src/model/nemotron_h_forward.cpp
+  src/model/nemotron_h_model.cpp
+  src/model/gemma4_model.cpp
+  src/model/gemma2_model.cpp
+  src/model/gemma3n_model.cpp
+  src/model/mixtral_model.cpp
+  src/model/qwen3_5_model.cpp
+  src/model/qwen3_5_moe_model.cpp
+  src/model/llama_like_model.cpp
   src/attention_workspace.cpp
   src/brle.cpp
   src/swap_pool.cpp
   src/distributed.cpp
   ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/ops/attention_flashinfer.cu
-  src/ops/attention_mla.cu
+  src/ops/flashinfer_mamba.cu
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
 )
 
@@ -256,31 +315,132 @@ target_include_directories(pie_driver_cuda_lib
     ${CMAKE_CURRENT_SOURCE_DIR}/../common/include
     ${PIE_BRIDGE_INCLUDE_DIR}
     ${NCCL_INCLUDE_DIR}
+    ${PIE_CCCL_INCLUDE_DIRS}
     ${flashinfer_SOURCE_DIR}/include
     ${flashinfer_SOURCE_DIR}/csrc
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
     ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
     ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
 
+# FlashInfer's CUTLASS MoE path expects generated launcher instantiations
+# beside the static csrc files. Generate only the SM80 grouped-GEMM launchers
+# needed by the SM89/Ada BF16 MoE path instead of pulling in the entire TVM
+# extension module.
+list(GET CMAKE_CUDA_ARCHITECTURES 0 PIE_FLASHINFER_MOE_ARCH)
+string(REGEX REPLACE "[^0-9].*$" "" PIE_FLASHINFER_MOE_ARCH_NUMBER
+  "${PIE_FLASHINFER_MOE_ARCH}")
+set(PIE_FLASHINFER_MOE_GEN_DIR
+  "${CMAKE_BINARY_DIR}/flashinfer_generated/cutlass_instantiations/${PIE_FLASHINFER_MOE_ARCH_NUMBER}")
+file(MAKE_DIRECTORY "${PIE_FLASHINFER_MOE_GEN_DIR}")
+# FlashInfer's code-gen script imports tvm_ffi, pynvml, tqdm at the
+# top level.  These must be available to the Python interpreter cmake
+# finds.  When building inside a venv that has them (e.g. the SGLang
+# or vLLM venv) they resolve naturally; on a bare system install add
+# them via `pip install apache-tvm-ffi pynvml tqdm`.
+execute_process(
+  COMMAND ${CMAKE_COMMAND} -E env
+          FLASHINFER_DISABLE_VERSION_CHECK=1
+          PYTHONPATH=${flashinfer_SOURCE_DIR}
+          ${Python3_EXECUTABLE} -c
+          "from pathlib import Path; from flashinfer.jit.gemm.cutlass.generate_kernels import generate_gemm_operations; generate_gemm_operations(Path(r'${PIE_FLASHINFER_MOE_GEN_DIR}'), '${PIE_FLASHINFER_MOE_ARCH_NUMBER};${PIE_FLASHINFER_MOE_ARCH_NUMBER}-real')"
+  RESULT_VARIABLE PIE_FLASHINFER_MOE_GEN_RESULT)
+if(NOT PIE_FLASHINFER_MOE_GEN_RESULT EQUAL 0)
+  message(FATAL_ERROR
+    "Failed to generate FlashInfer CUTLASS MoE launchers.  "
+    "Ensure the Python interpreter has tvm_ffi, pynvml, and tqdm installed.")
+endif()
+file(GLOB PIE_FLASHINFER_MOE_GENERATED_SOURCES CONFIGURE_DEPENDS
+  "${PIE_FLASHINFER_MOE_GEN_DIR}/gemm_grouped/80/*.generated.cu")
+list(LENGTH PIE_FLASHINFER_MOE_GENERATED_SOURCES PIE_FLASHINFER_MOE_GENERATED_COUNT)
+message(STATUS "Using ${PIE_FLASHINFER_MOE_GENERATED_COUNT} FlashInfer generated MoE launchers")
+
+# FlashInfer/TensorRT-LLM CUTLASS MoE runner. Keep this isolated from the
+# regular driver TUs because the dependency slice is large and should remain a
+# clear opt-in boundary for Nemotron experimentation.
+add_library(pie_flashinfer_cutlass_moe OBJECT
+  src/ops/flashinfer_moe.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/envUtils.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/logger.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/stringUtils.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/tllmException.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/cpp/common/memoryUtils.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/preQuantScaleKernel.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.cpp
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_tma_warp_specialized_input.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_kernels_bf16_bf16.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/lora/lora.cpp
+  ${PIE_FLASHINFER_MOE_GENERATED_SOURCES})
+target_include_directories(pie_flashinfer_cutlass_moe PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CUDAToolkit_INCLUDE_DIRS}
+  ${PIE_CCCL_INCLUDE_DIRS}
+  ${flashinfer_SOURCE_DIR}/include
+  ${flashinfer_SOURCE_DIR}/csrc
+  ${flashinfer_SOURCE_DIR}/csrc/fused_moe/cutlass_backend
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/include
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/cutlass_extensions/include
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/moe_gemm
+  ${flashinfer_SOURCE_DIR}/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm
+  ${PIE_FLASHINFER_MOE_GEN_DIR}
+  ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/include
+  ${flashinfer_SOURCE_DIR}/3rdparty/cutlass/tools/util/include
+  ${flashinfer_SOURCE_DIR}/3rdparty/spdlog/include)
+target_compile_definitions(pie_flashinfer_cutlass_moe PRIVATE
+  ENABLE_BF16=1
+  ENABLE_FP8=1
+  USING_OSS_CUTLASS_MOE_GEMM=1)
+target_compile_options(pie_flashinfer_cutlass_moe PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>:
+    --extended-lambda
+    --expt-relaxed-constexpr
+  >)
+set_target_properties(pie_flashinfer_cutlass_moe PROPERTIES
+  POSITION_INDEPENDENT_CODE ON)
+target_sources(pie_driver_cuda_lib PRIVATE
+  $<TARGET_OBJECTS:pie_flashinfer_cutlass_moe>)
+
 # ── Marlin (W4A16 / MXFP4 GEMM via vendored vLLM kernel) ──────────────
 # Built by default because GPT-OSS MXFP4 auto policy should use native
 # packed-weight GEMM on supported GPUs and fall back only on legacy targets.
 # Vendored sources live under `third_party/marlin/`; the wrapper exposes a
 # torch-free C++ API.
-option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" OFF)
+option(PIE_CUDA_BUILD_MARLIN "Build vendored marlin W4A16/MXFP4 GEMM" ON)
+option(PIE_MARLIN_ALL_SHAPES
+  "Compile all Marlin dtype combos (fp16/bf16/int8 × u4/u4b8/fp8/mxfp4). \
+OFF (default) compiles only bf16×{u4,u4b8,mxfp4} — the shapes pie dispatches."
+  OFF)
 if(PIE_CUDA_BUILD_MARLIN)
-	    # Include the generated kernel instantiations alongside the core driver.
-    file(GLOB MARLIN_SM_KERNELS
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/marlin/sm*_kernel_*.cu")
+    # CUDA 13 generates __global__ template stubs with static linkage,
+    # breaking cross-TU explicit instantiations. marlin.cu now #includes
+    # the sm80_kernel_*.cu files directly so instantiation and selection
+    # share a single TU. Do NOT list sm80_kernel_*.cu as separate
+    # sources — they would double-define every template.
     target_sources(pie_driver_cuda_lib PRIVATE
         third_party/marlin/marlin.cu
         third_party/marlin/gptq_marlin_repack.cu
         third_party/marlin/awq_marlin_repack.cu
-        third_party/marlin/marlin_wrapper.cpp
-        ${MARLIN_SM_KERNELS})
+        third_party/marlin/marlin_wrapper.cpp)
     target_include_directories(pie_driver_cuda_lib PRIVATE
         third_party/marlin)
     target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_CUDA_HAS_MARLIN=1)
+    if(PIE_MARLIN_ALL_SHAPES)
+        target_compile_definitions(pie_driver_cuda_lib PRIVATE PIE_MARLIN_ALL_SHAPES=1)
+    endif()
+endif()
+
+# FlashInfer Mamba SSU on Hopper / Blackwell gates the vertical and horizontal
+# producer-consumer kernels behind FLASHINFER_MAMBA_ENABLE_SM90 at compile
+# time (TMA + memcpy_async_tx are sm_90+). Without this define, sm_90+ runs
+# would silently fall back to the simple algorithm — the same slow path used
+# on sm_89 — even though the runtime SM check would otherwise pick vertical
+# or horizontal.
+if(PIE_CUDA_FLASHINFER_MAMBA_SM90)
+    target_compile_definitions(pie_driver_cuda_lib PRIVATE
+        FLASHINFER_MAMBA_ENABLE_SM90=1)
 endif()
 
 # Standalone test for flashinfer sampling debugging.
@@ -368,7 +528,6 @@ add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11
   tomlplusplus::tomlplusplus
-  zstd
   nlohmann_json::nlohmann_json
   rt
   dl

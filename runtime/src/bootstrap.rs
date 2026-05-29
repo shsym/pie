@@ -98,6 +98,14 @@ pub struct ModelConfig {
     pub arch_name: String,
     pub kv_page_size: usize,
     pub tokenizer_path: PathBuf,
+    /// True when every driver group wired a system drafter (the capability
+    /// signal). Manual/user drafts require this; auto-drafting additionally
+    /// requires `enable_system_speculation`.
+    pub system_speculation_supported: bool,
+    /// Operator opt-in for system speculation (deployment config, default
+    /// false). The runtime drives system drafts only when this is true AND the
+    /// model supports it; manual/user-supplied drafts are honored regardless.
+    pub enable_system_speculation: bool,
     pub drivers: Vec<DriverConfig>,
     pub scheduler: SchedulerConfig,
 }
@@ -109,6 +117,7 @@ pub struct DriverConfig {
     pub rs_cache_required: bool,
     pub rs_cache_slots: usize,
     pub rs_cache_slot_bytes: u64,
+    pub rs_cache_spec_rollback: bool,
     pub limits: crate::driver::SchedulerLimits,
 }
 
@@ -222,6 +231,8 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             &cfg.arch_name,
             cfg.kv_page_size as u32,
             cfg.tokenizer_path.clone(),
+            cfg.system_speculation_supported,
+            cfg.enable_system_speculation,
         )?;
 
         let drivers: Vec<usize> = cfg
@@ -243,15 +254,12 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             .map(|d| d.limits.max_forward_requests)
             .sum();
         let num_rs_slots: Vec<usize> = cfg.drivers.iter().map(|d| d.rs_cache_slots).collect();
-        let speculation_depth = if cfg
+        let rs_cache_spec_rollback: Vec<bool> = cfg
             .drivers
             .iter()
-            .any(|d| d.rs_cache_required || d.rs_cache_slots > 0)
-        {
-            0
-        } else {
-            cfg.scheduler.speculation_depth
-        };
+            .map(|d| d.rs_cache_spec_rollback)
+            .collect();
+        let speculation_depth = cfg.scheduler.speculation_depth;
 
         context::spawn(
             cfg.kv_page_size,
@@ -259,6 +267,7 @@ async fn bootstrap_inner(config: Config, listener: Option<TcpListener>) -> Resul
             num_cpu_pages,
             max_forward_requests,
             num_rs_slots,
+            rs_cache_spec_rollback,
             cfg.scheduler.default_endowment_pages.max(1),
             cfg.scheduler.default_token_limit,
             cfg.scheduler.admission_oversubscription_factor,

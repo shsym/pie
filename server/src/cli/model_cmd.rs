@@ -51,8 +51,7 @@ fn hub_dir() -> std::path::PathBuf {
     hf_hub::resolve_cache_dir()
 }
 
-/// Convert `models--org--name` ↔ `org/name`. Mirrors
-/// `pie_driver_dev.hf_utils.parse_repo_id_from_dirname`.
+/// Convert `models--org--name` ↔ `org/name`.
 fn dirname_to_repo_id(dir: &str) -> Option<String> {
     let stripped = dir.strip_prefix("models--")?;
     let parts: Vec<&str> = stripped.split("--").collect();
@@ -72,7 +71,6 @@ fn repo_id_to_dirname(repo_id: &str) -> String {
 // -----------------------------------------------------------------------------
 
 /// HuggingFace `model_type` → PIE arch name. Kept in sync with
-/// `driver/dev/src/pie_driver_dev/model/__init__.py`'s `register(...)` calls and
 /// the model_type strings the C++ drivers (`driver/cuda/src/loader/`,
 /// `driver/portable/src/`) recognise. Architectures supported by *any*
 /// of the standalone-linked drivers belong here.
@@ -94,6 +92,7 @@ const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
     ("olmo3", "olmo3"),
     ("gptoss", "gptoss"),
     ("gpt_oss", "gptoss"),
+    ("nemotron_h", "nemotron_h"),
 ];
 
 /// Read `<repo_dir>/snapshots/<latest>/config.json` and look up its
@@ -122,7 +121,10 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
         return (false, "no config".to_string());
     };
     let model_type = json
-        .get("model_type")
+        .get("text_config")
+        .or_else(|| json.get("llm_config"))
+        .and_then(|v| v.get("model_type"))
+        .or_else(|| json.get("model_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     if model_type.is_empty() {

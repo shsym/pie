@@ -21,14 +21,13 @@ use crate::context::pagestore::PhysicalPageId;
 use crate::driver::{DriverId, SchedulerLimits};
 use crate::service::{ServiceArray, ServiceHandler};
 use anyhow::Result;
+use dashmap::DashMap;
 use scheduler::BatchScheduler;
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering::Relaxed;
 
-pub use scheduler::SchedulerStats;
+pub use scheduler::{SchedulerStats, SYSTEM_SPEC_DRAFT_POS_BUCKETS};
 pub use speculator::{
     BYPASS_HIT_COUNT, CHAIN_DROP_COUNT, CHAIN_SUBMIT_COUNT, StagedBatch, lookup_for_ctx, try_hit,
 };
@@ -36,12 +35,19 @@ pub use speculator::{
 use speculator::StagedBatchMap;
 
 pub(crate) fn should_use_pass_speculation(driver_idx: usize) -> bool {
-    let pinned = crate::context::pinned_count(driver_idx);
-    let (active, cached_pinned) = crate::context::resident_count(driver_idx);
-    pinned.max(active.saturating_add(cached_pinned)) > 1
+    // The chain extender is already gated by scheduler.speculation_depth and
+    // request shape. If a staged entry exists, claim it even for a single
+    // resident context; otherwise the API path pays pin/actor overhead and
+    // the pre-fired chain only gets discovered later inside InferenceService.
+    let _ = driver_idx;
+    true
 }
 
 /// Aggregated inference stats for a single model (across all drivers).
+///
+/// Always-on counters live at the top; per-domain probe averages
+/// (currently just `fire`) are nested so the shape mirrors the probe
+/// hierarchy in `crate::probe::*`.
 #[derive(Debug, Default, serde::Serialize)]
 pub struct InferenceStats {
     pub total_batches: u64,
@@ -53,13 +59,72 @@ pub struct InferenceStats {
     pub last_batch_latency_us: u64,
     pub cumulative_batch_latency_us: u64,
     pub avg_batch_latency_us: u64,
-    pub avg_permit_wait_us: u64,
+
+    /// Fire-domain probe averages. Values are 0 when built without
+    /// `profile-fire`. Mirrors `crate::probe::fire::FireProbes`.
+    pub fire: FireStats,
+
+    pub system_spec_draft_tokens_proposed: u64,
+    pub system_spec_draft_tokens_accepted: u64,
+    pub system_spec_draft_tokens_proposed_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+    pub system_spec_draft_tokens_accepted_per_pos: [u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS],
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct FireStats {
+    pub avg_inter_fire_us: u64,
+    pub avg_post_dispatch_to_fire_us: u64,
+    pub accumulate: AccumulateStats,
+    pub pre_dispatch: PreDispatchStats,
+    pub execute: ExecuteStats,
+    pub post_dispatch: PostDispatchStats,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct AccumulateStats {
+    pub avg_accum_loop_us: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PreDispatchStats {
     pub avg_fire_prepare_us: u64,
-    pub avg_execute_batch_us: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ExecuteStats {
+    pub avg_total_us: u64,
     pub avg_batch_build_us: u64,
     pub avg_driver_fire_us: u64,
-    pub avg_response_dispatch_us: u64,
-    pub avg_context_tick_submit_us: u64,
+    pub response_dispatch: ResponseDispatchStats,
+    pub driver_cuda: DriverCudaStats,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct ResponseDispatchStats {
+    pub avg_total_us: u64,
+    pub direct_count: u64,
+    pub chain_count: u64,
+    pub chunk_count: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct DriverCudaStats {
+    pub avg_ipc_submit_us: u64,
+    pub avg_gpu_wait_us: u64,
+    pub avg_ipc_recv_us: u64,
+    pub avg_wire_parse_us: u64,
+    pub avg_plan_us: u64,
+    pub avg_h2d_us: u64,
+    pub avg_kernel_launch_us: u64,
+    pub avg_sync_us: u64,
+    pub avg_response_build_us: u64,
+    pub sum_sync_us: u64,
+    pub sum_kernel_launch_us: u64,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct PostDispatchStats {
+    pub avg_context_tick_us: u64,
     pub avg_stats_update_us: u64,
 }
 
@@ -134,6 +199,7 @@ pub async fn submit(
         physical_page_ids,
         extra_pages,
         last_page_len,
+        None,
         true,
     )?;
     rx.await
@@ -147,6 +213,7 @@ pub fn submit_async(
     physical_page_ids: Vec<PhysicalPageId>,
     extra_pages: Vec<PhysicalPageId>,
     last_page_len: u32,
+    active_page_idx: Option<usize>,
     allow_pass_speculation: bool,
 ) -> Result<oneshot::Receiver<Result<ForwardOutput>>> {
     let (tx, rx) = oneshot::channel();
@@ -158,6 +225,7 @@ pub fn submit_async(
             physical_page_ids,
             extra_pages,
             last_page_len,
+            active_page_idx,
             allow_pass_speculation,
             response: tx,
         },
@@ -272,7 +340,7 @@ impl InferenceService {
         let scheduler_stats: Vec<_> = schedulers.iter().map(|s| s.stats().clone()).collect();
 
         let staged_batch: Vec<StagedBatchMap> = (0..num_drivers)
-            .map(|_| Arc::new(Mutex::new(HashMap::new())))
+            .map(|_| Arc::new(DashMap::new()))
             .collect();
         speculator::register_model(model_idx, &staged_batch, speculation_depth);
 
@@ -295,14 +363,37 @@ impl InferenceService {
         let mut hist = [0u64; 8];
         let mut last_latency = 0u64;
         let mut cumulative_latency = 0u64;
-        let mut cumulative_permit_wait = 0u64;
-        let mut cumulative_fire_prepare = 0u64;
-        let mut cumulative_execute_batch = 0u64;
-        let mut cumulative_batch_build = 0u64;
-        let mut cumulative_driver_fire = 0u64;
-        let mut cumulative_response_dispatch = 0u64;
-        let mut cumulative_context_tick_submit = 0u64;
-        let mut cumulative_stats_update = 0u64;
+        // Per-driver sums of probe atomics. Walked in the same shape
+        // as InferenceStats.fire / FireProbes so the relationship is
+        // self-evident.
+        let mut fire_inter = 0u64;
+        let mut fire_post_dispatch_to_fire = 0u64;
+        let mut fire_accumulate_accum_loop = 0u64;
+        let mut fire_pre_dispatch_fire_prepare = 0u64;
+        let mut fire_execute_total = 0u64;
+        let mut fire_execute_batch_build = 0u64;
+        let mut fire_execute_driver_fire = 0u64;
+        let mut fire_execute_response_dispatch_total = 0u64;
+        let mut fire_execute_response_dispatch_direct = 0u64;
+        let mut fire_execute_response_dispatch_chain = 0u64;
+        let mut fire_execute_response_dispatch_chunk = 0u64;
+        let mut dc_ipc_submit = 0u64;
+        let mut dc_gpu_wait = 0u64;
+        let mut dc_ipc_recv = 0u64;
+        let mut dc_wire_parse = 0u64;
+        let mut dc_plan = 0u64;
+        let mut dc_h2d = 0u64;
+        let mut dc_kernel_launch = 0u64;
+        let mut dc_sync = 0u64;
+        let mut dc_response_build = 0u64;
+        let mut fire_post_dispatch_context_tick = 0u64;
+        let mut fire_post_dispatch_stats_update = 0u64;
+        let mut system_spec_draft_tokens_proposed = 0u64;
+        let mut system_spec_draft_tokens_accepted = 0u64;
+        let mut system_spec_draft_tokens_proposed_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
+        let mut system_spec_draft_tokens_accepted_per_pos =
+            [0u64; SYSTEM_SPEC_DRAFT_POS_BUCKETS];
 
         for s in &self.scheduler_stats {
             total_batches += s.total_batches.load(Relaxed);
@@ -315,19 +406,59 @@ impl InferenceService {
             }
             last_latency = last_latency.max(s.last_batch_latency_us.load(Relaxed));
             cumulative_latency += s.cumulative_latency_us.load(Relaxed);
-            cumulative_permit_wait += s.cumulative_permit_wait_us.load(Relaxed);
-            cumulative_fire_prepare += s.cumulative_fire_prepare_us.load(Relaxed);
-            cumulative_execute_batch += s.cumulative_execute_batch_us.load(Relaxed);
-            cumulative_batch_build += s.cumulative_batch_build_us.load(Relaxed);
-            cumulative_driver_fire += s.cumulative_driver_fire_us.load(Relaxed);
-            cumulative_response_dispatch += s.cumulative_response_dispatch_us.load(Relaxed);
-            cumulative_context_tick_submit += s.cumulative_context_tick_submit_us.load(Relaxed);
-            cumulative_stats_update += s.cumulative_stats_update_us.load(Relaxed);
+            let f = &s.fire;
+            fire_inter += f.inter_fire_us.load(Relaxed);
+            fire_post_dispatch_to_fire += f.post_dispatch_to_fire_us.load(Relaxed);
+            fire_accumulate_accum_loop += f.accumulate.accum_loop_us.load(Relaxed);
+            fire_pre_dispatch_fire_prepare += f.pre_dispatch.fire_prepare_us.load(Relaxed);
+            fire_execute_total += f.execute.total_us.load(Relaxed);
+            fire_execute_batch_build += f.execute.batch_build_us.load(Relaxed);
+            fire_execute_driver_fire += f.execute.driver_fire_us.load(Relaxed);
+            fire_execute_response_dispatch_total += f.execute.response_dispatch.total_us.load(Relaxed);
+            fire_execute_response_dispatch_direct += f.execute.response_dispatch.direct_count.load(Relaxed);
+            fire_execute_response_dispatch_chain += f.execute.response_dispatch.chain_count.load(Relaxed);
+            fire_execute_response_dispatch_chunk += f.execute.response_dispatch.chunk_count.load(Relaxed);
+            let dc = &s.driver_cuda;
+            dc_ipc_submit += dc.ipc_submit_us.load(Relaxed);
+            dc_gpu_wait += dc.gpu_wait_us.load(Relaxed);
+            dc_ipc_recv += dc.ipc_recv_us.load(Relaxed);
+            dc_wire_parse += dc.wire_parse_us.load(Relaxed);
+            dc_plan += dc.plan_us.load(Relaxed);
+            dc_h2d += dc.h2d_us.load(Relaxed);
+            dc_kernel_launch += dc.kernel_launch_us.load(Relaxed);
+            dc_sync += dc.sync_us.load(Relaxed);
+            dc_response_build += dc.response_build_us.load(Relaxed);
+            fire_post_dispatch_context_tick += f.post_dispatch.context_tick_us.load(Relaxed);
+            fire_post_dispatch_stats_update += f.post_dispatch.stats_update_us.load(Relaxed);
+            system_spec_draft_tokens_proposed += s.system_spec_draft_tokens_proposed.load(Relaxed);
+            system_spec_draft_tokens_accepted += s.system_spec_draft_tokens_accepted.load(Relaxed);
+            for (dst, src) in system_spec_draft_tokens_proposed_per_pos
+                .iter_mut()
+                .zip(s.system_spec_draft_tokens_proposed_per_pos.iter())
+            {
+                *dst += src.load(Relaxed);
+            }
+            for (dst, src) in system_spec_draft_tokens_accepted_per_pos
+                .iter_mut()
+                .zip(s.system_spec_draft_tokens_accepted_per_pos.iter())
+            {
+                *dst += src.load(Relaxed);
+            }
         }
 
         let avg = |value: u64| {
             if total_batches > 0 {
                 value / total_batches
+            } else {
+                0
+            }
+        };
+        // Inter-fire is sampled starting at the 2nd batch (first one has
+        // no prior to diff against), so divide by max(total_batches-1, 1)
+        // to get a stable mean.
+        let avg_pair = |value: u64| {
+            if total_batches > 1 {
+                value / (total_batches - 1)
             } else {
                 0
             }
@@ -341,14 +472,48 @@ impl InferenceService {
             last_batch_latency_us: last_latency,
             cumulative_batch_latency_us: cumulative_latency,
             avg_batch_latency_us: avg(cumulative_latency),
-            avg_permit_wait_us: avg(cumulative_permit_wait),
-            avg_fire_prepare_us: avg(cumulative_fire_prepare),
-            avg_execute_batch_us: avg(cumulative_execute_batch),
-            avg_batch_build_us: avg(cumulative_batch_build),
-            avg_driver_fire_us: avg(cumulative_driver_fire),
-            avg_response_dispatch_us: avg(cumulative_response_dispatch),
-            avg_context_tick_submit_us: avg(cumulative_context_tick_submit),
-            avg_stats_update_us: avg(cumulative_stats_update),
+            fire: FireStats {
+                avg_inter_fire_us: avg_pair(fire_inter),
+                avg_post_dispatch_to_fire_us: avg_pair(fire_post_dispatch_to_fire),
+                accumulate: AccumulateStats {
+                    avg_accum_loop_us: avg(fire_accumulate_accum_loop),
+                },
+                pre_dispatch: PreDispatchStats {
+                    avg_fire_prepare_us: avg(fire_pre_dispatch_fire_prepare),
+                },
+                execute: ExecuteStats {
+                    avg_total_us: avg(fire_execute_total),
+                    avg_batch_build_us: avg(fire_execute_batch_build),
+                    avg_driver_fire_us: avg(fire_execute_driver_fire),
+                    response_dispatch: ResponseDispatchStats {
+                        avg_total_us: avg(fire_execute_response_dispatch_total),
+                        direct_count: fire_execute_response_dispatch_direct,
+                        chain_count: fire_execute_response_dispatch_chain,
+                        chunk_count: fire_execute_response_dispatch_chunk,
+                    },
+                    driver_cuda: DriverCudaStats {
+                        avg_ipc_submit_us: avg(dc_ipc_submit),
+                        avg_gpu_wait_us: avg(dc_gpu_wait),
+                        avg_ipc_recv_us: avg(dc_ipc_recv),
+                        avg_wire_parse_us: avg(dc_wire_parse),
+                        avg_plan_us: avg(dc_plan),
+                        avg_h2d_us: avg(dc_h2d),
+                        avg_kernel_launch_us: avg(dc_kernel_launch),
+                        avg_sync_us: avg(dc_sync),
+                        avg_response_build_us: avg(dc_response_build),
+                        sum_sync_us: dc_sync,
+                        sum_kernel_launch_us: dc_kernel_launch,
+                    },
+                },
+                post_dispatch: PostDispatchStats {
+                    avg_context_tick_us: avg(fire_post_dispatch_context_tick),
+                    avg_stats_update_us: avg(fire_post_dispatch_stats_update),
+                },
+            },
+            system_spec_draft_tokens_proposed,
+            system_spec_draft_tokens_accepted,
+            system_spec_draft_tokens_proposed_per_pos,
+            system_spec_draft_tokens_accepted_per_pos,
         }
     }
 }
@@ -371,6 +536,7 @@ enum Message {
         /// full reserved range without re-allocating.
         extra_pages: Vec<PhysicalPageId>,
         last_page_len: u32,
+        active_page_idx: Option<usize>,
         allow_pass_speculation: bool,
         response: oneshot::Sender<Result<ForwardOutput>>,
     },
@@ -394,6 +560,7 @@ impl ServiceHandler for InferenceService {
                 physical_page_ids,
                 extra_pages,
                 last_page_len,
+                active_page_idx,
                 allow_pass_speculation,
                 response,
             } => {
@@ -414,15 +581,10 @@ impl ServiceHandler for InferenceService {
                 // cold or post-miss (the api layer's try_hit
                 // returned None).
                 let staged_entry = {
-                    let mut sb = self.staged_batch[idx].lock().ok();
-                    sb.as_mut().and_then(|sb| {
-                        let deque = sb.get_mut(&ctx_id)?;
+                    let mut deque = self.staged_batch[idx].get_mut(&ctx_id);
+                    deque.as_deref_mut().and_then(|deque| {
                         if let Some(front) = deque.front() {
-                            let req_token = request.token_ids.first().copied();
-                            let req_pos = request.position_ids.first().copied();
-                            if Some(front.anchor_token) == req_token
-                                && Some(front.anchor_pos) == req_pos
-                            {
+                            if speculator::entry_matches_request(front, &request) {
                                 let entry = deque.pop_front();
                                 if let Some(entry) = entry.as_ref() {
                                     if !allow_pass_speculation {
@@ -441,11 +603,7 @@ impl ServiceHandler for InferenceService {
 
                 let scheduler_handle = self.schedulers[idx].handle();
                 let staged_batch_arc = self.staged_batch[idx].clone();
-                let request_clone = request.clone();
-                let speculation_depth = if allow_pass_speculation
-                    && request_clone.rs_slot_ids.is_empty()
-                    && request_clone.spec_token_ids.is_empty()
-                {
+                let speculation_depth = if allow_pass_speculation {
                     self.speculation_depth
                 } else {
                     0
@@ -464,27 +622,20 @@ impl ServiceHandler for InferenceService {
                     return;
                 }
 
-                // No hit: cold submit + start a fresh chain.
-                let (sched_tx, sched_rx) = oneshot::channel();
-                if let Err(e) = self.schedulers[idx].submit(
-                    request,
-                    sched_tx,
-                    physical_page_ids.clone(),
-                    last_page_len,
-                ) {
-                    tracing::error!("submit failed: {e}");
-                    return;
-                }
-                let cur_page_idx = physical_page_ids.len().saturating_sub(1);
-                let mut all_pages = physical_page_ids;
+                // No hit: cold submit + start a fresh chain. The pool's
+                // dispatch-side hook will route this fire's output to a
+                // pool worker; no per-context task is spawned here.
+                let cur_page_idx =
+                    active_page_idx.unwrap_or_else(|| physical_page_ids.len().saturating_sub(1));
+                let mut all_pages = physical_page_ids.clone();
                 all_pages.extend(extra_pages);
-                speculator::spawn_extend_chain(
-                    sched_rx,
+                speculator::start_chain(
                     response,
                     scheduler_handle,
                     staged_batch_arc,
                     self.model_idx,
-                    request_clone,
+                    request,
+                    physical_page_ids,
                     all_pages,
                     cur_page_idx,
                     last_page_len,

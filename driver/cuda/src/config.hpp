@@ -21,11 +21,6 @@ struct ModelConfig {
     // Empty (default) = no quantization. Recognised values:
     //   * "fp8"  — per-channel symmetric FP8_E4M3 for projection weights.
     //   * "int8" — per-channel symmetric INT8 for projection weights.
-    //   * "fp4" / "mxfp4" — MXFP4 (E2M1 weight + E8M0 block scale) for the
-    //                      target model's expert weights. Used by GLM-5.1 to
-    //                      transcode the checkpoint's FP8 routed-expert
-    //                      weights to MXFP4 at materialize time, halving
-    //                      the per-rank expert footprint.
     // Norms, biases, embeddings, and lm_head stay in their native dtype.
     std::string runtime_quant;
     // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects native packed
@@ -36,6 +31,15 @@ struct ModelConfig {
     //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
     //   * "native" — require a true MXFP4 MoE GEMM backend.
     std::string mxfp4_moe = "auto";
+    // Optional Gemma-4 native MTP assistant checkpoint. When set on a
+    // Gemma-4 target, output_spec_flags requests draft from this assistant.
+    std::string mtp_assistant_snapshot_dir;
+    int mtp_num_drafts = 3;
+    // Deployment opt-in for system speculation (MTP). Emitted to the runtime,
+    // which OWNS the decision to drive drafts (the driver stays pure mechanism).
+    // Default false: speculation is a latency-regime feature, off unless the
+    // operator enables it (matches vLLM/SGLang's explicit-enable convention).
+    bool enable_system_speculation = false;
 };
 
 struct BatchingConfig {
@@ -104,6 +108,13 @@ inline Config load_config(const std::filesystem::path& path) {
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
         c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});
         c.model.mxfp4_moe     = (*m)["mxfp4_moe"].value_or(c.model.mxfp4_moe);
+        c.model.mtp_assistant_snapshot_dir =
+            (*m)["mtp_assistant_snapshot_dir"].value_or(std::string{});
+        c.model.mtp_num_drafts = static_cast<int>(
+            (*m)["mtp_num_drafts"].value_or<int64_t>(c.model.mtp_num_drafts));
+        c.model.enable_system_speculation =
+            (*m)["enable_system_speculation"].value_or(
+                c.model.enable_system_speculation);
     }
     if (auto b = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {
@@ -166,6 +177,10 @@ inline Config load_config(const std::filesystem::path& path) {
 
     if (c.model.snapshot_dir.empty()) {
         throw std::runtime_error("config: [model].snapshot_dir is required");
+    }
+    if (c.model.mtp_num_drafts < 0 || c.model.mtp_num_drafts > 32) {
+        throw std::runtime_error(
+            "config: [model].mtp_num_drafts must be in [0, 32]");
     }
     if (!(c.batching.gpu_mem_utilization > 0.0 &&
           c.batching.gpu_mem_utilization <= 1.0)) {

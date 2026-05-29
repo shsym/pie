@@ -2,7 +2,7 @@
 //!
 //! Same TOML the legacy Python server consumed. Both embedded
 //! ([`DriverKind::Portable`] / [`DriverKind::CudaNative`] / [`DriverKind::Dummy`])
-//! and subprocess-hosted ([`DriverKind::Dev`] / [`DriverKind::Vllm`] /
+//! and subprocess-hosted ([`DriverKind::Vllm`] /
 //! [`DriverKind::Sglang`] / [`DriverKind::TensorRtLlm`]) drivers are valid; the dispatch happens in
 //! [`crate::serve::start_engine`] via [`crate::serve::topology::resolve_flavor`].
 //! Python-only fields are absent from validation here (e.g. nothing
@@ -255,8 +255,15 @@ impl RuntimeConfig {
 }
 
 fn default_worker_threads() -> usize {
+    // Cap at 64 — pie's scheduler + chain-ext pool produces ~20-30
+    // active tokio tasks at conc=256. Beyond ~64 workers the runtime's
+    // scheduling overhead (queue management, wake propagation) starts
+    // adding variance without adding parallelism. Measured on AMD EPYC
+    // 7773X (256 threads visible): tok/s mean +0.5%, stdev cut to ~1/3
+    // by capping. Users with heavier non-inference work in the same
+    // process can override via `[runtime] worker_threads = ...`.
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(|n| n.get().min(64))
         .unwrap_or(4)
 }
 fn default_wasm_max_instances() -> u32 {
@@ -469,8 +476,8 @@ impl DriverConfig {
             "model.driver.device must be non-empty"
         );
         // All `DriverKind`s are valid here: embedded flavors run in-process
-        // through static libs, while dev/vllm/sglang are supervised through
-        // `crate::subprocess_driver`.
+        // through static libs, while vllm/sglang/tensorrt_llm are supervised
+        // through `crate::subprocess_driver`.
         match self.kind {
             DriverKind::Portable => {
                 let opts: PortableDriverOptions = toml::Value::Table(self.options.clone())
@@ -505,7 +512,7 @@ impl DriverConfig {
                         )
                     })?;
             }
-            DriverKind::Dev | DriverKind::Vllm | DriverKind::Sglang | DriverKind::TensorRtLlm => {
+            DriverKind::Vllm | DriverKind::Sglang | DriverKind::TensorRtLlm => {
                 validate_subprocess_driver_options(&self.options, self.kind)?;
                 if matches!(self.kind, DriverKind::TensorRtLlm) {
                     ensure!(
@@ -617,9 +624,6 @@ pub enum DriverKind {
     /// Rust dummy driver — random tokens, no model load. Always
     /// embedded in `pie-server`.
     Dummy,
-    /// Torch-backed reference Python driver (`pie_driver_dev`). Hosted
-    /// out-of-process by [`crate::subprocess_driver::SubprocessDriver`].
-    Dev,
     /// vLLM-backed Python driver. Subprocess-hosted.
     Vllm,
     /// SGLang-backed Python driver. Subprocess-hosted.
@@ -635,7 +639,6 @@ impl DriverKind {
             DriverKind::Portable => "portable",
             DriverKind::CudaNative => "cuda_native",
             DriverKind::Dummy => "dummy",
-            DriverKind::Dev => "dev",
             DriverKind::Vllm => "vllm",
             DriverKind::Sglang => "sglang",
             DriverKind::TensorRtLlm => "tensorrt_llm",
@@ -797,6 +800,18 @@ pub struct CudaNativeDriverOptions {
     /// BF16-scratch fallback; `"bf16"`/`"dequant"` eagerly materialize BF16
     /// experts; `"native"` requires true MXFP4 GEMM kernels.
     pub mxfp4_moe: String,
+    /// Optional Gemma-4 native MTP assistant checkpoint used by
+    /// `.system_speculation()` on cuda_native. If omitted, the CUDA
+    /// driver auto-discovers the paired `-assistant` checkpoint from
+    /// the Hugging Face cache when available.
+    pub mtp_assistant_snapshot_dir: String,
+    /// Maximum number of MTP draft tokens returned per system-spec step.
+    pub mtp_num_drafts: u32,
+    /// Operator opt-in for system speculation (MTP). Default false: the runtime
+    /// drives the auto-drafter only when this is true. Speculation is a
+    /// latency-regime win (helps at low batch, costs at compute saturation), so
+    /// it's off unless explicitly enabled — matching vLLM/SGLang convention.
+    pub enable_system_speculation: bool,
 
     pub ready_timeout_s: f64,
     pub shutdown_timeout_s: f64,
@@ -827,6 +842,9 @@ impl Default for CudaNativeDriverOptions {
             verbose: false,
             runtime_quant: String::new(),
             mxfp4_moe: "auto".to_string(),
+            mtp_assistant_snapshot_dir: String::new(),
+            mtp_num_drafts: 3,
+            enable_system_speculation: false,
             ready_timeout_s: 600.0,
             shutdown_timeout_s: 5.0,
         }
@@ -858,6 +876,10 @@ impl CudaNativeDriverOptions {
             self.mxfp4_moe.is_empty() || MXFP4.contains(&self.mxfp4_moe.as_str()),
             "model.driver.options.mxfp4_moe must be one of {:?}",
             MXFP4
+        );
+        ensure!(
+            self.mtp_num_drafts <= 32,
+            "model.driver.options.mtp_num_drafts must be in 0..=32"
         );
         Ok(())
     }
@@ -1035,8 +1057,6 @@ max_num_kv_pages = 1024
             ("dummy", "max_forward_tokens"),
             ("dummy", "max_forward_requests"),
             ("dummy", "max_model_len"),
-            ("dev", "max_forward_tokens"),
-            ("dev", "max_forward_requests"),
             ("sglang", "max_running_requests"),
             ("sglang", "max_total_tokens"),
         ] {
@@ -1149,9 +1169,9 @@ device = "cuda:0"
 
     #[test]
     fn accepts_subprocess_drivers() {
-        // dev/vllm/sglang/tensorrt_llm are hosted out-of-process by
+        // vllm/sglang/tensorrt_llm are hosted out-of-process by
         // `crate::subprocess_driver::SubprocessDriver`.
-        for ty in ["dev", "vllm", "sglang", "tensorrt_llm"] {
+        for ty in ["vllm", "sglang", "tensorrt_llm"] {
             let toml_text = format!(
                 "[[model]]\nname = \"m\"\nhf_repo = \"x\"\n[model.driver]\n\
                  type = \"{ty}\"\ndevice = [\"cuda:0\"]\n"
@@ -1243,6 +1263,8 @@ gpu_mem_utilization = 0.90
 memory_profile = "balanced"
 runtime_quant = "fp8"
 mxfp4_moe = "routed_dequant"
+mtp_assistant_snapshot_dir = "/models/gemma4-mtp"
+mtp_num_drafts = 6
 "#;
         let cfg: Config = toml::from_str(cuda).unwrap();
         cfg.validate().unwrap();
@@ -1253,6 +1275,8 @@ mxfp4_moe = "routed_dequant"
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Balanced);
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.mxfp4_moe, "routed_dequant");
+        assert_eq!(opts.mtp_assistant_snapshot_dir, "/models/gemma4-mtp");
+        assert_eq!(opts.mtp_num_drafts, 6);
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         assert_eq!(opts.kv_page_size, 32); // default
         assert_eq!(opts.kv_cache_dtype, "auto"); // default
@@ -1277,6 +1301,8 @@ device = ["cuda:0"]
         assert_eq!(opts.gpu_mem_utilization, 0.90);
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Auto);
         assert_eq!(opts.mxfp4_moe, "auto");
+        assert!(opts.mtp_assistant_snapshot_dir.is_empty());
+        assert_eq!(opts.mtp_num_drafts, 3);
         assert_eq!(opts.ready_timeout_s, 600.0);
         assert_eq!(opts.kv_cache_dtype, "auto");
     }

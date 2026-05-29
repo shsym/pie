@@ -272,18 +272,36 @@ fn build_cuda() {
         .define("PIE_BRIDGE_INCLUDE_DIR", pie_bridge_include_dir());
     enable_position_independent_archives(&mut cfg);
 
+    // Force CMake to use the system Python for the FlashInfer kernel generator.
+    // Maturin/uv build envs put a minimal venv Python first in PATH; that venv
+    // lacks filelock/tvm_ffi which the generator needs.
+    for candidate in ["/usr/bin/python3", "/usr/local/bin/python3"] {
+        if std::path::Path::new(candidate).exists() {
+            cfg.define("Python3_EXECUTABLE", candidate);
+            break;
+        }
+    }
+
+    println!("cargo:rerun-if-env-changed=CPM_SOURCE_CACHE");
+    if let Ok(cache) = std::env::var("CPM_SOURCE_CACHE") {
+        cfg.define("CPM_SOURCE_CACHE", cache);
+    }
+
     // Optional Marlin W4A16 support. Keep it off by default because the
     // vendored template kernels add substantial build time, but let Cargo
     // builds opt into the same CMake path used by standalone driver builds.
     println!("cargo:rerun-if-env-changed=PIE_CUDA_BUILD_MARLIN");
     if let Ok(value) = std::env::var("PIE_CUDA_BUILD_MARLIN") {
-        let enabled = matches!(
-            value.to_ascii_lowercase().as_str(),
-            "1" | "on" | "true" | "yes"
-        );
-        if enabled {
-            cfg.define("PIE_CUDA_BUILD_MARLIN", "ON");
-        }
+        let lower = value.to_ascii_lowercase();
+        let on = matches!(lower.as_str(), "1" | "on" | "true" | "yes");
+        cfg.define("PIE_CUDA_BUILD_MARLIN", if on { "ON" } else { "OFF" });
+    }
+    println!("cargo:rerun-if-env-changed=PIE_MARLIN_ALL_SHAPES");
+    if std::env::var("PIE_MARLIN_ALL_SHAPES")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "on" | "true" | "yes"))
+        .unwrap_or(false)
+    {
+        cfg.define("PIE_MARLIN_ALL_SHAPES", "ON");
     }
 
     // nvcc discovery. CMake reads `CMAKE_CUDA_COMPILER` / `CUDACXX` to
@@ -297,6 +315,8 @@ fn build_cuda() {
     if std::env::var_os("CUDACXX").is_none() && std::env::var_os("CMAKE_CUDA_COMPILER").is_none() {
         for candidate in [
             "/usr/local/cuda/bin/nvcc",
+            "/usr/local/cuda-13/bin/nvcc",
+            "/usr/local/cuda-13.0/bin/nvcc",
             "/usr/local/cuda-12/bin/nvcc",
             "/usr/local/cuda-12.8/bin/nvcc",
             "/opt/cuda/bin/nvcc",
@@ -316,6 +336,20 @@ fn build_cuda() {
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
     if let Ok(arch) = std::env::var("CMAKE_CUDA_ARCHITECTURES") {
         cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
+    }
+
+    // ccache for nvcc + host C++ compiles. Speeds up branch switches
+    // and clean rebuilds, no effect on first-time compiles. Wire only
+    // when ccache is on PATH so CI runners without it are unaffected.
+    if std::process::Command::new("ccache")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        cfg.define("CMAKE_C_COMPILER_LAUNCHER", "ccache");
+        cfg.define("CMAKE_CXX_COMPILER_LAUNCHER", "ccache");
+        cfg.define("CMAKE_CUDA_COMPILER_LAUNCHER", "ccache");
     }
 
     // NCCL discovery hint. The cuda driver's CMakeLists.txt does
@@ -356,12 +390,9 @@ fn build_cuda() {
 
     add_link_search_paths(&build_dir);
 
-    // Driver lib + the static deps CMake/CPM produced for us under
-    // build_dir (most importantly zstd, plus any tomlplusplus / nlohmann
-    // archives — those two are header-only at the time of writing but
-    // we still walk the tree in case that changes).
+    // Driver lib. tomlplusplus / nlohmann_json / CLI11 are header-only
+    // and produce no archive; the static lib is self-contained.
     println!("cargo:rustc-link-lib=static=pie_driver_cuda_lib");
-    println!("cargo:rustc-link-lib=static=zstd");
 
     // CUDA toolkit: dynamic-link cudart + cublas + cublasLt.
     // The cuda driver's `src/ops/gemm.cpp` directly references

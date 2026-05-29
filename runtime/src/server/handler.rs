@@ -18,6 +18,15 @@ use crate::workflow::WorkflowId;
 use super::Session;
 use super::data_transfer::{ChunkResult, InFlightUpload};
 
+fn trim_trailing_zeros(values: &[u64]) -> Vec<u64> {
+    let end = values
+        .iter()
+        .rposition(|&value| value != 0)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    values[..end].to_vec()
+}
+
 // =============================================================================
 // Query Handlers
 // =============================================================================
@@ -90,37 +99,138 @@ impl Session {
                         format!("{}.avg_batch_latency_us", model_name),
                         serde_json::Value::from(inf.avg_batch_latency_us),
                     );
+                    // Fire-domain probes. Dotted keys mirror the
+                    // `InferenceStats.fire.*` hierarchy. All-zero when the
+                    // binary is built without `--features profile-fire`.
                     stats.insert(
-                        format!("{}.avg_permit_wait_us", model_name),
-                        serde_json::Value::from(inf.avg_permit_wait_us),
+                        format!("{}.fire.inter_fire_us", model_name),
+                        serde_json::Value::from(inf.fire.avg_inter_fire_us),
                     );
                     stats.insert(
-                        format!("{}.avg_fire_prepare_us", model_name),
-                        serde_json::Value::from(inf.avg_fire_prepare_us),
+                        format!("{}.fire.post_dispatch_to_fire_us", model_name),
+                        serde_json::Value::from(inf.fire.avg_post_dispatch_to_fire_us),
                     );
                     stats.insert(
-                        format!("{}.avg_execute_batch_us", model_name),
-                        serde_json::Value::from(inf.avg_execute_batch_us),
+                        format!("{}.fire.accumulate.accum_loop_us", model_name),
+                        serde_json::Value::from(inf.fire.accumulate.avg_accum_loop_us),
                     );
                     stats.insert(
-                        format!("{}.avg_batch_build_us", model_name),
-                        serde_json::Value::from(inf.avg_batch_build_us),
+                        format!("{}.fire.pre_dispatch.fire_prepare_us", model_name),
+                        serde_json::Value::from(inf.fire.pre_dispatch.avg_fire_prepare_us),
                     );
                     stats.insert(
-                        format!("{}.avg_driver_fire_us", model_name),
-                        serde_json::Value::from(inf.avg_driver_fire_us),
+                        format!("{}.fire.execute.total_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.avg_total_us),
                     );
                     stats.insert(
-                        format!("{}.avg_response_dispatch_us", model_name),
-                        serde_json::Value::from(inf.avg_response_dispatch_us),
+                        format!("{}.fire.execute.batch_build_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.avg_batch_build_us),
                     );
                     stats.insert(
-                        format!("{}.avg_context_tick_submit_us", model_name),
-                        serde_json::Value::from(inf.avg_context_tick_submit_us),
+                        format!("{}.fire.execute.driver_fire_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.avg_driver_fire_us),
                     );
                     stats.insert(
-                        format!("{}.avg_stats_update_us", model_name),
-                        serde_json::Value::from(inf.avg_stats_update_us),
+                        format!("{}.fire.execute.response_dispatch.total_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.response_dispatch.avg_total_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.response_dispatch.direct_count", model_name),
+                        serde_json::Value::from(inf.fire.execute.response_dispatch.direct_count),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.response_dispatch.chain_count", model_name),
+                        serde_json::Value::from(inf.fire.execute.response_dispatch.chain_count),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.response_dispatch.chunk_count", model_name),
+                        serde_json::Value::from(inf.fire.execute.response_dispatch.chunk_count),
+                    );
+                    // Driver-cuda phase breakdown. All-zero when built
+                    // without `profile-driver-cuda`. C++-side probes
+                    // (wire_parse through response_build) are zero until
+                    // the C++ instrumentation commit wires them.
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.ipc_submit_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_ipc_submit_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.gpu_wait_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_gpu_wait_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.ipc_recv_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_ipc_recv_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.wire_parse_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_wire_parse_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.plan_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_plan_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.h2d_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_h2d_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.kernel_launch_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_kernel_launch_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.sync_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_sync_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.response_build_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.avg_response_build_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.sum_sync_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.sum_sync_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.execute.driver_cuda.sum_kernel_launch_us", model_name),
+                        serde_json::Value::from(inf.fire.execute.driver_cuda.sum_kernel_launch_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.post_dispatch.context_tick_us", model_name),
+                        serde_json::Value::from(inf.fire.post_dispatch.avg_context_tick_us),
+                    );
+                    stats.insert(
+                        format!("{}.fire.post_dispatch.stats_update_us", model_name),
+                        serde_json::Value::from(inf.fire.post_dispatch.avg_stats_update_us),
+                    );
+                    stats.insert(
+                        format!("{}.system_spec_draft_tokens_proposed", model_name),
+                        serde_json::Value::from(inf.system_spec_draft_tokens_proposed),
+                    );
+                    stats.insert(
+                        format!("{}.system_spec_draft_tokens_accepted", model_name),
+                        serde_json::Value::from(inf.system_spec_draft_tokens_accepted),
+                    );
+                    stats.insert(
+                        format!(
+                            "{}.system_spec_draft_tokens_proposed_per_pos",
+                            model_name
+                        ),
+                        serde_json::json!(
+                            trim_trailing_zeros(
+                                &inf.system_spec_draft_tokens_proposed_per_pos
+                            )
+                        ),
+                    );
+                    stats.insert(
+                        format!(
+                            "{}.system_spec_draft_tokens_accepted_per_pos",
+                            model_name
+                        ),
+                        serde_json::json!(
+                            trim_trailing_zeros(
+                                &inf.system_spec_draft_tokens_accepted_per_pos
+                            )
+                        ),
                     );
                     // Speculation hit counters — observability for
                     // `try_hit`/chain submissions/drops.
@@ -143,6 +253,26 @@ impl Session {
                             inference::CHAIN_DROP_COUNT.load(std::sync::atomic::Ordering::Relaxed),
                         ),
                     );
+                    {
+                        let n = inference::speculator::CHAIN_EXT_JOBS_SAMPLED
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let wake = inference::speculator::CHAIN_EXT_WAKE_LATENCY_US
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        let work = inference::speculator::CHAIN_EXT_WORK_LATENCY_US
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        stats.insert(
+                            format!("{}.chain_ext_avg_wake_us", model_name),
+                            serde_json::Value::from(if n > 0 { wake / n } else { 0 }),
+                        );
+                        stats.insert(
+                            format!("{}.chain_ext_avg_work_us", model_name),
+                            serde_json::Value::from(if n > 0 { work / n } else { 0 }),
+                        );
+                        stats.insert(
+                            format!("{}.chain_ext_jobs_sampled", model_name),
+                            serde_json::Value::from(n),
+                        );
+                    }
                     if let Some(exec) = crate::api::inference::execute_profile_snapshot() {
                         let mean_value = |total_us: u64, denom: u64| -> serde_json::Value {
                             serde_json::Value::from(if denom > 0 { total_us / denom } else { 0 })
