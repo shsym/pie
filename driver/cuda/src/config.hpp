@@ -21,6 +21,11 @@ struct ModelConfig {
     // Empty (default) = no quantization. Recognised values:
     //   * "fp8"  — per-channel symmetric FP8_E4M3 for projection weights.
     //   * "int8" — per-channel symmetric INT8 for projection weights.
+    //   * "fp4" / "mxfp4" — MXFP4 (E2M1 weight + E8M0 block scale) for the
+    //                      target model's expert weights. Used by GLM-5.1 to
+    //                      transcode the checkpoint's FP8 routed-expert
+    //                      weights to MXFP4 at materialize time, halving
+    //                      the per-rank expert footprint.
     // Norms, biases, embeddings, and lm_head stay in their native dtype.
     std::string runtime_quant;
     // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects native packed
@@ -35,11 +40,6 @@ struct ModelConfig {
     // Gemma-4 target, output_spec_flags requests draft from this assistant.
     std::string mtp_assistant_snapshot_dir;
     int mtp_num_drafts = 3;
-    // Deployment opt-in for system speculation (MTP). Emitted to the runtime,
-    // which OWNS the decision to drive drafts (the driver stays pure mechanism).
-    // Default false: speculation is a latency-regime feature, off unless the
-    // operator enables it (matches vLLM/SGLang's explicit-enable convention).
-    bool enable_system_speculation = false;
 };
 
 struct BatchingConfig {
@@ -112,9 +112,6 @@ inline Config load_config(const std::filesystem::path& path) {
             (*m)["mtp_assistant_snapshot_dir"].value_or(std::string{});
         c.model.mtp_num_drafts = static_cast<int>(
             (*m)["mtp_num_drafts"].value_or<int64_t>(c.model.mtp_num_drafts));
-        c.model.enable_system_speculation =
-            (*m)["enable_system_speculation"].value_or(
-                c.model.enable_system_speculation);
     }
     if (auto b = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {

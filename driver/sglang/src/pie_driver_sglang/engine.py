@@ -1,6 +1,6 @@
 """SGLang-backed inference engine.
 
-Mirrors the shared `Engine` public surface so pie's worker
+Mirrors `pie_driver_dev.engine.Engine`'s public surface so pie's worker
 (`._bridge.worker.run_worker`) can drive native, vllm, and sglang
 interchangeably. The model and kernels come from SGLang; pie owns the
 RPC, batching, telemetry, and dispatch around it.
@@ -24,7 +24,7 @@ from .config import SGLangDriverConfig
 
 class SGLangEngine:
     """Inference engine that delegates the forward pass to an SGLang
-    ModelRunner. Public surface matches the shared `Engine` contract."""
+    ModelRunner. Public surface matches `pie_driver_dev.engine.Engine`."""
 
     config: RuntimeConfig
     driver_config: SGLangDriverConfig

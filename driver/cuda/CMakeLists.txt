@@ -77,26 +77,6 @@ cpmaddpackage(
   GIT_SHALLOW TRUE
   DOWNLOAD_ONLY YES)
 
-# FlashInfer v0.6.9 has a narrowing-conversion warning that nvcc
-# escalates to an error: `state_stride_batch` (signed long) is brace-
-# initialized into a `uint64_t` field. Patch the source once after
-# fetch so we don't have to re-patch every fresh build hash dir.
-set(_FI_PATCH_SENTINEL "${flashinfer_SOURCE_DIR}/.pie_narrowing_patched")
-if(EXISTS "${flashinfer_SOURCE_DIR}" AND NOT EXISTS "${_FI_PATCH_SENTINEL}")
-  set(_FI_PATCH_FILE
-    "${flashinfer_SOURCE_DIR}/include/flashinfer/mamba/kernel_selective_state_update_stp.cuh")
-  if(EXISTS "${_FI_PATCH_FILE}")
-    file(READ  "${_FI_PATCH_FILE}" _fi_src)
-    string(REPLACE
-      "DSTATE * DIM, params.state_stride_batch}"
-      "DSTATE * DIM, static_cast<uint64_t>(params.state_stride_batch)}"
-      _fi_src "${_fi_src}")
-    file(WRITE "${_FI_PATCH_FILE}" "${_fi_src}")
-    file(WRITE "${_FI_PATCH_SENTINEL}" "patched")
-    message(STATUS "Patched FlashInfer narrowing conversion in ${_FI_PATCH_FILE}")
-  endif()
-endif()
-
 cpmaddpackage(URI "gh:marzer/tomlplusplus@3.4.0")
 cpmaddpackage(URI "gh:CLIUtils/CLI11@2.5.0")
 cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
@@ -104,7 +84,7 @@ cpmaddpackage(URI "gh:nlohmann/json@3.12.0" OPTIONS "JSON_BuildTests OFF")
 set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce.cu)
 foreach(PIE_CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
   string(REGEX REPLACE "[^0-9].*$" "" PIE_CUDA_ARCH_NUMBER "${PIE_CUDA_ARCH}")
-  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120")
+  if(PIE_CUDA_ARCH_NUMBER STREQUAL "120" OR PIE_CUDA_ARCH_NUMBER STREQUAL "100")
     set(PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE src/custom_all_reduce_stub.cpp)
   endif()
 endforeach()
@@ -163,6 +143,7 @@ add_library(pie_driver_cuda_lib STATIC
   src/spec_expansion.cpp
   src/tensor.cpp
   src/model/weight_store.cpp
+  src/mla_cache.cpp
   src/model/loaded_model.cpp
   src/model/bound_model.cpp
   ../common/src/safetensors_manifest.cpp
@@ -179,6 +160,16 @@ add_library(pie_driver_cuda_lib STATIC
   src/model/gemma3n.cpp
   src/model/mistral3.cpp
   src/model/gpt_oss.cpp
+  src/model/kimi.cpp
+  src/model/kimi_forward.cpp
+  src/model/kimi_model.cpp
+  src/model/deepseek_v4.cpp
+  src/model/deepseek_v4_forward.cpp
+  src/model/deepseek_v4_model.cpp
+  src/model/glm5.cpp
+  src/model/glm5_forward.cpp
+  src/model/glm5_model.cpp
+  src/dsa_cache.cpp
   src/model/qwen3_5.cpp
   src/model/nemotron_h.cpp
   src/kv_cache_format.cpp
@@ -197,8 +188,15 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/rope.cu
   src/kernels/split_packed.cu
   src/kernels/scatter_int32.cu
+  src/kernels/slab_scatter.cu
   src/kernels/argmax.cu
   src/kernels/kv_paged.cu
+  src/kernels/mla_paged.cu
+  src/kernels/kimi_mla.cu
+  src/kernels/dsv4_routing.cu
+  src/kernels/dsv4_hc.cu
+  src/kernels/dsv4_compress.cu
+  src/kernels/dsa_indexer.cu
   src/kernels/sample_temp.cu
   src/kernels/sample_flashinfer.cu
   src/kernels/entropy.cu
@@ -212,10 +210,13 @@ add_library(pie_driver_cuda_lib STATIC
   src/kernels/softcap.cu
   src/kernels/scalar_mul.cu
   src/kernels/dequant_fp4.cu
+  src/kernels/dequant_wna16.cu
   src/kernels/mxfp4_marlin.cu
   src/kernels/dequant_fp8.cu
   src/kernels/dtype_cast.cu
   src/kernels/quant_bf16_to_fp8.cu
+  src/kernels/quant_bf16_to_mxfp4.cu
+  src/kernels/transcode.cu
   src/kernels/head_dim_pad.cu
   src/kernels/attn_sink.cu
   src/kernels/deinterleave.cu
@@ -250,6 +251,7 @@ add_library(pie_driver_cuda_lib STATIC
   ${PIE_CUDA_CUSTOM_ALL_REDUCE_SOURCE}
   src/ops/attention_flashinfer.cu
   src/ops/flashinfer_mamba.cu
+  src/ops/attention_mla.cu
   ${PIE_CUDA_FLASHINFER_HOPPER_SOURCE}
 )
 
@@ -516,6 +518,17 @@ target_compile_options(test_mxfp4_marlin PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
 target_link_libraries(test_mxfp4_marlin PRIVATE CUDA::cudart)
 
+add_executable(test_transcode_fused
+  tests/test_transcode_fused.cu
+  src/kernels/transcode.cu
+  src/kernels/dequant_fp8.cu
+  src/kernels/quant_bf16_to_mxfp4.cu)
+target_include_directories(test_transcode_fused PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_compile_options(test_transcode_fused PRIVATE
+  $<$<COMPILE_LANGUAGE:CUDA>: --extended-lambda --expt-relaxed-constexpr >)
+target_link_libraries(test_transcode_fused PRIVATE CUDA::cudart)
+
 enable_testing()
 add_test(NAME brle COMMAND test_brle)
 add_test(NAME causal_conv1d COMMAND test_causal_conv1d)
@@ -524,6 +537,7 @@ add_test(NAME kv_cache_format COMMAND test_kv_cache_format)
 add_test(NAME kv_cache_quant COMMAND test_kv_cache_quant)
 add_test(NAME swap_pool COMMAND test_swap_pool)
 add_test(NAME mxfp4_marlin COMMAND test_mxfp4_marlin)
+add_test(NAME transcode_fused COMMAND test_transcode_fused)
 
 target_link_libraries(pie_driver_cuda_lib PUBLIC
   CLI11::CLI11

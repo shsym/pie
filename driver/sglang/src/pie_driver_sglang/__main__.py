@@ -1,7 +1,8 @@
 """Standalone launcher entry point for the `sglang` driver.
 
-The lifecycle lives in the vendored `._bridge._launcher`; this entry
-point imports and runs it.
+The lifecycle lives in `._bridge._launcher` — sglang depends on
+`pie-driver-dev` for the shared worker scaffolding anyway, so importing
+the launcher helper from there keeps the dependency graph one-deep.
 """
 
 from __future__ import annotations

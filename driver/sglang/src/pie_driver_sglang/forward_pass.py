@@ -1,6 +1,6 @@
 """Adapter that exposes an SGLang ModelRunner under pie_driver's ForwardPass contract.
 
-The `Engine` calls three methods on its `forward_pass` object:
+`pie_driver_dev.engine.Engine` calls three methods on its `forward_pass` object:
 `embed_inputs(inputs) -> hidden`, `transform(...) -> hidden`, and
 `sample(hidden, sampling_metadata) -> dict`. We delegate the actual compute
 to SGLang's ModelRunner.
