@@ -40,7 +40,6 @@ EMBEDDED_CLI_DRIVERS: set[str] = {
     "vllm",
     "sglang",
     "tensorrt_llm",
-    "dev",
 }
 KV_CACHE_DTYPES = [
     "auto",
@@ -91,13 +90,7 @@ def build_config(args: argparse.Namespace):
 
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
     driver_options: dict[str, Any]
-    if args.driver == "dev":
-        driver_options = {
-            "gpu_mem_utilization": args.gpu_mem_util,
-            "cpu_mem_budget_in_gb": args.cpu_mem_budget,
-            "kv_cache_dtype": args.kv_cache_dtype,
-        }
-    elif args.driver == "cuda_native":
+    if args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
             "ready_timeout_s": float(args.server_startup_timeout),
@@ -116,6 +109,8 @@ def build_config(args: argparse.Namespace):
             )
         if args.mtp_num_drafts is not None:
             driver_options["mtp_num_drafts"] = args.mtp_num_drafts
+        if args.enable_system_speculation:
+            driver_options["enable_system_speculation"] = True
     elif args.driver == "portable":
         driver_options = {
             "max_forward_tokens": args.max_forward_tokens,
@@ -777,7 +772,7 @@ def build_parser() -> argparse.ArgumentParser:
     for sp in p._subparsers._group_actions[0].choices.values():
         sp.add_argument("--device", default="cuda:0")
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["dev", "cuda_native", "portable", "vllm", "sglang", "tensorrt_llm", "dummy"])
+                        choices=["cuda_native", "portable", "vllm", "sglang", "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)
@@ -855,6 +850,15 @@ def build_parser() -> argparse.ArgumentParser:
             type=int,
             default=None,
             help="Number of native MTP draft tokens per accepted token.",
+        )
+        sp.add_argument(
+            "--enable-system-speculation",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="cuda_native deployment opt-in for system speculation (MTP). "
+                 "Sets the driver config [model].enable_system_speculation; the "
+                 "runtime drives the auto-drafter only when this is on. Default "
+                 "off (latency-regime feature).",
         )
         sp.add_argument(
             "--batch-policy",

@@ -272,6 +272,16 @@ fn build_cuda() {
         .define("PIE_BRIDGE_INCLUDE_DIR", pie_bridge_include_dir());
     enable_position_independent_archives(&mut cfg);
 
+    // Force CMake to use the system Python for the FlashInfer kernel generator.
+    // Maturin/uv build envs put a minimal venv Python first in PATH; that venv
+    // lacks filelock/tvm_ffi which the generator needs.
+    for candidate in ["/usr/bin/python3", "/usr/local/bin/python3"] {
+        if std::path::Path::new(candidate).exists() {
+            cfg.define("Python3_EXECUTABLE", candidate);
+            break;
+        }
+    }
+
     println!("cargo:rerun-if-env-changed=CPM_SOURCE_CACHE");
     if let Ok(cache) = std::env::var("CPM_SOURCE_CACHE") {
         cfg.define("CPM_SOURCE_CACHE", cache);
@@ -326,6 +336,20 @@ fn build_cuda() {
     println!("cargo:rerun-if-env-changed=CMAKE_CUDA_ARCHITECTURES");
     if let Ok(arch) = std::env::var("CMAKE_CUDA_ARCHITECTURES") {
         cfg.define("CMAKE_CUDA_ARCHITECTURES", arch);
+    }
+
+    // ccache for nvcc + host C++ compiles. Speeds up branch switches
+    // and clean rebuilds, no effect on first-time compiles. Wire only
+    // when ccache is on PATH so CI runners without it are unaffected.
+    if std::process::Command::new("ccache")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        cfg.define("CMAKE_C_COMPILER_LAUNCHER", "ccache");
+        cfg.define("CMAKE_CXX_COMPILER_LAUNCHER", "ccache");
+        cfg.define("CMAKE_CUDA_COMPILER_LAUNCHER", "ccache");
     }
 
     // NCCL discovery hint. The cuda driver's CMakeLists.txt does
