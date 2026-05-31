@@ -53,11 +53,6 @@ import type { Adapter } from './adapter.js';
 import type { Context } from './context.js';
 import type { Speculator } from './spec.js';
 
-function _samplerIsArgmax(sampler: Sampler): boolean {
-  const variant = sampler._variant;
-  return variant.tag === 'top-p' && variant.val[0] === 0.0;
-}
-
 // =============================================================================
 // Generator options
 // =============================================================================
@@ -76,9 +71,8 @@ export interface GenerateOptions {
   /** Custom speculative-decoding drafter. Mutually exclusive with
    *  `systemSpeculation`. */
   speculator?: Speculator;
-  /** If true, the runtime drives drafts via its built-in system drafter.
-   *  If omitted, argmax generation enables it by default when the model
-   *  advertises one. Mutually exclusive with `speculator`. */
+  /** If true, the runtime drives drafts via its built-in NGRAM/etc.
+   *  drafter. Mutually exclusive with `speculator`. */
   systemSpeculation?: boolean;
   /** Adapter (LoRA, etc.) applied on every forward pass. */
   adapter?: Adapter;
@@ -146,10 +140,7 @@ export class Generator implements AsyncIterable<GenStep> {
       );
     }
     this._speculator = options.speculator;
-    this._useSystemSpec = options.systemSpeculation ??
-      (options.speculator === undefined &&
-        _samplerIsArgmax(sampler) &&
-        ctx._model.defaultSystemSpeculation());
+    this._useSystemSpec = options.systemSpeculation === true;
   }
 
   /** @internal */
@@ -180,13 +171,6 @@ export class Generator implements AsyncIterable<GenStep> {
   /** Append to the stop set. */
   addStop(tokens: Iterable<number>): this {
     this._stop.push(...tokens);
-    return this;
-  }
-
-  /** Opt out of the default system drafter for this generator. */
-  disableSystemSpeculation(): this {
-    this._useSystemSpec = false;
-    this._specDrafts = [new Uint32Array(), new Uint32Array()];
     return this;
   }
 
@@ -465,10 +449,7 @@ export class GenStep {
     if (nDrafted > 0) {
       fwd.inputSpeculativeTokens(this.#drafts, this.#draftPositions);
     }
-    const remaining = gen._maxTokens === undefined
-      ? undefined
-      : gen._maxTokens - gen._tokensGenerated;
-    if (gen._useSystemSpec && (remaining === undefined || remaining > 1)) {
+    if (gen._useSystemSpec) {
       fwd.outputSpeculativeTokens(true);
     }
 

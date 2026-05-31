@@ -50,19 +50,18 @@ fn check_summary(path: &Path, cfg: &config::Config) -> String {
     )
 }
 
-/// `pie smoke [--flavor <name>]` — exercise the FFI plumbing without a
-/// real model load. Invokes the requested driver's entry with `--help`
-/// and reports its rc.
-///
-/// `rpc` is accepted for backwards compatibility with older invocation
-/// scripts but is now a no-op — the cold-path RPC infrastructure has
-/// been retired in favor of the unified DriverChannel.
+/// `pie smoke [--rpc] [--flavor <name>]` — exercise the FFI / RPC
+/// plumbing without a real model load. `rpc=false` invokes the
+/// requested driver's entry with `--help` and reports its rc;
+/// `rpc=true` constructs an `RpcServer` and confirms it can be opened
+/// + closed.
 pub fn smoke(rpc: bool, flavor_name: Option<&str>) -> Result<()> {
     if rpc {
-        eprintln!("[smoke] --rpc is a no-op; cold-path RpcServer has been retired");
+        smoke_rpc()
+    } else {
+        let flavor = pick_smoke_flavor(flavor_name)?;
+        smoke_ffi(flavor)
     }
-    let flavor = pick_smoke_flavor(flavor_name)?;
-    smoke_ffi(flavor)
 }
 
 fn pick_smoke_flavor(name: Option<&str>) -> Result<Flavor> {
@@ -119,4 +118,23 @@ fn smoke_ffi(flavor: Flavor) -> Result<()> {
     };
     println!("\n[smoke] driver entry returned rc={rc}");
     Ok(())
+}
+
+fn smoke_rpc() -> Result<()> {
+    use pie::device::RpcServer;
+    match RpcServer::create() {
+        Ok(server) => {
+            println!(
+                "[smoke-rpc] RpcServer ready, server_name={}",
+                server.server_name()
+            );
+            server.close();
+            println!("[smoke-rpc] closed cleanly");
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("[smoke-rpc] RpcServer::create failed: {e}");
+            std::process::exit(1);
+        }
+    }
 }

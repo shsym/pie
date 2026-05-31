@@ -47,9 +47,6 @@ pub fn drivers_config_path() -> PathBuf {
 ///
 /// [driver.sglang]
 /// python = "/home/me/envs/sgl/bin/python"
-///
-/// [driver.tensorrt_llm]
-/// venv = "/home/me/envs/trtllm"
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DriversConfig {
@@ -369,7 +366,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear_python_envs();
         let m = fixture_options("");
-        match resolve_python(SubprocessFlavor::Vllm, &m, None) {
+        match resolve_python(SubprocessFlavor::Dev, &m, None) {
             Ok(r) => {
                 assert!(r.source.contains("$PATH"), "got: {}", r.source);
             }

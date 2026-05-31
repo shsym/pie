@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
+use common::{create_mock_env, MockEnv, mock_device::EchoBehavior, inferlets};
 use pie::process;
 use pie::program::ProgramName;
 
