@@ -1,18 +1,16 @@
-pub mod adapter;
-pub mod audio_out;
+pub mod types;
 pub mod context;
-pub mod inference;
-pub mod media;
-pub mod messaging;
 pub mod model;
+pub mod inference;
+pub mod messaging;
+pub mod session;
+pub mod adapter;
 pub mod runtime;
 pub mod scheduling;
-pub mod session;
-pub mod types;
 
-pub mod instruct;
 pub mod mcp;
 pub mod zo;
+pub mod instruct;
 
 use wasmtime::component::HasSelf;
 
@@ -41,18 +39,10 @@ wasmtime::component::bindgen!({
         "pie:core/inference.future-output": inference::FutureOutput,
         "pie:core/inference.grammar": inference::Grammar,
         "pie:core/inference.matcher": inference::Matcher,
-        // pie:core/runtime
-        "pie:core/runtime.child": runtime::Child,
         // pie:core/messaging
         "pie:core/messaging.subscription": messaging::Subscription,
         // pie:core/adapter
         "pie:core/adapter.adapter": adapter::Adapter,
-        // pie:core/media
-        "pie:core/media.image": media::Image,
-        "pie:core/media.video": media::Video,
-        "pie:core/media.audio": media::Audio,
-        // pie:core/audio-out
-        "pie:core/audio-out.speech": audio_out::Speech,
         // pie:mcp/client
         "pie:mcp/client.session": mcp::Session,
         // pie:instruct
@@ -73,8 +63,6 @@ where
         + pie::core::messaging::Host
         + pie::core::session::Host
         + pie::core::adapter::Host
-        + pie::core::media::Host
-        + pie::core::audio_out::Host
         + pie::core::runtime::Host
         + pie::core::scheduling::Host
         + pie::mcp::types::Host
@@ -91,8 +79,6 @@ where
     pie::core::messaging::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::session::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::adapter::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    pie::core::media::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
-    pie::core::audio_out::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::runtime::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::core::scheduling::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;
     pie::mcp::types::add_to_linker::<T, HasSelf<T>>(linker, |s| s)?;

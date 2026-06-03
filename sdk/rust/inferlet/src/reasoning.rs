@@ -11,7 +11,10 @@
 
 use crate::Result;
 use crate::model::Model;
-use crate::pie::instruct::reasoning::{Decoder as RawDecoder, Event as RawEvent};
+use crate::pie::instruct::reasoning::{
+    Decoder as RawDecoder,
+    Event as RawEvent,
+};
 
 /// One unit of reasoning-decoded output.
 ///

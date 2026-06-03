@@ -8,7 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 mod common;
-use common::{MockEnv, create_mock_env, inferlets, mock_device::EchoBehavior};
+use common::{create_mock_env, MockEnv, mock_device::EchoBehavior, inferlets};
 
 use pie::process;
 use pie::program::ProgramName;
@@ -45,7 +45,11 @@ fn program_name(name: &str) -> ProgramName {
 
 /// Spawn a process within the tokio runtime and wait for it to complete.
 /// Returns true if the process exited within the timeout.
-fn spawn_and_wait(s: &TestState, name: &str, input: String) -> bool {
+fn spawn_and_wait(
+    s: &TestState,
+    name: &str,
+    input: String,
+) -> bool {
     let pid = s.rt.block_on(async {
         inferlets::add_and_install(name).await;
         process::spawn(
@@ -107,16 +111,7 @@ fn context_inferlet_exercises_host_apis() {
     );
 }
 
-// The generate test inferlet currently hangs at `step.execute().await`
-// — the mock backend's `EchoBehavior` response doesn't quite match what
-// the modernized `Generator` SDK expects on the forward pass. The
-// inferlet builds (commit `2cc9c0f6` fixed that), the runtime spawns
-// it, but the WASM task blocks indefinitely on the host RPC. Diagnosis
-// needs either a new public API to read a process's accumulated stderr
-// or instrumentation at the SDK→runtime boundary; both are outside
-// spec-exec scope. Skip until the mock fixture catches up to the SDK.
 #[test]
-#[ignore]
 fn generate_inferlet_exercises_forward_pass() {
     let s = state();
     assert!(
@@ -146,7 +141,7 @@ fn concurrent_spawns() {
                     false,
                     None,
                     None, // no workflow
-                    None, // token_budget
+            None, // token_budget
                 )
                 .unwrap_or_else(|e| panic!("spawn {i} failed: {e}"));
                 pid
@@ -164,10 +159,7 @@ fn concurrent_spawns() {
             })
             .await
             .is_ok();
-            assert!(
-                completed,
-                "concurrent echo {i} (pid {pid}) did not complete"
-            );
+            assert!(completed, "concurrent echo {i} (pid {pid}) did not complete");
         }
     });
 }
@@ -187,7 +179,7 @@ fn rapid_sequential_spawns() {
                 false,
                 None,
                 None, // no workflow
-                None, // token_budget
+            None, // token_budget
             )
             .unwrap_or_else(|e| panic!("sequential spawn {i} failed: {e}"));
 
@@ -201,18 +193,12 @@ fn rapid_sequential_spawns() {
             })
             .await
             .is_ok();
-            assert!(
-                completed,
-                "sequential echo {i} (pid {pid}) did not complete"
-            );
+            assert!(completed, "sequential echo {i} (pid {pid}) did not complete");
         }
 
         // After all processes finish, the process list should not grow unboundedly
         let remaining = process::list().len();
-        assert!(
-            remaining < 5,
-            "expected few residual processes, got {remaining}"
-        );
+        assert!(remaining < 5, "expected few residual processes, got {remaining}");
     });
 }
 
@@ -238,7 +224,7 @@ fn mixed_success_and_error() {
                 false,
                 None,
                 None, // no workflow
-                None, // token_budget
+            None, // token_budget
             )
             .unwrap_or_else(|e| panic!("mixed spawn {i} ({name}) failed: {e}"));
             pids.push((i, name, pid));
@@ -316,9 +302,6 @@ fn spawn_after_termination() {
         })
         .await
         .is_ok();
-        assert!(
-            completed,
-            "process spawned after termination should complete normally"
-        );
+        assert!(completed, "process spawned after termination should complete normally");
     });
 }

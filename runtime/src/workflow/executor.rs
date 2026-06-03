@@ -6,8 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use futures::future::join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -80,30 +80,19 @@ impl Executor {
             }
             match expr {
                 Expr::Literal { value } => Ok(value.clone()),
-                Expr::Process {
-                    program_name,
-                    config,
-                } => {
-                    self.eval_process(program_name, config.as_ref(), input, cancel)
-                        .await
+                Expr::Process { program_name, config } => {
+                    self.eval_process(program_name, config.as_ref(), input, cancel).await
                 }
                 Expr::Pipe { stages } => self.eval_pipe(stages, input, cancel).await,
                 Expr::Fork { branches } => self.eval_fork(branches, input, None, cancel).await,
                 Expr::Map { function, over } => {
                     self.eval_map(function, over, input, None, cancel).await
                 }
-                Expr::Fold {
-                    function,
-                    init,
-                    over,
-                } => self.eval_fold(function, init, over, input, cancel).await,
-                Expr::Cond {
-                    predicate,
-                    then,
-                    otherwise,
-                } => {
-                    self.eval_cond(predicate, then, otherwise, input, cancel)
-                        .await
+                Expr::Fold { function, init, over } => {
+                    self.eval_fold(function, init, over, input, cancel).await
+                }
+                Expr::Cond { predicate, then, otherwise } => {
+                    self.eval_cond(predicate, then, otherwise, input, cancel).await
                 }
                 Expr::Iterate { body, until } => {
                     self.eval_iterate(body, until, input, cancel).await
@@ -143,12 +132,10 @@ impl Executor {
             };
             val = Some(match (&stages[i], take_k) {
                 (Expr::Fork { branches }, Some(k)) => {
-                    self.eval_fork(branches, val, Some(k), cancel.clone())
-                        .await?
+                    self.eval_fork(branches, val, Some(k), cancel.clone()).await?
                 }
                 (Expr::Map { function, over }, Some(k)) => {
-                    self.eval_map(function, over, val, Some(k), cancel.clone())
-                        .await?
+                    self.eval_map(function, over, val, Some(k), cancel.clone()).await?
                 }
                 (stage, _) => self.eval(stage, val, cancel.clone()).await?,
             });
@@ -173,8 +160,7 @@ impl Executor {
         let name = ProgramName::parse(program_name)
             .map_err(|e| format!("Invalid program name '{program_name}': {e}"))?;
 
-        program::install(&name)
-            .await
+        program::install(&name).await
             .map_err(|e| format!("Failed to install '{program_name}': {e}"))?;
 
         let input_str = build_process_input(input.as_ref(), config);
@@ -189,8 +175,7 @@ impl Executor {
             Some(result_tx),
             Some(self.id),
             None, // token_budget: use default
-        )
-        .map_err(|e| e.to_string())?;
+        ).map_err(|e| e.to_string())?;
 
         self.running.lock().unwrap().insert(pid);
 
@@ -229,8 +214,7 @@ impl Executor {
         match take_k {
             // No Take: join_all preserves input order.
             None => {
-                let futs: Vec<_> = branches
-                    .iter()
+                let futs: Vec<_> = branches.iter()
                     .map(|b| self.eval(b, input.clone(), cancel.clone()))
                     .collect();
                 let results: Vec<Result<Value, String>> = join_all(futs).await;
@@ -243,8 +227,7 @@ impl Executor {
                 let branch_cancels: Vec<_> = (0..branches.len())
                     .map(|_| fork_cancel.child_token())
                     .collect();
-                let futs: Vec<_> = branches
-                    .iter()
+                let futs: Vec<_> = branches.iter()
                     .zip(branch_cancels.iter())
                     .map(|(b, bc)| self.eval(b, input.clone(), bc.clone()))
                     .collect();
@@ -302,8 +285,7 @@ impl Executor {
         match take_k {
             // No Take: join_all preserves input order.
             None => {
-                let futs: Vec<_> = items
-                    .into_iter()
+                let futs: Vec<_> = items.into_iter()
                     .map(|item| self.eval(function, Some(item), cancel.clone()))
                     .collect();
                 let results: Vec<Result<Value, String>> = join_all(futs).await;
@@ -313,10 +295,10 @@ impl Executor {
             // Take: FuturesUnordered for first-k-wins, cancel remaining.
             Some(k) => {
                 let map_cancel = cancel.child_token();
-                let branch_cancels: Vec<_> =
-                    (0..items.len()).map(|_| map_cancel.child_token()).collect();
-                let futs: Vec<_> = items
-                    .into_iter()
+                let branch_cancels: Vec<_> = (0..items.len())
+                    .map(|_| map_cancel.child_token())
+                    .collect();
+                let futs: Vec<_> = items.into_iter()
                     .zip(branch_cancels.iter())
                     .map(|(item, bc)| self.eval(function, Some(item), bc.clone()))
                     .collect();
@@ -430,6 +412,7 @@ impl Executor {
 
         val.ok_or_else(|| "iterate: no iterations".into())
     }
+
 }
 
 // =============================================================================
@@ -473,15 +456,11 @@ fn merge_sources(item: Value, acc: Value) -> Value {
 
     match item {
         Value::Object(map) => obj.extend(map),
-        other => {
-            obj.insert("_input".into(), other);
-        }
+        other => { obj.insert("_input".into(), other); }
     }
     match acc {
         Value::Object(map) => obj.extend(map),
-        other => {
-            obj.insert("_input".into(), other);
-        }
+        other => { obj.insert("_input".into(), other); }
     }
 
     Value::Object(obj)
@@ -500,9 +479,7 @@ pub(super) fn build_process_input(input: Option<&Value>, config: Option<&Value>)
     if let Some(val) = input {
         match val {
             Value::Object(map) => obj.extend(map.clone()),
-            other => {
-                obj.insert("_input".into(), other.clone());
-            }
+            other => { obj.insert("_input".into(), other.clone()); }
         }
     }
 
@@ -518,5 +495,6 @@ pub(super) fn build_process_input(input: Option<&Value>, config: Option<&Value>)
         }
     }
 
-    serde_json::to_string(&Value::Object(obj)).unwrap_or_else(|_| "{}".to_string())
+    serde_json::to_string(&Value::Object(obj))
+        .unwrap_or_else(|_| "{}".to_string())
 }
