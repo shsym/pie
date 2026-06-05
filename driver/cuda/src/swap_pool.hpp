@@ -24,8 +24,6 @@ namespace pie_cuda_driver {
 
 class SwapPool {
 public:
-    static SwapPool allocate_for_cache(const KvCache& cache, int num_pages);
-
     static SwapPool allocate(
         int num_layers,
         int num_pages,
@@ -73,11 +71,8 @@ private:
     int num_kv_heads_ = 0;
     int head_dim_ = 0;
     std::size_t page_bytes_ = 0;
-    struct HostBuffer {
-        void* data = nullptr;
-        std::size_t page_bytes = 0;
-    };
-    std::vector<std::vector<HostBuffer>> host_pools_;
+    std::vector<void*> k_host_pools_;
+    std::vector<void*> v_host_pools_;
     // Dedicated stream — swap copies don't share the default stream that
     // the forward pass runs on. Synced per-call before responding.
     cudaStream_t stream_ = nullptr;

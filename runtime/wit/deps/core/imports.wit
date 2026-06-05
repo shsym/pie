@@ -10,6 +10,4 @@ world imports {
     import runtime;
     import inference;
     import scheduling;
-    import media;
-    import audio-out;
 }

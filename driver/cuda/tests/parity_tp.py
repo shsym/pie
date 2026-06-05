@@ -29,9 +29,6 @@ import numpy as np
 
 
 def find_snapshot(hf_repo: str) -> Path:
-    local = Path(hf_repo).expanduser()
-    if local.exists():
-        return local.resolve()
     cache = Path(os.environ.get(
         "HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
     name = "models--" + hf_repo.replace("/", "--")
@@ -52,8 +49,10 @@ snapshot_dir = "{snapshot}"
 device = "{device}"
 dtype = "bfloat16"
 [batching]
-gpu_mem_utilization = 0.90
-memory_profile = "balanced"
+kv_page_size = 32
+max_num_kv_pages = 1024
+max_batch_tokens = 4096
+max_batch_size = 8
 """
 
 

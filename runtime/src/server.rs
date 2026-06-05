@@ -19,7 +19,7 @@ mod handler;
 
 pub use data_transfer::InFlightUpload;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock};
 
@@ -37,7 +37,6 @@ use tungstenite::Message as WsMessage;
 
 use crate::auth;
 use crate::process::{self, ProcessEvent, ProcessId};
-use crate::program::ProgramName;
 use crate::service::{Service, ServiceHandler, ServiceMap};
 use crate::workflow::{self, WorkflowId};
 
@@ -314,7 +313,6 @@ struct Session {
     pub(super) inflight_uploads: DashMap<String, InFlightUpload>,
     pub(super) attached_processes: Vec<ProcessId>,
     pub(super) attached_workflows: Vec<WorkflowId>,
-    pub(super) installed_programs: HashSet<ProgramName>,
     /// Per-process file delivery waiters (client → process).
     pub(super) file_waiters: HashMap<ProcessId, tokio::sync::oneshot::Sender<Bytes>>,
     ws_msg_tx: mpsc::Sender<WsMessage>,
@@ -386,7 +384,6 @@ impl Session {
             inflight_uploads: DashMap::new(),
             attached_processes: Vec::new(),
             attached_workflows: Vec::new(),
-            installed_programs: HashSet::new(),
             file_waiters: HashMap::new(),
             ws_msg_tx,
             send_pump,
@@ -715,33 +712,6 @@ impl Session {
                 token_budget,
             } => {
                 self.handle_launch_process(corr_id, inferlet, input, capture_outputs, token_budget)
-                    .await
-            }
-
-            ClientMessage::LaunchProcesses {
-                corr_id,
-                inferlet,
-                inputs,
-                capture_outputs,
-                token_budgets,
-            } => {
-                self.handle_launch_processes(
-                    corr_id,
-                    inferlet,
-                    inputs,
-                    capture_outputs,
-                    token_budgets,
-                )
-                .await
-            }
-
-            ClientMessage::RunProcesses {
-                corr_id,
-                inferlet,
-                inputs,
-                token_budgets,
-            } => {
-                self.handle_run_processes(corr_id, inferlet, inputs, token_budgets)
                     .await
             }
 

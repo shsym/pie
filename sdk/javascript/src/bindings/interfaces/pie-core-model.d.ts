@@ -8,7 +8,6 @@ export class Model {
   private constructor();
   static load(name: string): Model;
   tokenizer(): Tokenizer;
-  defaultSystemSpeculation(): boolean;
 }
 
 export class Tokenizer {

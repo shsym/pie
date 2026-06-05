@@ -10,10 +10,15 @@
 //! Each role marker and `<|end|>` are single special tokens
 //! (e.g. id 32010 / 32007 on Phi-3-mini-4k-instruct).
 
-use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
-use crate::model::instruct::{ChatDecoder, Instruct, ReasoningDecoder, ToolDecoder};
-use crate::model::tokenizer::Tokenizer;
 use std::sync::Arc;
+use crate::model::instruct::{
+    ChatDecoder,
+    Instruct,
+    ReasoningDecoder,
+    ToolDecoder,
+};
+use crate::model::instruct::decoders::{GenericChatDecoder, NoopReasoningDecoder, NoopToolDecoder};
+use crate::model::tokenizer::Tokenizer;
 
 pub struct Phi3Instruct {
     tokenizer: Arc<Tokenizer>,
@@ -83,18 +88,11 @@ impl Instruct for Phi3Instruct {
         self.stop_ids.clone()
     }
 
-    fn equip(&self, _tools: &[String]) -> Vec<u32> {
-        Vec::new()
-    }
-    fn answer(&self, _name: &str, _value: &str) -> Vec<u32> {
-        Vec::new()
-    }
+    fn equip(&self, _tools: &[String]) -> Vec<u32> { Vec::new() }
+    fn answer(&self, _name: &str, _value: &str) -> Vec<u32> { Vec::new() }
 
     fn chat_decoder(&self) -> Box<dyn ChatDecoder> {
-        Box::new(GenericChatDecoder::new(
-            self.tokenizer.clone(),
-            self.stop_ids.clone(),
-        ))
+        Box::new(GenericChatDecoder::new(self.tokenizer.clone(), self.stop_ids.clone()))
     }
 
     fn reasoning_decoder(&self) -> Box<dyn ReasoningDecoder> {
