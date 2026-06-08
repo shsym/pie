@@ -661,15 +661,9 @@ impl EmbeddedDriver {
         group_id: usize,
         tp: Option<TpLaunch>,
     ) -> Result<PendingEmbeddedDriver> {
-        // Portable allows either a safetensors dir or a single .gguf file
-        // (model.cpp branches on is_regular_file). CUDA + dummy still need
-        // a directory — those drivers fail later with their own message
-        // when handed a file, so we don't gate that here.
-        let is_gguf_file = snapshot_dir.is_file()
-            && snapshot_dir.extension().is_some_and(|e| e == "gguf");
-        if !snapshot_dir.is_dir() && !is_gguf_file {
+        if !snapshot_dir.is_dir() {
             return Err(anyhow!(
-                "snapshot_dir {snapshot_dir:?} does not exist, or is not a directory or .gguf file"
+                "snapshot_dir {snapshot_dir:?} does not exist or is not a directory"
             ));
         }
 

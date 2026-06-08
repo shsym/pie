@@ -14,7 +14,6 @@ use tokio::sync::{oneshot, Semaphore};
 use tokio::task::JoinHandle;
 
 use crate::context;
-use crate::instance::OutputMode;
 use crate::linker;
 use crate::program::ProgramName;
 use crate::server::{self, ClientId};
@@ -334,10 +333,7 @@ impl Process {
         };
 
         let result: Result<String, String> = async {
-            // capture_outputs ⇒ an attached client drains the per-process actor
-            // channel; otherwise this is a headless one-shot whose output is dropped.
-            let output = if capture_outputs { OutputMode::Stream } else { OutputMode::Discard };
-            let (mut store, instance) = linker::instantiate(process_id, username, &program, output, token_budget)
+            let (mut store, instance) = linker::instantiate(process_id, username, &program, capture_outputs, token_budget)
                 .await
                 .map_err(|e| e.to_string())?;
 
