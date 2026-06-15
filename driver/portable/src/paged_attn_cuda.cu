@@ -17,7 +17,6 @@
 // total_pages*page_size]` matches FlashInfer's `kNHD` byte-for-byte
 // (offset formula coincides), so K/V can be wrapped without copies.
 
-#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -121,7 +120,7 @@ Workspace& workspace() {
 // device→host copy. Set by `pie_paged_attn_set_host_indptr()`, called
 // from `upload_graph_inputs` immediately before the graph compute.
 //
-// thread_local because Pie may have multiple ForwardEngines (one per
+// thread_local because Pie may have multiple Executors (one per
 // device) running on separate threads; each gets its own snapshot.
 thread_local std::vector<IdType> g_host_indptr;
 
@@ -201,27 +200,6 @@ struct DecodeWorkEstimator {
             batch_size, kv_indptr_h, num_qo_heads, page_size, enable_cuda_graph, stream);
         split_kv       = false;
         new_batch_size = batch_size;
-
-        // With split_kv forced false, DecodePlan sets padded_batch_size =
-        // batch_size, but DecodeSplitKVIndptr still tiles each request's KV
-        // pages into ceil_div(pages_i, max_num_pages_per_batch) work items
-        // using the chunk size the (split-kv) estimator chose above. If any
-        // request has more pages than that chunk size, DecodeSplitKVIndptr
-        // emits more than `batch_size` (request,tile) entries, overflowing
-        // the request_indices/kv_tile_indices/o_indptr buffers (sized for
-        // padded_batch_size = batch_size) and producing a corrupted,
-        // truncated request_indices that maps multiple grid blocks onto the
-        // same request — clobbering other requests' output rows.
-        //
-        // Bump the chunk size to the largest per-request page count so every
-        // request maps to exactly one tile, keeping
-        // request_indices_vec.size() == batch_size == padded_batch_size.
-        uint32_t max_pages_per_req = 1;
-        for (uint32_t i = 0; i < batch_size; ++i) {
-            uint32_t pages_i = static_cast<uint32_t>(kv_indptr_h[i + 1] - kv_indptr_h[i]);
-            max_pages_per_req = std::max(max_pages_per_req, pages_i);
-        }
-        max_num_pages_per_batch = std::max(max_num_pages_per_batch, max_pages_per_req);
         return rc;
     }
 };

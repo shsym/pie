@@ -4,9 +4,6 @@
 .gitattributes
 .github
 
-Dockerfile*
-.dockerignore
-
 # Build artifacts (will be rebuilt in Docker)
 **/target/
 **/build/
