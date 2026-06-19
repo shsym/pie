@@ -406,14 +406,18 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
                                     rope_beta_fast, rope_beta_slow);
             }
         } else {
+            // Llama3 GGUFs use ggml normal RoPE pairing; NEOX rotates the
+            // wrong dimension pairs and the model attends incoherently.
+            const int rope_type = (h.arch == PieArch::Llama3)
+                ? GGML_ROPE_TYPE_NORMAL : GGML_ROPE_TYPE_NEOX;
             Q = ggml_rope_ext(ctx, Q, in.pos_input, c_rope,
-                              head_dim, GGML_ROPE_TYPE_NEOX, rope_n_ctx_orig,
+                              head_dim, rope_type, rope_n_ctx_orig,
                               layer_rope_theta, rope_freq_scale,
                               rope_ext_factor, rope_attn_factor,
                               rope_beta_fast, rope_beta_slow);
             if (!is_shared) {
                 K = ggml_rope_ext(ctx, K, in.pos_input, c_rope,
-                                  head_dim, GGML_ROPE_TYPE_NEOX, rope_n_ctx_orig,
+                                  head_dim, rope_type, rope_n_ctx_orig,
                                   layer_rope_theta, rope_freq_scale,
                                   rope_ext_factor, rope_attn_factor,
                                   rope_beta_fast, rope_beta_slow);
@@ -906,10 +910,13 @@ GraphResult build_qwen3_graph(ggml_context* ctx,
         // the get_rows trick used by the MoE router (build_moe_ffn).
         // probs reshaped to [1, vocab, n_slots]; get_rows along ne[1]
         // with index [K, n_slots] yields [1, K, n_slots] → reshape.
+        // n_slots (sampled rows), not n_req: speculation samples >1 slot
+        // per request, so n_slots >= n_req.
+        const std::int64_t n_slots = probs->ne[1];
         ggml_tensor* probs_3d = ggml_reshape_3d(
-            ctx, probs, 1, h.vocab_size, n_req);
+            ctx, probs, 1, h.vocab_size, n_slots);
         ggml_tensor* gathered = ggml_get_rows(ctx, probs_3d, top_k_idx);
-        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_req);
+        top_k_probs = ggml_reshape_2d(ctx, gathered, plan.uniform_top_k, n_slots);
 
         ggml_set_name(top_k_idx, "top_k_idx");
         ggml_set_name(top_k_probs, "top_k_probs");
