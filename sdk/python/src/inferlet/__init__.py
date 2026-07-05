@@ -3,10 +3,9 @@ Pie Inferlet SDK — Python bindings for the Pie runtime.
 
 Quickstart::
 
-    from inferlet import Context, Model, Sampler, runtime
+    from inferlet import Context, Sampler, model
 
-    model = Model.load(runtime.models()[0])
-    ctx = Context(model)
+    ctx = Context()
 
     ctx.system("You are helpful.").user("What is 2 + 2?")
     text = await ctx.generate(Sampler.argmax(), max_tokens=64).collect_text()
@@ -25,7 +24,7 @@ modules — compose by hand, no implicit suppression::
 
     from inferlet import chat, reasoning, tools
 
-    chat_dec = chat.Decoder(model)
+    chat_dec = chat.Decoder()
     async for step in gen:
         out = await step.execute()
         match chat_dec.feed(out.tokens):
@@ -42,7 +41,7 @@ method. No inheritance required.
 from __future__ import annotations
 
 # --- Core ---
-from .model import Model, Tokenizer
+from . import model
 from .sample import (
     Distribution,
     Entropy,
@@ -54,8 +53,6 @@ from .sample import (
 from .forward import Forward, Output, ProbeHandle, SampleHandle
 from .generation import GenStep, Generator
 from .context import Context
-from .media import Audio, Image, Video
-from .audio import Speech, SpeechBuilder, Voice, write_wav
 
 # --- Decoders + tools (sub-modules; users import as `inferlet.chat`, etc.) ---
 from . import chat
@@ -80,10 +77,8 @@ from .spec import Speculator
 
 # --- Runtime / IO ---
 from . import runtime
-from . import scheduling
 from . import messaging
 from . import session
-from . import mcp
 from . import zo
 
 # --- Adapter ---
@@ -93,16 +88,8 @@ from .adapter import Adapter
 __all__ = [
     # Core
     "Context",
-    "Model",
-    "Tokenizer",
+    "model",
     "Adapter",
-    "Image",
-    "Audio",
-    "Video",
-    "Speech",
-    "SpeechBuilder",
-    "Voice",
-    "write_wav",
     # Forward primitive
     "Forward",
     "Output",
@@ -136,10 +123,8 @@ __all__ = [
     "Speculator",
     # Runtime / IO
     "runtime",
-    "scheduling",
     "messaging",
     "session",
-    "mcp",
     "zo",
 ]
 
