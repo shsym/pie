@@ -2,27 +2,26 @@
 /**
  * Fill roles for history replay
  */
-export function system(message: string): Uint32Array;
-export function firstUser(message: string): Uint32Array;
-export function user(message: string): Uint32Array;
-export function systemUser(system: string, user: string): Uint32Array;
-export function assistant(message: string): Uint32Array;
+export function system(model: Model, message: string): Uint32Array;
+export function user(model: Model, message: string): Uint32Array;
+export function assistant(model: Model, message: string): Uint32Array;
 /**
  * Cue the model to generate (fills generation header)
  */
-export function cue(): Uint32Array;
+export function cue(model: Model): Uint32Array;
 /**
  * Seal the current turn (insert stop token)
  */
-export function seal(): Uint32Array;
+export function seal(model: Model): Uint32Array;
 /**
  * Returns the stop token IDs for the model
  */
-export function stopTokens(): Uint32Array;
+export function stopTokens(model: Model): Uint32Array;
 /**
  * Create a decoder to classify generated tokens
  */
-export function createDecoder(): Decoder;
+export function createDecoder(model: Model): Decoder;
+export type Model = import('./pie-core-model.js').Model;
 export type Error = import('./pie-core-types.js').Error;
 export type Event = EventDelta | EventInterrupt | EventDone;
 /**

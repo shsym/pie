@@ -16,7 +16,7 @@ differs from `attention-sink` / `windowed-attention`. The pure helpers
 model-free and unit-tested in `test_hierarchical_attention.py`.
 """
 
-from inferlet import Context, Sampler, chat, model
+from inferlet import Context, Model, Sampler, chat, runtime
 
 
 # =============================================================================
@@ -119,6 +119,9 @@ def _fmt_ranges(ranges: list[tuple[int, int]]) -> str:
 
 
 async def main(input: dict) -> str:
+    model = Model.load(runtime.models()[0])
+    tokenizer = model.tokenizer()
+
     prompt = input.get(
         "prompt",
         "Explain how LLM serving systems use KV cache, batching, scheduling, and "
@@ -141,6 +144,7 @@ async def main(input: dict) -> str:
 
     prompt_tokens.extend(
         chat.system(
+            model,
             "You are a concise assistant. Use the visible hierarchy: global "
             "instructions, the chunk summaries, and the selected local chunk.",
         )
@@ -151,24 +155,25 @@ async def main(input: dict) -> str:
         body = f"Chunk {i} full text:\n{chunk}\n"
 
         header_start = len(prompt_tokens)
-        prompt_tokens.extend(chat.user(header))
+        prompt_tokens.extend(chat.user(model, header))
         header_end = len(prompt_tokens)
         summary_ranges.append(
             (header_start, min(header_end, header_start + summary_tokens_per_chunk))
         )
 
         body_start = len(prompt_tokens)
-        prompt_tokens.extend(chat.user(body))
+        prompt_tokens.extend(chat.user(model, body))
         body_end = len(prompt_tokens)
         full_ranges.append((body_start, body_end))
 
     prompt_tokens.extend(
         chat.user(
+            model,
             "Answer the original request using the selected local chunk(s) and the "
             "global chunk summaries.",
         )
     )
-    prompt_tokens.extend(chat.cue())
+    prompt_tokens.extend(chat.cue(model))
 
     print("--- hierarchical-attention-python ---")
     print(f"chunks={len(chunks)}")
@@ -176,10 +181,10 @@ async def main(input: dict) -> str:
     print(f"summary_ranges={_fmt_ranges(summary_ranges)}")
     print(f"full_ranges={_fmt_ranges(full_ranges)}")
 
-    ctx = Context()
+    ctx = Context(model)
     pending = prompt_tokens
     generated: list[int] = []
-    stop_tokens = set(chat.stop_tokens())
+    stop_tokens = set(chat.stop_tokens(model))
     logged_mask = False
 
     for _ in range(max_tokens):
@@ -218,4 +223,4 @@ async def main(input: dict) -> str:
         pending = [int(token)]
 
     print(f"generated_tokens={len(generated)}")
-    return model.decode(generated)
+    return tokenizer.decode(generated)

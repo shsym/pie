@@ -1,12 +1,13 @@
 // $name — TypeScript inferlet.
 //
 // Demonstrates:
+// - Loading a model
 // - Using Context for chat-style prompt building
 // - Returning the generated response to the caller
 
 import {
-    Context, Sampler,
-    session,
+    Model, Context, Sampler,
+    session, runtime,
 } from '@pie-project/inferlet';
 
 interface Input {
@@ -24,8 +25,11 @@ export async function main(input: Input) {
     const temperature = input.temperature ?? 0.6;
     const topP = input.top_p ?? 0.95;
 
+    // Load the first model the engine has loaded.
+    const model = Model.load(runtime.models()[0]);
+
     // Build a chat context.
-    const ctx = new Context();
+    const ctx = new Context(model);
     ctx.system(system);
     ctx.user(prompt);
 

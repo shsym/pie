@@ -4,18 +4,20 @@
 // contexts. If not, one context will finish completely before the other starts.
 
 import {
-    Context, Sampler,
+    Model, Context, Sampler,
     chat,
-    session,
+    session, runtime,
 } from 'inferlet';
 
 export async function main(_input: Record<string, unknown>) {
+    const model = Model.load(runtime.models()[0]);
+
     // Create two separate contexts with different prompts.
-    const ctx1 = new Context();
+    const ctx1 = new Context(model);
     ctx1.system('You are helpful.');
     ctx1.user('Count from 1 to 5.');
 
-    const ctx2 = new Context();
+    const ctx2 = new Context(model);
     ctx2.system('You are helpful.');
     ctx2.user('Name 3 colors.');
 
@@ -26,7 +28,7 @@ export async function main(_input: Record<string, unknown>) {
         session.send(`[${label}] START`);
 
         const gen = ctx.generate(Sampler.topP(0.6, 0.95), { maxTokens: 20 });
-        const dec = new chat.Decoder();
+        const dec = new chat.Decoder(model);
 
         let stepCount = 0;
         for await (const step of gen) {

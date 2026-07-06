@@ -2,9 +2,10 @@
 //
 // Quickstart:
 //
-//     import { Context, Sampler } from 'inferlet';
+//     import { Context, Model, Sampler, runtime } from 'inferlet';
 //
-//     const ctx = new Context();
+//     const model = Model.load(runtime.models()[0]);
+//     const ctx = new Context(model);
 //
 //     ctx.system('You are helpful.').user('What is 2 + 2?');
 //     const text = await ctx
@@ -25,7 +26,7 @@
 //
 //     import { chat, reasoning, tools } from 'inferlet';
 //
-//     const chatDec = new chat.Decoder();
+//     const chatDec = new chat.Decoder(model);
 //     for await (const step of gen) {
 //       const out = await step.execute();
 //       const ev = chatDec.feed(out.tokens);
@@ -35,12 +36,15 @@
 //
 // Constraint specs (`jsonSchema`, `anyJson`, `regex`, `ebnf`) implement
 // the `Schema` interface — duck-typed, so your own grammar source class
-// plugs in by adding a `buildConstraint()` method.
+// plugs in by adding a `buildConstraint(model)` method.
 
 // ── Core ─────────────────────────────────────────────────────────────
-export * as model from './model.js';
+export { Model, Tokenizer } from './model.js';
 export { Adapter } from './adapter.js';
 export { Context } from './context.js';
+export { Image, Audio, Video } from './media.js';
+export { Speech, SpeechBuilder, writeWav } from './audio.js';
+export type { Voice } from './audio.js';
 
 // ── Forward primitive ────────────────────────────────────────────────
 export { Forward, Output } from './forward.js';
@@ -84,9 +88,12 @@ export type { Speculator } from './spec.js';
 
 // ── Runtime / IO sub-modules ─────────────────────────────────────────
 export * as runtime from './runtime.js';
+export * as scheduling from './scheduling.js';
 export * as session from './session.js';
 export * as messaging from './messaging.js';
+export * as mcp from './mcp.js';
 export * as zo from './zo.js';
 
 // Convenience re-exports for the most commonly subscribed-to types.
 export { Subscription } from './messaging.js';
+export { McpSession } from './mcp.js';

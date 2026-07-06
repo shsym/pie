@@ -2,20 +2,6 @@
 Mock WIT bindings for unit testing the inferlet SDK outside the Pie runtime.
 
 Installs mock ``wit_world.imports.*`` modules before any inferlet code imports.
-
-Reflects the WASI-Preview-3 single-model + working-set bindings the SDK now
-targets:
-
-* ``model`` exposes GLOBAL functions over the one bound model (no
-  ``model`` / ``tokenizer`` resource handles) plus the working-set / arena
-  capability getters.
-* the opaque ``context`` resource is gone — replaced by ``kv-working-set`` /
-  ``rs-working-set`` plus explicit ``kv-context`` / ``kv-output`` forward-pass
-  descriptors (``inference``).
-* ``forward-pass.execute`` (and ``messaging.pull`` / ``session.receive*``) are
-  component-model-async — ``async def`` returning values directly, with no
-  pollable ``future-output``.
-* ``media`` (image / video / audio) is the multimodal splice surface.
 """
 
 from __future__ import annotations
@@ -23,8 +9,10 @@ from __future__ import annotations
 import sys
 import types
 from dataclasses import dataclass
+from typing import Optional
 
 import pytest
+
 
 # =============================================================================
 # Fake resources & types
@@ -34,6 +22,33 @@ import pytest
 class FakePollable:
     def block(self) -> None:
         pass
+
+
+class FakeFutureBool:
+    def __init__(self, value: bool = True):
+        self._value = value
+    def pollable(self):
+        return FakePollable()
+    def get(self):
+        return self._value
+
+
+class FakeFutureString:
+    def __init__(self, value: str = ""):
+        self._value = value
+    def pollable(self):
+        return FakePollable()
+    def get(self):
+        return self._value
+
+
+class FakeFutureBlob:
+    def __init__(self, value: bytes = b""):
+        self._value = value
+    def pollable(self):
+        return FakePollable()
+    def get(self):
+        return self._value
 
 
 class FakeTokenizer:
@@ -59,68 +74,19 @@ class FakeTokenizer:
         pass
 
 
-# --- Working set (replaces the retired `context` resource) ---
-
-
-@dataclass
-class PageRange:
-    start: int
-    len: int
-
-
-class FakeKvWorkingSet:
-    """Dense ordered KV page array; structural mutators bump `generation`."""
-
-    _PAGE_SIZE = 64
-
+class FakeModel:
     def __init__(self):
-        self._size = 0
-        self._generation = 0
+        self._tokenizer = FakeTokenizer()
 
-    def size(self) -> int:
-        return self._size
+    @classmethod
+    def load(cls, name: str):
+        return cls()
 
-    def generation(self) -> int:
-        return self._generation
+    def tokenizer(self):
+        return self._tokenizer
 
-    def page_size(self) -> int:
-        return self._PAGE_SIZE
-
-    def alloc(self, n: int) -> PageRange:
-        start = self._size
-        self._size += n
-        self._generation += 1
-        return PageRange(start, n)
-
-    def free(self, indices: list[int]) -> None:
-        if len(set(indices)) != len(indices) or any(
-            i < 0 or i >= self._size for i in indices
-        ):
-            raise ValueError("free: out-of-range or duplicate indices")
-        self._size -= len(indices)
-        self._generation += 1
-
-    def reorder(self, perm: list[int]) -> None:
-        if sorted(perm) != list(range(self._size)):
-            raise ValueError("reorder: perm is not a bijection over 0..size")
-        self._generation += 1
-
-    def slice(self, start: int, length: int) -> "FakeKvWorkingSet":
-        if start < 0 or start + length > self._size:
-            raise ValueError("slice: out-of-range span")
-        new = FakeKvWorkingSet()
-        new._size = length
-        return new
-
-    def append(self, other: "FakeKvWorkingSet") -> None:
-        self._size += other._size
-        self._generation += 1
-
-    def fork(self) -> "FakeKvWorkingSet":
-        new = FakeKvWorkingSet()
-        new._size = self._size
-        new._generation = self._generation
-        return new
+    def default_system_speculation(self) -> bool:
+        return False
 
     def __enter__(self):
         return self
@@ -129,78 +95,98 @@ class FakeKvWorkingSet:
         pass
 
 
-class FakeRsWorkingSet:
-    """Buffered recurrent-state working set (hybrid / linear-attention)."""
-
-    _PAGE_SIZE = 64
-
+class FakeContext:
     def __init__(self):
-        self._buffer = 0
-        self._generation = 0
+        self._cursor: int = 0
+        self._committed_pages: int = 0
+        self._tokens_per_page_val: int = 64
+        self._bid: float = 0.0
 
-    def state_size(self) -> int:
+    @classmethod
+    def create(cls, model):
+        ctx = cls()
+        return ctx
+
+    def destroy(self):
+        pass
+
+    @classmethod
+    def lookup(cls, model, name):
+        return None
+
+    def fork(self):
+        new = FakeContext()
+        new._cursor = self._cursor
+        new._committed_pages = self._committed_pages
+        return new
+
+    def acquire_lock(self):
+        return FakeFutureBool(True)
+
+    def release_lock(self):
+        pass
+
+    def tokens_per_page(self):
+        return self._tokens_per_page_val
+
+    def model(self):
+        return FakeModel()
+
+    def committed_page_count(self):
+        return self._committed_pages
+
+    def working_page_count(self):
         return 0
 
-    def buffer_size(self) -> int:
-        return self._buffer
+    def commit_working_pages(self, num_pages):
+        self._committed_pages += num_pages
 
-    def buffer_page_size(self) -> int:
-        return self._PAGE_SIZE
+    def reserve_working_pages(self, n):
+        pass
 
-    def alloc_buffer(self, n: int) -> PageRange:
-        start = self._buffer
-        self._buffer += n
-        self._generation += 1
-        return PageRange(start, n)
+    def release_working_pages(self, n):
+        pass
 
-    def free_buffer(self, indices: list[int]) -> None:
-        if len(set(indices)) != len(indices) or any(
-            i < 0 or i >= self._buffer for i in indices
-        ):
-            raise ValueError("free-buffer: out-of-range or duplicate indices")
-        self._buffer -= len(indices)
-        self._generation += 1
+    def working_page_token_count(self):
+        return self._cursor
 
-    def reorder_buffer(self, perm: list[int]) -> None:
-        if sorted(perm) != list(range(self._buffer)):
-            raise ValueError("reorder-buffer: perm is not a bijection")
-        self._generation += 1
+    def truncate_working_page_tokens(self, num_tokens):
+        self._cursor = max(0, self._cursor - num_tokens)
 
-    def fork(self) -> "FakeRsWorkingSet":
-        new = FakeRsWorkingSet()
-        new._buffer = self._buffer
-        new._generation = self._generation
-        return new
+    def bid(self, value):
+        self._bid = value
 
     def __enter__(self):
         return self
 
     def __exit__(self, *args):
         pass
-
-
-# --- Multimodal media handles ---
 
 
 class FakeImage:
+    def __init__(self, token_count=4, prefix=None, suffix=None):
+        self._token_count = token_count
+        self._prefix = [10] if prefix is None else list(prefix)
+        self._suffix = [11] if suffix is None else list(suffix)
+
     @classmethod
-    def from_bytes(cls, data: bytes):
-        return cls()
+    def from_bytes(cls, model, data):
+        return cls(token_count=max(1, min(len(data), 8)))
 
-    def token_count(self) -> int:
-        return 4
+    def token_count(self):
+        return self._token_count
 
-    def position_span(self) -> int:
-        return 4
+    def position_span(self):
+        return self._token_count
 
     def grid(self):
-        return (1, 2, 2)
+        return (1, 1, self._token_count)
 
-    def prefix_tokens(self) -> list[int]:
-        return [100]
+    def prefix_tokens(self):
+        return list(self._prefix)
 
-    def suffix_tokens(self) -> list[int]:
-        return [101]
+    def suffix_tokens(self):
+        return list(self._suffix)
 
     def __enter__(self):
         return self
@@ -210,18 +196,22 @@ class FakeImage:
 
 
 class FakeVideo:
+    def __init__(self, frames=None):
+        self._frames = frames or [FakeImage(token_count=2, prefix=[], suffix=[])]
+
     @classmethod
-    def from_bytes(cls, data: bytes, max_frames: int):
-        return cls()
+    def from_bytes(cls, model, data, max_frames):
+        n = max(0, min(int(max_frames), 2))
+        return cls([FakeImage(token_count=2, prefix=[], suffix=[]) for _ in range(n)])
 
-    def frame_count(self) -> int:
-        return 1
+    def frame_count(self):
+        return len(self._frames)
 
-    def frame(self, index: int) -> FakeImage:
-        return FakeImage()
+    def frame(self, index):
+        return self._frames[index]
 
-    def timestamp(self, index: int) -> float:
-        return 0.0
+    def timestamp(self, index):
+        return float(index * 10)
 
     def __enter__(self):
         return self
@@ -231,21 +221,26 @@ class FakeVideo:
 
 
 class FakeAudio:
+    def __init__(self, token_count=6, prefix=None, suffix=None):
+        self._token_count = token_count
+        self._prefix = [20] if prefix is None else list(prefix)
+        self._suffix = [21] if suffix is None else list(suffix)
+
     @classmethod
-    def from_bytes(cls, data: bytes):
-        return cls()
+    def from_bytes(cls, model, data):
+        return cls(token_count=max(1, min(len(data), 8)))
 
-    def token_count(self) -> int:
-        return 3
+    def token_count(self):
+        return self._token_count
 
-    def position_span(self) -> int:
-        return 3
+    def position_span(self):
+        return self._token_count
 
-    def prefix_tokens(self) -> list[int]:
-        return []
+    def prefix_tokens(self):
+        return list(self._prefix)
 
-    def suffix_tokens(self) -> list[int]:
-        return []
+    def suffix_tokens(self):
+        return list(self._suffix)
 
     def __enter__(self):
         return self
@@ -254,35 +249,48 @@ class FakeAudio:
         pass
 
 
-# --- Forward-pass memory descriptors (records) ---
 @dataclass
-class KvContext:
-    set: object
-    start: int
-    len: int
-    valid_tokens: int
+class Voice_Speaker:
+    value: int
 
 
 @dataclass
-class KvOutput:
-    set: object
-    generation: int
-    indices: list
-    per_page_valid_lens: list
+class Voice_Named:
+    value: str
 
 
 @dataclass
-class RsBufferContext:
-    set: object
-    start_token: int
-    len_tokens: int
+class SpeechRequest:
+    text: str
+    voice: object
+    max_duration_ms: Optional[int]
 
 
-@dataclass
-class RsBufferOutput:
-    set: object
-    start_token: int
-    len_tokens: int
+class FakeSpeech:
+    def __init__(self, req=None):
+        self.req = req
+
+    @classmethod
+    def generate(cls, model, req):
+        return cls(req)
+
+    def sample_rate(self):
+        return 24_000
+
+    def channels(self):
+        return 1
+
+    def duration_ms(self):
+        return 80
+
+    def pcm(self):
+        return [0.0, 0.5, -0.5]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
 
 
 # --- Sampler variants ---
@@ -348,35 +356,42 @@ class Output:
     spec_positions: list
 
 
-class FakeForwardPass:
-    """P3 forward pass: explicit kv/rs descriptors + async `execute() -> output`."""
-
-    _next_output = None
-
-    def __init__(self):
+class FakeFutureOutput:
+    def __init__(self, output=None):
+        self._output = output or Output(slots=[SlotOutput_Token(42)], spec_tokens=[], spec_positions=[])
+    def pollable(self):
+        return FakePollable()
+    def get(self):
+        return self._output
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
         pass
 
-    def kv_context(self, ctx): pass
-    def kv_output(self, out): pass
-    def rs_context(self, ctx): pass
-    def rs_output(self, out): pass
-    def fold_buffered(self, tokens): pass
+
+class FakeForwardPass:
+    _next_output = None
+
+    def __init__(self, model):
+        self._model = model
+        self.images = []
+        self.audios = []
+
+    def context(self, ctx): pass
     def input_tokens(self, tokens, positions): pass
-    def input_image(self, image, anchor): pass
-    def input_audio(self, audio, anchor): pass
+    def input_image(self, image, anchor): self.images.append((image, anchor))
+    def input_audio(self, audio, anchor): self.audios.append((audio, anchor))
     def input_speculative_tokens(self, tokens, positions): pass
     def output_speculative_tokens(self, flag): pass
-    def pass_speculation(self, flag): pass
     def attention_mask(self, mask): pass
     def logit_mask(self, mask): pass
     def sampler(self, indices, sampler): pass
     def adapter(self, adapter): pass
 
-    async def execute(self):
+    def execute(self):
         if FakeForwardPass._next_output is not None:
-            return FakeForwardPass._next_output
-        # Default: a single EOS token (id 2, see special_tokens above).
-        return Output(slots=[SlotOutput_Token(2)], spec_tokens=[], spec_positions=[])
+            return FakeFutureOutput(FakeForwardPass._next_output)
+        return FakeFutureOutput(Output(slots=[SlotOutput_Token(2)], spec_tokens=[], spec_positions=[]))  # EOS
 
     def __enter__(self):
         return self
@@ -398,7 +413,7 @@ class FakeGrammar:
 
 
 class FakeMatcher:
-    def __init__(self, grammar):
+    def __init__(self, grammar, tokenizer):
         self._terminated = False
     def accept_tokens(self, token_ids): pass
     def next_token_logit_mask(self): return [1] * 256
@@ -462,39 +477,58 @@ class FakeToolDecoder:
 
 
 # --- Messaging ---
-class FakeStreamReader:
-    """Stand-in for a P3 `stream<string>` subscription handle: `async read`
-    returns up to `max_count` items, then `[]` (with `writer_dropped`) once
-    the writable end closes; `__exit__` drops the readable end."""
-
-    def __init__(self, messages=None):
-        self._messages = list(messages) if messages is not None else ["msg1", "msg2"]
-        self.writer_dropped = False
-        self.dropped = False
-
-    async def read(self, max_count):
-        if self._messages:
-            out = self._messages[:max_count]
-            del self._messages[:max_count]
-            return out
-        self.writer_dropped = True
-        return []
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
-        self.dropped = True
+class FakeSubscription:
+    def __init__(self):
+        self._messages = ["msg1", "msg2"]
+        self._idx = 0
+    def pollable(self): return FakePollable()
+    def get(self):
+        if self._idx < len(self._messages):
+            msg = self._messages[self._idx]
+            self._idx += 1
+            return msg
         return None
+    def unsubscribe(self): pass
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
 
+
+# --- MCP ---
+@dataclass
+class ContentText:
+    value: str
+@dataclass
+class ContentImage:
+    value: object
+@dataclass
+class ContentEmbeddedResource:
+    value: object
+
+class FakeMcpSession:
+    def list_tools(self): return '{"tools": []}'
+    def call_tool(self, name, args): return []
+    def list_resources(self): return '{"resources": []}'
+    def read_resource(self, uri): return []
+    def list_prompts(self): return '{"prompts": []}'
+    def get_prompt(self, name, args): return "{}"
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+
+@dataclass
+class McpError:
+    code: int
+    message: str
+    data: object
 
 # --- Adapter ---
 class FakeAdapter:
     @classmethod
-    def create(cls, name): return cls()
+    def create(cls, model, name): return cls()
     @classmethod
-    def open(cls, name): return None
-    def fork(self, new_name): return FakeAdapter()
+    def lookup(cls, model, name): return None
+    def clone(self, new_name): return FakeAdapter()
+    def acquire_lock(self): return FakeFutureBool(True)
+    def release_lock(self): pass
     def load(self, path): pass
     def save(self, path): pass
     def __enter__(self): return self
@@ -525,39 +559,46 @@ def _build_mock_modules():
     poll_mod = types.ModuleType("wit_world.imports.poll")
     poll_mod.Pollable = FakePollable
 
-    # model — the engine serves one bound model; global functions only,
-    # including the working-set / arena capability getters.
-    _tok = FakeTokenizer()
+    # pie_core_types
+    core_types = types.ModuleType("wit_world.imports.pie_core_types")
+    core_types.FutureBool = FakeFutureBool
+    core_types.FutureString = FakeFutureString
+    core_types.FutureBlob = FakeFutureBlob
+
+    # pie_mcp_types
+    mcp_types = types.ModuleType("wit_world.imports.pie_mcp_types")
+    mcp_types.Content_Text = ContentText
+    mcp_types.Content_Image = ContentImage
+    mcp_types.Content_EmbeddedResource = ContentEmbeddedResource
+    mcp_types.Content = ContentText | ContentImage | ContentEmbeddedResource
+    mcp_types.Error = McpError
+
+    # model
     model_mod = types.ModuleType("wit_world.imports.model")
-    model_mod.name = lambda: "mock-model"
-    model_mod.architecture = lambda: "mock-arch"
-    model_mod.default_system_speculation = lambda: False
-    model_mod.encode = lambda text: _tok.encode(text)
-    model_mod.decode = lambda tokens: _tok.decode(tokens)
-    model_mod.vocabs = lambda: _tok.vocabs()
-    model_mod.split_regex = lambda: _tok.split_regex()
-    model_mod.special_tokens = lambda: _tok.special_tokens()
-    model_mod.rs_state_size = lambda: 0
-    model_mod.rs_buffer_page_size = lambda: 0
-    model_mod.rs_fold_granularity = lambda: 1
-    model_mod.arena_block_size = lambda: 64
+    model_mod.Tokenizer = FakeTokenizer
+    model_mod.Model = FakeModel
 
-    # working_set — replaces the retired `context` resource.
-    ws_mod = types.ModuleType("wit_world.imports.working_set")
-    ws_mod.KvWorkingSet = FakeKvWorkingSet
-    ws_mod.RsWorkingSet = FakeRsWorkingSet
-    ws_mod.PageRange = PageRange
+    # context
+    context_mod = types.ModuleType("wit_world.imports.context")
+    context_mod.Context = FakeContext
 
-    # media — multimodal splice surface.
+    # media
     media_mod = types.ModuleType("wit_world.imports.media")
     media_mod.Image = FakeImage
     media_mod.Video = FakeVideo
     media_mod.Audio = FakeAudio
 
+    # audio_out
+    audio_out_mod = types.ModuleType("wit_world.imports.audio_out")
+    audio_out_mod.Voice_Speaker = Voice_Speaker
+    audio_out_mod.Voice_Named = Voice_Named
+    audio_out_mod.Voice = Voice_Speaker | Voice_Named
+    audio_out_mod.SpeechRequest = SpeechRequest
+    audio_out_mod.Speech = FakeSpeech
+
     # inference
     inf_mod = types.ModuleType("wit_world.imports.inference")
     for cls in [
-        KvContext, KvOutput, RsBufferContext, RsBufferOutput,
         Sampler_Multinomial, Sampler_TopK, Sampler_TopP, Sampler_MinP,
         Sampler_TopKTopP, Sampler_Embedding, Sampler_Dist, Sampler_RawLogits,
         Sampler_Logprob, Sampler_Logprobs, Sampler_Entropy,
@@ -576,6 +617,7 @@ def _build_mock_modules():
         SlotOutput_Token | SlotOutput_Distribution | SlotOutput_Logits
         | SlotOutput_Logprobs | SlotOutput_Entropy | SlotOutput_Embedding
     )
+    inf_mod.FutureOutput = FakeFutureOutput
     inf_mod.ForwardPass = FakeForwardPass
     inf_mod.Grammar = FakeGrammar
     inf_mod.Matcher = FakeMatcher
@@ -586,15 +628,13 @@ def _build_mock_modules():
     chat_mod.Event_Interrupt = ChatEvent_Interrupt
     chat_mod.Event_Done = ChatEvent_Done
     chat_mod.Decoder = FakeChatDecoder
-    chat_mod.system = lambda msg: []
-    chat_mod.first_user = lambda msg: [66]
-    chat_mod.user = lambda msg: []
-    chat_mod.system_user = lambda system, user: [67]
-    chat_mod.assistant = lambda msg: []
-    chat_mod.cue = lambda: [65]
-    chat_mod.seal = lambda: []
-    chat_mod.stop_tokens = lambda: [2]
-    chat_mod.create_decoder = lambda: FakeChatDecoder()
+    chat_mod.system = lambda ctx, msg: []
+    chat_mod.user = lambda ctx, msg: []
+    chat_mod.assistant = lambda ctx, msg: []
+    chat_mod.cue = lambda ctx: [65]
+    chat_mod.seal = lambda ctx: []
+    chat_mod.stop_tokens = lambda model: [2]
+    chat_mod.create_decoder = lambda model: FakeChatDecoder()
 
     # reasoning
     reasoning_mod = types.ModuleType("wit_world.imports.reasoning")
@@ -602,55 +642,50 @@ def _build_mock_modules():
     reasoning_mod.Event_Delta = ReasoningEvent_Delta
     reasoning_mod.Event_Complete = ReasoningEvent_Complete
     reasoning_mod.Decoder = FakeReasoningDecoder
-    reasoning_mod.create_decoder = lambda: FakeReasoningDecoder()
+    reasoning_mod.create_decoder = lambda model: FakeReasoningDecoder()
 
     # tool_use
     tool_mod = types.ModuleType("wit_world.imports.tool_use")
     tool_mod.Event_Start = ToolEvent_Start
     tool_mod.Event_Call = ToolEvent_Call
     tool_mod.Decoder = FakeToolDecoder
-    tool_mod.equip = lambda tools: []
-    tool_mod.answer = lambda name, value: []
-    tool_mod.create_decoder = lambda: FakeToolDecoder()
-    tool_mod.format = lambda tools: None
-    tool_mod.create_matcher = lambda tools: FakeMatcher(None)
+    tool_mod.equip = lambda ctx, tools: []
+    tool_mod.answer = lambda ctx, name, value: []
+    tool_mod.create_decoder = lambda model: FakeToolDecoder()
+    tool_mod.create_matcher = lambda model, tools: FakeMatcher(None, None)
 
     # runtime
     runtime_mod = types.ModuleType("wit_world.imports.runtime")
     runtime_mod.version = lambda: "0.1.0-mock"
     runtime_mod.instance_id = lambda: "mock-instance-001"
     runtime_mod.username = lambda: "test-user"
+    runtime_mod.models = lambda: ["mock-model"]
+    runtime_mod.spawn = lambda pkg, args: FakeFutureString("spawned")
 
-    async def _sleep(duration_ns):
-        return None
-    runtime_mod.sleep = _sleep
-
-    # messaging — `pull` is async; `subscribe` yields a stream reader.
+    # messaging
     messaging_mod = types.ModuleType("wit_world.imports.messaging")
     messaging_mod.push = lambda topic, msg: None
-
-    async def _pull(topic):
-        return "pulled"
-    messaging_mod.pull = _pull
+    messaging_mod.pull = lambda topic: FakeFutureString("pulled")
     messaging_mod.broadcast = lambda topic, msg: None
-    messaging_mod.subscribe = lambda topic: FakeStreamReader()
+    messaging_mod.subscribe = lambda topic: FakeSubscription()
+    messaging_mod.Subscription = FakeSubscription
 
-    # session — `receive` / `receive_file` are async.
+    # session
     session_mod = types.ModuleType("wit_world.imports.session")
     session_mod.send = lambda msg: None
-
-    async def _receive():
-        return "received"
-    session_mod.receive = _receive
+    session_mod.receive = lambda: FakeFutureString("received")
     session_mod.send_file = lambda data: None
-
-    async def _receive_file():
-        return b"file-data"
-    session_mod.receive_file = _receive_file
+    session_mod.receive_file = lambda: FakeFutureBlob(b"file-data")
 
     # adapter
     adapter_mod = types.ModuleType("wit_world.imports.adapter")
     adapter_mod.Adapter = FakeAdapter
+
+    # client (MCP)
+    client_mod = types.ModuleType("wit_world.imports.client")
+    client_mod.available_servers = lambda: ["mock-server"]
+    client_mod.connect = lambda name: FakeMcpSession()
+    client_mod.Session = FakeMcpSession
 
     # zo
     zo_mod = types.ModuleType("wit_world.imports.zo")
@@ -658,15 +693,26 @@ def _build_mock_modules():
     zo_mod.initialize = lambda adapter, rank, alpha, pop, mu, sigma: None
     zo_mod.update = lambda adapter, scores, seeds, max_sigma: None
 
+    # scheduling
+    scheduling_mod = types.ModuleType("wit_world.imports.scheduling")
+    scheduling_mod.balance = lambda model: 1000.0
+    scheduling_mod.rent = lambda ctx: 0.0
+    scheduling_mod.dividend = lambda model: 0.0
+    scheduling_mod.latency = lambda ctx: 0.01
+    scheduling_mod.price = lambda: 1.0
+
     # Install all
     modules = {
         "componentize_py_types": cpy_types,
         "wit_world": wit_world,
         "wit_world.imports": wit_imports,
         "wit_world.imports.poll": poll_mod,
+        "wit_world.imports.pie_core_types": core_types,
+        "wit_world.imports.pie_mcp_types": mcp_types,
         "wit_world.imports.model": model_mod,
-        "wit_world.imports.working_set": ws_mod,
+        "wit_world.imports.context": context_mod,
         "wit_world.imports.media": media_mod,
+        "wit_world.imports.audio_out": audio_out_mod,
         "wit_world.imports.inference": inf_mod,
         "wit_world.imports.chat": chat_mod,
         "wit_world.imports.reasoning": reasoning_mod,
@@ -675,16 +721,18 @@ def _build_mock_modules():
         "wit_world.imports.messaging": messaging_mod,
         "wit_world.imports.session": session_mod,
         "wit_world.imports.adapter": adapter_mod,
+        "wit_world.imports.client": client_mod,
         "wit_world.imports.zo": zo_mod,
+        "wit_world.imports.scheduling": scheduling_mod,
     }
 
     for name, mod in modules.items():
         sys.modules[name] = mod
 
     for attr in [
-        "poll", "model", "working_set", "media",
-        "inference", "chat", "reasoning", "tool_use", "runtime",
-        "messaging", "session", "adapter", "zo",
+        "poll", "pie_core_types", "pie_mcp_types", "model", "context",
+        "media", "audio_out", "inference", "chat", "reasoning", "tool_use", "runtime",
+        "messaging", "session", "adapter", "client", "zo", "scheduling",
     ]:
         setattr(wit_imports, attr, sys.modules[f"wit_world.imports.{attr}"])
 

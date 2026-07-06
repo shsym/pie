@@ -7,9 +7,11 @@ import asyncio
 
 from inferlet import (
     Context,
+    Model,
     Sampler,
     chat,
     reasoning,
+    runtime,
     session,
     set_return,
 )
@@ -22,8 +24,8 @@ async def generate(ctx: Context, label: str) -> None:
     log.append(msg)
     session.send(msg)
 
-    chat_dec = chat.Decoder()
-    think = reasoning.Decoder()
+    chat_dec = chat.Decoder(ctx.model)
+    think = reasoning.Decoder(ctx.model)
     step_count = 0
 
     g = ctx.generate(Sampler.top_p(0.6, 0.95), max_tokens=20)
@@ -55,10 +57,12 @@ async def generate(ctx: Context, label: str) -> None:
 
 
 async def main(input: dict) -> None:
-    ctx1 = Context()
+    model = Model.load(runtime.models()[0])
+
+    ctx1 = Context(model)
     ctx1.system("You are helpful.").user("Count from 1 to 5.")
 
-    ctx2 = Context()
+    ctx2 = Context(model)
     ctx2.system("You are helpful.").user("Name 3 colors.")
 
     session.send("[test] starting asyncio.gather")

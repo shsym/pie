@@ -3,10 +3,10 @@
 //! Two halves:
 //!
 //! 1. **Fillers** ([`system`], [`user`], [`assistant`], [`cue`], [`seal`])
-//!    produce token sequences for the model's chat template. Higher-level
-//!    prompt-buffering facades call them through their `system` /
+//!    produce token sequences for the model's chat template. The
+//!    [`Context`](crate::Context) calls them through its `system` /
 //!    `user` / `cue` / `seal` methods; for inferlets that build prompts
-//!    by hand, these are the public entry points.
+//!    by hand (no Context buffering), these are the public entry points.
 //!
 //! 2. **Decoder** ([`Decoder`], [`Event`]) parses the model's generated
 //!    tokens back into visible text + structural events.
@@ -15,6 +15,7 @@
 //! template knowledge lives in the Pie runtime, not in the SDK.
 
 use crate::Result;
+use crate::model::Model;
 use crate::pie::instruct::chat::{Decoder as RawDecoder, Event as RawEvent};
 
 // =============================================================================
@@ -22,44 +23,45 @@ use crate::pie::instruct::chat::{Decoder as RawDecoder, Event as RawEvent};
 // =============================================================================
 
 /// Token sequence for a system-role message.
-pub fn system(message: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::system(message)
+pub fn system(model: &Model, message: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::system(model, message)
 }
 
 /// Token sequence for a user-role message.
-pub fn user(message: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::user(message)
+pub fn user(model: &Model, message: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::user(model, message)
 }
 
 /// Token sequence for the first user-role message in a fresh chat.
-pub fn first_user(message: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::first_user(message)
+pub fn first_user(model: &Model, message: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::first_user(model, message)
 }
 
 /// Token sequence for a system message followed by the first user message.
-pub fn system_user(system: &str, user: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::system_user(system, user)
+pub fn system_user(model: &Model, system: &str, user: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::system_user(model, system, user)
 }
 
 /// Token sequence for an assistant-role message (history replay).
-pub fn assistant(message: &str) -> Vec<u32> {
-    crate::pie::instruct::chat::assistant(message)
+pub fn assistant(model: &Model, message: &str) -> Vec<u32> {
+    crate::pie::instruct::chat::assistant(model, message)
 }
 
 /// Token sequence for the generation cue (tells the model "your turn").
-pub fn cue() -> Vec<u32> {
-    crate::pie::instruct::chat::cue()
+pub fn cue(model: &Model) -> Vec<u32> {
+    crate::pie::instruct::chat::cue(model)
 }
 
 /// Token sequence that seals the current turn (inserts a stop token).
-pub fn seal() -> Vec<u32> {
-    crate::pie::instruct::chat::seal()
+pub fn seal(model: &Model) -> Vec<u32> {
+    crate::pie::instruct::chat::seal(model)
 }
 
-/// Stop-token IDs for the bound model's chat template — add to a decode
-/// loop's stop-token set for explicit termination control.
-pub fn stop_tokens() -> Vec<u32> {
-    crate::pie::instruct::chat::stop_tokens()
+/// Stop-token IDs for `model`'s chat template — pass to
+/// [`Generator::stop`](crate::generation::Generator::stop) for explicit
+/// termination control.
+pub fn stop_tokens(model: &Model) -> Vec<u32> {
+    crate::pie::instruct::chat::stop_tokens(model)
 }
 
 // =============================================================================
@@ -107,10 +109,10 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Construct a decoder for the bound model's chat template.
-    pub fn new() -> Self {
+    /// Construct a decoder for `model`'s chat template.
+    pub fn new(model: &Model) -> Self {
         Self {
-            inner: crate::pie::instruct::chat::create_decoder(),
+            inner: crate::pie::instruct::chat::create_decoder(model),
         }
     }
 

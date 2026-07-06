@@ -1,6 +1,7 @@
 // Adapter (LoRA) wrapper — wraps pie:core/adapter WIT resource.
 
 import { Adapter as _Adapter } from 'pie:core/adapter';
+import type { Model } from './model.js';
 
 /**
  * A LoRA adapter instance.
@@ -8,7 +9,7 @@ import { Adapter as _Adapter } from 'pie:core/adapter';
  * Wraps the `pie:core/adapter.Adapter` WIT resource. Implements
  * `Disposable` for use with `using`:
  *
- *     using adapter = Adapter.create("my-lora");
+ *     using adapter = Adapter.create(model, "my-lora");
  *     adapter.load("/path/to/weights");
  *     // adapter.destroy() called automatically on scope exit
  */
@@ -25,14 +26,14 @@ export class Adapter implements Disposable {
         this.destroy();
     }
 
-    /** Create a new adapter for the model with the given name. */
-    static create(name: string): Adapter {
-        return new Adapter(_Adapter.create(name));
+    /** Create a new adapter for a model with the given name. */
+    static create(model: Model, name: string): Adapter {
+        return new Adapter(_Adapter.create(model._handle, name));
     }
 
     /** Open an existing adapter by name. Returns `undefined` if not found. */
-    static open(name: string): Adapter | undefined {
-        const handle = _Adapter.open(name);
+    static open(model: Model, name: string): Adapter | undefined {
+        const handle = _Adapter.open(model._handle, name);
         return handle !== undefined ? new Adapter(handle) : undefined;
     }
 

@@ -3,10 +3,11 @@
 Python API for writing Pie inferlets.
 
 ```python
-from inferlet import Context, Sampler
+from inferlet import Context, Model, Sampler, runtime
 
 async def main(input: dict) -> str:
-    ctx = Context()
+    model = Model.load(runtime.models()[0])
+    ctx = Context(model)
 
     ctx.system("You are helpful.").user(input["prompt"])
 
@@ -25,7 +26,7 @@ async def main(input: dict) -> str:
   speculation, adapters, and JSON collection.
 - `chat`, `reasoning`, `tools`: optional decoders and helpers for model-native
   formats.
-- `runtime`, `session`, `messaging`: host services exposed to inferlets.
+- `runtime`, `session`, `messaging`, `mcp`: host services exposed to inferlets.
 
 ## Build notes
 

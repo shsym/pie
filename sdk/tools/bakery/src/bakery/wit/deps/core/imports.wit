@@ -2,15 +2,12 @@ package pie:core;
 
 world imports {
     import types;
-    import working-set;
+    import adapter;
+    import context;
     import messaging;
     import session;
     import model;
     import runtime;
-    import tensor;
     import inference;
-    import ptir;
-    import http;
-    import media;
-    import audio-out;
+    import scheduling;
 }

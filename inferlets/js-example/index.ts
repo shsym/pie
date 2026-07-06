@@ -1,14 +1,15 @@
 // Simple text completion — JavaScript inferlet example.
 //
 // Demonstrates:
+// - Loading a model
 // - Using Context for chat-style prompt building
 // - Manual streaming with `chat.Decoder` + optional `reasoning.Decoder`,
 //   composed by hand (no implicit suppression).
 
 import {
-    Context, Sampler,
+    Model, Context, Sampler,
     chat, reasoning,
-    session,
+    session, runtime,
 } from 'inferlet';
 
 interface Input {
@@ -20,7 +21,9 @@ interface Input {
 }
 
 export async function main(input: Input) {
-    using ctx = new Context();
+    const model = Model.load(runtime.models()[0]);
+
+    using ctx = new Context(model);
     ctx.system(input.system ?? 'You are a helpful assistant.');
     ctx.user(input.prompt ?? 'What is the capital of France? Tell me a joke.');
 
@@ -30,8 +33,8 @@ export async function main(input: Input) {
     );
     const gen = ctx.generate(sampler, { maxTokens: input.max_tokens ?? 256 });
 
-    const chatDec = new chat.Decoder();
-    const reasoningDec = new reasoning.Decoder();
+    const chatDec = new chat.Decoder(model);
+    const reasoningDec = new reasoning.Decoder(model);
 
     let output = '';
     for await (const step of gen) {

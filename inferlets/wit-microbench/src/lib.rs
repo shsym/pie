@@ -5,7 +5,7 @@
 //! scheduler / GPU latency.
 
 use std::time::Instant;
-use inferlet::{Result, runtime};
+use inferlet::{Result, model::Model, runtime};
 use inferlet::pie::core::inference::{ForwardPass, Sampler as WitSampler};
 use serde::{Deserialize, Serialize};
 
@@ -65,16 +65,21 @@ async fn main(input: Input) -> Result<Output> {
         std::hint::black_box(id);
     }));
 
+    // For ForwardPass we need a model. Load the first available.
+    let models = runtime::models();
+    let model_name = models.first().ok_or("no models available")?;
+    let model = Model::load(model_name)?;
+
     // 3. ForwardPass::new + drop. Measures full resource lifecycle:
     //    push to ResourceTable + WIT drop call.
     benches.push(measure("ForwardPass::new + drop", n.min(50_000), || {
-        let pass = ForwardPass::new();
+        let pass = ForwardPass::new(&model);
         std::hint::black_box(&pass);
         drop(pass);
     }));
 
     // Reuse one ForwardPass for the field-setter measurements.
-    let pass = ForwardPass::new();
+    let pass = ForwardPass::new(&model);
 
     // 4. Simplest field setter: a single bool.
     benches.push(measure("pass.output_speculative_tokens(true)", n, || {
@@ -108,7 +113,7 @@ async fn main(input: Input) -> Result<Output> {
         "full setup (new + 3 setters + drop)",
         n.min(50_000),
         || {
-            let p = ForwardPass::new();
+            let p = ForwardPass::new(&model);
             p.output_speculative_tokens(true);
             p.input_tokens(&tokens, &positions);
             p.sampler(&idx, &sampler);

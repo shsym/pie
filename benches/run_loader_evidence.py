@@ -63,7 +63,10 @@ def bench_env(
         paths.append(env["PYTHONPATH"])
     env["PYTHONPATH"] = os.pathsep.join(paths)
     if plan_dump is not None:
-        env["PIE_CUDA_RUST_LAYOUT_PLAN_DUMP"] = str(plan_dump)
+        if pie_driver == "portable":
+            env["PIE_PORTABLE_RUST_LAYOUT_PLAN_DUMP"] = str(plan_dump)
+        else:
+            env["PIE_CUDA_RUST_LAYOUT_PLAN_DUMP"] = str(plan_dump)
     return env
 
 
@@ -303,7 +306,7 @@ def main() -> None:
     parser.add_argument("--max-model-len", type=int, default=2048)
     parser.add_argument(
         "--pie-driver",
-        choices=["cuda_native"],
+        choices=["cuda_native", "portable"],
         default="cuda_native",
         help="Pie backend used for Pie evidence runs.",
     )
@@ -364,7 +367,7 @@ def main() -> None:
                 "cargo",
                 "test",
                 "--manifest-path",
-                str(ROOT / "driver" / "weight-loader" / "Cargo.toml"),
+                str(ROOT / "driver" / "weight_loader" / "Cargo.toml"),
             ],
             "weight-loader-tests.log",
         ),

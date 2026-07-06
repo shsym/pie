@@ -8,10 +8,8 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
+from ..imports import model
 from ..imports import inference
-import componentize_py_async_support
-from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
-from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 @dataclass
@@ -31,7 +29,7 @@ class Decoder:
     
     def feed(self, tokens: List[int]) -> Event:
         """
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        Raises: `wit_world.types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def reset(self) -> None:
@@ -48,30 +46,24 @@ class Decoder:
 
 
 
-def equip(tools: List[str]) -> List[int]:
+def equip(model: model.Model, tools: List[str]) -> List[int]:
     """
     Register available tools (list of JSON schema strings)
     
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    Raises: `wit_world.types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
-def answer(name: str, value: str) -> List[int]:
+def answer(model: model.Model, name: str, value: str) -> List[int]:
     """
     Provide a tool result (after a tool-call reply)
     """
     raise NotImplementedError
-def create_decoder() -> Decoder:
+def create_decoder(model: model.Model) -> Decoder:
     """
     Create a decoder to detect tool calls in generated tokens
     """
     raise NotImplementedError
-def format(tools: List[str]) -> Optional[inference.Grammar]:
-    """
-    Returns the grammar that constrains well-formed tool-call output for
-    this model and toolset, or none if the model has no enforceable format.
-    """
-    raise NotImplementedError
-def create_matcher(tools: List[str]) -> inference.Matcher:
+def create_matcher(model: model.Model, tools: List[str]) -> inference.Matcher:
     """
     Create a grammar matcher to force-generate tool calls
     """

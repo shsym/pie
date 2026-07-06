@@ -9,11 +9,9 @@
 use rand::rngs::SmallRng;
 use rand::{RngCore, SeedableRng};
 
-use pie_ipc::wire::encode_response;
-use pie_driver_abi::{
-    ArchivedForwardRequest, ForwardResponse, ResponseFrame, ResponsePayload, PIE_SAMPLER_DIST,
-    PIE_SAMPLER_EMBEDDING, PIE_SAMPLER_ENTROPY, PIE_SAMPLER_LOGPROB, PIE_SAMPLER_LOGPROBS,
-    PIE_SAMPLER_RAW_LOGITS,
+use pie_bridge::wire::encode_response;
+use pie_bridge::{
+    ArchivedForwardRequest, ArchivedSampler, ForwardResponse, ResponseFrame, ResponsePayload,
 };
 
 pub struct Handler {
@@ -66,15 +64,9 @@ impl Handler {
                 .and_then(|brle| AllowedRuns::parse(&brle, self.vocab_size));
 
             for slot in s_lo as usize..s_hi as usize {
-                let kind: u8 = fr.sampler_kinds[slot];
-                // Logprobs labels live in the sampler_token_ids CSR; the slot's
-                // run length is the count this slot emits.
-                let lo: u32 = fr.sampler_token_ids_indptr[slot].into();
-                let hi: u32 = fr.sampler_token_ids_indptr[slot + 1].into();
-                let logprobs_k = (hi - lo) as usize;
+                let sampler = &fr.samplers[slot];
                 self.fill_slot(
-                    kind,
-                    logprobs_k,
+                    sampler,
                     allowed.as_ref(),
                     &mut tokens,
                     &mut dists_ids,
@@ -121,11 +113,9 @@ impl Handler {
         encode_response(&frame).map_err(|e| anyhow::anyhow!("encode: {e}"))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn fill_slot(
         &mut self,
-        kind: u8,
-        logprobs_k: usize,
+        sampler: &ArchivedSampler,
         allowed: Option<&AllowedRuns>,
         tokens: &mut Vec<u32>,
         dists_ids: &mut Vec<u32>,
@@ -137,8 +127,19 @@ impl Handler {
         logprobs_val_indptr: &mut Vec<u32>,
         entropies: &mut Vec<f32>,
     ) {
-        match kind {
-            PIE_SAMPLER_DIST => {
+        match sampler {
+            ArchivedSampler::Multinomial { .. }
+            | ArchivedSampler::TopK { .. }
+            | ArchivedSampler::TopP { .. }
+            | ArchivedSampler::MinP { .. }
+            | ArchivedSampler::TopKTopP { .. } => {
+                let token = match allowed {
+                    Some(a) => self.random_masked_token(a),
+                    None => self.random_token(),
+                };
+                tokens.push(token);
+            }
+            ArchivedSampler::Dist { .. } => {
                 for _ in 0..8 {
                     dists_ids.push(self.random_token());
                 }
@@ -147,34 +148,27 @@ impl Handler {
                 ]);
                 dists_kv_indptr.push(dists_ids.len() as u32);
             }
-            PIE_SAMPLER_RAW_LOGITS => {
+            ArchivedSampler::RawLogits => {
                 logits_bytes.extend_from_slice(&self.zero_logits);
                 logits_byte_indptr.push(logits_bytes.len() as u32);
             }
-            PIE_SAMPLER_LOGPROB => {
+            ArchivedSampler::Logprob { .. } => {
                 logprobs_values.push(0.0);
                 logprobs_val_indptr.push(logprobs_values.len() as u32);
             }
-            PIE_SAMPLER_LOGPROBS => {
-                for _ in 0..logprobs_k {
+            ArchivedSampler::Logprobs { token_ids } => {
+                let k = token_ids.len();
+                for _ in 0..k {
                     logprobs_values.push(0.0);
                 }
                 logprobs_val_indptr.push(logprobs_values.len() as u32);
             }
-            PIE_SAMPLER_ENTROPY => {
+            ArchivedSampler::Entropy => {
                 entropies.push(0.0);
             }
-            PIE_SAMPLER_EMBEDDING => {
+            ArchivedSampler::Embedding => {
                 // Reserved variant; runtime filters Embedding out of the slot
                 // stream, so emitting nothing keeps the response aligned.
-            }
-            // Token-producing samplers (Multinomial/TopK/TopP/MinP/TopKTopP).
-            _ => {
-                let token = match allowed {
-                    Some(a) => self.random_masked_token(a),
-                    None => self.random_token(),
-                };
-                tokens.push(token);
             }
         }
     }

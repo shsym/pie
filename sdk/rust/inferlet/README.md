@@ -3,11 +3,12 @@
 Rust API for writing Pie inferlets.
 
 ```rust
-use inferlet::{Context, Result, sample::Sampler};
+use inferlet::{Context, Result, model::Model, runtime, sample::Sampler};
 
 #[inferlet::main]
 async fn main(_: ()) -> Result<String> {
-    let mut ctx = Context::new()?;
+    let model = Model::load(runtime::models().first().ok_or("no models")?)?;
+    let mut ctx = Context::new(&model)?;
 
     ctx.system("You are helpful.")
         .user("What's 2 + 2?")
@@ -29,9 +30,7 @@ async fn main(_: ()) -> Result<String> {
   speculation, adapters, and JSON collection.
 - `chat`, `reasoning`, `tools`: optional decoders and helpers for model-native
   formats.
-- `model`: global functions over the single bound model (`encode`, `decode`,
-  `name`, …).
-- `runtime`, `messaging`: host services exposed to inferlets.
+- `runtime`, `scheduling`, `messaging`: host services exposed to inferlets.
 
 ## Build
 

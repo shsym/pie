@@ -2,8 +2,9 @@
 
 This also includes helper classes and functions for working with `wasi:http`.
 
-This is only useful for `wasi:http@0.2.x`; `wasi:http@0.3.x` uses a different
-mechanism to model concurrency.
+As of WASI Preview 2, there is not yet a standard for first-class, composable
+asynchronous functions and streams.  We expect that little or none of this
+boilerplate will be needed once those features arrive in Preview 3.
 """
 
 import asyncio

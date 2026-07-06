@@ -12,7 +12,7 @@ Do not use it for numerical behavior.
 The dummy driver is always linked into `pie`.
 
 ```bash
-cargo build -p pie-worker --release
+cargo build -p pie-server --release
 ```
 
 Driver-only compile check:

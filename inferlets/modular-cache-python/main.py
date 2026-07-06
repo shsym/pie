@@ -14,7 +14,7 @@ Behavior:
   * save_cache=false              -> never save new snapshots
 """
 
-from inferlet import Context, Sampler
+from inferlet import Context, Model, Sampler, runtime
 
 # Bump when the snapshot layout / key meaning changes.
 CACHE_SCHEMA = "modular-cache-v1"
@@ -124,7 +124,7 @@ def topo_sort(modules):
     return ordered
 
 
-def open_longest_prefix(modules):
+def open_longest_prefix(model, modules):
     """Longest saved prefix as (ctx, prefix_len), or (None, 0).
 
     open() forks the snapshot (it stays immutable), so the context it returns is
@@ -134,7 +134,7 @@ def open_longest_prefix(modules):
     for length in range(len(modules), 0, -1):
         name = prefix_key(modules[:length])
         try:
-            ctx = Context.open(name)
+            ctx = Context.open(model, name)
         except Exception:
             ctx = None
         if ctx is not None:
@@ -143,6 +143,8 @@ def open_longest_prefix(modules):
 
 
 async def main(input: dict) -> str:
+    model = Model.load(runtime.models()[0])
+
     prompt = input.get(
         "prompt",
         "Explain modular KV caching for LLM serving in simple terms.",
@@ -161,17 +163,17 @@ async def main(input: dict) -> str:
 
     resume_index = 0
     if use_cache:
-        cached, resume_index = open_longest_prefix(modules)
+        cached, resume_index = open_longest_prefix(model, modules)
         if cached is not None:
             print(f"cache_hit_modules={resume_index}")
             ctx = cached
         else:
             print("cache_miss")
-            ctx = Context()
+            ctx = Context(model)
             resume_index = 0
     else:
         print("cache_miss (use_cache=false)")
-        ctx = Context()
+        ctx = Context(model)
 
     for i in range(resume_index, len(modules)):
         m = modules[i]

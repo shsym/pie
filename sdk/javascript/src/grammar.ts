@@ -18,7 +18,7 @@
 // * `ebnf(source)`          — custom EBNF grammar
 //
 // User code can implement the `Schema` interface on any class with a
-// `buildConstraint()` method — duck-typed, no inheritance required.
+// `buildConstraint(model)` method — duck-typed, no inheritance required.
 //
 // For custom logic that isn't a grammar (banned tokens, learned
 // constraints, etc.), implement the `Constraint` interface and pass it
@@ -29,6 +29,7 @@ import {
   Matcher as _Matcher,
 } from 'pie:core/inference';
 import type { Brle } from 'pie:core/inference';
+import type { Tokenizer, Model } from './model.js';
 
 // =============================================================================
 // Grammar / Matcher (raw resource wrappers)
@@ -67,16 +68,31 @@ export class Grammar {
 export class Matcher {
   /** @internal */ _handle: _Matcher;
 
-  /** Build from a compiled `Grammar`. */
-  constructor(grammar: Grammar) {
-    this._handle = new _Matcher(grammar._handle);
+  /**
+   * Public form: build from a `Grammar` and `Tokenizer`.
+   * @internal Two-arg internal form: adopt an existing host handle
+   * (used by `tools.nativeMatcher`).
+   */
+  constructor(grammar: Grammar, tokenizer: Tokenizer);
+  /** @internal */
+  constructor(handle: _Matcher);
+  constructor(
+    grammarOrHandle: Grammar | _Matcher,
+    tokenizer?: Tokenizer,
+  ) {
+    if (tokenizer === undefined) {
+      this._handle = grammarOrHandle as _Matcher;
+    } else {
+      this._handle = new _Matcher(
+        (grammarOrHandle as Grammar)._handle,
+        tokenizer._handle,
+      );
+    }
   }
 
   /** @internal Wrap a pre-existing host matcher (used by `tools.nativeMatcher`). */
   static _fromHandle(handle: _Matcher): Matcher {
-    const m = Object.create(Matcher.prototype) as Matcher;
-    m._handle = handle;
-    return m;
+    return new Matcher(handle);
   }
 
   acceptTokens(tokenIds: Uint32Array): void {
@@ -122,28 +138,28 @@ export class GrammarConstraint implements Constraint {
   }
 
   /** Build from a pre-compiled grammar (compile once, reuse). */
-  static fromGrammar(grammar: Grammar): GrammarConstraint {
-    return new GrammarConstraint(new Matcher(grammar));
+  static fromGrammar(grammar: Grammar, model: Model): GrammarConstraint {
+    return new GrammarConstraint(new Matcher(grammar, model.tokenizer()));
   }
 
   /** Build from a JSON Schema string. */
-  static fromJsonSchema(schema: string): GrammarConstraint {
-    return GrammarConstraint.fromGrammar(Grammar.fromJsonSchema(schema));
+  static fromJsonSchema(schema: string, model: Model): GrammarConstraint {
+    return GrammarConstraint.fromGrammar(Grammar.fromJsonSchema(schema), model);
   }
 
   /** Build a constraint that accepts any valid JSON. */
-  static json(): GrammarConstraint {
-    return GrammarConstraint.fromGrammar(Grammar.json());
+  static json(model: Model): GrammarConstraint {
+    return GrammarConstraint.fromGrammar(Grammar.json(), model);
   }
 
   /** Build from a regular expression pattern. */
-  static fromRegex(pattern: string): GrammarConstraint {
-    return GrammarConstraint.fromGrammar(Grammar.fromRegex(pattern));
+  static fromRegex(pattern: string, model: Model): GrammarConstraint {
+    return GrammarConstraint.fromGrammar(Grammar.fromRegex(pattern), model);
   }
 
   /** Build from an EBNF grammar string. */
-  static fromEbnf(ebnf: string): GrammarConstraint {
-    return GrammarConstraint.fromGrammar(Grammar.fromEbnf(ebnf));
+  static fromEbnf(ebnf: string, model: Model): GrammarConstraint {
+    return GrammarConstraint.fromGrammar(Grammar.fromEbnf(ebnf), model);
   }
 
   step(accepted: Uint32Array): Brle {
@@ -173,50 +189,50 @@ export class StaticMaskConstraint implements Constraint {
  *
  *      class MyLark {
  *        constructor(public readonly source: string) {}
- *        buildConstraint(): GrammarConstraint {
+ *        buildConstraint(model: Model): GrammarConstraint {
  *          const g = compileLarkToPieGrammar(this.source);
- *          return GrammarConstraint.fromGrammar(g);
+ *          return GrammarConstraint.fromGrammar(g, model);
  *        }
  *      }
  *
  *      ctx.generate(Sampler.argmax(), { constrain: new MyLark(grammar) });
  */
 export interface Schema {
-  buildConstraint(): GrammarConstraint;
+  buildConstraint(model: Model): GrammarConstraint;
 }
 
 /** JSON conforming to a JSON Schema string. */
 export function jsonSchema(schema: string): Schema {
   return {
-    buildConstraint: () => GrammarConstraint.fromJsonSchema(schema),
+    buildConstraint: (model) => GrammarConstraint.fromJsonSchema(schema, model),
   };
 }
 
 /** Any valid JSON value. */
 export function anyJson(): Schema {
   return {
-    buildConstraint: () => GrammarConstraint.json(),
+    buildConstraint: (model) => GrammarConstraint.json(model),
   };
 }
 
 /** Strings matching a regular expression pattern. */
 export function regex(pattern: string): Schema {
   return {
-    buildConstraint: () => GrammarConstraint.fromRegex(pattern),
+    buildConstraint: (model) => GrammarConstraint.fromRegex(pattern, model),
   };
 }
 
 /** A custom EBNF grammar. */
 export function ebnf(source: string): Schema {
   return {
-    buildConstraint: () => GrammarConstraint.fromEbnf(source),
+    buildConstraint: (model) => GrammarConstraint.fromEbnf(source, model),
   };
 }
 
 /** Wrap a pre-compiled `Grammar` as a `Schema` (compile once, reuse). */
 export function grammar(g: Grammar): Schema {
   return {
-    buildConstraint: () => GrammarConstraint.fromGrammar(g),
+    buildConstraint: (model) => GrammarConstraint.fromGrammar(g, model),
   };
 }
 

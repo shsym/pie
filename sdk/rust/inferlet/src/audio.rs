@@ -6,11 +6,12 @@
 //! front-end (see `runtime::multimodal::audio`).
 //!
 //! Audio **output** is model-agnostic in the same spirit: the inferlet expresses
-//! intent via [`speak`] — the text to say, a [`Voice`], and an optional
+//! intent via [`Model::speak`] — the text to say, a [`Voice`], and an optional
 //! target duration — and the host applies the bound model's own prompt framing
 //! (CSM: `"[speaker]text"` + BOS/EOS) and returns a self-describing [`Speech`]
 //! clip. No CSM constant or special-token id lives in the inferlet.
 
+use crate::model::Model;
 use crate::Result;
 use std::time::Duration;
 
@@ -53,16 +54,17 @@ impl Speech {
     }
 }
 
-/// Builder for a speech-synthesis request. Created via [`speak`]; finish
+/// Builder for a speech-synthesis request. Created via [`Model::speak`]; finish
 /// with [`generate`](Self::generate).
 #[must_use = "a SpeechBuilder does nothing until `.generate().await` is called"]
-pub struct SpeechBuilder {
+pub struct SpeechBuilder<'a> {
+    model: &'a Model,
     text: String,
     voice: Voice,
     max_duration: Option<Duration>,
 }
 
-impl SpeechBuilder {
+impl<'a> SpeechBuilder<'a> {
     /// Set the voice. Defaults to `Voice::Speaker(0)`.
     pub fn voice(mut self, voice: Voice) -> Self {
         self.voice = voice;
@@ -93,28 +95,32 @@ impl SpeechBuilder {
                 .max_duration
                 .map(|d| d.as_millis().min(u32::MAX as u128) as u32),
         };
-        let inner = crate::pie::core::audio_out::Speech::generate(&req)?;
+        let inner = crate::pie::core::audio_out::Speech::generate(self.model, &req)?;
         Ok(Speech { inner })
     }
 }
 
-/// Begin a model-agnostic speech-synthesis request. The inferlet supplies
-/// only intent; the host owns all model-specific framing.
-///
-/// ```ignore
-/// use std::time::Duration;
-/// let speech = inferlet::audio::speak("Hello, this is a test.")
-///     .speaker(0)
-///     .max_duration(Duration::from_secs(20))
-///     .generate()
-///     .await?;
-/// let wav = speech.to_wav(); // uses speech.sample_rate(), not a constant
-/// ```
-pub fn speak(text: impl Into<String>) -> SpeechBuilder {
-    SpeechBuilder {
-        text: text.into(),
-        voice: Voice::Speaker(0),
-        max_duration: None,
+impl Model {
+    /// Begin a model-agnostic speech-synthesis request. The inferlet supplies
+    /// only intent; the host owns all model-specific framing.
+    ///
+    /// ```ignore
+    /// use std::time::Duration;
+    /// let speech = model
+    ///     .speak("Hello, this is a test.")
+    ///     .speaker(0)
+    ///     .max_duration(Duration::from_secs(20))
+    ///     .generate()
+    ///     .await?;
+    /// let wav = speech.to_wav(); // uses speech.sample_rate(), not a constant
+    /// ```
+    pub fn speak(&self, text: impl Into<String>) -> SpeechBuilder<'_> {
+        SpeechBuilder {
+            model: self,
+            text: text.into(),
+            voice: Voice::Speaker(0),
+            max_duration: None,
+        }
     }
 }
 

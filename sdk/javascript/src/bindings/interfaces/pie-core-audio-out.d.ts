@@ -1,5 +1,6 @@
 /** @module Interface pie:core/audio-out **/
 export type Error = import('./pie-core-types.js').Error;
+export type Model = import('./pie-core-model.js').Model;
 /**
  * Which voice to speak in. A neutral selector; the host maps it onto the
  * bound model's own conditioning (CSM bakes an integer speaker id into its
@@ -44,10 +45,10 @@ export class Speech {
    */
   private constructor();
   /**
-  * Synthesize `req` on the bound model. Errors if the model has no
-  * audio-output front-end (i.e. is not a CSM checkpoint).
+  * Synthesize `req` on `model`. Errors if the model has no audio-output
+  * front-end (i.e. is not a CSM checkpoint).
   */
-  static generate(req: SpeechRequest): Speech;
+  static generate(model: Model, req: SpeechRequest): Speech;
   /**
   * Output sample rate in Hz (CSM: 24000).
   */

@@ -1,6 +1,8 @@
 // Messaging functions — wraps pie:core/messaging WIT interface.
 
 import * as _msg from 'pie:core/messaging';
+import type { Subscription as _Subscription } from 'pie:core/messaging';
+import { awaitFuture } from './_async.js';
 
 /** Pushes a message onto a topic queue. */
 export function push(topic: string, message: string): void {
@@ -8,8 +10,8 @@ export function push(topic: string, message: string): void {
 }
 
 /** Pulls the next message from a topic queue. */
-export function pull(topic: string): Promise<string> {
-  return _msg.pull(topic);
+export async function pull(topic: string): Promise<string> {
+  return awaitFuture(_msg.pull(topic), 'pull() returned undefined');
 }
 
 /** Broadcasts a message to all subscribers of a topic. */
@@ -25,29 +27,30 @@ export function subscribe(topic: string): Subscription {
 /**
  * A subscription to a broadcast topic.
  *
- * Async iterable — use `for await...of` to consume messages. Implements
- * `Disposable` for use with `using`. Cancelling the subscription (via
- * `unsubscribe()` or scope exit) drops the underlying stream reader,
- * which unsubscribes from the topic host-side.
+ * Async iterable — use `for await...of` to consume messages.
+ * Implements `Disposable` for use with `using`.
  */
 export class Subscription implements AsyncIterable<string>, Disposable {
-  readonly #reader: ReadableStreamDefaultReader<string>;
+  /** @internal */
+  readonly _handle: _Subscription;
 
   /** @internal */
-  constructor(stream: ReadableStream<string>) {
-    this.#reader = stream.getReader();
+  constructor(handle: _Subscription) {
+    this._handle = handle;
   }
 
-  /** Waits until a message arrives, then returns it. Resolves to
-   *  `undefined` once the stream closes. */
+  /** Waits until a message arrives, then returns it. */
   async next(): Promise<string | undefined> {
-    const { value, done } = await this.#reader.read();
-    return done ? undefined : value;
+    const pollable = this._handle.pollable();
+    while (!pollable.ready()) {
+      pollable.block();
+    }
+    return this._handle.get();
   }
 
-  /** Cancels the subscription, dropping the stream reader (unsubscribe). */
+  /** Cancels the subscription. */
   unsubscribe(): void {
-    void this.#reader.cancel();
+    this._handle.unsubscribe();
   }
 
   /** Disposable protocol — calls `unsubscribe()`. */
@@ -55,7 +58,7 @@ export class Subscription implements AsyncIterable<string>, Disposable {
     this.unsubscribe();
   }
 
-  /** Async iterate over incoming messages (until the stream closes). */
+  /** Async iterate over incoming messages (infinite — break manually). */
   async *[Symbol.asyncIterator](): AsyncIterableIterator<string> {
     while (true) {
       const msg = await this.next();
