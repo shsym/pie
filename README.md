@@ -55,13 +55,31 @@ pie run text-completion -- --prompt "The capital of France is"
 
 | Directory | Description |
 |---|---|
+| `worker/` | The `pie` CLI and standalone engine — the invariant entry point |
 | `runtime/` | Inferlet runtime |
-| `server/` | CLI |
-| `inferlets/` | Example inferlets |
+| `controller/` | Cluster-coordination control plane (pairing · roles · health) |
+| `driver/transport/` | Worker↔worker P2P KV-tensor data plane |
+| `driver/` | Backend drivers (CUDA · Metal) + runtime↔driver IPC |
+| `interface/` | Boundary contract crates (`ids` · `driver` · `controller` · `worker` · `client` · `inferlet`) — the dependency floor |
+| `tests/inferlets/` | Curated inferlet E2E fixtures |
 | `sdk/` | Inferlet SDKs (Rust · Python · JavaScript) |
 | `client/` | Client libraries (Rust · Python · JavaScript) |
-| `driver/` | Pie drivers (portable / CUDA / vLLM / SGLang) |
 | `website/` | [pie-project.org](https://pie-project.org) docs site |
+
+## Building inferlets
+
+Inferlets compile to the `wasm32-wasip2` component target. Install the target
+once after cloning:
+
+```bash
+rustup target add wasm32-wasip2
+```
+
+Build an inferlet with:
+
+```bash
+cargo build --target wasm32-wasip2
+```
 
 ## Getting Help
 

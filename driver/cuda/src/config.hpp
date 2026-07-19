@@ -9,7 +9,7 @@
 
 #include <toml++/toml.hpp>
 
-#include "kv_cache_format.hpp"
+#include "store/kv_cache_format.hpp"
 
 namespace pie_cuda_driver {
 
@@ -17,34 +17,7 @@ struct ModelConfig {
     std::string snapshot_dir;     // local path to weights + config.json
     std::string device = "cuda:0";
     std::string dtype = "bfloat16";
-    // Runtime quantization mode applied during load-plan materialization.
-    // Empty (default) = no quantization. Recognised values:
-    //   * "fp8"  — per-channel symmetric FP8_E4M3 for projection weights.
-    //   * "int8" — per-channel symmetric INT8 for projection weights.
-    //   * "fp4" / "mxfp4" — MXFP4 (E2M1 weight + E8M0 block scale) for the
-    //                      target model's expert weights. Used by GLM-5.1 to
-    //                      transcode the checkpoint's FP8 routed-expert
-    //                      weights to MXFP4 at materialize time, halving
-    //                      the per-rank expert footprint.
-    // Norms, biases, embeddings, and lm_head stay in their native dtype.
-    std::string runtime_quant;
-    // GPT-OSS MXFP4 MoE load/runtime policy. "auto" selects native packed
-    // MXFP4 expert GEMM on supported Blackwell-class GPUs/builds and uses the
-    // routed-dequant fallback on legacy GPUs. Recognised values:
-    //   * "routed_dequant" / "packed" — keep MXFP4 resident and dequantize
-    //     only routed experts into bounded BF16 runtime scratch.
-    //   * "bf16" / "dequant" — eagerly dequantize experts to BF16 at load.
-    //   * "native" — require a true MXFP4 MoE GEMM backend.
-    std::string mxfp4_moe = "auto";
-    // Optional Gemma-4 native MTP assistant checkpoint. When set on a
-    // Gemma-4 target, output_spec_flags requests draft from this assistant.
-    std::string mtp_assistant_snapshot_dir;
     int mtp_num_drafts = 3;
-    // Deployment opt-in for system speculation (MTP). Emitted to the runtime,
-    // which OWNS the decision to drive drafts (the driver stays pure mechanism).
-    // Default false: speculation is a latency-regime feature, off unless the
-    // operator enables it (matches vLLM/SGLang's explicit-enable convention).
-    bool enable_system_speculation = false;
 };
 
 struct BatchingConfig {
@@ -55,13 +28,18 @@ struct BatchingConfig {
     std::uint32_t swap_pool_size = 0;
     // KV cache storage format. "auto" preserves the historical bf16 cache.
     std::string kv_cache_dtype = "auto";
+    // Optional HARD cap on the runtime KV page count. 0 = derive from
+    // gpu_mem_utilization (default). >0 clamps `min(derived, total_pages)` so a
+    // tiny deterministic pool can be forced (contention/preempt tests + CI),
+    // independent of the forward-layout budget floor. Mirrors metal's total_pages.
+    std::int64_t total_pages = 0;
 };
 
 // Tensor-parallel group geometry. Default {1, 0, ""} = single-GPU; nothing
 // in the forward path runs collectives. Embedded TP launches set tp_size,
 // tp_rank, and nccl_unique_id_hex per process. `nccl_unique_id_hex`
 // also acts as the in-process rendezvous key for the startup barrier
-// and per-fire CPU gate (see `entry.cpp::tp_startup_cpu_barrier`).
+// and per-fire CPU gate (see `context.cpp::tp_startup_cpu_barrier`).
 struct DistributedConfig {
     int tp_size = 1;
     int tp_rank = 0;
@@ -111,15 +89,8 @@ inline Config load_config(const std::filesystem::path& path) {
         c.model.snapshot_dir  = (*m)["snapshot_dir"].value_or(std::string{});
         c.model.device        = (*m)["device"].value_or(c.model.device);
         c.model.dtype         = (*m)["dtype"].value_or(c.model.dtype);
-        c.model.runtime_quant = (*m)["runtime_quant"].value_or(std::string{});
-        c.model.mxfp4_moe     = (*m)["mxfp4_moe"].value_or(c.model.mxfp4_moe);
-        c.model.mtp_assistant_snapshot_dir =
-            (*m)["mtp_assistant_snapshot_dir"].value_or(std::string{});
         c.model.mtp_num_drafts = static_cast<int>(
             (*m)["mtp_num_drafts"].value_or<int64_t>(c.model.mtp_num_drafts));
-        c.model.enable_system_speculation =
-            (*m)["enable_system_speculation"].value_or(
-                c.model.enable_system_speculation);
     }
     if (auto b = tbl["batching"].as_table()) {
         constexpr std::string_view allowed[] = {
@@ -128,6 +99,7 @@ inline Config load_config(const std::filesystem::path& path) {
             "kv_page_size",
             "swap_pool_size",
             "kv_cache_dtype",
+            "total_pages",
         };
         for (const auto& [key, _] : *b) {
             const auto name = key.str();
@@ -167,6 +139,14 @@ inline Config load_config(const std::filesystem::path& path) {
         c.batching.swap_pool_size =
             static_cast<std::uint32_t>(swap_pool_size);
         c.batching.kv_cache_dtype   = (*b)["kv_cache_dtype"].value_or(c.batching.kv_cache_dtype);
+        const auto total_pages =
+            (*b)["total_pages"].value_or<int64_t>(
+                static_cast<std::int64_t>(c.batching.total_pages));
+        if (total_pages < 0) {
+            throw std::runtime_error(
+                "config: [batching].total_pages must be >= 0 (0 = derive from util)");
+        }
+        c.batching.total_pages = total_pages;
     }
     if (auto d = tbl["distributed"].as_table()) {
         c.distributed.tp_size = static_cast<int>(

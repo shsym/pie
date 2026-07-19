@@ -8,56 +8,20 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 
-def run_wasi(coro):
-    """Run SDK coroutines that wait through the mocked WASI waker list."""
-    import asyncio
-
-    async def main():
-        task = asyncio.create_task(coro)
-        wake = asyncio.create_task(pump_wakers(task))
-        try:
-            return await task
-        finally:
-            wake.cancel()
-            try:
-                await wake
-            except asyncio.CancelledError:
-                pass
-
-    async def pump_wakers(task):
-        while not task.done():
-            await asyncio.sleep(0)
-            loop = asyncio.get_running_loop()
-            for _, waker in list(loop.wakers):
-                if not waker.done():
-                    waker.set_result(None)
-
-    loop = asyncio.new_event_loop()
-    loop.wakers = []
-    try:
-        asyncio.set_event_loop(loop)
-        return loop.run_until_complete(main())
-    finally:
-        asyncio.set_event_loop(None)
-        loop.close()
-
-
 # =============================================================================
 # Model
 # =============================================================================
 
 
 class TestModel:
-    def test_load(self):
-        from inferlet import Model
-        m = Model.load("test-model")
-        assert m._handle is not None
+    def test_name(self):
+        from inferlet import model
+        assert model.name() == "mock-model"
 
-    def test_tokenizer_encode_decode(self):
-        from inferlet import Model
-        tok = Model.load("test-model").tokenizer()
-        assert tok.encode("Hi") == [72, 105]
-        assert tok.decode([72, 105]) == "Hi"
+    def test_encode_decode(self):
+        from inferlet import model
+        assert model.encode("Hi") == [72, 105]
+        assert model.decode([72, 105]) == "Hi"
 
 
 # =============================================================================
@@ -105,14 +69,16 @@ class TestSampler:
 
 class TestProbes:
     def test_logits_dataclass(self):
-        from inferlet import Logits
         from wit_world.imports.inference import Sampler_RawLogits
+
+        from inferlet import Logits
         p = Logits()
         assert isinstance(p._to_wit(), Sampler_RawLogits)
 
     def test_distribution_dataclass(self):
-        from inferlet import Distribution
         from wit_world.imports.inference import Sampler_Dist
+
+        from inferlet import Distribution
         p = Distribution(temperature=1.0, k=8)
         assert p.temperature == 1.0
         assert p.k == 8
@@ -121,8 +87,9 @@ class TestProbes:
         assert wit.value == (1.0, 8)
 
     def test_logprob_dataclass(self):
-        from inferlet import Logprob
         from wit_world.imports.inference import Sampler_Logprob
+
+        from inferlet import Logprob
         p = Logprob(token=42)
         assert p.token == 42
         wit = p._to_wit()
@@ -130,8 +97,9 @@ class TestProbes:
         assert wit.value == 42
 
     def test_logprobs_dataclass(self):
-        from inferlet import Logprobs
         from wit_world.imports.inference import Sampler_Logprobs
+
+        from inferlet import Logprobs
         p = Logprobs(tokens=(7, 11, 13))
         wit = p._to_wit()
         assert isinstance(wit, Sampler_Logprobs)
@@ -150,8 +118,9 @@ class TestProbes:
         assert Logprobs().tokens == ()
 
     def test_entropy_dataclass(self):
-        from inferlet import Entropy
         from wit_world.imports.inference import Sampler_Entropy
+
+        from inferlet import Entropy
         p = Entropy()
         assert isinstance(p._to_wit(), Sampler_Entropy)
 
@@ -163,124 +132,43 @@ class TestProbes:
 
 class TestContext:
     def test_create(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
-        assert ctx._handle is not None
+        from inferlet import Context
+        ctx = Context()
+        assert ctx._kv is not None
 
     def test_chat_fillers_chain(self):
         """system / user / cue return self for chaining."""
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         result = ctx.system("Hello").user("World").cue()
         assert result is ctx
 
     def test_append_raw_tokens(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         ctx.append([1, 2, 3])
         assert ctx.buffer() == [1, 2, 3]
 
     def test_fork(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         ctx.append([1, 2, 3])
         forked = ctx.fork()
-        assert forked._handle is not None
+        assert forked._kv is not None
 
     def test_release_via_context_manager(self):
-        from inferlet import Context, Model
-        with Context(Model.load("test-model")) as ctx:
+        from inferlet import Context
+        with Context() as ctx:
             ctx.append([42])
             assert ctx.buffer() == [42]
 
     def test_no_equip_tools_method(self):
         """The old equip_tools / answer_tool methods are gone — tools live
         in the `inferlet.tools` module now."""
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         assert not hasattr(ctx, "equip_tools")
         assert not hasattr(ctx, "answer_tool")
-
-    def test_idle_context_manager(self):
-        """`with ctx.idle():` drops bid to 0, restores on exit."""
-        from inferlet import Context, Model
-
-        class _RecordingHandle:
-            """Wrap the FakeContext handle, recording bid() calls."""
-            def __init__(self, inner):
-                self._inner = inner
-                self.bids: list[float] = []
-
-            def bid(self, value: float) -> None:
-                self.bids.append(value)
-
-            def __getattr__(self, name):
-                return getattr(self._inner, name)
-
-        ctx = Context(Model.load("test-model"))
-        ctx._handle = _RecordingHandle(ctx._handle)
-        with ctx.idle():
-            assert ctx._handle.bids[-1] == 0.0
-        # On exit a non-zero bid is restored (saved bid >= 0).
-        assert len(ctx._handle.bids) == 2
-        assert ctx._handle.bids[-1] >= 0.0
-
-    def test_append_image_commits_media_and_leaves_suffix_buffered(self):
-        from inferlet import Context, Image, Model
-
-        model = Model.load("test-model")
-        ctx = Context(model)
-        image = Image.from_bytes(model, b"abcd")
-        run_wasi(ctx.append_image(image))
-
-        # Prefix token was flushed before the image; image soft tokens advance seq_len.
-        assert ctx.seq_len == 1 + image.token_count()
-        assert ctx.buffer() == image.suffix_tokens()
-
-    def test_append_audio_commits_media_and_leaves_suffix_buffered(self):
-        from inferlet import Audio, Context, Model
-
-        model = Model.load("test-model")
-        ctx = Context(model)
-        clip = Audio.from_bytes(model, b"abcdef")
-        run_wasi(ctx.append_audio(clip))
-
-        assert ctx.seq_len == 1 + clip.token_count()
-        assert ctx.buffer() == clip.suffix_tokens()
-
-    def test_append_video_adds_timestamped_frames(self):
-        from inferlet import Context, Model, Video
-
-        model = Model.load("test-model")
-        ctx = Context(model)
-        video = Video.from_bytes(model, b"gif", max_frames=2)
-        run_wasi(ctx.append_video(video))
-
-        # Each frame has no delimiters in the fake binding. The timestamp
-        # marker is flushed before the frame and therefore contributes to seq_len.
-        assert video.frame_count() == 2
-        assert ctx.seq_len > 2 * video.frame(0).token_count()
-
-
-class TestMultimodalAudioOutput:
-    def test_model_speak_generates_self_describing_speech(self):
-        import asyncio
-        from inferlet import Model
-
-        speech = asyncio.run(
-            Model.load("test-model")
-            .speak("hello")
-            .speaker(1)
-            .max_duration_seconds(1.0)
-            .generate()
-        )
-
-        assert speech.sample_rate() == 24_000
-        assert speech.channels() == 1
-        assert speech.duration_ms() == 80
-        wav = speech.to_wav()
-        assert wav[:4] == b"RIFF"
-        assert wav[8:12] == b"WAVE"
 
 
 # =============================================================================
@@ -290,22 +178,22 @@ class TestMultimodalAudioOutput:
 
 class TestForward:
     def test_create_via_context(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         fwd = ctx.forward()
         assert fwd._ctx is ctx
         assert fwd.start_position() == ctx.seq_len
 
     def test_input_appends(self):
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context
+        ctx = Context()
         fwd = ctx.forward()
         fwd.input([1, 2, 3])
         assert fwd._auto_inputs == [1, 2, 3]
 
     def test_sample_returns_handle(self):
-        from inferlet import Context, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Sampler
+        ctx = Context()
         fwd = ctx.forward()
         fwd.input([1, 2, 3])
         h = fwd.sample([2], Sampler.argmax())
@@ -313,8 +201,8 @@ class TestForward:
         assert h.arity == 1
 
     def test_probe_returns_typed_handle(self):
-        from inferlet import Context, Distribution, Logits, Model
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Distribution, Logits
+        ctx = Context()
         fwd = ctx.forward()
         h_dist = fwd.probe(0, Distribution(temperature=1.0, k=8))
         h_logits = fwd.probe(0, Logits())
@@ -329,9 +217,11 @@ class TestForward:
         certainly a programming error — raise rather than silently
         returning an empty Output."""
         import asyncio
+
         import pytest
-        from inferlet import Context, Model
-        ctx = Context(Model.load("test-model"))
+
+        from inferlet import Context
+        ctx = Context()
         fwd = ctx.forward()
         with pytest.raises(ValueError, match="no inputs and no slots"):
             asyncio.run(fwd.execute())
@@ -339,8 +229,8 @@ class TestForward:
     def test_multi_arity_sample_advances_slot_correctly(self):
         """A multi-arity sampler attaches len(indices) Token slots, so the
         next slot index must advance by that count — not by 1."""
-        from inferlet import Context, Distribution, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Distribution, Sampler
+        ctx = Context()
         fwd = ctx.forward()
         h_multi = fwd.sample([0, 1, 2], Sampler.argmax())
         h_probe = fwd.probe(0, Distribution(temperature=1.0, k=0))
@@ -351,119 +241,81 @@ class TestForward:
 
 
 # =============================================================================
+# Async forward path — P3 component-model-async `execute()`
+# =============================================================================
+
+
+class TestForwardExecuteAsync:
+    """`forward-pass.execute` is component-model-async (`async def` returning
+    `output` directly — no pollable future-output). These exercise the real
+    await path that the construction tests above don't: the gap that let a
+    stale ``await_future(fwd.execute())`` wrapper slip past the suite."""
+
+    def test_forward_execute_returns_output(self):
+        import asyncio
+
+        from inferlet import Context, Sampler
+        ctx = Context()
+        fwd = ctx.forward()
+        fwd.input([1, 2, 3])
+        h = fwd.sample([2], Sampler.argmax())
+        out = asyncio.run(fwd.execute())
+        # Default mock output is a single EOS token (id 2) in slot 0.
+        assert out.token(h) == 2
+
+    def test_context_flush_advances_seq_len(self):
+        import asyncio
+
+        from inferlet import Context
+        ctx = Context()
+        ctx.append([5, 6, 7, 8])
+        asyncio.run(ctx.flush())
+        assert ctx.seq_len == 4
+        assert ctx.buffer() == []
+
+
+class TestAsyncIO:
+    """`session.receive*` are P3 async imports."""
+
+    def test_session_receive(self):
+        import asyncio
+
+        from inferlet import session
+        assert asyncio.run(session.receive()) == "received"
+
+
+# =============================================================================
 # Generator — kwargs-driven
 # =============================================================================
 
 
 class TestGenerator:
-    class _RecordingHandle:
-        def __init__(self, inner):
-            self._inner = inner
-            self.bids: list[float] = []
-
-        def bid(self, value: float) -> None:
-            self.bids.append(value)
-            self._inner.bid(value)
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-    @staticmethod
-    def _expected_bid(mu: float, cv2: float) -> float:
-        balance = 1000.0
-        pages = 1.0
-        page_size = 64.0
-        return (balance / mu) / (pages + mu * (1.0 + cv2) / (2.0 * page_size))
-
     def test_generate_returns_generator(self):
-        from inferlet import Context, Generator, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Generator, Sampler
+        ctx = Context()
         ctx.user("Hi")
         g = ctx.generate(Sampler.argmax(), max_tokens=64, auto_flush=False)
         assert isinstance(g, Generator)
 
     def test_chain_method(self):
-        from inferlet import Context, Generator, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import Context, Generator, Sampler
+        ctx = Context()
         g = (
             ctx.generate(Sampler.argmax(), auto_flush=False)
             .max_tokens(128)
             .horizon(256)
-            .rebid_each_step(False)
         )
         assert isinstance(g, Generator)
         assert g._max_tokens == 128
         assert g._horizon == 256
-        assert g._rebid_each_step is False
-
-    def test_generator_rebids_each_step_by_default(self):
-        import asyncio
-        from inferlet import Context, Model, Sampler
-
-        ctx = Context(Model.load("test-model"))
-        ctx._handle = self._RecordingHandle(ctx._handle)
-        g = ctx.generate(Sampler.argmax(), auto_flush=False)
-
-        assert len(ctx._handle.bids) == 1
-        asyncio.run(g.__anext__())
-        assert len(ctx._handle.bids) == 2
-
-    def test_generator_can_disable_step_rebids(self):
-        import asyncio
-        import pytest
-        from inferlet import Context, Model, Sampler
-
-        ctx = Context(Model.load("test-model"))
-        ctx._handle = self._RecordingHandle(ctx._handle)
-        g = ctx.generate(Sampler.argmax(), auto_flush=False, rebid_each_step=False)
-
-        assert len(ctx._handle.bids) == 1
-        assert ctx._handle.bids[-1] == pytest.approx(self._expected_bid(4096.0, 1.0))
-        asyncio.run(g.__anext__())
-        assert len(ctx._handle.bids) == 1
-
-    def test_disabled_step_rebid_primes_from_options(self):
-        import pytest
-        from inferlet import Context, Model, Sampler
-
-        ctx = Context(Model.load("test-model"))
-        ctx._handle = self._RecordingHandle(ctx._handle)
-        ctx.generate(
-            Sampler.argmax(),
-            max_tokens=16,
-            horizon=32,
-            rebid_each_step=False,
-            auto_flush=False,
-        )
-
-        assert len(ctx._handle.bids) == 1
-        assert ctx._handle.bids[-1] == pytest.approx(self._expected_bid(32.0, 0.0))
-
-    def test_disabling_step_rebid_reprimes_after_chain_methods(self):
-        import pytest
-        from inferlet import Context, Model, Sampler
-
-        mu = 16.0
-
-        ctx = Context(Model.load("test-model"))
-        ctx._handle = self._RecordingHandle(ctx._handle)
-        (
-            ctx.generate(Sampler.argmax(), auto_flush=False)
-            .max_tokens(int(mu))
-            .rebid_each_step(False)
-        )
-
-        assert len(ctx._handle.bids) == 2
-        assert ctx._handle.bids[-1] == pytest.approx(self._expected_bid(mu, 1.0))
 
     def test_constrain_with_schema(self):
         from inferlet import (
             Context,
             JsonSchema,
-            Model,
             Sampler,
         )
-        ctx = Context(Model.load("test-model"))
+        ctx = Context()
         g = ctx.generate(
             Sampler.argmax(),
             constrain=JsonSchema('{"type":"object"}'),
@@ -472,8 +324,8 @@ class TestGenerator:
         assert len(g._constraints) == 1
 
     def test_constrain_with_list_composes(self):
-        from inferlet import AnyJson, Context, Ebnf, Model, Sampler
-        ctx = Context(Model.load("test-model"))
+        from inferlet import AnyJson, Context, Ebnf, Sampler
+        ctx = Context()
         g = ctx.generate(
             Sampler.argmax(),
             constrain=[AnyJson(), Ebnf('root ::= "x"')],
@@ -482,9 +334,10 @@ class TestGenerator:
         assert len(g._constraints) == 2
 
     def test_speculator_and_system_are_mutually_exclusive(self):
-        from inferlet import Context, Model, Sampler
         import pytest
-        ctx = Context(Model.load("test-model"))
+
+        from inferlet import Context, Sampler
+        ctx = Context()
 
         class _Drafter:
             def draft(self): return [], []
@@ -529,17 +382,17 @@ class TestSchema:
         assert s.source == 'root ::= "x"'
 
     def test_user_schema_via_protocol(self):
-        """Any class with build_constraint(model) satisfies the Schema protocol."""
-        from inferlet import Model, Schema
+        """Any class with build_constraint() satisfies the Schema protocol."""
+        from inferlet import Schema
 
         class MyGrammar:
-            def build_constraint(self, model):
+            def build_constraint(self):
                 from inferlet import Grammar, GrammarConstraint
-                return GrammarConstraint.from_grammar(Grammar.json(), model)
+                return GrammarConstraint.from_grammar(Grammar.json())
 
         # Runtime-checkable Protocol — isinstance works.
         assert isinstance(MyGrammar(), Schema)
-        assert MyGrammar().build_constraint(Model.load("test-model")) is not None
+        assert MyGrammar().build_constraint() is not None
 
 
 # =============================================================================
@@ -549,8 +402,8 @@ class TestSchema:
 
 class TestDecoders:
     def test_chat_decoder_create(self):
-        from inferlet import Model, chat
-        d = chat.Decoder(Model.load("test-model"))
+        from inferlet import chat
+        d = chat.Decoder()
         assert d._inner is not None
 
     def test_chat_event_classes(self):
@@ -565,8 +418,8 @@ class TestDecoders:
         assert interrupt.token == 42
 
     def test_reasoning_decoder_create(self):
-        from inferlet import Model, reasoning
-        d = reasoning.Decoder(Model.load("test-model"))
+        from inferlet import reasoning
+        d = reasoning.Decoder()
         assert d._inner is not None
 
     def test_reasoning_event_classes(self):
@@ -585,18 +438,18 @@ class TestDecoders:
 
 class TestTools:
     def test_equip_prefix(self):
-        from inferlet import Model, tools
-        toks = tools.equip_prefix(Model.load("test-model"), ['{"name":"calc"}'])
+        from inferlet import tools
+        toks = tools.equip_prefix(['{"name":"calc"}'])
         assert isinstance(toks, list)
 
     def test_answer_prefix_dict(self):
-        from inferlet import Model, tools
-        toks = tools.answer_prefix(Model.load("test-model"), "calc", {"result": 42})
+        from inferlet import tools
+        toks = tools.answer_prefix("calc", {"result": 42})
         assert isinstance(toks, list)
 
     def test_decoder_create(self):
-        from inferlet import Model, tools
-        d = tools.Decoder(Model.load("test-model"))
+        from inferlet import tools
+        d = tools.Decoder()
         assert d._inner is not None
 
     def test_event_classes(self):
@@ -649,31 +502,20 @@ class TestGrammar:
         assert Grammar.from_ebnf('root ::= "x"')._handle is not None
 
     def test_matcher_create(self):
-        from inferlet import Grammar, Matcher, Model
-        m = Model.load("test-model")
-        matcher = Matcher(Grammar.json(), m.tokenizer())
+        from inferlet import Grammar, Matcher
+        matcher = Matcher(Grammar.json())
         assert not matcher.is_terminated
 
 
 # =============================================================================
-# Runtime / messaging / session — unchanged from before
+# Runtime / session — unchanged from before
 # =============================================================================
 
 
 class TestRuntime:
-    def test_models(self):
-        from inferlet import runtime
-        assert runtime.models() == ["mock-model"]
-
     def test_version(self):
         from inferlet import runtime
         assert runtime.version() == "0.1.0-mock"
-
-
-class TestMessaging:
-    def test_push(self):
-        from inferlet import messaging
-        messaging.push("topic", "msg")
 
 
 class TestSession:
@@ -689,22 +531,21 @@ class TestSession:
 
 class TestAdapter:
     def test_create(self):
-        from inferlet import Adapter, Model
-        a = Adapter.create(Model.load("test-model"), "my-adapter")
+        from inferlet import Adapter
+        a = Adapter.create("my-adapter")
         assert a._handle is not None
 
 
 class TestZo:
     def test_adapter_seed(self):
-        from inferlet import Adapter, Model, zo
-        m = Model.load("test-model")
-        # accept either a Forward (SDK) or a raw WIT ForwardPass
-        fwd = m._handle  # raw handle as fallback
-        zo.adapter_seed(fwd, 42)
+        from wit_world.imports.inference import ForwardPass
+
+        from inferlet import zo
+        zo.adapter_seed(ForwardPass(), 42)
 
     def test_initialize(self):
-        from inferlet import Adapter, Model, zo
-        a = Adapter.create(Model.load("test-model"), "my-adapter")
+        from inferlet import Adapter, zo
+        a = Adapter.create("my-adapter")
         zo.initialize(
             a,
             rank=8,

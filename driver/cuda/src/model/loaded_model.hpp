@@ -2,16 +2,17 @@
 
 // LoadedModel — owns the loaded model. Built once at startup; queried from main
 // to populate the READY capability JSON and (later milestones) handed to the
-// shmem executor for forward-pass execution.
+// direct executor for forward-pass execution.
 
 #include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 
-#include "config.hpp"
+#include <config.hpp>
 #include "loader/backend_target.hpp"
-#include "loader/hf_config.hpp"
-#include "loader/safetensors.hpp"
+#include "model/config.hpp"
+#include "loader/checkpoint_source.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
 
@@ -36,7 +37,11 @@ public:
     /// Pass `tp_comm` when `boot_cfg.distributed.tp_size > 1` to enable
     /// TP-aware runtime quantization (cross-rank absmax all-reduce for
     /// row-parallel weights). For single-GPU (tp_size=1) this can be null.
-    static LoadedModel load(const Config& boot_cfg, NcclComm* tp_comm = nullptr);
+    ///
+    static LoadedModel load(const Config& boot_cfg,
+                            NcclComm* tp_comm,
+                            std::span<const std::uint8_t> load_plan_bytes,
+                            std::uint64_t compiler_version);
 
     LoadedModel() = default;
     LoadedModel(const LoadedModel&) = delete;
@@ -67,7 +72,7 @@ public:
     std::optional<QuantMeta> quant_meta(const std::string& name) const;
 
 private:
-    // Owns runtime-layout tensors produced by the Rust storage-program loader.
+    // Owns runtime-layout tensors produced by LoadPlan execution.
     // Some names are non-owning views into packed backing tensors so older
     // forward paths can keep their unfused fallback pointers.
     Config boot_;
