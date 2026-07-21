@@ -2,17 +2,17 @@
 
 // LoadedModel — owns the loaded model. Built once at startup; queried from main
 // to populate the READY capability JSON and (later milestones) handed to the
-// direct executor for forward-pass execution.
+// shmem executor for forward-pass execution.
 
 #include <memory>
 #include <optional>
-#include <span>
 #include <utility>
 
-#include <config.hpp>
+#include "config.hpp"
+#include "expert_stream_cache.hpp"
 #include "loader/backend_target.hpp"
-#include "model/config.hpp"
-#include "loader/checkpoint_source.hpp"
+#include "loader/hf_config.hpp"
+#include "loader/safetensors.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
 
@@ -37,11 +37,7 @@ public:
     /// Pass `tp_comm` when `boot_cfg.distributed.tp_size > 1` to enable
     /// TP-aware runtime quantization (cross-rank absmax all-reduce for
     /// row-parallel weights). For single-GPU (tp_size=1) this can be null.
-    ///
-    static LoadedModel load(const Config& boot_cfg,
-                            NcclComm* tp_comm,
-                            std::span<const std::uint8_t> load_plan_bytes,
-                            std::uint64_t compiler_version);
+    static LoadedModel load(const Config& boot_cfg, NcclComm* tp_comm = nullptr);
 
     LoadedModel() = default;
     LoadedModel(const LoadedModel&) = delete;
@@ -71,14 +67,22 @@ public:
     // the weight is plain bf16/fp16/fp32 (the common case).
     std::optional<QuantMeta> quant_meta(const std::string& name) const;
 
+    // Per-expert file extents from the compiler's deferred stream plan when
+    // `[model].stream_routed_experts` is on (empty otherwise). Feeds the
+    // ExpertStreamCache constructed by the engine after load.
+    const StreamedExpertTable& streamed_expert_table() const noexcept {
+        return streamed_experts_;
+    }
+
 private:
-    // Owns runtime-layout tensors produced by LoadPlan execution.
+    // Owns runtime-layout tensors produced by the Rust storage-program loader.
     // Some names are non-owning views into packed backing tensors so older
     // forward paths can keep their unfused fallback pointers.
     Config boot_;
     HfConfig hf_;
     WeightStore weights_;
     Mxfp4MoeLowering mxfp4_moe_lowering_ = Mxfp4MoeLowering::Bf16Dequant;
+    StreamedExpertTable streamed_experts_;
 };
 
 namespace ops { struct RuntimeQuantScratchSpec; }

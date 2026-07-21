@@ -10,7 +10,8 @@
 //! independent of chat's (no implicit suppression).
 
 use crate::Result;
-use crate::pie::inferlet::reasoning::{Decoder as RawDecoder, Event as RawEvent};
+use crate::model::Model;
+use crate::pie::instruct::reasoning::{Decoder as RawDecoder, Event as RawEvent};
 
 /// One unit of reasoning-decoded output.
 ///
@@ -37,10 +38,10 @@ pub struct Decoder {
 }
 
 impl Decoder {
-    /// Construct a decoder for the bound model's reasoning template.
-    pub fn new() -> Self {
+    /// Construct a decoder for `model`'s reasoning template.
+    pub fn new(model: &Model) -> Self {
         Self {
-            inner: crate::pie::inferlet::reasoning::create_decoder(),
+            inner: crate::pie::instruct::reasoning::create_decoder(model),
         }
     }
 

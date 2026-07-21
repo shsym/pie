@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#include "kernels/mla_cache_view.hpp"
+#include "mla_cache.hpp"
 
 namespace pie_cuda_driver::kernels {
 
@@ -21,8 +21,7 @@ void launch_write_mla_to_pages_bf16(
     int page_size,
     int kv_lora_rank,
     int qk_rope_head_dim,
-    cudaStream_t stream,
-    const std::uint8_t* row_valid = nullptr);
+    cudaStream_t stream);
 
 void launch_write_mla_to_pages(
     MlaCacheLayerView layer,
@@ -34,7 +33,6 @@ void launch_write_mla_to_pages(
     const std::uint32_t* kv_last_page_lens,
     int total_tokens,
     int num_requests,
-    cudaStream_t stream,
-    const std::uint8_t* row_valid = nullptr);
+    cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::kernels

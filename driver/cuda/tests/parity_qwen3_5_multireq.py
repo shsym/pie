@@ -110,17 +110,17 @@ async def run_test(args) -> int:
     from pie.server import Server
     from pie.config import (
         Config, ModelConfig, DriverConfig, AuthConfig, RuntimeConfig,
-        ServerConfig, TelemetryConfig,
+        SchedulerConfig, ServerConfig, TelemetryConfig,
     )
 
     script_dir = Path(__file__).parent.resolve()
     repo_root = script_dir.parent.parent.parent
-    wasm_path = (repo_root / "inferlets" / "target"
-                 / "wasm32-wasip2" / "release" / "chat_completion.wasm")
-    manifest_path = repo_root / "inferlets" / "chat-completion" / "Pie.toml"
+    wasm_path = (repo_root / "inferlets" / "text-completion" / "target"
+                 / "wasm32-wasip2" / "release" / "text_completion.wasm")
+    manifest_path = repo_root / "inferlets" / "text-completion" / "Pie.toml"
     if not wasm_path.exists():
-        print(f"chat_completion.wasm not built at {wasm_path}")
-        print("Run `cargo build --target wasm32-wasip2 --release -p chat-completion` in inferlets first.")
+        print(f"text_completion.wasm not built at {wasm_path}")
+        print("Run `cargo build --target wasm32-wasip2 --release` in inferlets/text-completion first.")
         return 2
 
     cfg = Config(
@@ -128,19 +128,28 @@ async def run_test(args) -> int:
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(wasm_max_instances=4096),
-        model=ModelConfig(
-            name="default",
-            hf_repo=args.model,
-            driver=DriverConfig(
-                type="cuda_native",
-                device=args.device.split(","),
-                tensor_parallel_size=args.tp_size,
-                options={
-                    "gpu_mem_utilization": args.gpu_mem_util,
-                    "memory_profile": args.memory_profile,
-                },
+        models=[
+            ModelConfig(
+                name="default",
+                hf_repo=args.model,
+                scheduler=SchedulerConfig(
+                    # `greedy` packs as many ready requests as possible
+                    # into each fire — needed to actually exercise R>1
+                    # multi-request fires in the concurrent pass.
+                    batch_policy="greedy",
+                    default_token_limit=512,
+                ),
+                driver=DriverConfig(
+                    type="cuda_native",
+                    device=args.device.split(","),
+                    tensor_parallel_size=args.tp_size,
+                    options={
+                        "gpu_mem_utilization": args.gpu_mem_util,
+                        "memory_profile": args.memory_profile,
+                    },
+                ),
             ),
-        ),
+        ],
     )
 
     async with Server(cfg) as server:

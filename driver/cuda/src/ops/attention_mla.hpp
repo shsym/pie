@@ -6,8 +6,8 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/mla_cache_view.hpp"
-#include "ops/attention_workspace.hpp"
+#include "attention_workspace.hpp"
+#include "mla_cache.hpp"
 
 namespace pie_cuda_driver::ops {
 

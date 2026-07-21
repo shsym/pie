@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
-#include "kernels/kv_cache_view.hpp"
+#include "kv_cache.hpp"
 
 namespace pie_cuda_driver::ops {
 

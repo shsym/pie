@@ -31,7 +31,7 @@ await client.connect();
 await client.authByToken(process.env.PIE_TOKEN);
 
 const proc = await client.launchProcess(
-  "chat-completion@0.1.0",
+  "text-completion@0.1.0",
   { prompt: "Hello", max_tokens: 64 },
 );
 
@@ -61,7 +61,12 @@ await client.close();
 
 ### Authentication
 
-If the server has `[auth].enabled = false`, you can skip authentication entirely.
+| Method | Description |
+|--------|-------------|
+| `authByToken(token)` | Authenticate with an internal token. The only auth mechanism currently exposed by the JS client. |
+
+If the server has `[auth].enabled = false`, you can skip authentication
+entirely.
 
 ### Programs
 
@@ -80,6 +85,7 @@ If the server has `[auth].enabled = false`, you can skip authentication entirely
 | `signalProcess(processId, message)` | Fire-and-forget string signal. |
 | `terminateProcess(processId)` | Stop a process. |
 | `listProcesses()` | Return active process ids. |
+| `launchDaemon(inferlet, port, input={})` | Start a long-running daemon inferlet bound to `port`. |
 | `ping()` | Round-trip a ping. |
 | `query(subject, record)` | Generic key-value query passthrough. |
 

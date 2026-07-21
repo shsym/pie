@@ -71,9 +71,6 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_kernel(
     const std::uint32_t* __restrict__ kv_page_indices,
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
-    const std::uint32_t* __restrict__ w_page,
-    const std::uint32_t* __restrict__ w_off,
-    const std::uint8_t* __restrict__ row_valid,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -85,7 +82,6 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_kernel(
     const int r = blockIdx.x;
     const int head_idx = blockIdx.y;
     const bool is_q = head_idx < num_q_heads;
-    if (!is_q && row_valid != nullptr && row_valid[r] == 0) return;
     const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
     const int q_dim = num_q_heads * head_dim;
     const int kv_dim = num_kv_heads * head_dim;
@@ -117,23 +113,16 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_kernel(
         dst = q_out + (static_cast<long long>(r) * num_q_heads + local_head) *
                       head_dim;
     } else {
-        int actual_page;
-        int offset_in_page;
-        if (w_page != nullptr && w_off != nullptr) {
-            actual_page = static_cast<int>(w_page[r]);
-            offset_in_page = static_cast<int>(w_off[r]);
-        } else {
-            const int pages_first = kv_page_indptr[r];
-            const int pages_last = kv_page_indptr[r + 1];
-            const int num_pages_r = pages_last - pages_first;
-            const int abs_kv_pos =
-                (num_pages_r - 1) * page_size +
-                static_cast<int>(kv_last_page_lens[r]) - 1;
-            const int page_in_req = abs_kv_pos / page_size;
-            offset_in_page = abs_kv_pos % page_size;
-            actual_page = static_cast<int>(
-                kv_page_indices[pages_first + page_in_req]);
-        }
+        const int pages_first = kv_page_indptr[r];
+        const int pages_last = kv_page_indptr[r + 1];
+        const int num_pages_r = pages_last - pages_first;
+        const int abs_kv_pos =
+            (num_pages_r - 1) * page_size +
+            static_cast<int>(kv_last_page_lens[r]) - 1;
+        const int page_in_req = abs_kv_pos / page_size;
+        const int offset_in_page = abs_kv_pos % page_size;
+        const int actual_page =
+            static_cast<int>(kv_page_indices[pages_first + page_in_req]);
         if (hnd_layout) {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * num_kv_heads +
@@ -201,9 +190,6 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_warp_kernel(
     const std::uint32_t* __restrict__ kv_page_indices,
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
-    const std::uint32_t* __restrict__ w_page,
-    const std::uint32_t* __restrict__ w_off,
-    const std::uint8_t* __restrict__ row_valid,
     int num_requests,
     int num_q_heads,
     int num_kv_heads,
@@ -226,7 +212,6 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_warp_kernel(
     const int r = unit / total_qk_heads;
     const int head_idx = unit - r * total_qk_heads;
     const bool is_q = head_idx < num_q_heads;
-    if (!is_q && row_valid != nullptr && row_valid[r] == 0) return;
     const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
     const int q_dim = num_q_heads * HEAD_DIM;
     const int kv_dim = num_kv_heads * HEAD_DIM;
@@ -295,23 +280,16 @@ __global__ void qkv_decode_qk_norm_rope_write_kv_warp_kernel(
         dst = q_out + (static_cast<long long>(r) * num_q_heads + local_head) *
                       HEAD_DIM;
     } else {
-        int actual_page;
-        int offset_in_page;
-        if (w_page != nullptr && w_off != nullptr) {
-            actual_page = static_cast<int>(w_page[r]);
-            offset_in_page = static_cast<int>(w_off[r]);
-        } else {
-            const int pages_first = kv_page_indptr[r];
-            const int pages_last = kv_page_indptr[r + 1];
-            const int num_pages_r = pages_last - pages_first;
-            const int abs_kv_pos =
-                (num_pages_r - 1) * page_size +
-                static_cast<int>(kv_last_page_lens[r]) - 1;
-            const int page_in_req = abs_kv_pos / page_size;
-            offset_in_page = abs_kv_pos % page_size;
-            actual_page = static_cast<int>(
-                kv_page_indices[pages_first + page_in_req]);
-        }
+        const int pages_first = kv_page_indptr[r];
+        const int pages_last = kv_page_indptr[r + 1];
+        const int num_pages_r = pages_last - pages_first;
+        const int abs_kv_pos =
+            (num_pages_r - 1) * page_size +
+            static_cast<int>(kv_last_page_lens[r]) - 1;
+        const int page_in_req = abs_kv_pos / page_size;
+        const int offset_in_page = abs_kv_pos % page_size;
+        const int actual_page =
+            static_cast<int>(kv_page_indices[pages_first + page_in_req]);
         if (hnd_layout) {
             const long long page_row =
                 ((static_cast<long long>(actual_page) * num_kv_heads +
@@ -355,7 +333,6 @@ __global__ void qkv_packed_qk_norm_rope_vnorm_write_kv_kernel(
     const std::uint32_t* __restrict__ kv_page_indices,
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
-    const std::uint8_t* __restrict__ row_valid,
     int num_q_heads,
     int num_kv_heads,
     int head_dim,
@@ -367,7 +344,6 @@ __global__ void qkv_packed_qk_norm_rope_vnorm_write_kv_kernel(
     const int row = blockIdx.x;
     const int head_idx = blockIdx.y;
     const bool is_q = head_idx < num_q_heads;
-    if (!is_q && row_valid != nullptr && row_valid[row] == 0) return;
     const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
     const int q_dim = num_q_heads * head_dim;
     const int kv_dim = num_kv_heads * head_dim;
@@ -521,9 +497,6 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
-    const std::uint32_t* w_page,
-    const std::uint32_t* w_off,
-    const std::uint8_t* row_valid,
     int num_requests,
     int num_q_heads,
     int num_kv_heads,
@@ -550,8 +523,7 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                     static_cast<const __nv_bfloat16*>(q_weight),             \
                     static_cast<const __nv_bfloat16*>(k_weight),             \
                     positions, rope_table, kv_page_indices, kv_page_indptr,  \
-                    kv_last_page_lens, w_page, w_off, row_valid,             \
-                    num_requests, num_q_heads,                               \
+                    kv_last_page_lens, num_requests, num_q_heads,            \
                     num_kv_heads, page_size, hnd_layout, theta, eps);        \
         } else {                                                             \
             qkv_decode_qk_norm_rope_write_kv_warp_kernel<                   \
@@ -563,8 +535,7 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                     static_cast<const __nv_bfloat16*>(q_weight),             \
                     static_cast<const __nv_bfloat16*>(k_weight),             \
                     positions, rope_table, kv_page_indices, kv_page_indptr,  \
-                    kv_last_page_lens, w_page, w_off, row_valid,             \
-                    num_requests, num_q_heads,                               \
+                    kv_last_page_lens, num_requests, num_q_heads,            \
                     num_kv_heads, page_size, hnd_layout, theta, eps);        \
         }                                                                    \
     } while (0)
@@ -598,9 +569,6 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                 kv_page_indices,
                 kv_page_indptr,
                 kv_last_page_lens,
-                w_page,
-                w_off,
-                row_valid,
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
@@ -622,9 +590,6 @@ void launch_qkv_decode_qk_norm_rope_write_kv_bf16(
                 kv_page_indices,
                 kv_page_indptr,
                 kv_last_page_lens,
-                w_page,
-                w_off,
-                row_valid,
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
@@ -646,7 +611,6 @@ void launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
     const std::uint32_t* kv_page_indices,
     const std::uint32_t* kv_page_indptr,
     const std::uint32_t* kv_last_page_lens,
-    const std::uint8_t* row_valid,
     int num_rows,
     int num_q_heads,
     int num_kv_heads,
@@ -669,7 +633,6 @@ void launch_qkv_packed_qk_norm_rope_vnorm_write_kv_bf16(
             static_cast<const __nv_bfloat16*>(q_weight),
             static_cast<const __nv_bfloat16*>(k_weight),
             positions, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            row_valid,
             num_q_heads, num_kv_heads, head_dim, page_size, hnd_layout,
             theta, eps);
 }

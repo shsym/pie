@@ -4,7 +4,6 @@
 #include <type_traits>
 
 #include <algorithm>
-#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
@@ -222,12 +221,6 @@ struct PrefillPlanCache {
     bool use_sm90 = false;
     bool enable_pdl = false;
     bool valid = false;
-    /// The plan ran in graph mode (content-independent launch geometry) on
-    /// the FA2 causal path — the executor may capture/replay the dispatch.
-    /// False when graph mode was requested but demoted (SM90 route, split
-    /// disabled for the head dim, or the graph carve exceeding the float
-    /// workspace grant).
-    bool graph_capturable = false;
     std::vector<IdType> qo_h_buf;
     std::vector<IdType> kv_h_buf;
 };
@@ -475,13 +468,6 @@ void plan_attention_flashinfer_decode_bf16(
     bool hnd_layout)
 {
     const int gqa_group_size = num_q_heads / num_kv_heads;
-    if (head_dim != 64 && head_dim != 96 && head_dim != 128 &&
-        head_dim != 256 && head_dim != 512) {
-        throw std::runtime_error(
-            "flashinfer decode: unsupported head_dim " +
-            std::to_string(head_dim) +
-            " (instantiated: 64, 96, 128, 256, 512)");
-    }
 
     if (can_use_static_nonsplit_decode_plan(
             static_cast<uint32_t>(num_requests))) {
@@ -566,8 +552,7 @@ void plan_attention_flashinfer_prefill_bf16(
     int window_left,
     bool full_attention_variant,
     bool hnd_layout,
-    bool causal_mask,
-    bool custom_mask)
+    bool causal_mask)
 {
     if (head_dim != 64 && head_dim != 128 && head_dim != 256 && head_dim != 512) {
         throw std::runtime_error(
@@ -576,8 +561,7 @@ void plan_attention_flashinfer_prefill_bf16(
     }
     cache.use_sm90 = false;
     cache.sm90_plan.valid = false;
-    cache.graph_capturable = false;
-    if (!custom_mask && !hnd_layout &&
+    if (!hnd_layout &&
         kv_last_page_lens_h != nullptr &&
         hopper_prefill_supported(
             head_dim, window_left, total_tokens, num_requests)) {
@@ -625,54 +609,6 @@ void plan_attention_flashinfer_prefill_bf16(
     const bool disable_split_kv =
         !head_dim_supports_split;
 
-    // Graph-mode planning fixes the launch geometry as a pure function of
-    // (total_tokens, num_requests) but in exchange always splits KV, so the
-    // plan always carves its float partials — sized by the padded (not
-    // actual) work-item count. Demote to a content-shaped plan when the
-    // carve would overflow the float workspace grant: the wave then runs
-    // eager (uncapturable) instead of failing the plan. Graph mode with
-    // split disabled is not demote-exempt either — flashinfer only writes
-    // `block_valid_mask` on the split path, so an unsplit padded grid would
-    // read uninitialized work assignments.
-    if (enable_cuda_graph && !disable_split_kv) {
-        const std::uint64_t gqa_group =
-            static_cast<std::uint64_t>(num_q_heads) /
-            std::max(1, num_kv_heads);
-        const std::uint64_t max_qo_len =
-            static_cast<std::uint64_t>(
-                std::max(1, total_tokens - num_requests + 1)) *
-            std::max<std::uint64_t>(1, gqa_group);
-        const std::uint64_t cta_tile_q = ::flashinfer::FA2DetermineCtaTileQ(
-            static_cast<std::int64_t>(max_qo_len),
-            static_cast<std::uint32_t>(head_dim));
-        int num_sm = 0;
-        int dev_id = 0;
-        CUDA_CHECK(cudaGetDevice(&dev_id));
-        CUDA_CHECK(cudaDeviceGetAttribute(
-            &num_sm, cudaDevAttrMultiProcessorCount, dev_id));
-        const std::uint64_t max_batch_size_if_split =
-            static_cast<std::uint64_t>(2 * num_sm) /
-            std::max(1, num_kv_heads);
-        const std::uint64_t total_tiles =
-            (static_cast<std::uint64_t>(total_tokens) *
-                 std::max<std::uint64_t>(1, gqa_group) +
-             cta_tile_q - 1) /
-                cta_tile_q +
-            static_cast<std::uint64_t>(std::max(0, num_requests - 1));
-        const std::uint64_t padded_batch =
-            std::max(max_batch_size_if_split, total_tiles);
-        const std::uint64_t carve_bytes =
-            static_cast<std::uint64_t>(num_q_heads) * padded_batch *
-                cta_tile_q * (static_cast<std::uint64_t>(head_dim) + 1) *
-                sizeof(float) +
-            2 * 16;  // two 16-byte-aligned allocations
-        if (carve_bytes > workspace.float_bytes()) {
-            enable_cuda_graph = false;
-        }
-    } else {
-        enable_cuda_graph = enable_cuda_graph && !disable_split_kv;
-    }
-
     auto status = ::flashinfer::PrefillPlan<IdType>(
         workspace.float_buffer(), workspace.float_bytes(),
         workspace.int_buffer(), workspace.page_locked_int(),
@@ -705,10 +641,6 @@ void plan_attention_flashinfer_prefill_bf16(
     cache.full_attention_variant = full_attention_variant;
     cache.causal_mask = causal_mask;
     cache.hnd_layout = hnd_layout;
-    // Only the causal FA2 prefill dispatch is captured (Phase 1): the
-    // custom-mask variant stays eager, and the decode-shaped plans are
-    // admitted through the pure-decode rules instead.
-    cache.graph_capturable = enable_cuda_graph && causal_mask && !custom_mask;
     cache.enable_pdl = current_device_supports_pdl();
     cache.valid = true;
 }
@@ -776,35 +708,6 @@ cudaError_t dispatch_decode_for_head_dim_v(
         if (cache.plan_info.enable_cuda_graph) {
             params.block_valid_mask =
                 offset_ptr<bool>(int_buf, cache.plan_info.block_valid_mask_offset);
-        }
-    }
-
-    // Bug#2 device R>1 diagnostic (PIE_DECODE_PARAM_DUMP): the concurrent-decode
-    // corruption is per-request KV mis-attribution inside BatchDecode. Everything
-    // in the plan/kernel is per-request-correct in code, so dump the RUNTIME
-    // per-request KV bound + plan work-distribution the kernel actually reads —
-    // the wrong field (kv_len, request_indices, o_indptr, padded_batch_size, or
-    // batch_size) is the fix site. Env-gated, D2H copies (heavy) — off by default.
-    if (std::getenv("PIE_DECODE_PARAM_DUMP") != nullptr) {
-        const int R = static_cast<int>(cache.num_requests);
-        std::vector<IdType> h_indptr(R + 1), h_lastlen(R), h_reqidx(R), h_oindptr(R + 1);
-        cudaStreamSynchronize(stream);
-        cudaMemcpy(h_indptr.data(), kv_page_indptr_d, sizeof(IdType) * (R + 1), cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_lastlen.data(), kv_last_page_lens_d, sizeof(IdType) * R, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_reqidx.data(), params.request_indices, sizeof(IdType) * R, cudaMemcpyDeviceToHost);
-        cudaMemcpy(h_oindptr.data(), params.o_indptr, sizeof(IdType) * (R + 1), cudaMemcpyDeviceToHost);
-        std::fprintf(stderr,
-            "[DECODE_PARAM] R=%d padded_batch=%u split_kv=%d paged_kv.batch_size=%u page_size=%d\n",
-            R, params.padded_batch_size, static_cast<int>(params.partition_kv),
-            static_cast<unsigned>(cache.num_requests), cache.page_size);
-        for (int r = 0; r < R; ++r) {
-            const int pages = static_cast<int>(h_indptr[r + 1]) - static_cast<int>(h_indptr[r]);
-            const int kv_len = (pages - 1) * cache.page_size + static_cast<int>(h_lastlen[r]);
-            std::fprintf(stderr,
-                "[DECODE_PARAM]  r=%d indptr=[%d,%d) pages=%d last_page_len=%d kv_len=%d req_idx=%d o_indptr=%d\n",
-                r, static_cast<int>(h_indptr[r]), static_cast<int>(h_indptr[r + 1]), pages,
-                static_cast<int>(h_lastlen[r]), kv_len, static_cast<int>(h_reqidx[r]),
-                static_cast<int>(h_oindptr[r]));
         }
     }
 
@@ -1325,156 +1228,6 @@ using AttnVariantCustomSoftcap = ::flashinfer::DefaultAttention<
     /*use_alibi=*/false>;
 
 }  // namespace
-
-void dispatch_attention_flashinfer_prefill_custom_bf16(
-    const PrefillPlanCache& cache,
-    const void* q, void* k_pages, void* v_pages, void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t* mask_d,
-    const std::int32_t* mask_indptr_d,
-    AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    float logits_soft_cap,
-    float sm_scale,
-    float* lse_out)
-{
-    if (!cache.valid || cache.use_sm90) {
-        throw std::runtime_error(
-            "custom prefill dispatch requires a prepared non-SM90 plan");
-    }
-    ::flashinfer::paged_kv_t<DTypeKV, IdType> paged_kv(
-        static_cast<uint32_t>(cache.num_kv_heads),
-        static_cast<uint32_t>(cache.page_size),
-        static_cast<uint32_t>(cache.head_dim),
-        static_cast<uint32_t>(cache.num_requests),
-        kv_layout(cache.hnd_layout),
-        static_cast<DTypeKV*>(k_pages),
-        static_cast<DTypeKV*>(v_pages),
-        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indices_d)),
-        const_cast<IdType*>(reinterpret_cast<const IdType*>(kv_page_indptr_d)),
-        const_cast<IdType*>(
-            reinterpret_cast<const IdType*>(kv_last_page_lens_d)));
-
-    PrefillParams params;
-    params.q = const_cast<DTypeQ*>(static_cast<const DTypeQ*>(q));
-    params.paged_kv = paged_kv;
-    params.maybe_custom_mask = const_cast<std::uint8_t*>(mask_d);
-    params.q_indptr =
-        const_cast<IdType*>(reinterpret_cast<const IdType*>(qo_indptr_d));
-    params.maybe_mask_indptr = const_cast<IdType*>(mask_indptr_d);
-    params.maybe_q_rope_offset = nullptr;
-    params.o = static_cast<DTypeO*>(o);
-    params.lse = lse_out;
-    params.maybe_alibi_slopes = nullptr;
-    params.group_size = ::flashinfer::uint_fastdiv(
-        static_cast<uint32_t>(cache.num_q_heads / cache.num_kv_heads));
-    params.num_qo_heads = static_cast<uint32_t>(cache.num_q_heads);
-    params.q_stride_n =
-        static_cast<IdType>(cache.num_q_heads * cache.head_dim);
-    params.q_stride_h = static_cast<IdType>(cache.head_dim);
-    params.window_left = -1;
-    params.logits_soft_cap = logits_soft_cap;
-    params.sm_scale = sm_scale > 0.f
-        ? sm_scale
-        : 1.0f / std::sqrt(static_cast<float>(cache.head_dim));
-    params.rope_rcp_scale = 1.0f;
-    params.rope_rcp_theta = 1.0f;
-
-    void* int_buf = workspace.int_buffer();
-    void* float_buf = workspace.float_buffer();
-    const auto& plan_info = cache.plan_info;
-    params.request_indices =
-        offset_ptr<IdType>(int_buf, plan_info.request_indices_offset);
-    params.qo_tile_indices =
-        offset_ptr<IdType>(int_buf, plan_info.qo_tile_indices_offset);
-    params.kv_tile_indices =
-        offset_ptr<IdType>(int_buf, plan_info.kv_tile_indices_offset);
-    params.o_indptr = offset_ptr<IdType>(int_buf, plan_info.o_indptr_offset);
-    params.kv_chunk_size_ptr =
-        offset_ptr<IdType>(int_buf, plan_info.kv_chunk_size_ptr_offset);
-    params.padded_batch_size =
-        static_cast<uint32_t>(plan_info.padded_batch_size);
-    params.partition_kv = plan_info.split_kv;
-    params.max_total_num_rows =
-        static_cast<uint32_t>(plan_info.total_num_rows);
-    params.merge_indptr = nullptr;
-    params.block_valid_mask = nullptr;
-    params.total_num_rows = nullptr;
-    params.maybe_prefix_len_ptr = nullptr;
-    params.maybe_token_pos_in_items_ptr = nullptr;
-    params.token_pos_in_items_len = 0;
-    params.maybe_max_item_len_ptr = nullptr;
-
-    DTypeO* tmp_v = nullptr;
-    float* tmp_s = nullptr;
-    if (plan_info.split_kv) {
-        params.merge_indptr =
-            offset_ptr<IdType>(int_buf, plan_info.merge_indptr_offset);
-        tmp_v = offset_ptr<DTypeO>(float_buf, plan_info.v_offset);
-        tmp_s = offset_ptr<float>(float_buf, plan_info.s_offset);
-        if (plan_info.enable_cuda_graph) {
-            params.block_valid_mask =
-                offset_ptr<bool>(int_buf, plan_info.block_valid_mask_offset);
-        }
-    }
-
-    auto dispatch = [&]<class Variant>(::std::type_identity<Variant>) {
-        switch (cache.head_dim) {
-            case 64:
-                return prefill_dispatch_for_head_dim<
-                    64, ::flashinfer::MaskMode::kCustom, Variant>(
-                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
-            case 128:
-                return prefill_dispatch_for_head_dim<
-                    128, ::flashinfer::MaskMode::kCustom, Variant>(
-                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
-            case 256:
-                return prefill_dispatch_for_head_dim<
-                    256, ::flashinfer::MaskMode::kCustom, Variant>(
-                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
-            case 512:
-                return prefill_dispatch_for_head_dim<
-                    512, ::flashinfer::MaskMode::kCustom, Variant>(
-                    params, plan_info, tmp_v, tmp_s, cache.enable_pdl, stream);
-        }
-        return cudaErrorInvalidValue;
-    };
-    const cudaError_t status = logits_soft_cap > 0.f
-        ? dispatch(::std::type_identity<AttnVariantCustomSoftcap>{})
-        : dispatch(::std::type_identity<AttnVariantCustom>{});
-    CUDA_CHECK(status);
-}
-
-void dispatch_attention_flashinfer_prefill_custom(
-    const PrefillPlanCache& cache,
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t* mask_d,
-    const std::int32_t* mask_indptr_d,
-    AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    float logits_soft_cap,
-    float sm_scale,
-    float* lse_out)
-{
-    const int num_pages_in_batch =
-        cache.num_requests > 0 ? cache.kv_h_buf[cache.num_requests] : 0;
-    kernels::launch_dequant_kv_cache_layer_to_bf16_active(
-        kv_layer, kv_page_indices_d, num_pages_in_batch, stream);
-    dispatch_attention_flashinfer_prefill_custom_bf16(
-        cache, q, kv_layer.k_bf16_pages, kv_layer.v_bf16_pages, o,
-        qo_indptr_d, kv_page_indices_d, kv_page_indptr_d,
-        kv_last_page_lens_d, mask_d, mask_indptr_d, workspace, stream,
-        logits_soft_cap, sm_scale, lse_out);
-}
 
 void launch_attention_flashinfer_prefill_custom_bf16(
     const void* q, void* k_pages, void* v_pages, void* o,

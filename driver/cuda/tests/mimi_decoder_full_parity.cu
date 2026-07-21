@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "model/csm/mimi_decoder_forward.cu"  // decoder under test + kernels + .hpp
+#include "model/mimi_decoder_forward.cu"  // decoder under test + kernels + .hpp
 
 using namespace pie_cuda_driver::model;
 using BF = __nv_bfloat16;

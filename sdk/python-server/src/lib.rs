@@ -1,9 +1,9 @@
 //! `pie-server` Python bindings — the embeddable counterpart to the
 //! `pie` CLI binary.
 //!
-//! Both surfaces drive the same library (`pie-worker`); this crate
-//! is just a pyo3 wrapper around [`pie_worker::engine::start_engine`]
-//! plus a [`pie_worker::engine::EngineHandle`] handle. Lifecycle:
+//! Both surfaces drive the same library (`pie-server`); this crate
+//! is just a pyo3 wrapper around [`pie_server::serve::start_engine`]
+//! plus a [`pie_server::serve::EngineHandle`] handle. Lifecycle:
 //! when the Python `EngineHandle` is dropped (or the user's interpreter
 //! exits), the embedded tokio runtime + every subprocess driver are
 //! torn down — combined with the `PR_SET_PDEATHSIG` hook in
@@ -15,19 +15,22 @@ use std::sync::{Arc, Mutex};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use pie_worker::config::Config as ServeConfig;
-use pie_worker::engine::{self, EngineHandle as ServeHandle};
+use pie_server::config::Config as ServeConfig;
+use pie_server::serve::{self, EngineHandle as ServeHandle};
 
 /// Live engine returned by `bootstrap`. Holds the tokio runtime that
 /// keeps the WS scheduler + driver supervisors alive.
 ///
 /// Methods:
 ///   - `url` (str)        — `ws://host:port` the engine is listening on
+///   - `token` (str)      — internal auth token (pass to `pie-client`'s
+///                          `auth_by_token`)
 ///   - `shutdown()`       — blocking, idempotent. Stops drivers + runtime.
 ///   - `is_running()`     — `True` until `shutdown()` returns.
 #[pyclass(name = "EngineHandle")]
 struct PyEngineHandle {
     url: String,
+    token: String,
     /// `(handle, runtime)` together — once `shutdown()` runs, both are
     /// taken to `None`. The runtime has to outlive every subprocess
     /// driver join, which `ServeHandle::shutdown` guarantees.
@@ -41,6 +44,11 @@ impl PyEngineHandle {
         self.url.clone()
     }
 
+    #[getter]
+    fn token(&self) -> String {
+        self.token.clone()
+    }
+
     /// True until `shutdown()` returns. Cheap; no blocking.
     fn is_running(&self) -> bool {
         self.inner.lock().unwrap().is_some()
@@ -52,8 +60,8 @@ impl PyEngineHandle {
     fn shutdown(&self, py: Python<'_>) {
         let taken = self.inner.lock().unwrap().take();
         if let Some((handle, runtime)) = taken {
-            py.detach(|| {
-                runtime.block_on(handle.shutdown());
+            py.allow_threads(|| {
+                handle.shutdown();
                 // Drop the runtime; tokio joins worker threads.
                 drop(runtime);
             });
@@ -67,7 +75,7 @@ impl Drop for PyEngineHandle {
     /// Python `Server.__aexit__` raises before reaching `shutdown()`.
     fn drop(&mut self) {
         if let Some((handle, runtime)) = self.inner.lock().unwrap().take() {
-            runtime.block_on(handle.shutdown());
+            handle.shutdown();
             drop(runtime);
         }
     }
@@ -88,24 +96,26 @@ fn bootstrap(py: Python<'_>, toml_str: &str) -> PyResult<PyEngineHandle> {
     cfg.validate()
         .map_err(|e| PyValueError::new_err(format!("validate config: {e:#}")))?;
 
-    py.detach(|| -> PyResult<PyEngineHandle> {
-        let runtime = engine::build_runtime(&cfg)
+    py.allow_threads(|| -> PyResult<PyEngineHandle> {
+        let runtime = serve::build_runtime(&cfg)
             .map_err(|e| PyRuntimeError::new_err(format!("build tokio runtime: {e:#}")))?;
         let runtime = Arc::new(runtime);
 
-        // The embedded engine wheel is always single-node: embed an in-proc
-        // controller and self-register before booting the engine.
-        let control_addr = format!("{}:{}", cfg.server.host, cfg.server.port);
-        let coordinator = engine::connect(&engine::TopologyMode::SingleNode, control_addr)
-            .map_err(|e| PyRuntimeError::new_err(format!("join control plane: {e:#}")))?;
+        // Best-effort: install the Python WASM runtime tarball if missing,
+        // mirroring `pie serve`'s startup. Failures (offline / no registry)
+        // log + continue; only matters for Python inferlets.
+        pie_server::py_runtime::ensure_installed_best_effort();
 
         let handle = runtime
-            .block_on(engine::start_engine(cfg, coordinator))
+            .block_on(serve::start_engine(cfg))
             .map_err(|e| PyRuntimeError::new_err(format!("start_engine: {e:#}")))?;
 
         let url = handle.url.clone();
+        let token = handle.token.clone();
+
         Ok(PyEngineHandle {
             url,
+            token,
             inner: Mutex::new(Some((handle, runtime))),
         })
     })

@@ -4,7 +4,7 @@
 
 #include <cuda_runtime.h>
 
-#include "ops/attention_workspace.hpp"
+#include "attention_workspace.hpp"
 
 namespace pie_cuda_driver::ops {
 

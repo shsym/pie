@@ -23,8 +23,8 @@ let out = fwd.execute().await?;
 A primitive at this level is enough to express decoding strategies that other serving systems either hardcode or do not support at all. Each of the following is a library on top of `forward()`, not an engine feature:
 
 - **Constrained decoding.** Mask logits against a grammar or JSON schema before sampling. See [Structured generation](../guide/forward/constrained).
-- **Speculative decoding.** Run a drafter, verify with the target model, accept or reject. Pie supports prompt-lookup and **native MTP drafting** for models with an MTP head. See [Speculative decoding](../guide/forward/speculation), [`cacheback-speculative-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/cacheback-speculative-decoding), and [`mtp-speculative-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/mtp-speculative-decoding).
-- **Custom samplers and raw logits.** Score candidate strings, compute entropy, or pull the full distribution back into your inferlet. See [`sampling-primitives`](https://github.com/pie-project/pie/tree/main/inferlets/sampling-primitives).
+- **Speculative decoding.** Run a drafter, verify with the target model, accept or reject. Pie ships an n-gram speculator, a Jacobi decoder, and **native MTP drafters** for models with an MTP head (Gemma-4, Qwen3.5), and you can write your own. See [Speculative decoding](../guide/forward/speculation) and the `text-completion-spec`, `cacheback-decoding`, and `jacobi-decoding` inferlets.
+- **Custom samplers and raw logits.** Score candidate strings, compute entropy, or pull the full distribution back into your inferlet. See the `sampler-suite` and `output-validation` inferlets.
 - **Custom attention masks.** Sliding window, attention sink, hierarchical masks, anything that can be expressed as a per-token mask. See [Customize generation](../guide/forward/overview).
 - **LoRA adapters.** Attach an adapter for a single forward pass or for every step of a generation loop.
 
@@ -49,8 +49,8 @@ let resp = ctx.generate(sampler).collect_text().await?;
 Patterns this supports:
 
 - **Prompt prefix caching.** Compute a long system prompt once, save it, fork from the snapshot for every request. The prefill cost is paid once for the lifetime of the snapshot.
-- **Parallel candidates and tree search.** Branch from a shared prefix N times. Each branch's compute and memory scales with its divergent tokens, not with the prompt length. See [`consensus-decoding`](https://github.com/pie-project/pie/tree/main/inferlets/consensus-decoding) and [`prefix-tree-kv-cache`](https://github.com/pie-project/pie/tree/main/inferlets/prefix-tree-kv-cache).
-- **Sliding window and attention sink.** Mask positions that fall out of the window while keeping sink positions visible. See [`sliding-window-attention`](https://github.com/pie-project/pie/tree/main/inferlets/sliding-window-attention) and [`attention-sink`](https://github.com/pie-project/pie/tree/main/inferlets/attention-sink).
+- **Best-of-N and tree of thought.** Branch from a shared prefix N times. Each branch's compute and memory scales with its divergent tokens, not with the prompt length. See the `best-of-n`, `tree-of-thought`, and `graph-of-thought` inferlets.
+- **Sliding window and attention sink.** Drop pages that fall out of the window, keep the sink pages pinned. See the `windowed-attention` and `attention-sink` inferlets.
 - **Resumable sessions.** A named context outlives the inferlet that created it. The next request reattaches by name.
 
 ## Integrated I/O
@@ -58,7 +58,8 @@ Patterns this supports:
 An inferlet runs inside a WASI sandbox with three I/O surfaces:
 
 - **Session.** `session::send` and `session::receive` exchange text and binary payloads with the client that launched the inferlet. The engine streams tokens back through this channel.
-- **WASI HTTP and filesystem.** Inferlets can issue HTTP requests and read files from a sandboxed view. The `wstd` crate exposes `http::Client`, useful for fetching tool outputs, images, or documents inline. See the `image-fetch` inferlet.
+- **WASI HTTP and filesystem.** Inferlets can issue HTTP requests and read files from a sandboxed view. The `wstd` crate exposes `http::Client`, useful for fetching tool outputs, images, or documents inline. See the `image-fetch` and `http-server` inferlets.
+- **Messaging.** `messaging::broadcast` and `messaging::subscribe` exchange messages between inferlets running in the same engine. Useful for coordinating swarms.
 
 These surfaces enable patterns that are awkward when application logic runs outside the engine:
 
@@ -66,6 +67,7 @@ These surfaces enable patterns that are awkward when application logic runs outs
 - **MCP.** A first-class MCP client. Connect to a registered MCP server, list tools, call them. See the `mcp-example` family.
 - **Virtual filesystem.** Inferlets can read from a sandboxed file tree exposed by the engine. Useful for episodic memory and checkpoint/resume.
 - **Embedded language runtimes.** Run JavaScript or Python from inside an inferlet (CodeACT-style). The model emits code; the inferlet executes it. See the `agent-codeact` inferlet.
+- **HTTP servers as inferlets.** An inferlet can implement `wasi:http/incoming-handler` and serve requests directly. See the `openresponses` inferlet, which exposes the OpenAI Responses API.
 
 I/O happens on the inferlet's own time, on a worker thread the engine manages. The model's forward passes do not stall waiting for HTTP.
 

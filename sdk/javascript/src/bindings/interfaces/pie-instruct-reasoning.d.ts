@@ -2,7 +2,8 @@
 /**
  * Create a decoder to detect reasoning blocks in generated tokens
  */
-export function createDecoder(): Decoder;
+export function createDecoder(model: Model): Decoder;
+export type Model = import('./pie-core-model.js').Model;
 export type Error = import('./pie-core-types.js').Error;
 export type Event = EventStart | EventDelta | EventComplete;
 /**

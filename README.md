@@ -55,43 +55,19 @@ pie run text-completion -- --prompt "The capital of France is"
 
 | Directory | Description |
 |---|---|
-| `worker/` | The `pie` CLI and standalone engine — the invariant entry point |
 | `runtime/` | Inferlet runtime |
-| `controller/` | Cluster-coordination control plane (pairing · roles · health) |
-| `driver/transport/` | Worker↔worker P2P KV-tensor data plane |
-| `driver/` | Backend drivers (CUDA · Metal) + runtime↔driver IPC |
-| `interface/` | Boundary contract crates (`ids` · `driver` · `controller` · `worker` · `client` · `inferlet`) — the dependency floor |
-| `tests/inferlets/` | Curated inferlet E2E fixtures |
+| `server/` | CLI |
+| `inferlets/` | Example inferlets |
 | `sdk/` | Inferlet SDKs (Rust · Python · JavaScript) |
 | `client/` | Client libraries (Rust · Python · JavaScript) |
+| `driver/` | Pie drivers (portable / CUDA / vLLM / SGLang) |
 | `website/` | [pie-project.org](https://pie-project.org) docs site |
-
-## Building inferlets
-
-Inferlets compile to the `wasm32-wasip2` component target. Install the target
-once after cloning:
-
-```bash
-rustup target add wasm32-wasip2
-```
-
-Build an inferlet with:
-
-```bash
-cargo build --target wasm32-wasip2
-```
 
 ## Getting Help
 
 Questions and bug reports are welcome on
 [GitHub Issues](https://github.com/pie-project/pie/issues) and
 [GitHub Discussions](https://github.com/pie-project/pie/discussions).
-
-## Acknowledgements
-
-The constrained-decoding engine in `runtime/grammar` is a Rust rewrite derived
-in part from [XGrammar](https://github.com/mlc-ai/xgrammar), licensed under
-Apache License 2.0. See [NOTICE](NOTICE) for attribution.
 
 ## License
 
