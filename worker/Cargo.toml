@@ -81,7 +81,9 @@ tarpc = { version = "0.37", features = [
 # comes from `pie-client`, already a dependency below).
 tokio-tungstenite = "0.30.0"
 futures = "0.3.33"
-mimalloc = "0.1"
+# `local_dynamic_tls`: the pyo3 wheel is dlopen()ed, and mimalloc's default
+# initial-exec TLS model cannot be satisfied by a late-loaded library.
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
 tracing = "0.1"
 # Async HTTP client for the data-plane blob fetch (gateway_link.rs): the
 # worker pulls `GET {origin}/blob/{hash}` for multimodal inputs during
@@ -91,7 +93,10 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "s
 
 # Always-linked Rust dummy driver — random tokens, no model load.
 pie-driver-dummy = { path = "../driver/dummy" }
-pie-loader = { path = "../loader" }
+# `default-features = false` drops the loader's testkit (oracle, contract
+# fixture builder, CPU executor). Nothing under `ffi/` reaches them, and this is
+# what keeps that true.
+pie-loader = { path = "../loader", default-features = false }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
 # the engine subprocess we boot. Same crate the dummy_roundtrip example
@@ -100,7 +105,7 @@ pie-client = { path = "../client/rust" }
 
 [dev-dependencies]
 tempfile = "3"
-pie-ptir = { path = "../interface/ptir" }
+pie-ir = { path = "../compiler/ir" }
 
 [build-dependencies]
 cmake = "0.1"

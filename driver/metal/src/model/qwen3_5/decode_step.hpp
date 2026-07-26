@@ -40,6 +40,9 @@ struct Dispatch {
     bool        fuse_residual = false;  // QmvO/QmvOut/QmvDown: add the block residual in the
                                         // GEMV epilogue (buffer 7) → drops the following
                                         // Residual/LayerOut dispatch. PIE_FUSE_RESIDUAL.
+    int         qmm_bn = 0;   // output columns per threadgroup when this
+                              // projection runs as the steel GEMM
+                              // (affine_qmm_t); 0 = use the GEMV.
 };
 
 // PSOs compiled once from src/kernels/*.metal, indexed by Kernel kind.
@@ -56,6 +59,19 @@ struct DecodeStepPsos {
 // appends the optional device-argmax substrate (I3); logits are ALWAYS produced.
 std::vector<Dispatch> build_decode_dag(const DecodeGeometry& g, bool with_argmax = false,
                                        bool fuse_residual = false, bool gdn_prep = false);
+
+// ── Concurrent runs ──────────────────────────────────────────────────────────
+// A maximal run of consecutive same-layer dispatches that may execute at once:
+// they read an activation their predecessors already produced and write disjoint
+// scratch, so no barrier is needed between them. Returns, per dispatch, the index
+// of the last dispatch of its run (== its own index when it runs alone).
+//
+// One derivation, three readers: the two encoders decide barriers from it, and
+// the scratch allocator extends a value's live range to the end of the run its
+// last use falls in, so a buffer is never rewritten by a dispatch still running
+// alongside its reader. Keeping those in one place is what makes widening a run
+// safe -- they cannot disagree.
+std::vector<int> concurrent_run_ends(const std::vector<Dispatch>& dag);
 
 // ── GPU-exec attribution hook (optimization-phase prep; off by default) ───────
 // When provided to encode_decode_step, the walker emits a timestamp mark at boundary i
