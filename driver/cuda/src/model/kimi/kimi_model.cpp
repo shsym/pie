@@ -28,10 +28,6 @@ KimiModel::KimiModel(
     // are only captured for pure-decode shapes.
     caps_.graph_safe = mla_cache_.dtype() == DType::BF16;
     caps_.graph_padding_kv_write_safe = true;
-
-    // Must happen before any graph capture: allocating inside a capture would
-    // produce graph-ordered memory that is invalid on replay.
-    kimi_materialize_bf16_expert_stacks(weights_, hf_config_, tp_size);
 }
 
 void KimiModel::prepare(AttentionWorkspace& attn_ws,
@@ -58,7 +54,8 @@ void KimiModel::body(Workspace& ws,
         in.qo_indptr_h, in.kv_page_indptr_h,
         in.total_tokens, in.num_requests, in.is_pure_decode,
         in.row_valid_d,
-        in.logit_row_indices_d, in.num_logit_rows);
+        in.logit_row_indices_d, in.num_logit_rows,
+        in.stage_hooks);
 }
 
 }  // namespace pie_cuda_driver::model

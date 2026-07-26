@@ -1,4 +1,5 @@
 #include "model/nemotron_h/nemotron_h_forward.hpp"
+#include "model/nemotron_h/nemotron_h_contract.hpp"
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>
@@ -338,10 +339,6 @@ struct ExpertRouting {
     std::vector<std::vector<float>> weights;
 };
 
-const void* maybe_tp_data(const DeviceTensor* full, const DeviceTensor& tp) {
-    return tp.empty() ? full->data() : tp.data();
-}
-
 ExpertRouting build_routing(
     const std::vector<std::int32_t>& topk_idx_h,
     const std::vector<float>& topk_w_h,
@@ -388,7 +385,8 @@ void attention_layer(
     const void* next_norm_w,
     float eps,
     cudaStream_t stream,
-    bool* produced_next_norm)
+    bool* produced_next_norm,
+    const StageHooks* hooks)
 {
     if (produced_next_norm != nullptr) *produced_next_norm = false;
     const int T = std::max(1, fwd_cfg.tp_size);
@@ -416,6 +414,7 @@ void attention_layer(
         // post-rope -- compares in the same space. Placing it on the raw
         // projection instead would silently mis-rank pages for Quest.
     invoke_stage_hook(
+        hooks,
         StageHookPoint::OnAttnProj, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -469,6 +468,7 @@ void attention_layer(
             N, R, num_q_heads_local, attn_ws, stream);
     }
     invoke_stage_hook(
+        hooks,
         StageHookPoint::OnAttn, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -542,20 +542,15 @@ void mamba_layer(
     const int conv_dim =
         m_intermediate + 2 * m_groups * cfg.mamba_state_size;
     const int projection_dim = m_intermediate + conv_dim + m_heads;
-    const void* in_proj_w =
-        maybe_tp_data(Lw.mamba_in_proj, Lw.mamba_in_proj_tp);
-    const void* conv_w =
-        maybe_tp_data(Lw.mamba_conv_w, Lw.mamba_conv_w_tp);
-    const void* conv_b =
-        maybe_tp_data(Lw.mamba_conv_b, Lw.mamba_conv_b_tp);
-    const void* D_bf16 =
-        maybe_tp_data(Lw.mamba_D, Lw.mamba_D_tp);
-    const void* dt_bias_bf16 =
-        maybe_tp_data(Lw.mamba_dt_bias, Lw.mamba_dt_bias_tp);
-    const void* norm_w =
-        maybe_tp_data(Lw.mamba_norm_w, Lw.mamba_norm_w_tp);
-    const void* out_proj_w =
-        maybe_tp_data(Lw.mamba_out_proj, Lw.mamba_out_proj_tp);
+    // Already this rank's share: the contract declared the split, so there is
+    // no second copy to choose between here.
+    const void* in_proj_w = Lw.mamba_in_proj->data();
+    const void* conv_w = Lw.mamba_conv_w->data();
+    const void* conv_b = Lw.mamba_conv_b->data();
+    const void* D_bf16 = Lw.mamba_D->data();
+    const void* dt_bias_bf16 = Lw.mamba_dt_bias->data();
+    const void* norm_w = Lw.mamba_norm_w->data();
+    const void* out_proj_w = Lw.mamba_out_proj->data();
 
     profile_cuda_stage(profile, profile ? &profile->mamba_inproj_ms : nullptr,
         stream, [&] {
@@ -1413,7 +1408,8 @@ void nemotron_h_forward_paged(
     const std::int32_t* slot_ids_d,
     const std::uint8_t* is_fresh_d,
     const std::int32_t* logit_row_indices_d,
-    int num_logit_rows)
+    int num_logit_rows,
+    const StageHooks* hooks)
 {
     const int H = cfg.hidden_size;
     const int V = cfg.vocab_size;
@@ -1482,7 +1478,7 @@ void nemotron_h_forward_paged(
                     static_cast<int>(li),
                     N, R, is_pure_decode, row_valid_d,
                     custom_mask_d, custom_mask_indptr_d,
-                    next_norm_w, eps, stream, &produced_next_norm);
+                    next_norm_w, eps, stream, &produced_next_norm, hooks);
             });
         } else {
             ++profile.moe_layers;

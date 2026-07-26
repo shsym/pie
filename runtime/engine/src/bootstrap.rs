@@ -159,6 +159,7 @@ pub struct DriverConfig {
     pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
+    pub has_lora: bool,
     pub device_geometry_port_mask: u32,
     pub limits: crate::driver::SchedulerLimits,
     pub driver_backend: crate::driver::DriverBackend,
@@ -304,6 +305,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             && driver_configs.iter().all(|d| d.has_attn_score),
         has_attn_page_mask: !driver_configs.is_empty()
             && driver_configs.iter().all(|d| d.has_attn_page_mask),
+        has_lora: !driver_configs.is_empty() && driver_configs.iter().all(|d| d.has_lora),
     };
     model::register(
         name.clone(),
@@ -406,7 +408,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                 // a tracing event here would go nowhere.
                 println!(
                     "[planner-trace] queue={} head_pages={} head_kind={} accum={} \
-                     free={}/{} host_free={}/{} parks={} serves={} evictions={} \
+                     free={}/{} host_free={}/{} head_rs={} rs_free={}/{} \
+                     parks={} serves={} evictions={} \
                      evict_rollbacks={} restores={} restore_failures={} gate_parks={} \
                      hogs={} starved={} salvaged={} swapfull={}/{} e6_relax={} \
                      d2h_pages={} h2d_pages={} d2h_ms={} h2d_ms={} \
@@ -420,6 +423,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                     d.device_pages_total,
                     d.host_slots_free,
                     d.host_slots_total,
+                    d.queue.first().map_or(0, |w| w.rs_slots),
+                    d.rs_slots_free,
+                    d.rs_slots_total,
                     d.parks_total,
                     d.serves_total,
                     d.evictions_total,

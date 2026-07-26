@@ -41,6 +41,7 @@
 #include "batch/frame.hpp"
 #include "batch/fire_timing.hpp"
 #include "batch/forward.hpp"
+#include "batch/planner_calibration.hpp"
 #include "batch/tp.hpp"
 #include "kernels/kv_paged.hpp"
 #include "store/kv_cache.hpp"
@@ -58,6 +59,7 @@
 #include "model/kimi/kimi_forward.hpp"
 #include "model/llama_like/llama_like.hpp"
 #include "model/loaded_model.hpp"
+#include "model/nemotron_h/nemotron_h_contract.hpp"
 #include "model/nemotron_h/nemotron_h.hpp"
 #include "model/nemotron_h/nemotron_h_forward.hpp"
 #include "model/qwen3_5/qwen3_5_config.hpp"
@@ -821,6 +823,7 @@ int Context::Impl::load_model(
             {"has_kv_envelopes", false},
             {"has_attn_score", false},
             {"has_attn_page_mask", false},
+            {"has_lora", false},
             {"max_forward_tokens",
              static_cast<std::uint32_t>(std::max(1, c.max_model_len))},
             {"max_forward_requests", 256},
@@ -1678,6 +1681,18 @@ int Context::Impl::load_model(
 
     registry_->dispatch().set_attn_page_mask_available(has_attn_page_mask);
 
+    // `lora`: the llama_like forward applies the low-rank delta at its q/v
+    // projection GEMMs (llama_like.cpp `LoraFireState`), so that family — and
+    // only that family — may bind programs naming the sink. TP is excluded:
+    // the adapter's B is traced against the UNSHARDED projection widths, a TP
+    // rank holds only its head slice, and the lora table is resolved on rank
+    // 0 alone. This one bool feeds both the bind gate here and the `has_lora`
+    // capability rows below, so the engine's honour check and the driver
+    // cannot disagree.
+    const bool has_lora =
+        family == model::Family::LlamaLike && local_tp_size == 1;
+    registry_->dispatch().set_lora_available(has_lora);
+
     registry_->dispatch().set_kv_envelopes_available(
         has_kv_envelopes,
         has_kv_envelopes
@@ -1766,6 +1781,24 @@ int Context::Impl::load_model(
         attention_allocator_->ensure_all();
         state_allocator_->ensure_all();
         capture_forward_graph_lattice(*executor_);
+        if (!is_tp_follower()) {
+            workspace_allocator_->trim_bytes(pie::elastic::kLogicalPageBytes);
+            attention_allocator_->trim_bytes(0);
+            if (tp_size_ == 1) {
+                state_allocator_->trim_bytes(0);
+            }
+        }
+    }
+    // Opt-in: time the forward step across the token-budget ladder and cache
+    // the winner, so the next start selects `max_forward_tokens` from a
+    // measurement on THIS device instead of from the planner's analytic score.
+    // The sweep runs the real forward body, so it needs the arenas resident —
+    // hence the ensure/trim pair here rather than relying on the capture path's.
+    if (planner_calibration_requested()) {
+        workspace_allocator_->ensure_all();
+        attention_allocator_->ensure_all();
+        state_allocator_->ensure_all();
+        calibrate_memory_planner(*executor_, tp_size_, mem_plan.kv_page_size);
         if (!is_tp_follower()) {
             workspace_allocator_->trim_bytes(pie::elastic::kLogicalPageBytes);
             attention_allocator_->trim_bytes(0);
@@ -1903,6 +1936,7 @@ int Context::Impl::load_model(
         {"has_kv_envelopes", has_kv_envelopes},
         {"has_attn_score", has_attn_score},
         {"has_attn_page_mask", has_attn_page_mask},
+        {"has_lora", has_lora},
         // RV-26: PIE_DEVICE_PORT_ATTN_MASK is deliberately NOT advertised.
         // The runtime classifies masked device-carried decode into the
         // DecodeEnvelope class exactly when this mask claims the port, but

@@ -13,6 +13,8 @@
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 struct KimiForwardCfg {
     int tp_size = 1;
     NcclComm* tp_comm = nullptr;
@@ -93,15 +95,6 @@ struct KimiWorkspace {
         int tp_size);
 };
 
-// Dequantises the routed experts into per-layer BF16 stacks (`[E, 2I, H]` and
-// `[E, H, I]`) so the batched-GEMM MoE path can read each expert once. Skipped
-// when the stacks would exceed `kKimiMoeBf16StackBudget`. Must be called before
-// any CUDA graph capture: allocating during capture yields graph-ordered memory.
-void kimi_materialize_bf16_expert_stacks(
-    KimiWeights& weights,
-    const HfConfig& cfg,
-    int tp_size);
-
 std::size_t kimi_workspace_bytes(
     const HfConfig& cfg,
     int max_tokens,
@@ -151,6 +144,9 @@ void kimi_forward_paged(
     bool is_pure_decode,
     const std::uint8_t* row_valid_d = nullptr,
     const std::int32_t* logit_row_indices_d = nullptr,
-    int num_logit_rows = 0);
+    int num_logit_rows = 0,
+    // The fire's stage hooks (ForwardInputs::stage_hooks). Null = no program
+    // attached.
+    const StageHooks* hooks = nullptr);
 
 }  // namespace pie_cuda_driver::model

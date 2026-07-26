@@ -56,6 +56,8 @@ struct PrecomputedEmbeddingInputs;
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 struct Gemma4LayerWeights {
     // Four RMSNorms — same placement as Gemma-2/3.
     const DeviceTensor* attn_norm_pre  = nullptr;  // input_layernorm
@@ -85,7 +87,7 @@ struct Gemma4LayerWeights {
     // stand-alone module: RMSNorm-no-scale → channel-scale → 1/sqrt(H)
     // → linear → softmax → top-k → renorm → per-expert-scale.
     const DeviceTensor* router_proj            = nullptr;  // [E, H]
-    const DeviceTensor* router_scale           = nullptr;  // [H]
+    const DeviceTensor* router_scale           = nullptr;  // [H], 1/sqrt(H) folded in
     const DeviceTensor* router_per_expert_scale = nullptr; // [E]
     const DeviceTensor* moe_gate_up_proj       = nullptr;  // [E, 2*Im, H]
     const DeviceTensor* moe_down_proj          = nullptr;  // [E, H, Im]
@@ -124,11 +126,6 @@ struct Gemma4Weights {
     const DeviceTensor* final_norm  = nullptr;       // model.language_model.norm
     const DeviceTensor* lm_head     = nullptr;       // tied to embed unless lm_head.weight present
     std::vector<Gemma4LayerWeights> layers;
-
-    // Owned per-layer `router.scale` baked together with `1/sqrt(H)`,
-    // so the router pipeline collapses to a single rmsnorm+weight call.
-    // Empty on dense Gemma-4 ckpts; one tensor per layer when MoE is on.
-    std::vector<DeviceTensor> owned_router_combined_scales;
 
     // Cached per-layer arrays for the forward / KV-cache allocator.
     std::vector<int> per_layer_head_dim;
@@ -413,7 +410,10 @@ void gemma4_forward_paged(
     // Multimodal: encode + scatter audio soft tokens after the embed step.
     // nullptr / 0 clips for non-audio passes. See gemma4_audio_forward.hpp.
     const Gemma4AudioInputs* audio_in = nullptr,
-    const ::pie_cuda_driver::PrecomputedEmbeddingInputs* precomputed_embeddings = nullptr);
+    const ::pie_cuda_driver::PrecomputedEmbeddingInputs* precomputed_embeddings = nullptr,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
+    // program attached; hook-conditional paths fold to their fast form.
+    const StageHooks* hooks = nullptr);
 
 // Gemma4 MoE workspace byte budget. Returns 0 if the config has no MoE
 // block configured.

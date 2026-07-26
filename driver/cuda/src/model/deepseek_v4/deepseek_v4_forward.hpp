@@ -13,15 +13,13 @@
 
 namespace pie_cuda_driver::model {
 
+struct StageHooks;
+
 struct DsV4ForwardCfg {
     int tp_size = 1;
     int tp_rank = 0;
     NcclComm* tp_comm = nullptr;
     bool emit_logits = true;
-    // When true, the MXFP4 routed experts are dequantised to BF16 once and
-    // cached. Costs 2x the packed footprint per layer but removes a full
-    // expert-bank dequant from every forward.
-    bool eager_bf16_experts = true;
     // Mirrors LlamaLikeForwardCfg: when CUDA graphs are on, the FlashInfer
     // plan must be built in graph mode so the captured body re-reads the
     // plan buffers on replay instead of baking first-fire metadata in.
@@ -124,16 +122,6 @@ struct DsV4Workspace {
         int tp_size);
 };
 
-// Dequantises the MXFP4 routed experts into per-layer BF16 stacks
-// (`[E, 2I, H]` and `[E, H, I]`) so the GEMV/batched-GEMM MoE paths can read
-// them directly. Must run at model construction: allocating inside the forward
-// picks up whatever allocator binding is active there (the elastic KV arena)
-// and yields memory that is not safely writable.
-void dsv4_materialize_bf16_expert_stacks(
-    DsV4Weights& weights,
-    const HfConfig& cfg,
-    int tp_size);
-
 std::size_t dsv4_workspace_bytes(
     const HfConfig& cfg,
     int max_tokens,
@@ -168,6 +156,9 @@ void dsv4_forward_paged(
     bool is_pure_decode,
     const std::uint8_t* row_valid_d,
     const std::int32_t* logit_row_indices_d = nullptr,
-    int num_logit_rows = 0);
+    int num_logit_rows = 0,
+    // The fire's stage hooks (`ForwardInputs::stage_hooks`). Null = no
+    // program attached.
+    const StageHooks* hooks = nullptr);
 
 }  // namespace pie_cuda_driver::model

@@ -14,8 +14,7 @@ DsV4Model::DsV4Model(
     int tp_size,
     int tp_rank,
     NcclComm* tp_comm,
-    bool emit_logits,
-    bool eager_bf16_experts)
+    bool emit_logits)
     : weights_(std::move(weights)),
       hf_config_(hf_config),
       ws_(ws),
@@ -38,10 +37,6 @@ DsV4Model::DsV4Model(
         const bool on = !(v != nullptr && v[0] == '0');
         caps_.graph_safe = on;
         caps_.graph_padding_kv_write_safe = on;
-    }
-    fwd_cfg_.eager_bf16_experts = eager_bf16_experts;
-    if (eager_bf16_experts) {
-        dsv4_materialize_bf16_expert_stacks(weights_, hf_config_, tp_size);
     }
 }
 
@@ -88,7 +83,8 @@ void DsV4Model::body(Workspace& ws,
         in.qo_indptr_h, in.kv_page_indptr_h,
         in.total_tokens, in.num_requests, in.is_pure_decode,
         in.row_valid_d,
-        in.logit_row_indices_d, in.num_logit_rows);
+        in.logit_row_indices_d, in.num_logit_rows,
+        in.stage_hooks);
 }
 
 }  // namespace pie_cuda_driver::model

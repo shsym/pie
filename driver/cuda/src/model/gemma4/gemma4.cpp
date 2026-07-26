@@ -761,13 +761,6 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
     }
 
     Gemma4Weights w;
-    // Reserve up front: pointers into `owned_router_combined_scales`
-    // get cached on each `Gemma4LayerWeights`, so any vector reallocation
-    // would dangle them. One slot per layer when MoE is on.
-    if (cfg.gemma4_enable_moe) {
-        w.owned_router_combined_scales.reserve(
-            static_cast<std::size_t>(cfg.num_hidden_layers));
-    }
     const bool fuse_dense_gate_up = gemma4_dense_gate_up_fused_enabled(cfg);
     const bool fuse_dense_qkv =
         !cfg.gemma4_enable_moe && gemma4_dense_qkv_fused_enabled();
@@ -987,31 +980,10 @@ Gemma4Weights bind_gemma4(const LoadedModel& engine) {
             Lw.mlp_norm_post_dense    = &must(engine, lp + "post_feedforward_layernorm_1.weight");
             Lw.moe_norm_pre           = &must(engine, lp + "pre_feedforward_layernorm_2.weight");
             Lw.moe_norm_post          = &must(engine, lp + "post_feedforward_layernorm_2.weight");
-            // The router pipeline does `(rmsnorm_no_scale(x) * scale) *
-            // (1/sqrt(H))` then a linear. Bake `1/sqrt(H)` into the
-            // per-channel `scale` here so the forward collapses the
-            // first three steps into a single rmsnorm-with-weight call.
-            const auto* raw_scale = &must(engine, lp + "router.scale");
-            const std::int64_t H64 = raw_scale->numel();
-            const float inv_sqrt_h = 1.f / std::sqrt(static_cast<float>(H64));
-            std::vector<std::uint16_t> host(static_cast<std::size_t>(H64));
-            CUDA_CHECK(cudaMemcpy(host.data(), raw_scale->data(),
-                                  H64 * sizeof(std::uint16_t),
-                                  cudaMemcpyDeviceToHost));
-            for (auto& bits : host) {
-                std::uint32_t f32_bits = static_cast<std::uint32_t>(bits) << 16;
-                float v;
-                std::memcpy(&v, &f32_bits, sizeof(float));
-                v *= inv_sqrt_h;
-                std::memcpy(&f32_bits, &v, sizeof(float));
-                bits = static_cast<std::uint16_t>(f32_bits >> 16);
-            }
-            DeviceTensor combined = DeviceTensor::allocate(DType::BF16, {H64});
-            CUDA_CHECK(cudaMemcpy(combined.data(), host.data(),
-                                  H64 * sizeof(std::uint16_t),
-                                  cudaMemcpyHostToDevice));
-            w.owned_router_combined_scales.push_back(std::move(combined));
-            Lw.router_scale = &w.owned_router_combined_scales.back();
+            // `1/sqrt(H)` is already folded into this vector by
+            // `gemma4_fold_router_scale`, so the forward's rmsnorm-with-weight
+            // call is the whole of `rmsnorm_no_scale(x) * scale * (1/sqrt(H))`.
+            Lw.router_scale = &must(engine, lp + "router.scale");
         }
 
         if (is_full) w.full_layer_indices.push_back(i);
@@ -1453,7 +1425,8 @@ void gemma4_forward_paged(
     int num_logit_rows,
     const Gemma4VisionInputs* vision_in,
     const Gemma4AudioInputs* audio_in,
-    const PrecomputedEmbeddingInputs* precomputed_embeddings)
+    const PrecomputedEmbeddingInputs* precomputed_embeddings,
+    const StageHooks* hooks)
 {
     const int H        = cfg.hidden_size;
     const int L        = cfg.num_hidden_layers;
@@ -1728,7 +1701,7 @@ void gemma4_forward_paged(
                 ws.norm_x.data(), layer.qkv_proj_fused->data(),
                 ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
             const bool can_fuse_packed_qkv_post =
-                active_stage_hooks == nullptr &&
+                hooks == nullptr &&
                 qk_norm_enabled && !partial && !dbg_dumps_enabled() &&
                 kv_view.is_native_bf16() &&
                 (use_row_decode_path || use_decode_path);
@@ -1856,6 +1829,7 @@ void gemma4_forward_paged(
         // observer scoring it against the cached keys -- which are stored
         // post-rope -- compares in the same space.
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttnProj, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),
@@ -1963,6 +1937,7 @@ void gemma4_forward_paged(
                 }
             });
         invoke_stage_hook(
+            hooks,
             StageHookPoint::OnAttn, ws.q.data(),
             static_cast<std::uint32_t>(N),
             static_cast<std::uint32_t>(Hq),

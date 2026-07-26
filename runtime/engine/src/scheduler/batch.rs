@@ -105,7 +105,7 @@ impl AdmissionLimits {
 }
 
 pub(crate) fn build_batch_request(
-    requests: &[PendingRequest],
+    requests: &[Box<PendingRequest>],
     page_size: u32,
     stats: &SchedulerStats,
 ) -> StepBuild {
@@ -236,12 +236,12 @@ pub(crate) fn build_batch_request(
 /// - `required_kv_pages` is the frame-union high-water over every member
 ///   (declared high-water and page-id-derived floors).
 pub(crate) fn build_frame_submission(
-    waves: Vec<Vec<PendingRequest>>,
+    waves: Vec<Vec<Box<PendingRequest>>>,
     limits: SchedulerLimits,
     page_size: u32,
     stats: &SchedulerStats,
-) -> (FrameSubmission, Vec<PendingRequest>) {
-    let mut step_groups: Vec<Vec<PendingRequest>> = Vec::new();
+) -> (FrameSubmission, Vec<Box<PendingRequest>>) {
+    let mut step_groups: Vec<Vec<Box<PendingRequest>>> = Vec::new();
     for wave in waves {
         if wave.is_empty() {
             continue;
@@ -251,8 +251,8 @@ pub(crate) fn build_frame_submission(
         // step, exactly like the old deferred-class re-dispatch.
         while !deferred.is_empty() {
             let mut grouping = super::worker::LaunchGrouping::default();
-            let mut group: Vec<PendingRequest> = Vec::new();
-            let mut rest: Vec<PendingRequest> = Vec::new();
+            let mut group: Vec<Box<PendingRequest>> = Vec::new();
+            let mut rest: Vec<Box<PendingRequest>> = Vec::new();
             let mut closed = false;
             for req in deferred {
                 if closed || !grouping.accepts(&req, limits, page_size) {
@@ -277,25 +277,26 @@ pub(crate) fn build_frame_submission(
     let mut lane_translation: Vec<Vec<u32>> = Vec::new();
     let mut required_kv_pages = 0u32;
     let mut steps: Vec<StepSubmission> = Vec::new();
-    let mut flattened: Vec<PendingRequest> = Vec::new();
+    let mut flattened: Vec<Box<PendingRequest>> = Vec::new();
 
     for group in step_groups {
         // Ordered sub-batches: wire (Host-class) members first, the
         // device-resolved envelope suffix last — the driver's offset
         // fixed-decode compose requires the envelope lanes to be a
-        // contiguous program suffix. Stable sort keeps arrival order
-        // within each class.
+        // contiguous program suffix. That contract stays PRIMARY. Within
+        // each class, attention-hook-carrying programs sort last: the
+        // driver's hook-free prefix (`StageHooks::hook_free_prefix_rows`)
+        // is the fused fast path, and a leading hook-free run that spans
+        // ALL hook-free lanes makes that prefix maximal instead of ending
+        // at whichever hook lane happened to arrive first. Stable sort
+        // keeps arrival order otherwise.
         let mut group = group;
-        group.sort_by_key(|req| req.request.device_resolved_geometry);
+        group.sort_by_key(|req| (req.request.device_resolved_geometry, req.hook_program));
         let wire_count = group
             .iter()
             .take_while(|req| !req.request.device_resolved_geometry)
             .count();
         let envelope_count = group.len() - wire_count;
-        // TEMP DIAG (remove before landing).
-        if super::sched_trace_enabled() && envelope_count > 0 && wire_count > 0 {
-            eprintln!("[sched] MIXED step wire={wire_count} envelope={envelope_count}");
-        }
         let mut sub_batch_indptr: Vec<u32> = vec![0];
         let mut sub_batch_class: Vec<u32> = Vec::new();
         if wire_count > 0 {
@@ -373,8 +374,8 @@ mod tests {
     use super::*;
     use crate::driver::{LaunchPlan, WorkItemCompletion};
 
-    fn pending(request: LaunchPlan, instance_id: u64, prebuilt: bool) -> PendingRequest {
-        PendingRequest {
+    fn pending(request: LaunchPlan, instance_id: u64, prebuilt: bool) -> Box<PendingRequest> {
+        Box::new(PendingRequest {
             logical_fire_id: 1,
             last_page_len: 1,
             request,
@@ -383,11 +384,12 @@ mod tests {
             process_id: None,
             pipeline_id: None,
             prebuilt,
+            hook_program: false,
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
             timing: None,
-        }
+        })
     }
 
     fn wire_decode(token: u32, page: u32) -> LaunchPlan {
