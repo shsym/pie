@@ -2,12 +2,9 @@
 
 // Tensor-parallel plumbing on top of NCCL.
 //
-// Each TP rank runs as its own `pie_driver_cuda` process and joins a single
-// `ncclComm_t` keyed by a shared `ncclUniqueId`. The wrapper
-// (`pie_driver_cuda_native/worker.py`) generates the unique-id, passes it
-// to all ranks via the startup TOML, and only rank 0 of each group exposes
-// a shmem server to the runtime. Followers consume their inputs by NCCL
-// broadcast from rank 0 — see executor for the broadcast plumbing.
+// The runtime creates one local driver object per rank with a shared
+// `ncclUniqueId`. Rank 0 receives direct scheduler calls; follower objects
+// consume inputs through NCCL broadcasts from rank 0.
 
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +17,7 @@
 
 namespace pie_cuda_driver {
 
-class CustomAllReduce;  // see custom_all_reduce.hpp
+class CustomAllReduce;  // see kernels/custom_all_reduce.hpp
 
 #define NCCL_CHECK(expr)                                                       \
     do {                                                                       \
@@ -100,9 +97,20 @@ public:
     void all_gather_bytes(const void* send, void* recv,
                           std::size_t count_per_rank, cudaStream_t stream);
 
+    // Host-buffer variant of the above: stages through device memory and
+    // synchronizes, so `recv` holds every rank's bytes on return. Cold path
+    // only (startup handshakes).
+    void all_gather_host_bytes(const void* send, void* recv,
+                               std::size_t bytes_per_rank);
+
     // Stream-synchronous device barrier. Implemented as a 1-byte all-reduce
     // so we don't depend on `ncclAllReduce(0, …)` semantics across versions.
     void barrier(cudaStream_t stream);
+
+    // Best-effort teardown wake-up for follower ranks blocked in NCCL. Safe to
+    // call multiple times; the communicator is released and this object's
+    // handle is cleared, so `comm()` returns nullptr afterwards.
+    void abort() noexcept;
 
     // Optional fast-path: when set, `all_reduce_bf16(... ncclSum ...)`
     // routes small messages through the NVLink P2P custom kernel

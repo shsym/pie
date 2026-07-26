@@ -49,7 +49,6 @@ batch_policy = "adaptive"
 request_timeout_secs = 120
 default_endowment_pages = 64
 admission_oversubscription_factor = 1.0
-restore_pause_at_utilization = 0.85
 # default_token_limit = 100000
 
 [model.driver]
@@ -58,14 +57,13 @@ device = ["cuda:0"]
 tensor_parallel_size = 1
 activation_dtype = "bfloat16"
 random_seed = 42
-ipc_profile = "balanced"
 
 [model.driver.options]
 gpu_mem_utilization = 0.90
 memory_profile = "auto"
 ```
 
-`[model.driver].type` is a discriminator. Embedded drivers (`portable`, `cuda_native`, `dummy`) run inside the `pie` process. Python drivers (`vllm`, `sglang`, `tensorrt_llm`) run as supervised subprocesses. Driver-specific knobs live in `[model.driver.options]`; see the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang), [TensorRT-LLM](./drivers/tensorrt-llm)) for what each backend accepts.
+`[model.driver].type` is a discriminator. Embedded drivers (`cuda_native`, `metal`, `dummy`) run inside the `pie` process. Driver-specific knobs live in `[model.driver.options]`; see the per-driver pages ([CUDA](./drivers/cuda)) for what each backend accepts.
 
 To add a second model, append another `[[model]]` block with a unique `name` and a `device` list that does not overlap any other model's.
 
@@ -107,8 +105,8 @@ The `[runtime]` block tunes the tokio worker pool, the wasmtime engine pool, the
 | `wasm_warm_slots` | `100` | Number of pool slots to keep warm. Must be `>= 0`. |
 | `allow_fs` | `false` | When true, every inferlet receives a preopened scratch directory at `/scratch` mapped to a per-process subdirectory under `fs_scratch_dir`. Inferlets without this flag have no host filesystem visibility. |
 | `fs_scratch_dir` | `<tempdir>/pie` | Host root under which per-process `/scratch` directories are created when `allow_fs = true`. |
-| `allow_network` | `true` | When false, wasi:sockets is denied and outbound wasi:http is not linked. Useful for tight outbound HTTP control. |
-| `network_allowed_hosts` | `["*"]` | Allowed-host filter for wasi:sockets and outbound wasi:http. Supports CIDRs and host:port forms (e.g. `["10.0.0.0/8", "127.0.0.1"]`, `["10.0.0.0/8:443"]`). Restricted wasi:http policies accept IP-literal authorities only; use `["*"]` for legacy unrestricted host networking. |
+| `allow_network` | `true` | When false, wasi:sockets is denied. Useful for tight outbound HTTP control. |
+| `network_allowed_hosts` | `["*"]` | Allowed-host filter for wasi:sockets. Supports CIDRs and host:port forms (e.g. `["10.0.0.0/8", "127.0.0.1"]`, `["10.0.0.0/8:443"]`). Filters wasi:sockets only — wasi:http bypasses the per-socket hook. |
 | `max_upload_mb` | `256` | Maximum size of a single chunked upload accepted by the server, in MiB. Must be `> 0`. |
 
 ## Per-model keys
@@ -133,7 +131,6 @@ Batch firing + per-process admission/market knobs:
 | `default_token_limit` | unset | Per-process compute cap (tokens) when the launch request doesn't specify one. Unset means no hard cap. Must be `> 0` if set. |
 | `default_endowment_pages` | `64` | Per-process initial endowment in KV pages. Sets the process's claim weight in the bidding market — bigger values guarantee more pages held under contention. Must be `> 0`. |
 | `admission_oversubscription_factor` | `1.0` | How much logical KV memory the market overcommits relative to physical: `Σ endowment ≤ total_pages × factor`. `1.0` = no overbook. Higher values sell more entitlement than physical capacity and are best treated as an explicit workload choice. Must be a finite `> 0` number. |
-| `restore_pause_at_utilization` | `0.85` | Pause restoring suspended processes when any device exceeds this GPU page utilization (`(0.0, 1.0]`). Prevents evict→restore→re-evict thrash. |
 
 ### `[model.driver]`
 
@@ -141,17 +138,15 @@ Driver discriminator + universal driver fields:
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `type` | required | Driver name. One of `portable`, `cuda_native`, `dummy`, `vllm`, `sglang`, `tensorrt_llm`. See the per-driver reference pages. |
+| `type` | required | Driver name. One of `cuda_native`, `metal`, `dummy`. See the per-driver reference pages. |
 | `device` | required | Device list for this model. A single string is accepted and normalized to a one-element list. The list across all `[[model]]` entries must be disjoint. |
 | `tensor_parallel_size` | `1` | TP world size. |
 | `activation_dtype` | `"bfloat16"` | Activation dtype for forward passes. |
 | `random_seed` | `42` | Seed used by samplers and dropout-free stochastic ops. |
-| `ipc_profile` | driver-dependent | IPC wait profile. Omitted CUDA uses `latency`; omitted non-CUDA uses `balanced`. `latency` uses the polling in-process channel for embedded CUDA/portable drivers and busy-spins on shmem; `balanced` spins for 1000 us then parks; `power` parks immediately. |
-| `spin_budget_us` | unset | Expert override for the profile's busy-spin window in microseconds. Leave unset unless tuning latency/CPU tradeoffs directly. |
 
 ### `[model.driver.options]`
 
-Driver-specific knobs in the driver's own vocabulary. Embedded drivers are validated by `pie` before boot. Python drivers accept `venv` or `python` as standalone-only interpreter overrides and pass the remaining options to the driver subprocess. See the per-driver pages ([CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang), [TensorRT-LLM](./drivers/tensorrt-llm)) for each driver's option set.
+Driver-specific knobs in the driver's own vocabulary. Embedded drivers are validated by `pie` before boot. See the per-driver pages ([CUDA](./drivers/cuda)) for each driver's option set.
 
 ## Editing the config
 
@@ -203,5 +198,5 @@ Run `pie config init` to regenerate the file in the new shape.
 ## Related
 
 - [CLI reference](./pie): every `pie` command and flag.
-- Per-driver options: [CUDA](./drivers/cuda), [Portable](./drivers/portable), [vLLM](./drivers/vllm), [SGLang](./drivers/sglang), [TensorRT-LLM](./drivers/tensorrt-llm).
+- Per-driver options: [CUDA](./drivers/cuda).
 - Supported architectures are listed on each driver page (e.g. [CUDA `#supported-architectures`](./drivers/cuda#supported-architectures)).

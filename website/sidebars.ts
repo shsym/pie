@@ -43,9 +43,6 @@ const sidebars: SidebarsConfig = {
         'guide/examples/structured',
         'guide/examples/kv-cache',
         'guide/examples/speculation',
-        'guide/examples/reasoning',
-        'guide/examples/agents',
-        'guide/examples/integration',
       ],
     },
     {
@@ -97,15 +94,13 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: 'category',
-      label: 'I/O and messaging',
+      label: 'I/O',
       collapsed: false,
       items: [
         'guide/io/overview',
         'guide/io/session',
-        'guide/io/messaging',
         'guide/io/http',
         'guide/io/filesystem',
-        {type: 'doc', id: 'guide/io/mcp', className: 'sidebar-experimental'},
       ],
     },
     {
@@ -160,10 +155,6 @@ const sidebars: SidebarsConfig = {
       collapsed: false,
       items: [
         'reference/drivers/cuda',
-        'reference/drivers/portable',
-        {type: 'doc', id: 'reference/drivers/vllm', className: 'sidebar-experimental'},
-        {type: 'doc', id: 'reference/drivers/sglang', className: 'sidebar-experimental'},
-        {type: 'doc', id: 'reference/drivers/tensorrt-llm', className: 'sidebar-experimental'},
       ],
     },
     {

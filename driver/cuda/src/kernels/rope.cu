@@ -1,7 +1,5 @@
 #include "kernels/rope.hpp"
 
-#include <algorithm>
-#include <cmath>
 #include <cuda_bf16.h>
 
 namespace pie_cuda_driver::kernels {
@@ -513,7 +511,8 @@ __global__ void rope_yarn_original_bf16_kernel(
     int num_q_heads, int num_kv_heads, int head_dim,
     float theta, float factor,
     float low_dim, float high_dim,
-    float mscale)
+    float mscale,
+    bool interleaved)
 {
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
@@ -537,12 +536,14 @@ __global__ void rope_yarn_original_bf16_kernel(
         if (head_idx < num_q_heads) {
             __nv_bfloat16* qp = q + (static_cast<long long>(n) * num_q_heads +
                                      head_idx) * head_dim;
-            rotate_pair(qp, half, dim_pair, cos_v, sin_v);
+            if (interleaved) rotate_pair_interleaved(qp, dim_pair, cos_v, sin_v);
+            else             rotate_pair(qp, half, dim_pair, cos_v, sin_v);
         } else {
             const int kv_h = head_idx - num_q_heads;
             __nv_bfloat16* kp = k + (static_cast<long long>(n) * num_kv_heads +
                                      kv_h) * head_dim;
-            rotate_pair(kp, half, dim_pair, cos_v, sin_v);
+            if (interleaved) rotate_pair_interleaved(kp, dim_pair, cos_v, sin_v);
+            else             rotate_pair(kp, half, dim_pair, cos_v, sin_v);
         }
     }
 }
@@ -558,7 +559,8 @@ void launch_rope_yarn_original_bf16(
     float beta_fast, float beta_slow,
     float attention_factor,
     int original_max_position,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    bool interleaved)
 {
     constexpr float TWO_PI = 6.2831853071795864769f;
     // correction_dim(rot) = head_dim * ln(max_pos / (rot * 2π)) / (2 * ln(theta))
@@ -585,7 +587,7 @@ void launch_rope_yarn_original_bf16(
         static_cast<__nv_bfloat16*>(k),
         positions,
         num_q_heads, num_kv_heads, head_dim,
-        theta, factor, low_dim, high_dim, attention_factor);
+        theta, factor, low_dim, high_dim, attention_factor, interleaved);
 }
 
 // ── Partial rotary (Gemma-4 full-attention layers) ─────────────────────────
@@ -708,15 +710,6 @@ void launch_rope_partial_bf16_position_delta(
 
 namespace {
 
-// DeepSeek-V4 tail RoPE. Rotates ADJACENT dim pairs (2p, 2p+1) — GPT-J /
-// interleaved convention — matching the checkpoint's native layout and the
-// reference `rope_tail_ext_inplace`. Pair p carries frequency
-// theta^(-2p / rotary_dim).
-//
-// YaRN long-context interpolation (compressed layers): the rotation angle
-// blends between the interpolated angle (pos * freq_scale * freq) and the
-// extrapolated angle (pos * freq) with a per-dim ramp between corr_low and
-// corr_high, weighted by ext_factor.
 __global__ void rope_partial_last_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k,
@@ -726,11 +719,11 @@ __global__ void rope_partial_last_bf16_kernel(
     int head_dim,
     int rotary_dim,
     float theta,
-    float freq_scale,
-    float ext_factor,
-    float corr_low,
-    float corr_high,
-    bool inverse)
+    bool inverse,
+    bool interleaved,
+    float yarn_factor,
+    float yarn_low_dim,
+    float yarn_high_dim)
 {
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
@@ -742,20 +735,14 @@ __global__ void rope_partial_last_bf16_kernel(
         const int head_idx = t / rope_half;
         const int dim_pair = t % rope_half;
 
-        const float freq = powf(theta,
+        float freq = powf(theta,
             -2.f * static_cast<float>(dim_pair) /
                    static_cast<float>(rotary_dim));
-        const float theta_extrap = static_cast<float>(pos) * freq;
-        float ang = freq_scale * theta_extrap;
-        if (ext_factor != 0.f) {
-            // rope_yarn_ramp over pair index.
-            const float y = (static_cast<float>(dim_pair) - corr_low) /
-                            fmaxf(0.001f, corr_high - corr_low);
-            const float ramp =
-                (1.f - fminf(1.f, fmaxf(0.f, y))) * ext_factor;
-            ang = ang * (1.f - ramp) + theta_extrap * ramp;
+        if (yarn_factor > 1.f) {
+            freq = yarn_original_freq(freq, yarn_factor,
+                                      yarn_low_dim, yarn_high_dim, dim_pair);
         }
-        if (inverse) ang = -ang;
+        const float ang = (inverse ? -1.f : 1.f) * static_cast<float>(pos) * freq;
         float cos_v, sin_v;
         __sincosf(ang, &sin_v, &cos_v);
 
@@ -764,24 +751,16 @@ __global__ void rope_partial_last_bf16_kernel(
             ? q + static_cast<long long>(n * num_q_heads + head_idx) * head_dim
             : k + static_cast<long long>(n * num_kv_heads + (head_idx - num_q_heads)) * head_dim;
 
-        const int i = offset + 2 * dim_pair;
-        const int j = i + 1;
+        // GPT-J pairing (adjacent dims) for DeepSeek-V4 (`is_neox_style=False`
+        // in vLLM `build_deepseek_v4_rope`); NeoX half/half otherwise.
+        const int i = interleaved ? offset + 2 * dim_pair : offset + dim_pair;
+        const int j = interleaved ? offset + 2 * dim_pair + 1
+                                  : offset + dim_pair + rope_half;
         const float a = __bfloat162float(base[i]);
         const float b = __bfloat162float(base[j]);
         base[i] = __float2bfloat16(a * cos_v - b * sin_v);
         base[j] = __float2bfloat16(b * cos_v + a * sin_v);
     }
-}
-
-// YaRN correction dim (same formula as the reference `rope_yarn_corr_dim`):
-// the rotary index at which a wavelength completes `n_rot` cycles over
-// `orig_ctx` tokens.
-float yarn_corr_dim(int rotary_dim, int orig_ctx, float n_rot, float base)
-{
-    return static_cast<float>(rotary_dim) *
-           std::log(static_cast<float>(orig_ctx) /
-                    (n_rot * 2.0f * 3.14159265358979323846f)) /
-           (2.0f * std::log(base));
 }
 
 }  // namespace
@@ -797,33 +776,38 @@ void launch_rope_partial_last_bf16(
     float theta,
     cudaStream_t stream,
     bool inverse,
-    float freq_scale,
-    float ext_factor,
-    float beta_fast,
-    float beta_slow,
-    int original_max_position)
+    bool interleaved,
+    float yarn_factor,
+    float yarn_beta_fast,
+    float yarn_beta_slow,
+    int   yarn_original_max_position)
 {
+    // Same ramp as `launch_rope_yarn_original_bf16`, but the correction range
+    // is over `rotary_dim` (the rotated slice), not the full head_dim.
+    float low_dim = 0.f, high_dim = 0.f;
+    if (yarn_factor > 1.f && yarn_original_max_position > 0) {
+        constexpr float TWO_PI = 6.2831853071795864769f;
+        const float ln_theta = logf(theta);
+        auto corr_dim = [&](float rot) -> float {
+            return rotary_dim * logf(static_cast<float>(yarn_original_max_position) /
+                                     (rot * TWO_PI)) / (2.f * ln_theta);
+        };
+        low_dim  = floorf(corr_dim(yarn_beta_fast));
+        high_dim = ceilf(corr_dim(yarn_beta_slow));
+        if (low_dim < 0.f) low_dim = 0.f;
+        const float max_pair = static_cast<float>(rotary_dim / 2) - 1.f;
+        if (high_dim > max_pair) high_dim = max_pair;
+        if (high_dim < low_dim)  high_dim = low_dim;
+    }
     constexpr int BLOCK = 256;
     dim3 grid(num_tokens);
     dim3 block(BLOCK);
-
-    float corr_low = 0.f;
-    float corr_high = 0.f;
-    if (ext_factor != 0.f) {
-        const float start = std::floor(
-            yarn_corr_dim(rotary_dim, original_max_position, beta_fast, theta));
-        const float end = std::ceil(
-            yarn_corr_dim(rotary_dim, original_max_position, beta_slow, theta));
-        corr_low = std::max(0.f, start);
-        corr_high = std::min(static_cast<float>(rotary_dim - 1), end);
-    }
-
     rope_partial_last_bf16_kernel<<<grid, block, 0, stream>>>(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
-        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta,
-        freq_scale, ext_factor, corr_low, corr_high, inverse);
+        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta, inverse,
+        interleaved, yarn_factor, low_dim, high_dim);
 }
 
 }  // namespace pie_cuda_driver::kernels

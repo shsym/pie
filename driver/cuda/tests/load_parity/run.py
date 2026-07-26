@@ -62,26 +62,28 @@ def _free_port() -> int:
 def _toml(snap: Path, runtime_quant: str, port: int, devices: list[str], tp: int) -> str:
     rq = f'runtime_quant = "{runtime_quant}"\n' if runtime_quant else ""
     devs = ", ".join(f'"{d}"' for d in devices)
-    return f"""[server]
-host = "127.0.0.1"
-port = {port}
-verbose = true
-[auth]
+    return f"""[controller]
+
+[gateway]
+listen = "127.0.0.1:{port}"
+
+[worker]
+
+[worker.auth]
 enabled = false
-[runtime]
-wasm_max_instances = 64
-[[model]]
+
+[worker.model]
 name = "default"
 hf_repo = "{snap}"
-[model.driver]
+
+[worker.model.driver]
 type = "cuda_native"
 device = [{devs}]
 tensor_parallel_size = {tp}
-[model.driver.options]
+
+[worker.model.driver.options]
 gpu_mem_utilization = 0.30
 {rq}ready_timeout_s = 120.0
-[model.scheduler]
-batch_policy = "adaptive"
 """
 
 
@@ -96,7 +98,7 @@ def materialize(snap: Path, runtime_quant: str, env_extra: dict, cache_dir: Path
     env = dict(os.environ)
     env["PIE_CUDA_WEIGHT_CACHE_DIR"] = str(cache_dir)
     env.update(env_extra)
-    proc = subprocess.Popen([str(PIE_BIN), "serve", "--config", str(toml)],
+    proc = subprocess.Popen([str(PIE_BIN), "--config", str(toml), "serve"],
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env)
     deadline, lines = time.time() + timeout_s, []
     try:
@@ -203,7 +205,7 @@ def main() -> int:
     args = ap.parse_args()
 
     if not PIE_BIN.exists():
-        sys.stderr.write(f"missing {PIE_BIN}; build with: cargo build -p pie-server "
+        sys.stderr.write(f"missing {PIE_BIN}; build with: cargo build -p pie-worker "
                          "--release --no-default-features --features driver-cuda\n")
         return 2
 

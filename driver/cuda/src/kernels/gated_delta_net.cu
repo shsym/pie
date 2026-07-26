@@ -1,8 +1,12 @@
 #include "kernels/gated_delta_net.hpp"
 
 #include <cuda_bf16.h>
+#include <cstdint>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace pie_cuda_driver::kernels {
 
@@ -109,6 +113,31 @@ bool qwen_gdn_fused_step_enabled() {
 // bf16 V-last decode shape (V_d==K_d==128, !k_last); everything else
 // falls back to the legacy kernel. Set PIE_QWEN35_GDN_SMEM_STEP=0 to
 // force the fallback.
+// `cudaFuncSetAttribute` configures a kernel's dynamic shared-memory cap
+// PER DEVICE. A process-global "already configured" flag therefore lies to
+// every device but the first: under tensor parallelism rank 0 raises the
+// cap on device 0, sets the flag, and rank 1 skips the call — then launches
+// the same kernel on device 1 asking for more shared memory than that
+// device allows. Track the high-water mark per device instead.
+bool gdn_raise_shmem_cap(const void* func, int shmem_bytes) {
+    if (shmem_bytes <= 48 * 1024) return true;
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static std::mutex mutex;
+    static std::map<std::pair<int, const void*>, int> configured;
+    std::lock_guard<std::mutex> guard(mutex);
+    int& high_water = configured[{device, func}];
+    if (shmem_bytes <= high_water) return true;
+    const cudaError_t status = cudaFuncSetAttribute(
+        func, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem_bytes);
+    if (status != cudaSuccess) {
+        static_cast<void>(cudaGetLastError());
+        return false;
+    }
+    high_water = shmem_bytes;
+    return true;
+}
+
 bool qwen_gdn_smem_step_enabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("PIE_QWEN35_GDN_SMEM_STEP");
@@ -496,6 +525,7 @@ __global__ void chunk_gated_delta_prefill_batched_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -571,6 +601,7 @@ __global__ void chunk_gated_delta_prefill_batched_cached_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -655,6 +686,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -752,6 +784,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -856,6 +889,7 @@ __global__ void chunk_gated_delta_prefill_batched_warp_tiled_gqa_ilp2_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -969,6 +1003,7 @@ __global__ void recurrent_step_batched_kernel(
     const int r = blockIdx.x;
     const int h = blockIdx.y;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long bh = (long long)r * V_h + h;
     const float* q_h = q_norm + bh * K_d;
@@ -1035,6 +1070,7 @@ __global__ void recurrent_step_batched_gqa_kernel(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
     const long long vh = (long long)r * V_h + h;
@@ -1130,6 +1166,7 @@ __global__ void recurrent_step_batched_fused_kernel(
     const int r = blockIdx.x;
     const int h = blockIdx.y;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long bh = (long long)r * V_h + h;
     const float* q_h = q_norm + bh * K_d;
@@ -1238,6 +1275,7 @@ __global__ void recurrent_step_batched_gqa_fused_kernel(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
     const long long vh = (long long)r * V_h + h;
@@ -1349,6 +1387,7 @@ __global__ void recurrent_step_batched_fla_kernel(
     const int r  = blockIdx.y;
     const int h  = blockIdx.z;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const int v_idx = vt * BV + threadIdx.x;
     if (v_idx >= V_d) return;
@@ -1431,6 +1470,7 @@ __global__ void recurrent_step_batched_gqa_fla_kernel(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const int v_idx = vt * BV + threadIdx.x;
     if (v_idx >= V_d) return;
@@ -1541,6 +1581,7 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
     const int repeat = V_h / K_h;
     const int h_k = h / repeat;
     const int slot = slot_ids[r];
+    if (slot < 0) return;
 
     const long long qh = ((long long)r * K_h + h_k) * K_d;
     const long long vh = (long long)r * V_h + h;
@@ -1561,9 +1602,49 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
     // Stage state HBM → SMEM. Adjacent threads at fixed k load
     // adjacent v indices → coalesced HBM reads; SMEM layout is
     // [k][v_local] → coalesced SMEM writes.
-    for (int k = 0; k < K_d; ++k) {
-        s_state[k * BV + threadIdx.x] =
-            state[(long long)k * V_d + v_idx];
+    //
+    // Load a tile into registers BEFORE storing any of it. Writing each
+    // element to SMEM as it arrives makes every load depend on the
+    // previous store's address computation, so only a couple of loads are
+    // ever in flight — fine at R=512 where thousands of blocks hide the
+    // latency for each other, ruinous at R=1 where 32 blocks are all the
+    // parallelism there is. Decoupling the two halves lets a whole tile
+    // of loads issue at once. Measured on A100 (V_h=32, K_d=V_d=128):
+    //   R=1   19.7 -> 10.8 us      R=8   29.6 -> 16.1 us
+    //   R=2   22.9 -> 11.7 us      R=64 138.0 -> 96.5 us
+    // bf16 stays bf16 the whole way, so the staged values are identical.
+    // When one block covers the whole v axis, SMEM's [k][v] layout is
+    // byte-for-byte the HBM tile's, so staging is a flat copy -- and a flat
+    // copy can move 16 bytes per thread instead of 2. The scalar path below
+    // has each warp touch 32 adjacent bf16, a 64-byte transaction: half a
+    // cache line, and the reason this kernel sustained ~1100 GB/s where
+    // flashinfer's equivalent reaches ~1450 GB/s on the same shape.
+    const bool vec_tile =
+        (BV == V_d) && ((V_d & 7) == 0) &&
+        ((reinterpret_cast<std::uintptr_t>(state) & 15) == 0);
+    const int n_vec = (K_d * V_d) >> 3;
+    if (vec_tile) {
+        const uint4* __restrict__ src = reinterpret_cast<const uint4*>(state);
+        uint4* __restrict__ dst = reinterpret_cast<uint4*>(s_state);
+        for (int i = threadIdx.x; i < n_vec; i += BV) dst[i] = src[i];
+    } else {
+        constexpr int kStageTile = 16;
+        __nv_bfloat16 staged[kStageTile];
+        int k = 0;
+        for (; k + kStageTile <= K_d; k += kStageTile) {
+            #pragma unroll
+            for (int u = 0; u < kStageTile; ++u) {
+                staged[u] = state[(long long)(k + u) * V_d + v_idx];
+            }
+            #pragma unroll
+            for (int u = 0; u < kStageTile; ++u) {
+                s_state[(k + u) * BV + threadIdx.x] = staged[u];
+            }
+        }
+        for (; k < K_d; ++k) {
+            s_state[k * BV + threadIdx.x] =
+                state[(long long)k * V_d + v_idx];
+        }
     }
     const float* q_h = q_norm_kh + qh;
     const float* k_h = k_norm_kh + qh;
@@ -1588,9 +1669,23 @@ __global__ void recurrent_step_batched_gqa_smem_kernel(
         float s = __bfloat162float(s_state[k * BV + threadIdx.x]) * g_h
                 + sk[k] * delta;
         out_v += s * sq[k];
-        state[(long long)k * V_d + v_idx] = __float2bfloat16(s);
+        // Each thread owns column `threadIdx.x` for every k, so rewriting
+        // its own SMEM slot races with nothing. Costing a SMEM round trip
+        // to make the HBM store a flat vectorised copy is a good trade:
+        // the store is the second half of this kernel's HBM traffic.
+        if (vec_tile) {
+            s_state[k * BV + threadIdx.x] = __float2bfloat16(s);
+        } else {
+            state[(long long)k * V_d + v_idx] = __float2bfloat16(s);
+        }
     }
     out_bh[v_idx] = out_v;
+    if (vec_tile) {
+        __syncthreads();
+        const uint4* __restrict__ src = reinterpret_cast<const uint4*>(s_state);
+        uint4* __restrict__ dst = reinterpret_cast<uint4*>(state);
+        for (int i = threadIdx.x; i < n_vec; i += BV) dst[i] = src[i];
+    }
 }
 
 // Opt-in FLA-port path (PIE_QWEN35_GDN_FLA_STEP=1).
@@ -1668,6 +1763,7 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -1697,6 +1793,20 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
         bh_state[j] = __floats2bfloat162_rn(s0, s1);
     }
 
+    // COMMIT-LEN-GATED rounding (verified on the 4090): the SAME kernel
+    // serves two ops with DIFFERENT bit-exactness references:
+    //   * commit_len == nullptr (plain PREFILL, K=0 & K=2 initial): fold N fresh
+    //     tokens into a reset state. The HF reference (T0 GDN_GOLDEN) matches the
+    //     DOUBLE-round trajectory here — single-round diverges (T0 glitch, the
+    //     warp-tiled-bug signature). So plain prefill KEEPS double-round.
+    //   * commit_len != nullptr (COMMIT-ADVANCE replay [input|accepted]): must
+    //     bit-match the K=0 decode-step kernel (single bf16 round/token) so the
+    //     spec-verify is lossless → SINGLE-round (fixes T1 K=0==K=2).
+    // Verified: gating → T0 HF-exact (golden) AND T1 K=0==K=2 both green; ungated
+    // single-round gave T1 green but T0 red (both glitch); double-round-only gave
+    // T0 green but T1 red. (:1625 is shared prefill+commit-advance.)
+    const bool single_round = (commit_len != nullptr);
+
     // Walk T tokens; state stays in registers.
     for (int t = 0; t < T; ++t) {
         const long long bh = (long long)(t0 + t) * V_h + h;
@@ -1713,7 +1823,9 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
         }
         __syncthreads();
 
-        // Phase 1: state *= g; accumulate kv_mem (fp32).
+        // Phase 1: accumulate kv_mem = Σ (state*g)·sk (fp32). single_round leaves
+        // bh_state untouched (Phase 2 recomputes state*g from the original);
+        // double_round re-packs the g-scaled state into bh_state (the extra round).
         float kv_mem = 0.f;
         #pragma unroll
         for (int j = 0; j < BK_MAX / 2; ++j) {
@@ -1722,15 +1834,18 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
             const int k1 = k0 + 1;
             float2 s = __bfloat1622float2(bh_state[j]);
             s.x *= g_h;
-            s.y *= g_h;
-            bh_state[j] = __floats2bfloat162_rn(s.x, s.y);
+            if (k1 < K_d) s.y *= g_h;
+            if (!single_round) bh_state[j] = __floats2bfloat162_rn(s.x, s.y);
             kv_mem += s.x * sk[k0];
             if (k1 < K_d) kv_mem += s.y * sk[k1];
         }
         const float v_t   = v[bh * V_d + v_idx];
         const float delta = (v_t - kv_mem) * beta_h;
 
-        // Phase 2: state += k*delta; accumulate out_v (fp32).
+        // Phase 2: state = state*g + k·δ, accumulate out_v (fp32). single_round
+        // recomputes state*g fresh from the ORIGINAL bh_state (one round total);
+        // double_round reloads the already-g-scaled-and-rounded bh_state from
+        // Phase 1 and adds k·δ (a second round) — matches HF for the plain prefill.
         float out_v = 0.f;
         #pragma unroll
         for (int j = 0; j < BK_MAX / 2; ++j) {
@@ -1738,11 +1853,18 @@ __global__ void chunk_gated_delta_prefill_batched_fla_kernel(
             if (k0 >= K_d) break;
             const int k1 = k0 + 1;
             float2 s = __bfloat1622float2(bh_state[j]);
-            s.x += sk[k0] * delta;
-            if (k1 < K_d) s.y += sk[k1] * delta;
-            bh_state[j] = __floats2bfloat162_rn(s.x, s.y);
-            out_v += s.x * sq[k0];
-            if (k1 < K_d) out_v += s.y * sq[k1];
+            float sx, sy;
+            if (single_round) {
+                sx = s.x * g_h + sk[k0] * delta;
+                sy = (k1 < K_d) ? (s.y * g_h + sk[k1] * delta) : s.y;
+            } else {
+                // bh_state already holds round(state*g) from Phase 1.
+                sx = s.x + sk[k0] * delta;
+                sy = (k1 < K_d) ? (s.y + sk[k1] * delta) : s.y;
+            }
+            bh_state[j] = __floats2bfloat162_rn(sx, sy);
+            out_v += sx * sq[k0];
+            if (k1 < K_d) out_v += sy * sq[k1];
         }
         out[bh * V_d + v_idx] = out_v;
         __syncthreads();
@@ -1799,6 +1921,7 @@ __global__ void chunk_gated_delta_prefill_batched_gqa_fla_kernel(
     if (T <= 0) return;
 
     const int slot = slot_ids[r];
+    if (slot < 0) return;
     StateT* state = state_base
         + (long long)slot * slot_stride_elems
         + (long long)h * K_d * V_d;
@@ -2328,22 +2451,13 @@ void launch_chunk_gated_delta_prefill_batched_cached(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = K_d * V_d * static_cast<int>(sizeof(float));
-    static int configured_shmem_bytes = 0;
     const bool k_last = qwen_gdn_k_last_state_enabled();
-    if (shmem_bytes > 48 * 1024 && shmem_bytes > configured_shmem_bytes) {
-        if (k_last) {
-            cudaFuncSetAttribute(
-                chunk_gated_delta_prefill_batched_cached_kernel<float, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                shmem_bytes);
-        } else {
-            cudaFuncSetAttribute(
-                chunk_gated_delta_prefill_batched_cached_kernel<float, false>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                shmem_bytes);
-        }
-        configured_shmem_bytes = shmem_bytes;
-    }
+    gdn_raise_shmem_cap(
+        k_last ? reinterpret_cast<const void*>(
+                     chunk_gated_delta_prefill_batched_cached_kernel<float, true>)
+               : reinterpret_cast<const void*>(
+                     chunk_gated_delta_prefill_batched_cached_kernel<float, false>),
+        shmem_bytes);
     if (k_last) {
         chunk_gated_delta_prefill_batched_cached_kernel<float, true><<<
             grid, block, shmem_bytes, stream>>>(
@@ -2375,22 +2489,13 @@ void launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
     dim3 grid(R, V_h);
     dim3 block(BLOCK);
     const int shmem_bytes = K_d * V_d * static_cast<int>(sizeof(float));
-    static int configured_shmem_bytes = 0;
     const bool k_last = qwen_gdn_k_last_state_enabled();
-    if (shmem_bytes > 48 * 1024 && shmem_bytes > configured_shmem_bytes) {
-        if (k_last) {
-            cudaFuncSetAttribute(
-                chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                shmem_bytes);
-        } else {
-            cudaFuncSetAttribute(
-                chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, false>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize,
-                shmem_bytes);
-        }
-        configured_shmem_bytes = shmem_bytes;
-    }
+    gdn_raise_shmem_cap(
+        k_last ? reinterpret_cast<const void*>(
+                     chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true>)
+               : reinterpret_cast<const void*>(
+                     chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, false>),
+        shmem_bytes);
     if (k_last) {
         chunk_gated_delta_prefill_batched_cached_kernel<__nv_bfloat16, true><<<
             grid, block, shmem_bytes, stream>>>(

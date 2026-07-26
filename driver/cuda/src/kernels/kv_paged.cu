@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "cuda_check.hpp"
+#include "kernels/envelope.hpp"
 
 namespace pie_cuda_driver::kernels {
 
@@ -34,12 +35,14 @@ __global__ void write_kv_kernel(
     const std::uint32_t* __restrict__ kv_page_indices,
     const std::uint32_t* __restrict__ kv_page_indptr,
     const std::uint32_t* __restrict__ kv_last_page_lens,
+    const std::uint8_t* __restrict__ row_valid,
     int R,
     int page_size,
     int h_kv,
     int d)
 {
     const int t = blockIdx.x;
+    if (row_valid != nullptr && row_valid[t] == 0) return;
 
     const int r = find_request(qo_indptr, R, t);
     const int qo_lo = qo_indptr[r];
@@ -120,6 +123,100 @@ __global__ void write_kv_at_positions_kernel(
         }
         k_pages[dst] = k_curr[src + i];
         v_pages[dst] = v_curr[src + i];
+    }
+}
+
+// Explicit-descriptor KV write (the general WSlot/WOff lowering; formerly
+// write_kv_beam). Each lane writes its ONE new-token K/V into an EXPLICIT
+// (physical_page[lane], offset[lane]) target — NOT a position→(page,offset)
+// derivation. A program's descriptor separates the write offset (WOff = old tail
+// fill, or 0 for a fresh page) from the attention length (KvLen = new span), and
+// a fresh-page write (WSlot) that is not the page-run tail cannot be expressed by
+// a linear `abs_pos/page_size` mapping. Single-cell append: touches exactly ONE
+// (page,offset) per lane, so a sibling sharing the page read-only is safe (its
+// mask hides this cell); never clears/reformats the page.
+template <bool HND_LAYOUT>
+__global__ void write_kv_explicit_kernel(
+    const __nv_bfloat16* __restrict__ k_curr,   // [LANES, h_kv, d]
+    const __nv_bfloat16* __restrict__ v_curr,
+    __nv_bfloat16* __restrict__ k_pages,
+    __nv_bfloat16* __restrict__ v_pages,
+    const std::uint32_t* __restrict__ w_page,   // [LANES] PHYSICAL page id per lane
+    const std::uint32_t* __restrict__ w_off,    // [LANES] offset-in-page per lane
+    const std::uint8_t* __restrict__ row_valid,
+    int B,
+    int page_size,
+    int h_kv,
+    int d)
+{
+    const int b = blockIdx.x;
+    if (b >= B) return;
+    if (row_valid != nullptr && row_valid[b] == 0) return;
+    const int actual_page = static_cast<int>(w_page[b]);
+    const int offset_in_page = static_cast<int>(w_off[b]);
+    if (offset_in_page < 0 || offset_in_page >= page_size) return;
+
+    const long long row = static_cast<long long>(h_kv) * d;
+    const long long src = static_cast<long long>(b) * row;
+    for (int i = threadIdx.x; i < row; i += blockDim.x) {
+        long long dst;
+        if constexpr (HND_LAYOUT) {
+            const int h = i / d;
+            const int j = i - h * d;
+            dst = ((static_cast<long long>(actual_page) * h_kv + h) *
+                   page_size + offset_in_page) * d + j;
+        } else {
+            dst = ((static_cast<long long>(actual_page) * page_size) +
+                   offset_in_page) * row + i;
+        }
+        k_pages[dst] = k_curr[src + i];
+        v_pages[dst] = v_curr[src + i];
+    }
+}
+
+// Explicit-descriptor KV cell MOVE (compaction primitive, §Design-B lazy GC):
+// copy ONE token's K/V cell from (src physical page, src offset) → (dst physical
+// page, dst offset), for a single layer. `N` independent cells; block n handles
+// cell n. Correct as a raw element copy because the KV cache is stored POST-RoPE
+// (a physical slot is pure storage; positions live in the per-beam mask, not the
+// slot) — so a compaction move that renumbers slots preserves attention. The
+// caller guarantees src/dst spans are DISJOINT (in-place two-pointer: last-alive
+// → first-empty), so one parallel pass needs no scratch buffer. Native-bf16 KV.
+template <bool HND_LAYOUT>
+__global__ void copy_kv_cells_kernel(
+    __nv_bfloat16* __restrict__ k_pages,
+    __nv_bfloat16* __restrict__ v_pages,
+    const std::uint32_t* __restrict__ dst_page,  // [N] PHYSICAL page id per cell
+    const std::uint32_t* __restrict__ dst_off,   // [N] offset-in-page per cell
+    const std::uint32_t* __restrict__ src_page,  // [N] PHYSICAL page id per cell
+    const std::uint32_t* __restrict__ src_off,   // [N] offset-in-page per cell
+    int N,
+    int page_size,
+    int h_kv,
+    int d)
+{
+    const int n = blockIdx.x;
+    if (n >= N) return;
+    const int dpage = static_cast<int>(dst_page[n]);
+    const int doff  = static_cast<int>(dst_off[n]);
+    const int spage = static_cast<int>(src_page[n]);
+    const int soff  = static_cast<int>(src_off[n]);
+    if (doff < 0 || doff >= page_size || soff < 0 || soff >= page_size) return;
+
+    const long long row = static_cast<long long>(h_kv) * d;
+    for (int i = threadIdx.x; i < row; i += blockDim.x) {
+        long long dst, src;
+        if constexpr (HND_LAYOUT) {
+            const int h = i / d;
+            const int j = i - h * d;
+            dst = ((static_cast<long long>(dpage) * h_kv + h) * page_size + doff) * d + j;
+            src = ((static_cast<long long>(spage) * h_kv + h) * page_size + soff) * d + j;
+        } else {
+            dst = ((static_cast<long long>(dpage) * page_size) + doff) * row + i;
+            src = ((static_cast<long long>(spage) * page_size) + soff) * row + i;
+        }
+        k_pages[dst] = k_pages[src];
+        v_pages[dst] = v_pages[src];
     }
 }
 
@@ -545,7 +642,8 @@ void launch_write_kv_to_pages_bf16(
     int num_kv_heads,
     int head_dim,
     bool hnd_layout,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
 {
     constexpr int BLOCK = 256;
     if (hnd_layout) {
@@ -555,7 +653,7 @@ void launch_write_kv_to_pages_bf16(
             static_cast<__nv_bfloat16*>(k_pages),
             static_cast<__nv_bfloat16*>(v_pages),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            num_requests, page_size, num_kv_heads, head_dim);
+            row_valid, num_requests, page_size, num_kv_heads, head_dim);
     } else {
         write_kv_kernel<false><<<total_tokens, BLOCK, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k_curr),
@@ -563,7 +661,7 @@ void launch_write_kv_to_pages_bf16(
             static_cast<__nv_bfloat16*>(k_pages),
             static_cast<__nv_bfloat16*>(v_pages),
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            num_requests, page_size, num_kv_heads, head_dim);
+            row_valid, num_requests, page_size, num_kv_heads, head_dim);
     }
 }
 
@@ -577,7 +675,8 @@ void launch_write_kv_to_pages(
     const std::uint32_t* kv_last_page_lens,
     int total_tokens,
     int num_requests,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
 {
     const int page_size = layer.page_size;
     const int num_kv_heads = layer.num_kv_heads;
@@ -587,14 +686,26 @@ void launch_write_kv_to_pages(
             layer.k_pages, layer.v_pages, k_curr, v_curr,
             qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
             total_tokens, num_requests, page_size, num_kv_heads, head_dim,
-            layer.hnd_layout, stream);
+            layer.hnd_layout, stream, row_valid);
+        // Quest maintenance rides the append: the pages this fire just grew are
+        // exactly the ones whose envelopes went stale, and the same stream
+        // orders the refresh after the write. Opt-in -- `has_envelopes()` is
+        // false unless a program declared it needs them.
+        if (layer.has_envelopes() && !layer.hnd_layout && total_tokens > 0) {
+            launch_envelope_update_appended_bf16(
+                static_cast<const std::uint16_t*>(layer.k_pages),
+                qo_indptr, kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                layer.k_env_min, layer.k_env_max, num_requests,
+                (total_tokens + page_size - 1) / page_size + num_requests,
+                page_size, num_kv_heads, head_dim, stream);
+        }
         return;
     }
 
     constexpr int BLOCK = 256;
-    switch (layer.format->scheme) {
+    switch (layer.scheme) {
         case KvCacheScheme::Fp8PerTensor: {
-            const auto fp8_kind = layer.format->storage_dtype == DType::FP8_E5M2
+            const auto fp8_kind = layer.storage_dtype == DType::FP8_E5M2
                 ? __NV_E5M2
                 : __NV_E4M3;
             write_kv_fp8_per_tensor_kernel<<<total_tokens, BLOCK, 0, stream>>>(
@@ -633,8 +744,8 @@ void launch_write_kv_to_pages(
             break;
         }
         case KvCacheScheme::Fp4Block: {
-            const int block_size = layer.format->block_size > 0
-                ? layer.format->block_size
+            const int block_size = layer.block_size > 0
+                ? layer.block_size
                 : 16;
             const int blocks = (head_dim + block_size - 1) / block_size;
             const dim3 grid(total_tokens, num_kv_heads, blocks);
@@ -695,6 +806,85 @@ void launch_write_kv_to_pages_at_positions_bf16(
     CUDA_CHECK(cudaGetLastError());
 }
 
+void launch_write_kv_explicit_bf16(
+    KvCacheLayerView layer,
+    const void* k_curr,                 // [LANES, h_kv, d]
+    const void* v_curr,
+    const std::uint32_t* w_page,        // [LANES] PHYSICAL page id per lane
+    const std::uint32_t* w_off,         // [LANES] offset-in-page per lane
+    int B,
+    cudaStream_t stream,
+    const std::uint8_t* row_valid)
+{
+    if (!layer.is_native_bf16()) {
+        throw std::runtime_error(
+            "write_kv_explicit_bf16 requires native bf16 KV cache");
+    }
+    if (B <= 0) return;
+    constexpr int BLOCK = 256;
+    if (layer.hnd_layout) {
+        write_kv_explicit_kernel<true><<<B, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            w_page, w_off, row_valid, B, layer.page_size, layer.num_kv_heads,
+            layer.head_dim);
+    } else {
+        write_kv_explicit_kernel<false><<<B, BLOCK, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(k_curr),
+            static_cast<const __nv_bfloat16*>(v_curr),
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            w_page, w_off, row_valid, B, layer.page_size, layer.num_kv_heads,
+            layer.head_dim);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    // Quest maintenance rides this append too. The CSR-derived path in
+    // `launch_write_kv_to_pages` cannot be reused: there is no page list here,
+    // only the per-token descriptor the program wrote. Opt-in on
+    // `has_envelopes()`, same stream, so the refresh is ordered after the
+    // write it describes.
+    if (layer.has_envelopes() && !layer.hnd_layout) {
+        launch_envelope_merge_written_bf16(
+            static_cast<const std::uint16_t*>(k_curr),
+            w_page, w_off, row_valid, layer.k_env_min, layer.k_env_max,
+            B, layer.num_kv_heads, layer.head_dim, stream);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
+
+void launch_copy_kv_cells_bf16(
+    KvCacheLayerView layer,
+    const std::uint32_t* dst_page,      // [N] PHYSICAL page id per cell
+    const std::uint32_t* dst_off,       // [N] offset-in-page per cell
+    const std::uint32_t* src_page,      // [N] PHYSICAL page id per cell
+    const std::uint32_t* src_off,       // [N] offset-in-page per cell
+    int N,
+    cudaStream_t stream)
+{
+    if (!layer.is_native_bf16()) {
+        throw std::runtime_error(
+            "copy_kv_cells_bf16 requires native bf16 KV cache");
+    }
+    if (N <= 0) return;
+    constexpr int BLOCK = 256;
+    if (layer.hnd_layout) {
+        copy_kv_cells_kernel<true><<<N, BLOCK, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            dst_page, dst_off, src_page, src_off, N, layer.page_size,
+            layer.num_kv_heads, layer.head_dim);
+    } else {
+        copy_kv_cells_kernel<false><<<N, BLOCK, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(layer.k_pages),
+            static_cast<__nv_bfloat16*>(layer.v_pages),
+            dst_page, dst_off, src_page, src_off, N, layer.page_size,
+            layer.num_kv_heads, layer.head_dim);
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void launch_dequant_kv_cache_layer_to_bf16_active(
     KvCacheLayerView layer,
     const std::uint32_t* kv_page_indices,
@@ -708,9 +898,9 @@ void launch_dequant_kv_cache_layer_to_bf16_active(
         static_cast<long long>(num_pages_in_batch) * page_elems;
     const auto blocks = static_cast<unsigned>((logical_n + BLOCK - 1) / BLOCK);
 
-    switch (layer.format->scheme) {
+    switch (layer.scheme) {
         case KvCacheScheme::Fp8PerTensor: {
-            const auto fp8_kind = layer.format->storage_dtype == DType::FP8_E5M2
+            const auto fp8_kind = layer.storage_dtype == DType::FP8_E5M2
                 ? __NV_E5M2
                 : __NV_E4M3;
             dequant_fp8_pages_active_kernel<<<blocks, BLOCK, 0, stream>>>(
@@ -744,8 +934,8 @@ void launch_dequant_kv_cache_layer_to_bf16_active(
                 layer.head_dim);
             break;
         case KvCacheScheme::Fp4Block: {
-            const int block_size = layer.format->block_size > 0
-                ? layer.format->block_size
+            const int block_size = layer.block_size > 0
+                ? layer.block_size
                 : 16;
             dequant_fp4_pages_active_kernel<<<blocks, BLOCK, 0, stream>>>(
                 static_cast<const std::uint8_t*>(layer.k_pages),
