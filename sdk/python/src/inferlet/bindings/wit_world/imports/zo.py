@@ -8,22 +8,19 @@ from abc import abstractmethod
 import weakref
 
 from componentize_py_types import Result, Ok, Err, Some
-from ..imports import adapter
 from ..imports import inference
-import componentize_py_async_support
-from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
-from componentize_py_async_support.futures import FutureReader, FutureWriter
+from ..imports import adapter
 
 
 def adapter_seed(self: inference.ForwardPass, seed: int) -> None:
     raise NotImplementedError
 def initialize(self: adapter.Adapter, rank: int, alpha: float, population_size: int, mu_fraction: float, initial_sigma: float) -> None:
     """
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    Raises: `wit_world.types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError
 def update(self: adapter.Adapter, scores: List[float], seeds: List[int], max_sigma: float) -> None:
     """
-    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    Raises: `wit_world.types.Err(wit_world.imports.str)`
     """
     raise NotImplementedError

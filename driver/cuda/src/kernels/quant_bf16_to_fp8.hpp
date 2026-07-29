@@ -2,7 +2,7 @@
 
 // Runtime quantization helpers — convert bf16 weight tensors to FP8
 // (E4M3) or INT8 with per-tensor / per-channel symmetric scaling.
-// Used by the Rust LoadPlan runtime quantization path
+// Used by the Rust storage-program runtime quantization path
 // (`--runtime-quant {fp8|int8}`): the loader emits an Encode TileMap that
 // reads the source weight, computes absmax, and stores the quantized weight
 // plus scale tensor directly as runtime outputs.
@@ -173,28 +173,6 @@ void launch_cast_bf16_to_fp8_e4m3_per_channel(
     const float*   scale_inv_dev,    // [rows]
     int            rows,
     int            cols,
-    cudaStream_t   stream);
-
-/// Blockwise (a.k.a. per-token-group) FP8 activation quantization, the
-/// activation half of DeepSeek-style W8A8 block FP8.  Acts on a row-major
-/// `[M, K]` activation buffer and emits one FP32 scale per contiguous
-/// `group_size`-element run along K:
-///   * `act_fp8`   — `[M, K]` raw FP8 E4M3 bytes
-///   * `act_scale` — `[M, ceil(K/group_size)]` fp32, row-major, such that
-///                   `bf16[m, g*gs + t] ~= fp8[m, g*gs + t] * act_scale[m, g]`
-///
-/// The row-major `[M, K/gs]` layout is bit-identical to the column-major
-/// `[K/gs, M]` tensor cuBLASLt expects for
-/// `CUBLASLT_MATMUL_MATRIX_SCALE_VEC128_32F` on operand B when B is the
-/// column-major `[K, M]` view of the row-major activation, so the buffer
-/// can be handed to cuBLASLt unchanged.
-void quantize_bf16_to_fp8_e4m3_per_token_group(
-    const void*    act_bf16,
-    std::uint8_t*  act_fp8,
-    float*         act_scale,
-    int            m,
-    int            k,
-    int            group_size,
     cudaStream_t   stream);
 
 }  // namespace pie_cuda_driver::kernels

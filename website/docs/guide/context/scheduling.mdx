@@ -97,6 +97,8 @@ Where `mu` is the expected steps to finish, `cv2` is the squared coefficient of 
 
 You do not need to read this formula to use Pie. It says: bid more when you have more credit, when more dividend is coming, and when fewer pages are at stake; bid less when many pages are at stake or when the horizon is long.
 
+The SDK refreshes this bid before every decode step by default. Throughput-oriented single-tenant loops can disable that refresh with `rebid_each_step(False)` / `rebidEachStep(false)` after the initial bid has been set.
+
 ## Override the bid
 
 Two ways to influence the bid.
@@ -180,4 +182,4 @@ The implementation lives in `runtime/src/context/sched.rs` (auction tick, rent, 
 ## Next
 
 - [The forward pass](../forward/overview): the primitive a bid pays for.
-- [I/O overview](../io/overview): session, filesystem, HTTP, and MCP surfaces around the scheduler.
+- [I/O and messaging](../io/overview): coordination across inferlets, where `idle()` is most useful.

@@ -62,9 +62,11 @@ The client receives each `send` as a `Stdout` event and each `send_file` as a `F
 <TabItem value="rust" label="Rust" default>
 
 ```rust
-use inferlet::session;
+use inferlet::pie::core::session;
+use inferlet::FutureStringExt;
 
-let msg: Option<String> = session::receive().await;
+let next = session::receive();
+let msg: Option<String> = next.wait_async().await;   // None if the client disconnected
 ```
 
 </TabItem>
@@ -195,9 +197,11 @@ For inferlets that operate on user-uploaded data, the client uploads via the cli
 <TabItem value="rust" label="Rust" default>
 
 ```rust
-use inferlet::session;
+use inferlet::pie::core::session;
+use inferlet::FutureBlobExt;
 
-let blob = session::receive_file()
+let blob: Vec<u8> = session::receive_file()
+    .wait_async()
     .await
     .ok_or("client disconnected")?;
 process_pdf(&blob)?;
@@ -234,9 +238,11 @@ A signal is a fire-and-forget string the client sends with `process.signal(...)`
 ```rust
 // Client side: process.signal("stop").
 // Inferlet side: pick the message up via session::receive.
-use inferlet::session;
+use inferlet::pie::core::session;
+use inferlet::FutureStringExt;
 
-if session::receive().await.as_deref() == Some("stop") {
+let next = session::receive();
+if next.wait_async().await.as_deref() == Some("stop") {
     return Ok("stopped".into());
 }
 ```
@@ -275,5 +281,6 @@ The `pie run` CLI mirrors `Stderr` events to the launcher's terminal. A long-run
 
 ## Next
 
+- [Inferlet and inferlet (messaging)](./messaging): pub/sub and queues.
 - [Filesystem](./filesystem): persistent storage that survives across runs.
 - [Client SDK](../../reference/client-python): the receive side of the session.

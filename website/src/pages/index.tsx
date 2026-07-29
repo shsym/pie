@@ -45,9 +45,19 @@ const KV_DEMOS: DemoMeta[] = [
 
 const IO_DEMOS: DemoMeta[] = [
     {
+        id: 'mcp-tools',
+        tab: 'Tools',
+        metric: 'Tool loop in user code',
+    },
+    {
         id: 'filesystem',
         tab: 'Virtual filesystem',
         metric: 'std::fs to persistent /scratch',
+    },
+    {
+        id: 'messaging',
+        tab: 'Messaging',
+        metric: 'Topics inside the engine',
     },
 ];
 

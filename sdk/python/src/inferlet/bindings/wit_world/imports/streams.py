@@ -17,9 +17,6 @@ import weakref
 from componentize_py_types import Result, Ok, Err, Some
 from ..imports import error
 from ..imports import poll
-import componentize_py_async_support
-from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
-from componentize_py_async_support.futures import FutureReader, FutureWriter
 
 
 @dataclass
@@ -79,7 +76,7 @@ class InputStream:
         as a return value by the callee. The callee may return a list of bytes
         less than `len` in size while more bytes are available for reading.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def blocking_read(self, len: int) -> bytes:
@@ -87,7 +84,7 @@ class InputStream:
         Read bytes from a stream, after blocking until at least one byte can
         be read. Except for blocking, behavior is identical to `read`.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def skip(self, len: int) -> int:
@@ -97,7 +94,7 @@ class InputStream:
         Behaves identical to `read`, except instead of returning a list
         of bytes, returns the number of bytes consumed from the stream.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def blocking_skip(self, len: int) -> int:
@@ -105,7 +102,7 @@ class InputStream:
         Skip bytes from a stream, after blocking until at least one byte
         can be skipped. Except for blocking behavior, identical to `skip`.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def subscribe(self) -> poll.Pollable:
@@ -157,7 +154,7 @@ class OutputStream:
         become ready when this function will report at least 1 byte, or an
         error.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def write(self, contents: bytes) -> None:
@@ -176,7 +173,7 @@ class OutputStream:
         returns Err(closed) without writing if the stream has closed since
         the last call to check-write provided a permit.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def blocking_write_and_flush(self, contents: bytes) -> None:
@@ -206,7 +203,7 @@ class OutputStream:
         let _ = this.check-write();         // eliding error handling
         ```
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def flush(self) -> None:
@@ -222,7 +219,7 @@ class OutputStream:
         completed. The `subscribe` pollable will become ready when the
         flush has completed and the stream can accept more writes.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def blocking_flush(self) -> None:
@@ -230,7 +227,7 @@ class OutputStream:
         Request to flush buffered output, and block until flush completes
         and stream is ready for writing again.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def subscribe(self) -> poll.Pollable:
@@ -256,7 +253,7 @@ class OutputStream:
         passing a list of bytes, you simply pass the number of zero-bytes
         that should be written.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def blocking_write_zeroes_and_flush(self, len: int) -> None:
@@ -286,7 +283,7 @@ class OutputStream:
         let _ = this.check-write();         // eliding error handling
         ```
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def splice(self, src: InputStream, len: int) -> int:
@@ -305,7 +302,7 @@ class OutputStream:
         This function returns the number of bytes transferred; it may be less
         than `len`.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def blocking_splice(self, src: InputStream, len: int) -> int:
@@ -316,7 +313,7 @@ class OutputStream:
         `output-stream` is ready for writing, and the `input-stream`
         is ready for reading, before performing the `splice`.
         
-        Raises: `componentize_py_types.Err(wit_world.imports.streams.StreamError)`
+        Raises: `wit_world.types.Err(wit_world.imports.streams.StreamError)`
         """
         raise NotImplementedError
     def __enter__(self) -> Self:

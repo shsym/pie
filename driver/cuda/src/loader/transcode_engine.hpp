@@ -1,9 +1,9 @@
 #pragma once
 
 // TranscodeEngine: the quant/transcode TileMap path — Cast, Encode
-// (FP8->bf16->FP8/MXFP4, fused or staged), Repack (Marlin) and Reblock.
+// (FP8->bf16->FP8/MXFP4, fused or staged), Repack (Marlin) and Reblock/Reorder.
 // Factored out of the storage executor; it consumes source bytes (loader + copy
-// engine), resolves input/output buffers (resolver), reads the LoadPlan
+// engine), resolves input/output buffers (resolver), reads the storage program
 // (program index), and owns the FP8 encode scratch buffers.
 
 #include <algorithm>
@@ -15,11 +15,12 @@
 #include <unordered_map>
 #include <vector>
 
-#include "pie_loader/plan.hpp"
+#include "../../../weight_loader/include/weight_loader.h"
+#include "../../../weight_loader/include/weight_loader_cpp.hpp"
 #include "loader_config.hpp"
 #include "loader_helpers.hpp"
 #include "tensor.hpp"
-#include "pie_loader/checkpoint_source.hpp"
+#include "loader/safetensors.hpp"
 #include "loader/buffer_resolver.hpp"
 #include "loader/strided_copy.hpp"
 #include "loader/weight_copy_engine.hpp"
@@ -37,8 +38,6 @@
 #include "cuda_check.hpp"
 #include "kernels/dtype_cast.hpp"
 #include "kernels/mxfp4_marlin.hpp"
-#include "kernels/dequant_fp4.hpp"
-#include "kernels/dequant_wna16.hpp"
 #include "kernels/dequant_fp8.hpp"
 #include "kernels/quant_bf16_to_fp8.hpp"
 #include "kernels/quant_bf16_to_mxfp4.hpp"
@@ -50,15 +49,17 @@
 
 namespace pie_cuda_driver {
 
-namespace lp = pie_loader;
+namespace wl_cpp = pie_weight_loader::cpp;
 
 class TranscodeEngine {
 public:
-    TranscodeEngine(pie_loader::CheckpointSource& loader,
+    TranscodeEngine(SafetensorsCheckpointSource& loader,
+                    const std::vector<std::string>& source_tensor_names,
                     WeightCopyEngine& copy_engine,
-                    const pie_loader::LoadPlanIndex& plan_index,
+                    const wl_cpp::StorageProgramIndex& program_index,
                     BufferResolver& resolver)
-        : loader_(loader), copy_engine_(copy_engine), plan_index_(plan_index),
+        : loader_(loader), source_tensor_names_(source_tensor_names),
+          copy_engine_(copy_engine), program_index_(program_index),
           resolver_(resolver) {}
 
     ~TranscodeEngine() { free_scratch_noexcept(); }
@@ -66,28 +67,26 @@ public:
     TranscodeEngine& operator=(const TranscodeEngine&) = delete;
 
     void tile_map(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
         LoadExecutionStats& stats)
     {
         switch (instr.tile_kind) {
-        case lp::PieLoaderTileMapKind::Cast:
+        case pie_weight_loader::PieLoaderTileMapKind::Cast:
             cast_tile_map(instr);
             return;
-        case lp::PieLoaderTileMapKind::Reblock:
+        case pie_weight_loader::PieLoaderTileMapKind::Reblock:
+        case pie_weight_loader::PieLoaderTileMapKind::Reorder:
             reblock_tile_map(instr);
             return;
-        case lp::PieLoaderTileMapKind::Encode:
+        case pie_weight_loader::PieLoaderTileMapKind::Encode:
             encode_tile_map(instr, stats);
             return;
-        case lp::PieLoaderTileMapKind::Repack:
+        case pie_weight_loader::PieLoaderTileMapKind::Repack:
             repack_tile_map(instr);
             return;
-        case lp::PieLoaderTileMapKind::Scale:
-            scale_tile_map(instr);
-            return;
-        case lp::PieLoaderTileMapKind::Decode:
-        case lp::PieLoaderTileMapKind::Transcode:
-        case lp::PieLoaderTileMapKind::None:
+        case pie_weight_loader::PieLoaderTileMapKind::Decode:
+        case pie_weight_loader::PieLoaderTileMapKind::Transcode:
+        case pie_weight_loader::PieLoaderTileMapKind::None:
             throw std::runtime_error(
                 "rust storage executor: unsupported TileMap kind in CUDA "
                 "cutover path");
@@ -130,9 +129,6 @@ private:
         } else if (src.dtype() == DType::BF16 && dst_dtype == DType::FP32) {
             kernels::launch_cast_bf16_to_fp32(
                 src.data(), dst, src.numel(), /*stream=*/0);
-        } else if (src.dtype() == DType::E8M0 && dst_dtype == DType::FP32) {
-            kernels::launch_cast_e8m0_to_fp32(
-                src.data(), dst, src.numel(), /*stream=*/0);
         } else {
             throw std::runtime_error(
                 "rust storage executor: unsupported TileMap Cast " +
@@ -150,7 +146,7 @@ private:
     }
 
     void cast_tile_map(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr)
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
         if (instr.output_buffers.len != 1) {
             throw std::runtime_error(
@@ -163,38 +159,30 @@ private:
         auto* dst = static_cast<std::uint8_t*>(out.data()) + dst_offset;
 
         if (instr.has_source) {
-            if (!pie_loader::compact_extent(instr.source.stride)) {
+            if (instr.source.tensor_id >= source_tensor_names_.size()) {
+                throw std::runtime_error(
+                    "rust storage executor: Cast source tensor id out of range");
+            }
+            if (!wl_cpp::compact_extent(instr.source.stride)) {
                 throw std::runtime_error(
                     "rust storage executor: non-compact Cast source is not "
                     "implemented");
             }
+            const TensorInfo& info =
+                loader_.info(source_tensor_names_[instr.source.tensor_id]);
             DeviceTensor scratch =
                 DeviceTensor::allocate(
-                    dtype_from_rust(instr.source.dtype),
-                    pie_loader::extent_shape(instr.source.stride));
+                    info.dtype,
+                    wl_cpp::extent_shape(instr.source.stride));
             if (scratch.nbytes() != instr.source.span_bytes) {
                 throw std::runtime_error(
                     "rust storage executor: Cast source byte size mismatch");
             }
-#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-            // Stream-0 H2D: `cast_tensor_to_ptr` launches on stream 0 and reads
-            // this scratch immediately. The batched/pinned `queue()` path lands
-            // on a private copy stream with no flush before the kernel, so the
-            // cast would read an unwritten buffer -- every DeepSeek-V4 block
-            // scale decoded to zero, and every quantized GEMM with it.
-            copy_engine_.queue_on_stream(
-                instr.source.file_id,
-                instr.source.file_offset + instr.source.stride.base_offset,
-                instr.source.span_bytes,
-                scratch.data(),
-                /*stream=*/0);
-#else
             copy_engine_.queue(
                 instr.source.file_id,
-                instr.source.file_offset + instr.source.stride.base_offset,
+                instr.source.file_offset,
                 instr.source.span_bytes,
                 scratch.data());
-#endif
             cast_tensor_to_ptr(scratch, dst, out.dtype());
             return;
         }
@@ -206,261 +194,11 @@ private:
         cast_tensor_to_ptr(resolver_.or_finalized(instr.input_buffers.ptr[0]), dst, out.dtype());
     }
 
-    /// `dst = src * factor`, elementwise, in the source's own dtype.
-    ///
-    /// The loader guarantees the shapes and the dtype match -- `Scale` is
-    /// type-preserving, and a contract that also narrows gets a separate `Cast`
-    /// instruction -- so there is nothing to negotiate here beyond dispatching
-    /// on the dtype.
-    static void scale_tensor_to_ptr(
-        const DeviceTensor& src,
-        void* dst,
-        float factor)
-    {
-#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-        switch (src.dtype()) {
-        case DType::BF16:
-            kernels::launch_scale_bf16(src.data(), dst, src.numel(), factor, /*stream=*/0);
-            return;
-        case DType::FP32:
-            kernels::launch_scale_fp32(src.data(), dst, src.numel(), factor, /*stream=*/0);
-            return;
-        case DType::FP16:
-            kernels::launch_scale_fp16(src.data(), dst, src.numel(), factor, /*stream=*/0);
-            return;
-        default:
-            throw std::runtime_error(
-                "rust storage executor: unsupported TileMap Scale dtype " +
-                std::string(dtype_name(src.dtype())));
-        }
-#else
-        (void)src;
-        (void)dst;
-        (void)factor;
-        throw std::runtime_error(
-            "rust storage executor: CUDA TileMap Scale compiled without CUDA "
-            "headers");
-#endif
-    }
-
-    void scale_tile_map(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr)
-    {
-        if (instr.output_buffers.len != 1) {
-            throw std::runtime_error(
-                "rust storage executor: Scale TileMap expects one output");
-        }
-        DeviceTensor& out = resolver_.tensor(instr.output_buffers.ptr[0]);
-        const auto dst_offset =
-            instr.has_dest ? instr.dest.offset + instr.dest.stride.base_offset : 0;
-        auto* dst = static_cast<std::uint8_t*>(out.data()) + dst_offset;
-
-        if (instr.transform_scale_group != 0) {
-            scale_per_group_tile_map(instr, out, dst);
-            return;
-        }
-
-        float factor = 0.f;
-        std::memcpy(&factor, &instr.transform_scale_factor_bits, sizeof(factor));
-
-        if (instr.has_source) {
-            if (!pie_loader::compact_extent(instr.source.stride)) {
-                throw std::runtime_error(
-                    "rust storage executor: non-compact Scale source is not "
-                    "implemented");
-            }
-            DeviceTensor scratch =
-                DeviceTensor::allocate(
-                    dtype_from_rust(instr.source.dtype),
-                    pie_loader::extent_shape(instr.source.stride));
-            if (scratch.nbytes() != instr.source.span_bytes) {
-                throw std::runtime_error(
-                    "rust storage executor: Scale source byte size mismatch");
-            }
-#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-            // Stream-0 H2D for the same reason `cast_tile_map` uses one: the
-            // kernel below launches on stream 0 and reads this scratch straight
-            // away, while the batched `queue()` path lands on a private copy
-            // stream with no flush in between.
-            copy_engine_.queue_on_stream(
-                instr.source.file_id,
-                instr.source.file_offset + instr.source.stride.base_offset,
-                instr.source.span_bytes,
-                scratch.data(),
-                /*stream=*/0);
-#else
-            copy_engine_.queue(
-                instr.source.file_id,
-                instr.source.file_offset + instr.source.stride.base_offset,
-                instr.source.span_bytes,
-                scratch.data());
-#endif
-            scale_tensor_to_ptr(scratch, dst, factor);
-            return;
-        }
-
-        if (instr.input_buffers.len != 1) {
-            throw std::runtime_error(
-                "rust storage executor: Scale TileMap expects source or one input");
-        }
-        scale_tensor_to_ptr(resolver_.or_finalized(instr.input_buffers.ptr[0]), dst, factor);
-    }
-
-    // One factor per `transform_scale_group` elements, read from the operand
-    // the contract paired with the payload rather than from a sibling tensor
-    // whose name was guessed. Dequantization written this way happens once, in
-    // the plan, so the packed original never has to be resident: a weight is a
-    // view into the shared arena, and a view cannot be freed.
-    void scale_per_group_tile_map(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
-        const DeviceTensor& out,
-        std::uint8_t* dst)
-    {
-        if (instr.input_buffers.len < 1) {
-            throw std::runtime_error(
-                "rust storage executor: per-group Scale has no factor operand");
-        }
-        const DeviceTensor& factors =
-            resolver_.or_finalized(instr.input_buffers.ptr[instr.input_buffers.len - 1]);
-
-        const auto& shape = out.shape();
-        if (shape.size() < 2) {
-            throw std::runtime_error(
-                "rust storage executor: per-group Scale expects a matrix output");
-        }
-        // Groups run along the last axis, which the loader checks, so every
-        // earlier axis is a whole number of rows however many there are.
-        const std::int64_t cols = shape.back();
-        const std::int64_t rows = out.numel() / cols;
-        if (cols % instr.transform_scale_group != 0) {
-            throw std::runtime_error(
-                "rust storage executor: per-group Scale group does not divide "
-                "the output row");
-        }
-
-        // The scheme is what says how a stored code becomes a number, and both
-        // schemes below are four bits packed low nibble first -- so reading one
-        // as the other is silent, and the check has to be exact rather than a
-        // width test.
-        const bool mxfp4 = instr.transform_from == lp::PieLoaderQuantScheme::Mxfp4E2M1E8M0;
-        const bool int4b8 = instr.transform_from == lp::PieLoaderQuantScheme::Int4B8;
-        if (!mxfp4 && !int4b8) {
-            throw std::runtime_error(
-                "rust storage executor: per-group Scale is implemented for "
-                "MXFP4 and Int4B8 elements only");
-        }
-        if (instr.transform_scale_group != loader_config::kMxfp4Group) {
-            throw std::runtime_error(
-                "rust storage executor: these block scales come in groups of 32");
-        }
-        if (out.dtype() != DType::BF16) {
-            throw std::runtime_error(
-                "rust storage executor: this dequant writes BF16, but the "
-                "output declares " +
-                std::string(dtype_name(out.dtype())));
-        }
-        // MXFP4 pairs E2M1 elements with E8M0 exponents; Int4B8 pairs
-        // biased nibbles with plain BF16 factors. Neither kernel reads the
-        // other's factor format.
-        const DType want_factors = mxfp4 ? DType::E8M0 : DType::BF16;
-        if (factors.dtype() != want_factors) {
-            throw std::runtime_error(
-                "rust storage executor: this scheme's block scales are " +
-                std::string(dtype_name(want_factors)) +
-                ", but the factor operand declares " +
-                std::string(dtype_name(factors.dtype())));
-        }
-
-        DeviceTensor scratch = acquire_scale_source(instr, rows * cols / 2);
-#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-        if (mxfp4) {
-            kernels::launch_dequant_mxfp4_to_bf16(
-                static_cast<const std::uint8_t*>(scratch.data()),
-                static_cast<const std::uint8_t*>(factors.data()),
-                dst,
-                static_cast<int>(rows),
-                static_cast<int>(cols),
-                /*stream=*/0);
-        } else {
-            // The kernel reads the payload as 32-bit words. Eight nibbles to a
-            // word in little-endian order is the same byte sequence the packed
-            // source already holds, so the reinterpret is a type change and
-            // not a repack -- but it does require the row to be a multiple of
-            // eight elements, which a group of 32 already guarantees.
-            kernels::launch_dequant_wna16_int4b8_to_bf16(
-                static_cast<const std::int32_t*>(scratch.data()),
-                factors.data(),
-                dst,
-                static_cast<int>(rows),
-                static_cast<int>(cols),
-                static_cast<int>(instr.transform_scale_group),
-                /*stream=*/0);
-        }
-#else
-        (void)scratch;
-        (void)dst;
-        throw std::runtime_error(
-            "rust storage executor: CUDA TileMap Scale compiled without CUDA "
-            "headers");
-#endif
-    }
-
-    // The packed payload on device, whether it arrives as file bytes or as a
-    // buffer an earlier instruction filled.
-    DeviceTensor acquire_scale_source(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
-        std::int64_t want_bytes)
-    {
-        if (!instr.has_source) {
-            const DeviceTensor& input = resolver_.or_finalized(instr.input_buffers.ptr[0]);
-            if (static_cast<std::int64_t>(input.nbytes()) != want_bytes) {
-                throw std::runtime_error(
-                    "rust storage executor: per-group Scale input is the wrong "
-                    "size for its output");
-            }
-            return DeviceTensor::view(
-                const_cast<void*>(input.data()),
-                DType::UINT8,
-                {want_bytes});
-        }
-        if (!pie_loader::compact_extent(instr.source.stride)) {
-            throw std::runtime_error(
-                "rust storage executor: non-compact Scale source is not "
-                "implemented");
-        }
-        if (static_cast<std::int64_t>(instr.source.span_bytes) != want_bytes) {
-            throw std::runtime_error(
-                "rust storage executor: per-group Scale source is the wrong "
-                "size for its output");
-        }
-        DeviceTensor scratch = DeviceTensor::allocate(
-            DType::UINT8, {static_cast<std::int64_t>(instr.source.span_bytes)});
-#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-        // Stream-0 H2D for the same reason the uniform path uses one: the
-        // kernel that reads this scratch launches on stream 0 straight away,
-        // while the batched `queue()` path lands on a private copy stream with
-        // no flush in between.
-        copy_engine_.queue_on_stream(
-            instr.source.file_id,
-            instr.source.file_offset + instr.source.stride.base_offset,
-            instr.source.span_bytes,
-            scratch.data(),
-            /*stream=*/0);
-#else
-        copy_engine_.queue(
-            instr.source.file_id,
-            instr.source.file_offset + instr.source.stride.base_offset,
-            instr.source.span_bytes,
-            scratch.data());
-#endif
-        return scratch;
-    }
-
     // Acquire the Encode source tile on device (FP8 / other source bytes, or a
     // slice of an input buffer) WITHOUT dequantizing. Shared by the BF16
     // materialize path and the fused FP8->MXFP4 transcode path.
     DeviceTensor acquire_encode_source_tile(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
         int rows)
@@ -472,8 +210,13 @@ private:
         };
         DeviceTensor source;
         if (instr.has_source) {
-            const DType source_dtype = dtype_from_rust(instr.source.dtype);
-            const bool compact = pie_loader::compact_extent(instr.source.stride);
+            if (instr.source.tensor_id >= source_tensor_names_.size()) {
+                throw std::runtime_error(
+                    "rust storage executor: Encode source tensor id out of range");
+            }
+            const TensorInfo& info =
+                loader_.info(source_tensor_names_[instr.source.tensor_id]);
+            const bool compact = wl_cpp::compact_extent(instr.source.stride);
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
             // Reuse a persistent device tile buffer for compact sources — the
             // encode/dequant kernel consumes it then we move on, so per-tile
@@ -489,18 +232,18 @@ private:
                 const std::size_t want_bytes =
                     static_cast<std::size_t>(rows) *
                     static_cast<std::size_t>(cols) *
-                    dtype_bytes(source_dtype);
-                const bool is_fp8 = source_dtype == DType::FP8_E4M3;
+                    dtype_bytes(info.dtype);
+                const bool is_fp8 = info.dtype == DType::FP8_E4M3;
                 void*& tile_ptr =
                     is_fp8 ? fp8_source_tile_ptr_ : bf16_source_tile_ptr_;
                 std::size_t& tile_cap =
                     is_fp8 ? fp8_source_tile_bytes_ : bf16_source_tile_bytes_;
                 ensure_dev_buffer(tile_ptr, tile_cap, want_bytes);
-                source = DeviceTensor::view(tile_ptr,                 source_dtype, tile_shape);
+                source = DeviceTensor::view(tile_ptr, info.dtype, tile_shape);
             } else
 #endif
             {
-                source = DeviceTensor::allocate(source_dtype, tile_shape);
+                source = DeviceTensor::allocate(info.dtype, tile_shape);
             }
             if (!compact) {
                 if (row_start != 0 || rows != full_shape[0]) {
@@ -508,10 +251,9 @@ private:
                         "rust storage executor: tiled Encode for non-compact "
                         "sources is not implemented");
                 }
-                copy_strided_extent_to_device(
-                    loader_, instr.source, source.data(), source.nbytes());
+                copy_strided_extent_to_device(loader_, source_tensor_names_, instr, source.data(), full_shape);
             } else {
-                const std::uint64_t elem = dtype_bytes(source_dtype);
+                const std::uint64_t elem = dtype_bytes(info.dtype);
                 const std::uint64_t row_bytes =
                     static_cast<std::uint64_t>(cols) * elem;
                 const std::uint64_t off =
@@ -559,7 +301,7 @@ private:
     }
 
     DeviceTensor materialize_encode_input_bf16_rows(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
         int rows)
@@ -617,9 +359,9 @@ private:
     // caching saves both disk I/O and cudaMalloc churn.
     void ensure_fp8_scale_loaded(
         const std::string& scale_name,
-        const lp::PieLoaderSourceTensorView& scale_info,
+        const TensorInfo& scale_info,
         std::size_t scale_nbytes,
-        const lp::PieLoaderSourceTensorView& storage)
+        const TensorStorageInfo& storage)
     {
         auto it = fp8_scale_cache_.find(scale_name);
         if (it != fp8_scale_cache_.end()) return;
@@ -635,8 +377,8 @@ private:
         // expert weights, each syncing every copy stream. Stream-0 ordering
         // is free.
         copy_engine_.queue_on_stream(
-            storage.file_id, storage.file_offset,
-            storage.span_bytes, entry.data, /*stream=*/0);
+            storage.shard_id, storage.file_offset,
+            storage.nbytes, entry.data, /*stream=*/0);
         (void)scale_info;
         fp8_scale_cache_.emplace(scale_name, entry);
     }
@@ -648,12 +390,11 @@ private:
     };
 
     // Resolve the per-group FP8 block scale for an Encode-source tile: loads/
-    // caches the scale tensor the instruction names, slices the rank-local
-    // block for TP shards,
+    // caches `<weight>_scale_inv`, slices the rank-local block for TP shards,
     // and offsets to the tile's first scale row. Shared by the BF16 dequant and
     // the fused FP8->MXFP4 paths so both see identical scale data.
     Fp8TileScale fp8_tile_scale(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
         int rows)
@@ -666,41 +407,33 @@ private:
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode source must be 2-D");
         }
-        const auto& weight_info = plan_index_.source(instr.source.tensor_id);
-        const std::string weight_name =
-            pie_loader::bytes_to_string(weight_info.name);
-        // Which tensor holds the block scales is the checkpoint's naming
-        // convention, and the loader read the tensor table. It says so on the
-        // instruction rather than leaving this to rebuild the name and hope.
-        if (instr.transform_metadata_source == pie_loader::PIE_LOADER_NO_TENSOR) {
+        const std::string& weight_name =
+            source_tensor_names_[instr.source.tensor_id];
+        const std::string scale_name = weight_name + "_scale_inv";
+        if (!loader_.contains(scale_name)) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode source '" + weight_name +
-                "' has no block-scale tensor on its instruction");
+                "' has no '_scale_inv' sibling tensor");
         }
-        const auto& scale_info =
-            plan_index_.source(instr.transform_metadata_source);
-        const auto scale_shape =
-            pie_loader::i64_slice_to_vector(scale_info.shape);
-        if (scale_shape.size() != 2) {
+        const TensorInfo& scale_info = loader_.info(scale_name);
+        if (scale_info.shape.size() != 2) {
             throw std::runtime_error(
-                "rust storage executor: FP8 Encode scale '" +
-                pie_loader::bytes_to_string(scale_info.name) +
+                "rust storage executor: FP8 Encode scale '" + scale_name +
                 "' must be 2-D (block-scaled FP8)");
         }
         // Get the FULL (un-sharded) weight shape from the checkpoint so we
         // can compute the true group_size. The tile's `full_shape` may be
         // TP-sharded and not match the on-disk scale dimensions.
-        const auto weight_shape =
-            pie_loader::i64_slice_to_vector(weight_info.shape);
-        if (weight_shape.size() != 2) {
+        const TensorInfo& weight_info = loader_.info(weight_name);
+        if (weight_info.shape.size() != 2) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode weight '" + weight_name +
                 "' must be 2-D on disk");
         }
-        const int true_rows = checked_int(weight_shape[0], "FP8 weight rows");
-        const int true_cols = checked_int(weight_shape[1], "FP8 weight cols");
-        const int scale_rows = checked_int(scale_shape[0], "FP8 scale rows");
-        const int scale_cols = checked_int(scale_shape[1], "FP8 scale cols");
+        const int true_rows = checked_int(weight_info.shape[0], "FP8 weight rows");
+        const int true_cols = checked_int(weight_info.shape[1], "FP8 weight cols");
+        const int scale_rows = checked_int(scale_info.shape[0], "FP8 scale rows");
+        const int scale_cols = checked_int(scale_info.shape[1], "FP8 scale cols");
         const int true_group_rows = (scale_rows > 0) ? (true_rows / scale_rows) : 0;
         const int true_group_cols = (scale_cols > 0) ? (true_cols / scale_cols) : 0;
         if (true_group_rows <= 0 || true_group_cols <= 0
@@ -725,18 +458,17 @@ private:
         const std::uint64_t rank_row_off_full = base_byte / true_cols;
         const std::uint64_t rank_col_off_full = base_byte % true_cols;
 
-        const std::string scale_name = pie_loader::bytes_to_string(scale_info.name);
-        if (dtype_from_rust(scale_info.dtype) != DType::FP32) {
+        if (scale_info.dtype != DType::FP32) {
             throw std::runtime_error(
                 "rust storage executor: FP8 Encode scale '" + scale_name +
                 "' must be FP32");
         }
         // Cache the full FP8 scale per weight: one disk read + one cudaMalloc
         // amortised across every tile of the same Encode instruction.
+        const TensorStorageInfo storage = loader_.storage_info(scale_name);
         const std::size_t scale_nbytes =
             static_cast<std::size_t>(scale_rows) * scale_cols * sizeof(float);
-        ensure_fp8_scale_loaded(
-            scale_name, scale_info, scale_nbytes, scale_info);
+        ensure_fp8_scale_loaded(scale_name, scale_info, scale_nbytes, storage);
         const auto& cached_scale = fp8_scale_cache_[scale_name];
         const float* scale_full_ptr =
             static_cast<const float*>(cached_scale.data);
@@ -787,7 +519,7 @@ private:
     }
 
     DeviceTensor dequant_fp8_tile_to_bf16(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
         const DeviceTensor& fp8_tile,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
@@ -822,7 +554,7 @@ private:
     // dequant_fp8_tile_to_bf16 + quantize_bf16_to_mxfp4 — the fused kernel
     // rounds through BF16; see tests/test_transcode_fused.cu.
     void transcode_fp8_tile_to_mxfp4(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
         const DeviceTensor& fp8_tile,
         const std::vector<std::int64_t>& full_shape,
         int row_start,
@@ -846,25 +578,64 @@ private:
     }
 #endif
 
-    // How many rows to transform per launch. The loader decided this in
-    // `backend::cuda` (loader/architecture.md §8.1) after weighing the source
-    // dtype, the extent's stride and the tile budget; 0 means "the whole tensor
-    // in one pass", which is both the untileable case and the case where one
-    // tile already covers everything. Clamped against `rows` so a malformed plan
-    // cannot turn the loop below into a spin.
-    static int encode_rows_per_tile(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
-        int rows)
+    DType encode_source_dtype(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
-        if (instr.rows_per_tile == 0) {
+        if (instr.has_source) {
+            if (instr.source.tensor_id >= source_tensor_names_.size()) {
+                throw std::runtime_error(
+                    "rust storage executor: Encode source tensor id out of range");
+            }
+            return loader_.info(source_tensor_names_[instr.source.tensor_id]).dtype;
+        }
+        if (instr.input_buffers.len != 1) {
+            throw std::runtime_error(
+                "rust storage executor: Encode expects source or one input");
+        }
+        return resolver_.or_finalized(instr.input_buffers.ptr[0]).dtype();
+    }
+
+    bool can_tile_encode(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr) const
+    {
+        return !instr.has_source || wl_cpp::compact_extent(instr.source.stride);
+    }
+
+    int encode_rows_per_tile(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
+        DType source_dtype,
+        int rows,
+        int cols) const
+    {
+        // FP8 Encode source needs a [rows/128, cols/128] block scale; tiling
+        // the dequant by an arbitrary row count would slice through the 128
+        // row block boundary. Disable tiling on FP8 sources — GLM-5.1 expert
+        // weights at [2048, 6144] fit comfortably (~50MB BF16 scratch).
+        if (source_dtype == DType::FP8_E4M3 ||
+            source_dtype == DType::FP8_E5M2) {
             return rows;
         }
-        return static_cast<int>(std::min<std::uint64_t>(
-            instr.rows_per_tile, static_cast<std::uint64_t>(rows)));
+        const std::uint64_t max_tile_bytes =
+            instr.max_tile_bytes == 0 ? loader_config::kFallbackTileBytes : instr.max_tile_bytes;
+        const std::uint64_t source_row_bytes =
+            static_cast<std::uint64_t>(cols) * dtype_bytes(source_dtype);
+        const std::uint64_t bf16_row_bytes =
+            static_cast<std::uint64_t>(cols) * dtype_bytes(DType::BF16);
+        const std::uint64_t scratch_per_row =
+            source_dtype == DType::BF16
+                ? bf16_row_bytes
+                : source_row_bytes + bf16_row_bytes;
+        const std::uint64_t rows_per_tile = std::max<std::uint64_t>(
+            1,
+            max_tile_bytes / std::max<std::uint64_t>(1, scratch_per_row));
+        return static_cast<int>(
+            std::min<std::uint64_t>(
+                static_cast<std::uint64_t>(rows),
+                rows_per_tile));
     }
 
     void launch_encode_tile(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
         const DeviceTensor& bf16,
         DeviceTensor& out,
         DeviceTensor& scale,
@@ -874,7 +645,7 @@ private:
     {
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
         switch (instr.transform_to) {
-        case lp::PieLoaderQuantScheme::Fp8E4M3:
+        case pie_weight_loader::PieLoaderQuantScheme::Fp8E4M3:
             if (out.dtype() != DType::FP8_E4M3) {
                 throw std::runtime_error(
                     "rust storage executor: FP8 Encode output dtype mismatch");
@@ -890,7 +661,7 @@ private:
                 /*stream=*/0);
             CUDA_CHECK(cudaGetLastError());
             return;
-        case lp::PieLoaderQuantScheme::Int8Symmetric:
+        case pie_weight_loader::PieLoaderQuantScheme::Int8Symmetric:
             if (out.dtype() != DType::INT8) {
                 throw std::runtime_error(
                     "rust storage executor: INT8 Encode output dtype mismatch");
@@ -906,7 +677,7 @@ private:
                 /*stream=*/0);
             CUDA_CHECK(cudaGetLastError());
             return;
-        case lp::PieLoaderQuantScheme::Mxfp4E2M1E8M0: {
+        case pie_weight_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0: {
             // Output is packed nibbles `[rows, cols/2]` uint8. Scale is
             // E8M0 `[rows, cols/32]` uint8.
             if (out.dtype() != DType::UINT8 && out.dtype() != DType::MXFP4_PACKED) {
@@ -959,11 +730,16 @@ private:
 #endif
     }
 
+    bool fused_transcode_enabled() const
+    {
+        return !loader_config::env_truthy("PIE_CUDA_DISABLE_FUSED_TRANSCODE");
+    }
+
     // Fused FP8->MXFP4 for one Encode tile: acquire the FP8 source tile and
     // transcode it straight into the MXFP4 packed/scale outputs at this tile's
     // row offset (same offsets as launch_encode_tile's MXFP4 case).
     void launch_fused_mxfp4_tile(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
         DeviceTensor& out,
         DeviceTensor& scale,
         const std::vector<std::int64_t>& shape,
@@ -995,7 +771,7 @@ private:
     }
 
     void encode_tile_map(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr,
+        const pie_weight_loader::PieLoaderStorageInstrView& instr,
         LoadExecutionStats& stats)
     {
         if (instr.output_buffers.len != 2) {
@@ -1009,11 +785,11 @@ private:
         // it from the program index.
         std::vector<std::int64_t> shape = out.shape();
         if (instr.transform_to ==
-            lp::PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
-            const auto& buf = plan_index_.buffer(instr.output_buffers.ptr[0]);
+            pie_weight_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0) {
+            const auto& buf = program_index_.buffer(instr.output_buffers.ptr[0]);
             if (buf.has_tensor) {
-                const auto& t = plan_index_.tensor(buf.tensor_id);
-                shape = pie_loader::i64_slice_to_vector(t.shape);
+                const auto& t = program_index_.tensor(buf.tensor_id);
+                shape = wl_cpp::i64_slice_to_vector(t.shape);
             }
         }
         if (shape.size() != 2) {
@@ -1023,15 +799,15 @@ private:
         const int rows = checked_int(shape[0], "Encode rows");
         const int cols = checked_int(shape[1], "Encode cols");
         switch (instr.transform_to) {
-        case lp::PieLoaderQuantScheme::Mxfp4E2M1E8M0: {
+        case pie_weight_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0: {
             // MXFP4 scale is `[rows, cols/32]` uint8 (E8M0 byte per block).
             // Scale buffer may also be allocated 1-D flat — fetch the logical
             // shape from the decl for comparison.
             std::vector<std::int64_t> scale_shape = scale.shape();
-            const auto& sbuf = plan_index_.buffer(instr.output_buffers.ptr[1]);
+            const auto& sbuf = program_index_.buffer(instr.output_buffers.ptr[1]);
             if (sbuf.has_tensor) {
-                const auto& st = plan_index_.tensor(sbuf.tensor_id);
-                scale_shape = pie_loader::i64_slice_to_vector(st.shape);
+                const auto& st = program_index_.tensor(sbuf.tensor_id);
+                scale_shape = wl_cpp::i64_slice_to_vector(st.shape);
             }
             const std::vector<std::int64_t> want{shape[0], shape[1] / loader_config::kMxfp4Group};
             if (scale_shape != want) {
@@ -1057,89 +833,86 @@ private:
                 resolver_.or_finalized(instr.input_buffers.ptr[0]).nbytes();
         }
 
-        // Fusing FP8 -> MXFP4 skips the BF16 HBM round-trip and is bit-identical
-        // to the two-step path (kernel parity-tested). Whether to do it is the
-        // loader's call, not this executor's, so that the plan — and therefore
-        // the artifact cache key — records which kernel sequence ran.
+        // Fuse FP8 -> MXFP4 directly when possible, skipping the BF16 HBM
+        // round-trip. Bit-identical to the two-step (kernel parity-tested);
+        // opt out with PIE_CUDA_DISABLE_FUSED_TRANSCODE.
         const bool fuse_fp8_mxfp4 =
-            instr.transform_fusion == lp::PieLoaderTransformFusion::Fp8ToMxfp4;
+            fused_transcode_enabled()
+            && instr.transform_to ==
+                   pie_weight_loader::PieLoaderQuantScheme::Mxfp4E2M1E8M0
+            && instr.has_source
+            && encode_source_dtype(instr) == DType::FP8_E4M3;
 
-        const int rows_per_tile = encode_rows_per_tile(instr, rows);
-        for (int row = 0; row < rows; row += rows_per_tile) {
-            const int tile_rows = std::min(rows_per_tile, rows - row);
-            if (fuse_fp8_mxfp4) {
-                launch_fused_mxfp4_tile(
-                    instr, out, scale, shape, row, tile_rows, cols);
-            } else {
-                DeviceTensor bf16_tile =
-                    materialize_encode_input_bf16_rows(
-                        instr, shape, row, tile_rows);
-                launch_encode_tile(
-                    instr, bf16_tile, out, scale, row, tile_rows, cols);
+        if (can_tile_encode(instr)) {
+            const DType source_dtype = encode_source_dtype(instr);
+            const int rows_per_tile =
+                encode_rows_per_tile(instr, source_dtype, rows, cols);
+            for (int row = 0; row < rows; row += rows_per_tile) {
+                const int tile_rows = std::min(rows_per_tile, rows - row);
+                if (fuse_fp8_mxfp4) {
+                    launch_fused_mxfp4_tile(
+                        instr, out, scale, shape, row, tile_rows, cols);
+                } else {
+                    DeviceTensor bf16_tile =
+                        materialize_encode_input_bf16_rows(
+                            instr, shape, row, tile_rows);
+                    launch_encode_tile(
+                        instr, bf16_tile, out, scale, row, tile_rows, cols);
+                }
             }
+            return;
+        }
+
+        if (fuse_fp8_mxfp4) {
+            launch_fused_mxfp4_tile(instr, out, scale, shape, 0, rows, cols);
+        } else {
+            DeviceTensor bf16 =
+                materialize_encode_input_bf16_rows(instr, shape, 0, rows);
+            launch_encode_tile(instr, bf16, out, scale, 0, rows, cols);
         }
     }
 
-    // Stage the bytes a Repack reads, reusing the block staged for the tile map
-    // before it when both read the same extent.
-    //
-    // Written when GPT-OSS cut its gate and up projections out of a single
-    // `gate_up_proj` block that both halves had to name in full, so each block
-    // was staged twice. The contract now narrows each half's read to its own
-    // rows, so that case no longer arises and the reuse is opportunistic: it
-    // costs one comparison and still covers any future pair of repacks that
-    // land on identical bytes.
-    //
-    // Reuse is safe because the staging copy and the repack kernel that reads it
-    // both run on stream 0, so the copy has landed before any kernel that sees
-    // the block, and because repack kernels only ever read their source.
-    const DeviceTensor& materialize_repack_source(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr)
+#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
+    static kernels::Mxfp4RowSelect repack_row_map(
+        pie_weight_loader::PieLoaderRowMap row_map)
+    {
+        switch (row_map) {
+        case pie_weight_loader::PieLoaderRowMap::Identity:
+            return kernels::Mxfp4RowSelect::Identity;
+        case pie_weight_loader::PieLoaderRowMap::Even:
+            return kernels::Mxfp4RowSelect::Even;
+        case pie_weight_loader::PieLoaderRowMap::Odd:
+            return kernels::Mxfp4RowSelect::Odd;
+        }
+        throw std::runtime_error(
+            "rust storage executor: unknown Repack row map");
+    }
+#endif
+
+    DeviceTensor materialize_repack_source(
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
         if (instr.has_source) {
-            const bool compact = pie_loader::compact_extent(instr.source.stride);
-            const StagedSource staged{
-                /*valid=*/compact,
-                instr.source.file_id,
-                instr.source.file_offset + instr.source.stride.base_offset,
-                instr.source.span_bytes};
-            if (staged.valid && staged == staged_source_) {
-                return repack_source_;
+            if (instr.source.tensor_id >= source_tensor_names_.size()) {
+                throw std::runtime_error(
+                    "rust storage executor: Repack source tensor id out of range");
             }
-            // Drop the previous block before taking the next so that two are
-            // never resident at once.
-            repack_source_ = DeviceTensor{};
-            staged_source_ = StagedSource{};
             DeviceTensor scratch = DeviceTensor::allocate(
                 DType::UINT8,
                 {static_cast<std::int64_t>(instr.source.span_bytes)});
-            if (!compact) {
+            if (!wl_cpp::compact_extent(instr.source.stride)) {
                 copy_strided_extent_to_device(
-                    loader_, instr.source,
+                    loader_, source_tensor_names_, instr,
                     scratch.data(),
-                    scratch.nbytes());
+                    wl_cpp::extent_shape(instr.source.stride));
             } else {
-#if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
-                // Stream-0 H2D for the same reason as the Cast path: the repack
-                // kernel that consumes this scratch runs on stream 0 with no
-                // intervening flush.
-                copy_engine_.queue_on_stream(
-                    staged.file_id,
-                    staged.file_offset,
-                    staged.span_bytes,
-                    scratch.data(),
-                    /*stream=*/0);
-#else
                 copy_engine_.queue(
-                    staged.file_id,
-                    staged.file_offset,
-                    staged.span_bytes,
+                    instr.source.file_id,
+                    instr.source.file_offset + instr.source.stride.base_offset,
+                    instr.source.span_bytes,
                     scratch.data());
-#endif
             }
-            repack_source_ = std::move(scratch);
-            staged_source_ = staged;
-            return repack_source_;
+            return scratch;
         }
         if (instr.input_buffers.len != 1) {
             throw std::runtime_error(
@@ -1147,8 +920,6 @@ private:
         }
         const DeviceTensor& input =
             resolver_.or_finalized(instr.input_buffers.ptr[0]);
-        repack_source_ = DeviceTensor{};
-        staged_source_ = StagedSource{};
         DeviceTensor scratch = DeviceTensor::allocate(
             DType::UINT8,
             {static_cast<std::int64_t>(input.nbytes())});
@@ -1163,51 +934,72 @@ private:
         throw std::runtime_error(
             "rust storage executor: CUDA Repack compiled without CUDA headers");
 #endif
-        repack_source_ = std::move(scratch);
-        return repack_source_;
+        return scratch;
     }
 
     void repack_tile_map(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr)
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
 #if PIE_CUDA_TRANSCODE_ENGINE_HAS_CUDA
         if (instr.output_buffers.len != 1 || !instr.has_dest) {
             throw std::runtime_error(
                 "rust storage executor: Repack expects one output and destination extent");
         }
-        // The source is dense and holds exactly the rows and columns this
-        // repack wants: which ones those are was decided by the contract's
-        // `Slice`/`Shard`/`Stride` nodes and resolved by the plan, so a kernel
-        // sees a block, never a selection.
         const int batch = static_cast<int>(instr.transform_batch);
         const int source_rows = static_cast<int>(instr.transform_source_rows);
+        const int source_row_offset =
+            static_cast<int>(instr.transform_source_row_offset);
         const int target_rows = static_cast<int>(instr.transform_target_rows);
+        const int valid_rows = instr.transform_valid_rows == 0
+            ? target_rows
+            : static_cast<int>(instr.transform_valid_rows);
+        const int source_stride_cols = instr.transform_source_stride_cols == 0
+            ? static_cast<int>(instr.transform_source_cols)
+            : static_cast<int>(instr.transform_source_stride_cols);
+        const int source_col_offset =
+            static_cast<int>(instr.transform_source_col_offset);
         const int source_cols = static_cast<int>(instr.transform_source_cols);
         const int target_cols = static_cast<int>(instr.transform_target_cols);
-        if (batch <= 0 || source_rows <= 0 || target_rows < source_rows ||
-            source_cols <= 0 || target_cols < source_cols) {
+        if (batch <= 0 || source_rows <= 0 || target_rows <= 0 ||
+            valid_rows <= 0 || valid_rows > target_rows ||
+            source_stride_cols <= 0 || source_col_offset < 0 ||
+            source_cols <= 0 || target_cols <= 0 ||
+            source_col_offset + source_cols > source_stride_cols) {
             throw std::runtime_error(
                 "rust storage executor: Repack has invalid transform dimensions");
         }
         DeviceTensor& output = resolver_.tensor(instr.output_buffers.ptr[0]);
         auto* dst_base = static_cast<std::uint8_t*>(output.data()) +
             instr.dest.offset + instr.dest.stride.base_offset;
-        const DeviceTensor& source = materialize_repack_source(instr);
+        DeviceTensor source = materialize_repack_source(instr);
         const auto* src_base =
             static_cast<const std::uint8_t*>(source.data());
+        const auto row_map = repack_row_map(instr.row_map);
 
         switch (instr.repack_layout) {
-        case lp::PieLoaderRepackLayout::MarlinMxfp4Weight:
+        case pie_weight_loader::PieLoaderRepackLayout::MarlinMxfp4Weight:
             repack_marlin_mxfp4_weight(
-                src_base, dst_base, batch, source_rows, target_rows,
-                source_cols, target_cols);
+                src_base, dst_base, batch, source_rows, source_row_offset,
+                target_rows, valid_rows, source_stride_cols,
+                source_col_offset, source_cols, target_cols, row_map);
             return;
-        case lp::PieLoaderRepackLayout::MarlinMxfp4Scale:
+        case pie_weight_loader::PieLoaderRepackLayout::MarlinMxfp4Scale:
             repack_marlin_mxfp4_scale(
-                src_base, dst_base, batch, source_rows, target_rows,
-                source_cols, target_cols);
+                src_base, dst_base, batch, source_rows, source_row_offset,
+                target_rows, valid_rows, source_stride_cols,
+                source_col_offset, source_cols, target_cols, row_map);
             return;
-        case lp::PieLoaderRepackLayout::None:
+        case pie_weight_loader::PieLoaderRepackLayout::DenseRowGather:
+            if (source_cols != 1 || target_cols != 1) {
+                throw std::runtime_error(
+                    "rust storage executor: DenseRowGather Repack expects column count 1");
+            }
+            kernels::launch_bf16_row_map_to_dense(
+                src_base, dst_base, batch, source_rows, source_row_offset,
+                target_rows, valid_rows, row_map, /*stream=*/0);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        case pie_weight_loader::PieLoaderRepackLayout::None:
             break;
         }
         throw std::runtime_error(
@@ -1225,18 +1017,27 @@ private:
         std::uint8_t* dst_base,
         int batch,
         int source_rows,
+        int source_row_offset,
         int target_rows,
+        int valid_rows,
+        int source_stride_cols,
+        int source_col_offset,
         int source_cols,
-        int target_cols)
+        int target_cols,
+        kernels::Mxfp4RowSelect row_map)
     {
 #if defined(PIE_CUDA_HAS_MARLIN)
-        if (source_cols % 8 != 0 || target_cols % 8 != 0) {
+        if (source_cols % 8 != 0 || target_cols % 8 != 0 ||
+            source_stride_cols % 8 != 0 || source_col_offset % 8 != 0 ||
+            target_cols < source_cols ||
+            source_col_offset + source_cols > source_stride_cols) {
             throw std::runtime_error(
                 "rust storage executor: MarlinMxfp4Weight Repack requires "
-                "source and target K divisible by 8");
+                "K/stride/offset divisible by 8 and target K >= source K");
         }
         const std::uint64_t source_bytes =
-            checked_nibble_bytes(source_rows, source_cols, "MXFP4 source");
+            checked_nibble_bytes(
+                source_rows, source_stride_cols, "MXFP4 source");
         const std::uint64_t target_bytes =
             checked_nibble_bytes(target_rows, target_cols, "MXFP4 target");
         DeviceTensor gptq_stage = DeviceTensor::allocate(
@@ -1249,10 +1050,9 @@ private:
                 dst_base + static_cast<std::uint64_t>(b) * target_bytes;
             kernels::launch_mxfp4_weight_to_gptq_w4(
                 src, gptq_stage.data(),
-                source_rows, /*source_row_offset=*/0, target_rows,
-                /*valid_rows=*/source_rows, /*source_stride_cols=*/source_cols,
-                /*source_col_offset=*/0, source_cols, target_cols,
-                kernels::Mxfp4RowSelect::Identity, /*stream=*/0);
+                source_rows, source_row_offset, target_rows, valid_rows,
+                source_stride_cols, source_col_offset, source_cols,
+                target_cols, row_map, /*stream=*/0);
             marlin::launch_gptq_repack_w4_no_perm(
                 gptq_stage.data(), dst, target_cols, target_rows,
                 /*stream=*/0);
@@ -1263,9 +1063,14 @@ private:
         (void)dst_base;
         (void)batch;
         (void)source_rows;
+        (void)source_row_offset;
         (void)target_rows;
+        (void)valid_rows;
+        (void)source_stride_cols;
+        (void)source_col_offset;
         (void)source_cols;
         (void)target_cols;
+        (void)row_map;
         throw std::runtime_error(
             "rust storage executor: MarlinMxfp4Weight Repack requires Marlin");
 #endif
@@ -1276,29 +1081,42 @@ private:
         std::uint8_t* dst_base,
         int batch,
         int source_rows,
+        int source_row_offset,
         int target_rows,
+        int valid_rows,
+        int source_stride_groups,
+        int source_group_offset,
         int source_groups,
-        int target_groups)
+        int target_groups,
+        kernels::Mxfp4RowSelect row_map)
     {
+        if (source_stride_groups <= 0 || source_group_offset < 0 ||
+            target_groups < source_groups ||
+            source_group_offset + source_groups > source_stride_groups) {
+            throw std::runtime_error(
+                "rust storage executor: MarlinMxfp4Scale Repack requires "
+                "target group count >= source group count and source slice "
+                "within stride");
+        }
         const std::uint64_t source_bytes =
-            checked_mul_u64(source_rows, source_groups, "MXFP4 scale source");
+            checked_mul_u64(
+                source_rows, source_stride_groups, "MXFP4 scale source");
         const std::uint64_t target_bytes =
             checked_mul_u64(target_rows, target_groups, "MXFP4 scale target");
         for (int b = 0; b < batch; ++b) {
             kernels::launch_mxfp4_scales_to_marlin_e8m0(
                 src_base + static_cast<std::uint64_t>(b) * source_bytes,
                 dst_base + static_cast<std::uint64_t>(b) * target_bytes,
-                source_rows, /*source_row_offset=*/0, target_rows,
-                /*valid_rows=*/source_rows, /*source_stride_groups=*/source_groups,
-                /*source_group_offset=*/0, source_groups, target_groups,
-                kernels::Mxfp4RowSelect::Identity, /*stream=*/0);
+                source_rows, source_row_offset, target_rows, valid_rows,
+                source_stride_groups, source_group_offset, source_groups,
+                target_groups, row_map, /*stream=*/0);
         }
         CUDA_CHECK(cudaGetLastError());
     }
 #endif
 
     void reblock_tile_map(
-        const lp::PieLoaderStorageOp::TileMap_Body& instr)
+        const pie_weight_loader::PieLoaderStorageInstrView& instr)
     {
         if (instr.input_buffers.len != 1 || instr.output_buffers.len != 1) {
             throw std::runtime_error(
@@ -1311,7 +1129,7 @@ private:
         const auto dst_offset =
             instr.has_dest ? instr.dest.offset + instr.dest.stride.base_offset : 0;
         const auto bytes = instr.has_dest
-            ? pie_loader::extent_bytes(
+            ? wl_cpp::extent_bytes(
                   instr.dest.stride,
                   "rust storage executor")
             : static_cast<std::uint64_t>(input.nbytes());
@@ -1335,25 +1153,13 @@ private:
     }
 
 
-    // The checkpoint extent currently held in `repack_source_`. A strided read
-    // is never cached, so `valid` also says "this holds a whole block".
-    struct StagedSource {
-        bool valid = false;
-        std::uint32_t file_id = 0;
-        std::uint64_t file_offset = 0;
-        std::uint64_t span_bytes = 0;
-
-        bool operator==(const StagedSource& other) const = default;
-    };
-
-    pie_loader::CheckpointSource& loader_;
+    SafetensorsCheckpointSource& loader_;
+    const std::vector<std::string>& source_tensor_names_;
     WeightCopyEngine& copy_engine_;
-    const pie_loader::LoadPlanIndex& plan_index_;
+    const wl_cpp::StorageProgramIndex& program_index_;
     BufferResolver& resolver_;
     void* fp8_bf16_scratch_ptr_ = nullptr;
     std::size_t fp8_bf16_scratch_bytes_ = 0;
-    DeviceTensor repack_source_;
-    StagedSource staged_source_;
     struct CachedFp8Scale { void* data = nullptr; std::size_t nbytes = 0; };
     std::unordered_map<std::string, CachedFp8Scale> fp8_scale_cache_;
     void* fp8_scale_local_ptr_ = nullptr;

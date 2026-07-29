@@ -11,8 +11,8 @@ Each ``test_<name>.py`` file defines one or more async test functions and a
 
 Usage from project root::
 
-    uv run python tests/inferlets/test_curated.py --dummy
-    uv run python tests/inferlets/test_curated.py --model Qwen/Qwen3-0.6B
+    uv run python tests/inferlets/test_watermarking.py --dummy
+    uv run python tests/inferlets/test_watermarking.py --model Qwen/Qwen3-0.6B
 """
 
 from __future__ import annotations
@@ -31,7 +31,8 @@ from pie_client import Event
 # Paths
 # ---------------------------------------------------------------------------
 
-INFERLETS_DIR = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent.parent
+INFERLETS_DIR = ROOT / "inferlets"
 
 
 # ---------------------------------------------------------------------------
@@ -46,8 +47,8 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per inferlet (seconds)")
     parser.add_argument("--verbose", action="store_true", help="Show stdout on failure")
     driver_group = parser.add_mutually_exclusive_group()
-    driver_group.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "tensorrt_llm", "dummy", "cuda_native"],
-                              help="Inference driver: 'dev', 'vllm', 'sglang', 'tensorrt_llm', 'dummy', or 'cuda_native'")
+    driver_group.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "tensorrt_llm", "dummy", "cuda_native", "portable"],
+                              help="Inference driver: 'dev', 'vllm', 'sglang', 'tensorrt_llm', 'dummy', 'cuda_native', or 'portable'")
     driver_group.add_argument("--dummy", action="store_true",
                               help="Alias for --driver dummy")
     parser.add_argument("--vllm-attention-backend", default=None,
@@ -66,6 +67,9 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
                         help="If set, write each test's captured inferlet output to "
                              "<dir>/<test-name>.txt (one file per test, multiple "
                              "run_inferlet calls concatenated with separators).")
+    parser.add_argument("--portable-n-gpu-layers", type=int, default=None,
+                        help="(--driver portable only) Override n_gpu_layers; "
+                             "-1 = all layers on GPU, 0 = CPU only, N = first N.")
     return parser
 
 
@@ -120,13 +124,10 @@ async def run_inferlet(
     if extra_args is None:
         extra_args = []
     wasm_name = name.replace("-", "_")
-    # Rust workspace artifacts live under this directory's target/. Keep the member
-    # paths as fallbacks for inferlets built outside the curated workspace.
+    # Rust: cargo emits to target/wasm32-wasip2/{release,debug}/<name>.wasm
     # JS (bakery build) / Python (componentize-py): flat target/<name>.wasm
     inferlet_dir = INFERLETS_DIR / name
     candidates = [
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
-        INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / f"{wasm_name}.wasm",
@@ -210,20 +211,24 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     if args.driver in ("sglang", "vllm") and args.spec_ngram:
         driver_subsection["spec_ngram_enabled"] = True
         driver_subsection["spec_ngram_num_drafts"] = args.spec_num_drafts
+    if args.driver == "portable" and args.portable_n_gpu_layers is not None:
+        driver_subsection["n_gpu_layers"] = args.portable_n_gpu_layers
 
     cfg = Config(
         server=ServerConfig(port=0),
         auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        model=ModelConfig(
-            name="default",
-            hf_repo=args.model,
-            driver=DriverConfig(
-                type=args.driver,
-                device=device,
-                options=driver_subsection,
+        models=[
+            ModelConfig(
+                name="default",
+                hf_repo=args.model,
+                driver=DriverConfig(
+                    type=args.driver,
+                    device=device,
+                    options=driver_subsection,
+                ),
             ),
-        ),
+        ],
     )
     out_dir = Path(args.output_dir) if args.output_dir else None
     if out_dir is not None:

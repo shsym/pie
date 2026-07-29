@@ -9,14 +9,14 @@
 
 #include <cuda_runtime.h>
 
-#include "kernels/kv_cache_view.hpp"
-#include "ops/attention_workspace.hpp"
+#include "attention_workspace.hpp"
+#include "kv_cache.hpp"
 
 namespace pie_cuda_driver::ops {
 
 // Opaque cache of flashinfer's `DecodePlanInfo` plus the few scheduling
 // fields the dispatch needs. Lifecycle: created once (e.g. in
-// BatchEngine), reset each fire by `plan_attention_flashinfer_decode_bf16`,
+// Executor), reset each fire by `plan_attention_flashinfer_decode_bf16`,
 // then reused by 28 per-layer dispatch calls within that fire. Hoisting
 // the plan out of the per-layer loop saves ~27 redundant DecodePlan
 // invocations per fire — the plan is identical across all layers in
@@ -44,12 +44,6 @@ PrefillPlanCachePtr make_prefill_plan();
 // plans need distinct graph keys.
 std::uint32_t decode_plan_graph_layout(const DecodePlanCache& cache);
 std::uint32_t prefill_plan_graph_layout(const PrefillPlanCache& cache);
-
-// Whether this plan's schedule is independent of the page counts it was
-// planned against, and therefore whether the launch may be handed a different
-// (compacted) page list than the plan saw. Only the static non-split decode
-// plan qualifies. See `DecodePlanCache::page_count_independent`.
-bool decode_plan_is_page_count_independent(const DecodePlanCache& cache);
 
 // Compute decode plan once per fire. Stores results in `cache` and the
 // workspace's int/float buffers (so per-layer dispatch can read them).
@@ -103,14 +97,7 @@ void plan_attention_flashinfer_prefill_bf16(
     int window_left = -1,
     bool full_attention_variant = false,
     bool hnd_layout = false,
-    bool causal_mask = true,
-    bool custom_mask = false,
-    // Set when the caller intends to dispatch through
-    // `dispatch_attention_flashinfer_prefill_capture_bf16`. Only the FA2
-    // kernel is instrumented, and SM90-vs-FA2 is decided HERE, at plan time --
-    // so the intent has to reach the planner or the capture dispatch would
-    // find an SM90 plan it can only refuse.
-    bool wants_prefill_score = false);
+    bool causal_mask = true);
 
 // Per-layer dispatch reusing the cached plan. `q`/`k_pages`/`v_pages`/`o`
 // vary per layer; everything else comes from the cache + workspace.
@@ -153,45 +140,6 @@ void dispatch_attention_flashinfer_decode_bf16(
     float sm_scale = -1.f,
     float* lse_out = nullptr);
 
-// Score-observing decode (design doc §3): identical attention output, plus
-// `p[head, kv_idx]` written to `score_out` for every request in the batch.
-// This is what H2O (arXiv:2306.14048) and TOVA (arXiv:2305.19370) evict on.
-//
-// `score_out` is RAGGED, because requests in a decode batch have unrelated
-// `kv_len`s and a dense `[R, H, max_kv_len]` buffer would be mostly padding:
-//
-//     score_out[score_indptr[r] + h * kv_len(r) + kv_idx]
-//
-// `score_indptr` is a device buffer of `num_requests + 1` int32 element
-// offsets; the caller sizes `score_out` to `score_indptr[num_requests]`.
-//
-// What lands there is the NORMALISED attention probability: the variant
-// records the scaled pre-softmax logit and a follow-up kernel divides by the
-// row's own softmax denominator, so each `[h, :]` row sums to 1 over the
-// request's live KV. That second pass is exact, not an approximation — at
-// decode `qo_len == 1`, so the captured row IS the full softmax input.
-//
-// Throws `std::invalid_argument` for configurations where a captured score
-// would not mean what the eviction policies assume: `logits_soft_cap > 0`
-// (the score is rewritten by `cap * tanh(s/cap)`) or `window_left >= 0`
-// (sliding window masks positions *after* the capture hook runs).
-void dispatch_attention_flashinfer_decode_capture_bf16(
-    const DecodePlanCache& cache,
-    const void* q,
-    void* k_pages, void* v_pages,
-    void* o,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    float* score_out,
-    const std::int32_t* score_indptr_d,
-    int window_left = -1,
-    float logits_soft_cap = 0.f,
-    float sm_scale = -1.f,
-    float* lse_out = nullptr);
-
 void dispatch_attention_flashinfer_decode(
     const DecodePlanCache& cache,
     const void* q,
@@ -207,44 +155,6 @@ void dispatch_attention_flashinfer_decode(
     float sm_scale = -1.f,
     float* lse_out = nullptr);
 
-// As `dispatch_attention_flashinfer_decode`, but also records the attention
-// probability each live KV position received. Same refusals as the `_bf16`
-// entry point above.
-void dispatch_attention_flashinfer_decode_capture(
-    const DecodePlanCache& cache,
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    float* score_out,
-    const std::int32_t* score_indptr_d,
-    int window_left = -1,
-    float logits_soft_cap = 0.f,
-    float sm_scale = -1.f,
-    float* lse_out = nullptr);
-
-// Average the `[num_q_heads, kv_len(r)]` probability rows `score_out` holds
-// into one `[kv_len(r)]` row per request, written at
-// `folded + score_indptr[r] / num_q_heads`.
-//
-// Folding is not a convenience: the paged layout carries one page list per
-// request, so an eviction policy cannot act on a per-head keep-set. Averaging
-// (not summing) keeps the result a distribution over the live prefix.
-void launch_attn_score_fold_heads(
-    const float* scores,
-    const std::int32_t* score_indptr_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    int page_size,
-    int num_requests,
-    int num_q_heads,
-    float* folded,
-    cudaStream_t stream);
-
 void dispatch_attention_flashinfer_prefill_bf16(
     const PrefillPlanCache& cache,
     const void* q,
@@ -254,94 +164,6 @@ void dispatch_attention_flashinfer_prefill_bf16(
     const std::uint32_t* kv_page_indices_d,
     const std::uint32_t* kv_page_indptr_d,
     const std::uint32_t* kv_last_page_lens_d,
-    AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    float logits_soft_cap = 0.f,
-    float sm_scale = -1.f,
-    float* lse_out = nullptr);
-
-// Score-observing prefill (design doc §12): identical attention output, plus
-// the OBSERVATION WINDOW's attention probabilities. This is what SnapKV
-// (arXiv:2404.14469) selects on -- it asks which prefix positions the tail of
-// the prompt actually looked at, then keeps those and drops the rest before
-// the first decode step.
-//
-// Only the last `window` query rows are recorded, because those are the ones
-// SnapKV's selection is defined over and recording all of them would be
-// O(qo_len * kv_len) per head. Layout, ragged over the batch:
-//
-//     score_out[score_indptr[r] + (h * window + w) * kv_len(r) + kv_idx]
-//
-// with `w = qo_idx - (qo_len - rows)` and `rows = min(window, qo_len)`. A
-// prompt shorter than the window records fewer rows and LEAVES THE REST OF ITS
-// SLOT UNTOUCHED, so `score_out` must be zeroed by the caller.
-//
-// What lands there is the causal softmax of the recorded rows: the variant
-// records the scaled pre-softmax logit for every `(q, kv)` pair the kernel
-// evaluates -- including pairs the causal mask later discards, since
-// `LogitsMask` runs after `LogitsTransform` -- and the normalisation pass
-// zeroes everything past window row `w`'s causal limit before taking the
-// softmax over what remains.
-//
-// `folded_out` receives the head- and row-averaged distribution, one
-// `[kv_len(r)]` row per request at `folded_out + score_indptr[r] / (heads *
-// window)`. The divisor is `heads * rows`, not `heads * window`: rows that do
-// not exist must not dilute a short prompt's mass.
-//
-// Throws for configurations where a captured score would not mean what SnapKV
-// assumes (`logits_soft_cap > 0`, `window_left >= 0`, non-full-attention
-// variant), and for an SM90 plan -- the Hopper kernel takes a different
-// variant API and is not instrumented. Plan with `wants_prefill_score` set so
-// the planner picks FA2.
-void dispatch_attention_flashinfer_prefill_capture_bf16(
-    const PrefillPlanCache& cache,
-    const void* q,
-    void* k_pages, void* v_pages,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    float* score_out,
-    float* folded_out,
-    const std::int32_t* score_indptr_d,
-    int window,
-    float logits_soft_cap = 0.f,
-    float sm_scale = -1.f,
-    float* lse_out = nullptr);
-
-// Custom-mask dispatch against a plan prepared outside the graph capture
-// region. Pointer arguments are device-persistent and may be captured/replayed.
-void dispatch_attention_flashinfer_prefill_custom_bf16(
-    const PrefillPlanCache& cache,
-    const void* q,
-    void* k_pages, void* v_pages,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t* mask_d,
-    const std::int32_t* mask_indptr_d,
-    AttentionWorkspace& workspace,
-    cudaStream_t stream,
-    float logits_soft_cap = 0.f,
-    float sm_scale = -1.f,
-    float* lse_out = nullptr);
-
-void dispatch_attention_flashinfer_prefill_custom(
-    const PrefillPlanCache& cache,
-    const void* q,
-    KvCacheLayerView kv_layer,
-    void* o,
-    const std::uint32_t* qo_indptr_d,
-    const std::uint32_t* kv_page_indices_d,
-    const std::uint32_t* kv_page_indptr_d,
-    const std::uint32_t* kv_last_page_lens_d,
-    const std::uint8_t* mask_d,
-    const std::int32_t* mask_indptr_d,
     AttentionWorkspace& workspace,
     cudaStream_t stream,
     float logits_soft_cap = 0.f,

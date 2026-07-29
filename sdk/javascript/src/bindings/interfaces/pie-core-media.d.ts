@@ -1,5 +1,6 @@
 /** @module Interface pie:core/media **/
 export type Error = import('./pie-core-types.js').Error;
+export type Model = import('./pie-core-model.js').Model;
 
 export class Audio {
   /**
@@ -12,7 +13,7 @@ export class Audio {
   * (Gemma4AudioFeatureExtractor). Errors if the model has no audio
   * front-end or the bytes don't decode.
   */
-  static fromBytes(bytes: Uint8Array): Audio;
+  static fromBytes(model: Model, bytes: Uint8Array): Audio;
   /**
   * Hidden-state rows / KV slots this clip occupies == audio soft tokens.
   */
@@ -41,7 +42,7 @@ export class Image {
   * processor requires (Gemma SigLIP2 vs Qwen smart-resize, etc.). Errors
   * if the model has no vision front-end or the bytes don't decode.
   */
-  static fromBytes(bytes: Uint8Array): Image;
+  static fromBytes(model: Model, bytes: Uint8Array): Image;
   /**
   * Hidden-state rows / KV slots this visual span occupies.
   */
@@ -77,7 +78,7 @@ export class Video {
   * model. Errors if the model has no vision front-end or the bytes don't
   * decode as an animation.
   */
-  static fromBytes(bytes: Uint8Array, maxFrames: number): Video;
+  static fromBytes(model: Model, bytes: Uint8Array, maxFrames: number): Video;
   /**
   * Number of sampled frames.
   */

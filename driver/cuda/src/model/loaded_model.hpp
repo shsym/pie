@@ -2,19 +2,17 @@
 
 // LoadedModel — owns the loaded model. Built once at startup; queried from main
 // to populate the READY capability JSON and (later milestones) handed to the
-// direct executor for forward-pass execution.
+// shmem executor for forward-pass execution.
 
 #include <memory>
 #include <optional>
-#include <span>
-#include <string_view>
 #include <utility>
 
-#include <config.hpp>
-#include "loader/load_plan.hpp"
-#include "model/config.hpp"
-#include "model/contract.hpp"
-#include "pie_loader/checkpoint_source.hpp"
+#include "config.hpp"
+#include "expert_stream_cache.hpp"
+#include "loader/backend_target.hpp"
+#include "loader/hf_config.hpp"
+#include "loader/safetensors.hpp"
 #include "model/weight_store.hpp"
 #include "tensor.hpp"
 
@@ -39,12 +37,7 @@ public:
     /// Pass `tp_comm` when `boot_cfg.distributed.tp_size > 1` to enable
     /// TP-aware runtime quantization (cross-rank absmax all-reduce for
     /// row-parallel weights). For single-GPU (tp_size=1) this can be null.
-    ///
-    static LoadedModel load(const Config& boot_cfg,
-                            NcclComm* tp_comm,
-                            std::string_view runtime_quant,
-                            model::Mxfp4MoeRequest mxfp4_moe,
-                            model::Component component);
+    static LoadedModel load(const Config& boot_cfg, NcclComm* tp_comm = nullptr);
 
     LoadedModel() = default;
     LoadedModel(const LoadedModel&) = delete;
@@ -55,16 +48,8 @@ public:
     const HfConfig& hf_config() const noexcept { return hf_; }
     const DistributedConfig& distributed() const noexcept { return boot_.distributed; }
     const WeightStore& weight_store() const noexcept { return weights_; }
-    /// How MXFP4 experts are executed, as the *contract author* decided.
-    ///
-    /// Read back rather than re-decided. The caller's request is answered once,
-    /// by the family that knows what its own alternatives are, and the plan
-    /// then materialized the weights in the layout that answer implies -- so a
-    /// second opinion here could only disagree with the bytes on the device.
-    /// That is why there is no accessor for the raw request: a bind path that
-    /// wants to know reads the weights it was handed.
-    model::Mxfp4MoePolicy mxfp4_moe_policy() const noexcept {
-        return mxfp4_moe_policy_;
+    Mxfp4MoeLowering mxfp4_moe_lowering() const noexcept {
+        return mxfp4_moe_lowering_;
     }
     LoadedModelCapabilities capabilities() const;
 
@@ -82,15 +67,22 @@ public:
     // the weight is plain bf16/fp16/fp32 (the common case).
     std::optional<QuantMeta> quant_meta(const std::string& name) const;
 
+    // Per-expert file extents from the compiler's deferred stream plan when
+    // `[model].stream_routed_experts` is on (empty otherwise). Feeds the
+    // ExpertStreamCache constructed by the engine after load.
+    const StreamedExpertTable& streamed_expert_table() const noexcept {
+        return streamed_experts_;
+    }
+
 private:
-    // Owns runtime-layout tensors produced by LoadPlan execution.
+    // Owns runtime-layout tensors produced by the Rust storage-program loader.
     // Some names are non-owning views into packed backing tensors so older
     // forward paths can keep their unfused fallback pointers.
     Config boot_;
     HfConfig hf_;
     WeightStore weights_;
-    model::Mxfp4MoePolicy mxfp4_moe_policy_ =
-        model::Mxfp4MoePolicy::EagerBf16;
+    Mxfp4MoeLowering mxfp4_moe_lowering_ = Mxfp4MoeLowering::Bf16Dequant;
+    StreamedExpertTable streamed_experts_;
 };
 
 namespace ops { struct RuntimeQuantScratchSpec; }

@@ -39,22 +39,6 @@ __global__ void cast_bf16_to_fp32_kernel(
     dst[i] = __bfloat162float(src[i]);
 }
 
-// E8M0 stores an exponent and nothing else: byte `b` denotes `2^(b - 127)`,
-// with `0xFF` reserved for NaN. That is the fp32 exponent field verbatim, so
-// the decode is a shift rather than any arithmetic -- `b << 23` *is* the
-// answer, and `exp2f` would be a slower way to write it.
-__global__ void cast_e8m0_to_fp32_kernel(
-    const std::uint8_t* __restrict__ src,
-    float*              __restrict__ dst,
-    std::size_t                      n)
-{
-    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
-    if (i >= n) return;
-    const std::uint32_t bits = static_cast<std::uint32_t>(src[i]);
-    dst[i] = bits == 0xFFu ? __int_as_float(0x7FFFFFFF)
-                           : __int_as_float(bits << 23);
-}
-
 }  // namespace
 
 void launch_cast_fp16_to_bf16(
@@ -88,91 +72,6 @@ void launch_cast_bf16_to_fp32(
     cast_bf16_to_fp32_kernel<<<blocks, BLOCK, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(src_bf16),
         static_cast<float*>(dst_fp32), n);
-}
-
-void launch_cast_e8m0_to_fp32(
-    const void* src_e8m0, void* dst_fp32,
-    std::size_t n, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    cast_e8m0_to_fp32_kernel<<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const std::uint8_t*>(src_e8m0),
-        static_cast<float*>(dst_fp32), n);
-}
-
-namespace {
-
-// One multiply per element, in fp32 whatever the storage dtype. The narrow
-// dtypes round once, on the store -- accumulating in bf16 would round the
-// operand as well, and the loader's host executor (which multiplies in fp32
-// and is compared against this) would disagree.
-__global__ void scale_bf16_kernel(
-    const __nv_bfloat16* __restrict__ src,
-    __nv_bfloat16*       __restrict__ dst,
-    std::size_t                       n,
-    float                             factor)
-{
-    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = __float2bfloat16(__bfloat162float(src[i]) * factor);
-}
-
-__global__ void scale_fp32_kernel(
-    const float* __restrict__ src,
-    float*       __restrict__ dst,
-    std::size_t               n,
-    float                     factor)
-{
-    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = src[i] * factor;
-}
-
-__global__ void scale_fp16_kernel(
-    const __half* __restrict__ src,
-    __half*       __restrict__ dst,
-    std::size_t                n,
-    float                      factor)
-{
-    const std::size_t i = static_cast<std::size_t>(blockIdx.x) * BLOCK + threadIdx.x;
-    if (i >= n) return;
-    dst[i] = __float2half(__half2float(src[i]) * factor);
-}
-
-}  // namespace
-
-void launch_scale_bf16(
-    const void* src_bf16, void* dst_bf16,
-    std::size_t n, float factor, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    scale_bf16_kernel<<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(src_bf16),
-        static_cast<__nv_bfloat16*>(dst_bf16), n, factor);
-}
-
-void launch_scale_fp32(
-    const void* src_fp32, void* dst_fp32,
-    std::size_t n, float factor, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    scale_fp32_kernel<<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const float*>(src_fp32),
-        static_cast<float*>(dst_fp32), n, factor);
-}
-
-void launch_scale_fp16(
-    const void* src_fp16, void* dst_fp16,
-    std::size_t n, float factor, cudaStream_t stream)
-{
-    if (n == 0) return;
-    const auto blocks = static_cast<unsigned>((n + BLOCK - 1) / BLOCK);
-    scale_fp16_kernel<<<blocks, BLOCK, 0, stream>>>(
-        static_cast<const __half*>(src_fp16),
-        static_cast<__half*>(dst_fp16), n, factor);
 }
 
 namespace {
@@ -230,6 +129,134 @@ void launch_marlin_permute_scales_bf16(
             static_cast<__nv_bfloat16*>(bf16_scales), total64);
     }
     // Per-channel uses a different perm — skip until needed.
+}
+
+namespace {
+
+// AWQ qzeros → marlin qzeros. Replicates vLLM's `awq_to_marlin_zero_
+// points` (see vllm/.../marlin_utils.py):
+//   1. unpack_cols on transposed AWQ qzeros → [N, groups] uint8 (one
+//      nibble per element).
+//   2. Apply AWQ's undo-interleave perm `[0,4,1,5,2,6,3,7]` over each
+//      8-element stride. Equivalent to "AWQ stored values with
+//      interleave [0,2,4,6,1,3,5,7]; argsort gives the inverse".
+//   3. marlin_zero_points: reshape [N, groups] flat → [-1, 64] and
+//      apply scale_perm (`perm[i*8+j] = i + 8*j`); reshape to
+//      [groups, N] and pack 8 nibbles per int32.
+//
+// The whole pipeline is pure index arithmetic — we read the source
+// nibble directly per output position rather than materialising the
+// intermediate buffers.
+__global__ void awq_qzero_to_marlin_w4_kernel(
+    const std::uint32_t* __restrict__ in,    // AWQ [groups, N/8]
+    std::uint32_t*       __restrict__ out,   // marlin [groups, N/8]
+    int                                groups,
+    int                                size_n)
+{
+    const int g_out = blockIdx.x;
+    const int n8_out = blockIdx.y * blockDim.x + threadIdx.x;
+    if (g_out >= groups) return;
+    const int n8 = size_n / 8;
+    if (n8_out >= n8) return;
+
+    // Replicates vLLM's exact AWQ-marlin linear flow:
+    // _convert_awq_tensor_layout (qzeros) + marlin_zero_points.
+    //
+    // For output[g_out, n_out] (flat p = g_out*N + n_out in the post-
+    // marlin-perm (G, N) view):
+    //   pre = (p/64)*64 + scale_perm[p%64]
+    //   pre_g = pre / N, pre_n = pre % N        (LINEAR-decoded coords)
+    //   nibble = (AWQ[pre_g, pre_n/8] >> (4 * reverse_order[pre_n%8])) & 0xF
+    //
+    // where `reverse_order = _REVERSE_AWQ_PACK_ORDER = [0,4,1,5,2,6,3,7]`
+    // = bit position in the AWQ-packed int32 holding slot j of the
+    // unpacked array.
+    constexpr int reverse_order[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+
+    std::uint32_t v = 0;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int n_out = n8_out * 8 + j;
+        const int p = g_out * size_n + n_out;
+        const int p_in_64 = p % 64;
+        const int p_in_64_perm = (p_in_64 % 8) * 8 + (p_in_64 / 8);
+        const int pre = (p / 64) * 64 + p_in_64_perm;
+        const int pre_g = pre / size_n;
+        const int pre_n = pre % size_n;
+        const std::uint32_t src = in[pre_g * n8 + (pre_n / 8)];
+        const int src_bit = 4 * reverse_order[pre_n % 8];
+        const std::uint32_t nibble = (src >> src_bit) & 0xFu;
+        v |= nibble << (4 * j);
+    }
+    out[g_out * n8 + n8_out] = v;
+}
+
+}  // namespace
+
+void launch_awq_qzero_to_marlin_w4(
+    const void* awq_qzeros_in, void* qzeros_marlin_out,
+    int groups, int size_n, cudaStream_t stream)
+{
+    if (groups == 0 || size_n == 0) return;
+    if (size_n % 64 != 0) return;  // marlin requires multiple of 64
+    const int n8 = size_n / 8;
+    const int threads = 32;
+    const dim3 grid(groups, (n8 + threads - 1) / threads);
+    awq_qzero_to_marlin_w4_kernel<<<grid, threads, 0, stream>>>(
+        static_cast<const std::uint32_t*>(awq_qzeros_in),
+        static_cast<std::uint32_t*>(qzeros_marlin_out),
+        groups, size_n);
+}
+
+namespace {
+
+// AWQ qweight `[K, N/8]` packed-along-N with bit interleave
+// [0,2,4,6,1,3,5,7] → GPTQ qweight `[K/8, N]` packed-along-K linear bit
+// order. One output int32 per (k8_out, n_out) covers 8 nibbles for
+// k = k8_out*8 + i (i in 0..7), reading from AWQ_qweight[k, n_out/8] at
+// bit `4 * reverse_order[n_out%8]` where reverse_order = [0,4,1,5,2,6,
+// 3,7] (AWQ's stored bit position for unpack-slot j).
+__global__ void awq_qweight_to_gptq_w4_kernel(
+    const std::uint32_t* __restrict__ in,    // AWQ [K, N/8]
+    std::uint32_t*       __restrict__ out,   // GPTQ [K/8, N]
+    int                                size_k,
+    int                                size_n)
+{
+    const int k8_out = blockIdx.x;
+    const int n_out = blockIdx.y * blockDim.x + threadIdx.x;
+    if (k8_out >= size_k / 8 || n_out >= size_n) return;
+    constexpr int reverse_order[8] = {0, 4, 1, 5, 2, 6, 3, 7};
+    const int n8 = size_n / 8;
+    const int n_packed = n_out / 8;
+    const int n_in_8 = n_out % 8;
+    const int src_bit = 4 * reverse_order[n_in_8];
+
+    std::uint32_t v = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int k = k8_out * 8 + i;
+        const std::uint32_t src = in[k * n8 + n_packed];
+        const std::uint32_t nibble = (src >> src_bit) & 0xFu;
+        v |= nibble << (4 * i);
+    }
+    out[k8_out * size_n + n_out] = v;
+}
+
+}  // namespace
+
+void launch_awq_qweight_to_gptq_w4(
+    const void* awq_qweight_in, void* gptq_qweight_out,
+    int size_k, int size_n, cudaStream_t stream)
+{
+    if (size_k == 0 || size_n == 0) return;
+    if (size_k % 8 != 0) return;
+    const int k8 = size_k / 8;
+    const int threads = 64;
+    const dim3 grid(k8, (size_n + threads - 1) / threads);
+    awq_qweight_to_gptq_w4_kernel<<<grid, threads, 0, stream>>>(
+        static_cast<const std::uint32_t*>(awq_qweight_in),
+        static_cast<std::uint32_t*>(gptq_qweight_out),
+        size_k, size_n);
 }
 
 namespace {

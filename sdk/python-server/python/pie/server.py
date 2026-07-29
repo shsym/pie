@@ -14,9 +14,9 @@ Lifecycle:
     ephemeral port and returns the bound URL. The pyo3 layer blocks until
     drivers + WS listener are up, then returns a handle. We run that on a
     thread (`asyncio.to_thread`) so the asyncio loop isn't blocked.
-  * `connect()`: build a `pie_client.PieClient` against the bound URL.
-    Each call returns a fresh client; the user is responsible for
-    closing them.
+  * `connect()`: build a `pie_client.PieClient` against the bound URL +
+    auth-token-handshake using the engine's internal token. Each call
+    returns a fresh client; the user is responsible for closing them.
   * `__aexit__`: closes any connect()'d clients, then shuts the engine
     down (also off-thread). The pyo3 handle's `Drop` is the safety net
     if `__aexit__` doesn't run (interpreter exit, hard crash) — combined
@@ -36,22 +36,6 @@ if TYPE_CHECKING:
     from pie_client import PieClient
 
 
-def _ensure_py_runtime() -> None:
-    """Best-effort install of the Python WASM runtime (componentize-py).
-
-    R3: provisioning moved out of the Rust engine into the ``pie`` CLI; the
-    canonical installer is ``bakery.py_runtime``. Failures (offline, or bakery
-    not installed in this environment) are swallowed — only Python inferlets
-    need the runtime, and non-Python inferlets still work without it.
-    """
-    try:
-        from bakery.py_runtime import ensure_installed
-
-        ensure_installed(quiet=True)
-    except Exception:
-        pass
-
-
 class Server:
     """Async context manager that owns a Pie runtime.
 
@@ -69,11 +53,11 @@ class Server:
         cfg = Config(
             server=ServerConfig(port=0),
             auth=AuthConfig(enabled=False),
-            model=ModelConfig(
+            models=[ModelConfig(
                 name="default",
                 hf_repo="Qwen/Qwen3-0.6B",
                 driver=DriverConfig(type="dev", device=["cuda:0"]),
-            ),
+            )],
         )
         async with Server(cfg) as server:
             client = await server.connect()
@@ -96,14 +80,15 @@ class Server:
             return f"ws://{self._config.server.host or '127.0.0.1'}:{self._config.server.port}"
         return self._handle.url
 
+    @property
+    def token(self) -> str:
+        if self._handle is None:
+            raise RuntimeError("server is not started; use `async with Server(cfg) as server:`")
+        return self._handle.token
+
     async def __aenter__(self) -> "Server":
         from pie import _engine  # the pyo3 module
-
-        # Provision the Python WASM runtime if missing (R3: the Rust engine no
-        # longer auto-installs it). Best-effort, off-thread.
-        await asyncio.to_thread(_ensure_py_runtime)
-
-        toml_str = self._config.to_engine_toml()
+        toml_str = self._config.to_toml()
         self._handle = await asyncio.to_thread(_engine.bootstrap, toml_str)
         return self
 
@@ -129,5 +114,6 @@ class Server:
         from pie_client import PieClient
         client = PieClient(self._handle.url)
         await client.connect()
+        await client.auth_by_token(self._handle.token)
         self._clients.append(client)
         return client

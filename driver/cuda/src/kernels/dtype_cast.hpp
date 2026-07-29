@@ -1,8 +1,7 @@
 #pragma once
 
 // Element-wise dtype casts used by the loader to bring non-bf16
-// checkpoints into our standard bf16 format, plus the element-wise scale
-// the loader's `Scale` tile map dispatches to.
+// checkpoints into our standard bf16 format.
 
 #include <cstddef>
 #include <cstdint>
@@ -36,46 +35,6 @@ void launch_cast_bf16_to_fp32(
     std::size_t   n,
     cudaStream_t  stream);
 
-/// `dst[i] = 2^(src[i] - 127)` for `n` E8M0 elements. Block-scaled FP8
-/// checkpoints (DeepSeek-V4) ship their per-tile scales in OCP Microscaling's
-/// exponent-only format, while the FP8 GEMM wants fp32 scales.
-void launch_cast_e8m0_to_fp32(
-    const void*   src_e8m0,
-    void*         dst_fp32,
-    std::size_t   n,
-    cudaStream_t  stream);
-
-/// `dst[i] = src[i] * factor` for `n` elements, in the dtype named by the
-/// suffix. Backs the loader's `Scale` tile map, which is how a contract says
-/// "fold this constant into the weight" instead of the driver copying the
-/// tensor to the host, multiplying it there and uploading the result.
-///
-/// The arithmetic is done in fp32 for every input dtype, matching the loader's
-/// host executor exactly so the two can be compared bit for bit. `src` and
-/// `dst` may be the same pointer.
-void launch_scale_bf16(
-    const void*   src_bf16,
-    void*         dst_bf16,
-    std::size_t   n,
-    float         factor,
-    cudaStream_t  stream);
-
-/// `dst[i] = src[i] * factor` for `n` fp32 elements. See `launch_scale_bf16`.
-void launch_scale_fp32(
-    const void*   src_fp32,
-    void*         dst_fp32,
-    std::size_t   n,
-    float         factor,
-    cudaStream_t  stream);
-
-/// `dst[i] = src[i] * factor` for `n` fp16 elements. See `launch_scale_bf16`.
-void launch_scale_fp16(
-    const void*   src_fp16,
-    void*         dst_fp16,
-    std::size_t   n,
-    float         factor,
-    cudaStream_t  stream);
-
 /// In-place marlin scale permutation. Marlin's gptq W4A16 kernel reads
 /// per-group scales in a specific 64-wide column-interleaved layout
 /// rather than the row-major `[groups, N]` shape that GPTQ checkpoints
@@ -96,6 +55,34 @@ void launch_marlin_permute_scales_bf16(
     int           size_n,
     int           group_size,
     int           size_k,
+    cudaStream_t  stream);
+
+/// AWQ → marlin zero-point repack. AWQ stores per-group zero-points as
+/// packed int4 in `[groups, N/8]` int32 (each int32 holds 8 nibbles
+/// along the N axis with the AWQ-specific [0,2,4,6,1,3,5,7] interleave).
+/// Marlin's W4 kernel expects them in `[groups, N/8]` int32 too, but
+/// with the SAME 64-wide column permutation that scales undergo
+/// (`marlin_permute_scales`) AFTER the AWQ undo-interleave. This kernel
+/// does the full pipeline: undo AWQ interleave → marlin scale_perm →
+/// repack int4. Verified to match vLLM's `awq_to_marlin_zero_points`.
+void launch_awq_qzero_to_marlin_w4(
+    const void*   awq_qzeros_in,    // [groups, N/8] int32 (AWQ packing)
+    void*         qzeros_marlin_out,// [groups, N/8] int32 (marlin packing)
+    int           groups,
+    int           size_n,           // N (must be multiple of 64)
+    cudaStream_t  stream);
+
+/// AWQ qweight → GPTQ-format qweight conversion. AWQ stores `[K, N/8]`
+/// int32 packed along N with the AWQ-specific [0,2,4,6,1,3,5,7] bit
+/// interleave; GPTQ stores `[K/8, N]` int32 packed along K with linear
+/// bit order. After this conversion the standard `gptq_marlin_repack`
+/// can process the result. Mirrors vLLM's `_convert_awq_tensor_layout`
+/// qweight branch (awq_marlin.py:99-108).
+void launch_awq_qweight_to_gptq_w4(
+    const void*   awq_qweight_in,   // [K, N/8] int32 (AWQ packing)
+    void*         gptq_qweight_out, // [K/8, N] int32 (GPTQ packing)
+    int           size_k,
+    int           size_n,
     cudaStream_t  stream);
 
 /// Direct AWQ dequant to bf16 — bypasses marlin entirely. Produces

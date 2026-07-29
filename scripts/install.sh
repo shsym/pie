@@ -7,7 +7,7 @@
 #
 # Environment overrides:
 #   PIE_VERSION       Release tag (default: 0.4.0).
-#   PIE_FLAVOR        metal (macOS arm64) | cuda{12.8,13.0} (Linux NVIDIA). Auto-detected when unset.
+#   PIE_FLAVOR        portable | cuda{12.8,13.0}. Auto-detected when unset.
 #   PIE_CC            GPU compute capability for CUDA flavors, e.g. 90, 100
 #                     (auto-detected via nvidia-smi; selects the per-CC binary).
 #   PIE_INSTALL_DIR   Install location for the `pie` binary (default: ~/.local/bin).
@@ -94,9 +94,8 @@ fi
 # CUDA toolkit -> minimum driver (Linux):
 #   13.0 -> 580.65.06
 #   12.x -> 525.60.13
-# Pick the highest toolkit the installed driver supports. There is no
-# CPU/Vulkan fallback — a Linux host without a supported NVIDIA driver has
-# no prebuilt binary. Users override with PIE_FLAVOR.
+# Pick the highest toolkit the installed driver supports; otherwise fall
+# back to the portable build. Users override with PIE_FLAVOR.
 # ---------------------------------------------------------------------------
 
 detect_cuda_flavor() {
@@ -143,9 +142,9 @@ detect_cuda_cc() {
 if [ -z "${PIE_FLAVOR:-}" ]; then
   if [ "$os" = linux ] && { [ "$arch" = x86_64 ] || [ "$arch" = aarch64 ]; }; then
     detect_cuda_flavor || true
-    PIE_FLAVOR="${PIE_DETECTED_FLAVOR:-}"
-  elif [ "$os" = darwin ] && [ "$arch" = aarch64 ]; then
-    PIE_FLAVOR=metal
+    PIE_FLAVOR="${PIE_DETECTED_FLAVOR:-portable}"
+  else
+    PIE_FLAVOR=portable
   fi
 fi
 
@@ -159,12 +158,31 @@ fi
 # .github/workflows/build.yml uploads). CUDA flavors select the per-compute-
 # capability build (glibc 2.28 floor) for the detected (or PIE_CC) capability.
 assets_for() {
+  if [[ "$PIE_VERSION" =~ ^0\.3\. ]]; then
+    case "$os/$arch/$1" in
+      linux/x86_64/portable)            echo "pie-x86_64-manylinux_2_28.tar.gz" ;;
+      linux/aarch64/portable)           echo "pie-aarch64-manylinux_2_28.tar.gz" ;;
+      darwin/aarch64/portable)          echo "pie-aarch64-darwin.tar.gz" ;;
+      linux/x86_64/cuda12.6 \
+      | linux/x86_64/cuda12.8 \
+      | linux/x86_64/cuda13.0 \
+      | linux/x86_64/portable-cuda12.6 \
+      | linux/x86_64/portable-cuda12.8 \
+      | linux/x86_64/portable-cuda13.0)
+        echo "pie-x86_64-linux-${1}.tar.gz" ;;
+      linux/aarch64/cuda*)
+        echo "pie-aarch64-manylinux_2_28.tar.gz" ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+
   case "$os/$arch/$1" in
-    darwin/aarch64/metal)             echo "pie-aarch64-macos-metal.tar.gz" ;;
+    linux/x86_64/portable)            echo "pie-x86_64-linux-vulkan.tar.gz" ;;
+    linux/aarch64/portable)           echo "pie-aarch64-linux-vulkan.tar.gz" ;;
+    darwin/aarch64/portable)          echo "pie-aarch64-macos-metal.tar.gz" ;;
     linux/x86_64/cuda12.8 | linux/x86_64/cuda13.0 \
     | linux/aarch64/cuda12.8 | linux/aarch64/cuda13.0)
-      # Per-compute-capability binary, selected from the detected (or
-      # PIE_CC-overridden) compute capability.
       if [ -n "${PIE_CC:-}" ]; then
         echo "pie-${arch}-linux-${1}-sm${PIE_CC}.tar.gz"
       fi
@@ -174,17 +192,19 @@ assets_for() {
 }
 
 candidates="$(assets_for "$PIE_FLAVOR")" || err \
-  "no prebuilt 'pie' binary for $os/$arch (flavor '${PIE_FLAVOR:-unset}'). Published builds: macOS arm64 -> metal; Linux x86_64/aarch64 -> cuda12.8 / cuda13.0 (NVIDIA GPU required). No CPU/Vulkan build is published.${PIE_FLAVOR_REASON:+ [$PIE_FLAVOR_REASON]}"
+  "no '$PIE_FLAVOR' build for $os/$arch. Valid flavors: portable; or (Linux) cuda12.8, cuda13.0."
 
 # CUDA flavors select per-compute-capability binaries; without a CC we have
 # nothing to download. Guide the user to set PIE_CC.
-case "$PIE_FLAVOR" in
-  cuda*)
-    [ -n "${PIE_CC:-}" ] || err \
-      "CUDA flavor '${PIE_FLAVOR}' needs a GPU compute capability, but none was detected. \
+if [[ ! "$PIE_VERSION" =~ ^0\.3\. ]]; then
+  case "$PIE_FLAVOR" in
+    cuda*)
+      [ -n "${PIE_CC:-}" ] || err \
+        "CUDA flavor '${PIE_FLAVOR}' needs a GPU compute capability, but none was detected. \
 Set PIE_CC explicitly, e.g. PIE_CC=90 (H100), 100 (B200), 89 (L40/RTX40), 86 (A10), 80 (A100)."
-    ;;
-esac
+      ;;
+  esac
+fi
 
 heading "Installing Pie"
 detail "Version:  ${PIE_VERSION}"

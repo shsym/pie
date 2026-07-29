@@ -149,7 +149,6 @@ __global__ void causal_conv1d_prefill_batched_kernel(
     if (Nr <= 0) return;
 
     const int slot = slot_ids[r];
-    if (slot < 0) return;
     const __nv_bfloat16* x_r = x + (long long)t0 * C;
     __nv_bfloat16* y_r = y + (long long)t0 * C;
     __nv_bfloat16* state =
@@ -224,7 +223,6 @@ __global__ void causal_conv1d_prefill_batched_channel_tile_kernel(
     if (Nr <= 0) return;
 
     const int slot = slot_ids[r];
-    if (slot < 0) return;
     const __nv_bfloat16* x_r = x + static_cast<long long>(t0) * C;
     __nv_bfloat16* y_r = y + static_cast<long long>(t0) * C;
     __nv_bfloat16* state =
@@ -287,7 +285,6 @@ __global__ void causal_conv1d_update_batched_kernel(
     if (r >= R || c >= C) return;
 
     const int slot = slot_ids[r];
-    if (slot < 0) return;
     __nv_bfloat16* state = state_base + (long long)slot * slot_stride_elems;
     const __nv_bfloat16* x_r = x + (long long)r * C;
     __nv_bfloat16* y_r = y + (long long)r * C;
@@ -419,3 +416,4 @@ void launch_causal_conv1d_prefill_batched_bf16(
 }
 
 }  // namespace pie_cuda_driver::kernels
+

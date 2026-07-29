@@ -1,7 +1,6 @@
 #pragma once
 
-// loader/: Rust-planned checkpoint materialization into the model WeightStore.
-// Single source of truth for the CUDA load executor's tunable constants and the
+// Single source of truth for the CUDA weight loader's tunable constants and the
 // PIE_CUDA_* environment knobs. Every default lives here, and every knob is read
 // through one of the helpers below so the parse convention is stated once rather
 // than re-spelled at each call site. Conventions:
@@ -43,6 +42,7 @@ inline constexpr std::size_t kReaderThreadsDefault = 4;
 inline constexpr std::uint64_t kReaderBufBytesDefault = 2ull * kMiB;
 
 // --- transcode / quant ---
+inline constexpr std::uint64_t kFallbackTileBytes = 64ull * kMiB;  // when max_tile_bytes==0
 inline constexpr int kE8M0Bias = 127;                              // E8M0 exponent bias
 inline constexpr int kMxfp4Group = 32;        // MXFP4 values per E8M0 block
 inline constexpr int kMxfp4PackedPerByte = 2;  // E2M1 nibbles packed per output byte
