@@ -1,5 +1,7 @@
 #pragma once
 
+// ops/: attention, GEMM, MoE, and SSM kernel wrappers shared by every model forward.
+//
 // Thin cuBLAS wrapper for bf16 matmul.
 //
 // The transformer linear layers are all of shape `out = act @ W^T`, where
@@ -14,7 +16,7 @@
 #include <cuda_runtime.h>
 #include <memory>
 
-#include "model/loaded_model.hpp"
+#include "ops/quant_meta.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver::ops {
@@ -23,6 +25,7 @@ struct RuntimeQuantScratchSpec {
     std::size_t max_tokens = 0;
     std::size_t max_weight_rows = 0;  // GEMM N
     std::size_t max_weight_cols = 0;  // GEMM K
+    std::size_t max_dequant_weight_elems = 0;
     bool has_fp8 = false;
     bool has_int8 = false;
 
@@ -35,6 +38,32 @@ struct RuntimeQuantScratchSpec {
 };
 
 std::size_t runtime_quant_scratch_bytes(const RuntimeQuantScratchSpec& spec);
+
+class RuntimeQuantContext {
+public:
+    RuntimeQuantContext();
+    ~RuntimeQuantContext();
+    RuntimeQuantContext(const RuntimeQuantContext&) = delete;
+    RuntimeQuantContext& operator=(const RuntimeQuantContext&) = delete;
+
+    void reset() noexcept;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    friend class ScopedRuntimeQuantContext;
+};
+
+class ScopedRuntimeQuantContext {
+public:
+    explicit ScopedRuntimeQuantContext(RuntimeQuantContext& context) noexcept;
+    ~ScopedRuntimeQuantContext();
+    ScopedRuntimeQuantContext(const ScopedRuntimeQuantContext&) = delete;
+    ScopedRuntimeQuantContext& operator=(const ScopedRuntimeQuantContext&) = delete;
+
+private:
+    void* previous_ = nullptr;
+};
 
 // Preallocate the runtime-quant GEMM scratch described by `spec`. When
 // `seal_after_reserve` is true, any later attempt to grow those buffers throws
@@ -103,7 +132,7 @@ struct WeightView {
     {
         WeightView v;
         v.data = weight.data();
-        v.dtype = DType::MXFP4_MARLIN;
+        v.dtype = DType::MXFP4_PACKED;
         v.nbytes = weight.nbytes();
         v.scale_data = scale.data();
         v.scale_dtype = DType::UINT8;
@@ -141,10 +170,9 @@ private:
 //   y:   [M, N]
 // Default beta = 0 (overwrite). Pass beta = 1 to fuse a residual add.
 //
-// Dispatcher entry point. Currently routes only `(BF16, BF16)` to the
-// existing cuBLAS path; M1 adds `(BF16, FP8_E4M3)` and M3 adds
-// `(BF16, INT4_PACKED)` via marlin. Throws on unsupported combos rather
-// than silently miscomputing.
+// Dispatcher entry point. Routes supported dense and quantized combinations
+// through cuBLAS/cuBLASLt or Marlin, and throws on unsupported combinations
+// rather than silently miscomputing.
 //
 // `act_dtype` / `y_dtype` default to BF16 so the common-case call site
 // just passes `(handle, act, w_tensor, y, M, N, K[, beta])` unchanged
@@ -186,6 +214,17 @@ void gemm_batched_act_x_w(
 // Grouped variant for sparse-MoE expert buckets. Each group has one GEMM
 // with a shared output width `N` and reduction dim `K`, but its own row count
 // `M_array[group]`.
+//
+// POINTER-ARRAY RESIDENCY (measured hazard): cublasGemmGroupedBatchedEx
+// does not consume the act/W/y pointer arrays synchronously at call time.
+// Transient host arrays handed to back-to-back grouped calls produced
+// illegal-address / misaligned-address faults (repro: lora grouped lanes;
+// a stream sync between calls or device-resident arrays both cure it).
+// Callers must pass DEVICE-RESIDENT pointer arrays whose slots are not
+// rewritten while a call may still read them — the nemotron_h MoE and the
+// llama_like lora grouping both stage through per-use device slots.
+// `M_array` and the internal int/scalar arrays are consumed at call time
+// and may be transient host memory.
 void gemm_grouped_act_x_wt_bf16(
     cublasHandle_t handle,
     const void* const* act_ptrs_host,
@@ -226,6 +265,26 @@ void gemm_act_x_wt_bf16_out_fp32(
     int N,
     int K);
 
+// Dense bf16 linear with a broadcast row bias: y[m][n] = sum_k act[m][k] *
+// W[n][k] + bias[n]. `bias` may be null, in which case this is exactly
+// `gemm_act_x_wt_bf16`.
+//
+// At M=1 -- the decode shape -- the bias is folded into the GEMV epilogue,
+// which removes an entire kernel launch per biased projection. gpt-oss-20b
+// has five of them per layer, so at 24 layers that was 120 launches per
+// decode step at ~3.6 us each against a 2.2 us empty-launch floor: 11.9% of
+// decode GPU time spent re-reading and re-writing a few KB. The fold is
+// bit-identical (see `launch_gemv_bf16`).
+//
+// The fold only happens when the dense autotuner has *already* chosen the
+// GEMV for this shape, so a shape where cuBLAS wins is never forced onto a
+// slower kernel just to save a launch. Set PIE_GEMV_FUSED_BIAS=0 to disable.
+void gemm_act_x_wt_bias_bf16(
+    cublasHandle_t handle,
+    const void* act, const void* W, const void* bias, void* y,
+    int M, int N, int K,
+    cudaStream_t stream);
+
 // Same math as `gemm_act_x_wt_bf16`, but bypasses the cuBLASLt BF16
 // dispatcher. This is useful for a few skinny-M packed projections where
 // Lt's heuristic is slower than cuBLAS GEMMEx.
@@ -254,5 +313,25 @@ void maybe_bench_lm_head_algos(
     cublasHandle_t handle,
     const void* act, const void* W, void* y,
     int M, int N, int K);
+
+// ── MLA weight absorption ────────────────────────────────────────────────
+// `kv_b_proj` is [heads, qk_nope_dim + v_head_dim, kv_lora_rank] BF16.
+//
+//   q_latent[n, h, l] = sum_d q_nope[n, h, d] * kv_b[h, d, l]
+//   attn_v  [n, h, v] = sum_l latent[n, h, l] * kv_b[h, qk_nope_dim + v, l]
+//
+// Both are per-head GEMMs over a strided batch, so they run as a single
+// `cublasGemmStridedBatchedEx` instead of the scalar one-thread-per-output
+// kernels they replace (those stride the inner loop by `kv_lora_rank` and
+// reach a small fraction of HBM bandwidth).
+void mla_absorb_q_to_latent_bf16(
+    cublasHandle_t handle,
+    const void* q_nope, const void* kv_b_proj, void* q_latent,
+    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank);
+
+void mla_absorb_latent_to_v_bf16(
+    cublasHandle_t handle,
+    const void* attn_latent, const void* kv_b_proj, void* attn_v,
+    int tokens, int heads, int qk_nope_dim, int v_head_dim, int kv_lora_rank);
 
 }  // namespace pie_cuda_driver::ops

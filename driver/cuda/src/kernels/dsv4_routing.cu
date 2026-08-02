@@ -68,19 +68,17 @@ __global__ void topk_sqrtsoftplus_kernel(
     }
 }
 
-// Hash layers pick experts from the token-id table but still weight them by
-// the router: w_k = sqrtsoftplus(logit[e_k]), normalized over the K selected
-// experts (sum floored at 2^-14) and scaled by routed_scaling_factor.
 __global__ void hash_route_lookup_kernel(
     const std::int32_t* __restrict__ token_ids,
     const std::int64_t* __restrict__ tid2eid,
-    const __nv_bfloat16* __restrict__ router_logits,
+    const __nv_bfloat16* __restrict__ logits,
     std::int32_t* __restrict__ topk_idx,
     float* __restrict__ topk_w,
     int tokens,
     int vocab_size,
     int E,
     int K,
+    bool renormalize,
     float routed_scaling_factor)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
@@ -89,23 +87,22 @@ __global__ void hash_route_lookup_kernel(
     const int clamped = (tok >= 0 && tok < vocab_size) ? tok : 0;
 
     const std::int64_t* row = tid2eid + static_cast<long long>(clamped) * K;
-    const __nv_bfloat16* logits = router_logits + static_cast<long long>(n) * E;
+    const __nv_bfloat16* lg = logits + static_cast<long long>(n) * E;
     std::int32_t* out_idx = topk_idx + static_cast<long long>(n) * K;
     float* out_w = topk_w + static_cast<long long>(n) * K;
 
     float sum = 0.f;
     for (int k = 0; k < K; ++k) {
         const int e = static_cast<int>(row[k]);
-        out_idx[k] = e;
-        const float p = (e >= 0 && e < E)
-            ? sqrtsoftplus(__bfloat162float(logits[e]))
-            : 0.f;
-        out_w[k] = p;
-        sum += p;
+        const int ec = (e >= 0 && e < E) ? e : 0;
+        out_idx[k] = ec;
+        const float w = sqrtsoftplus(__bfloat162float(lg[ec]));
+        out_w[k] = w;
+        sum += w;
     }
-    // Reference floors the normalizer at 2^-14 to avoid dividing by ~0.
-    sum = fmaxf(sum, 6.103515625e-5f);
-    const float scale = routed_scaling_factor / sum;
+    const float scale = renormalize
+        ? routed_scaling_factor / fmaxf(sum, 1e-20f)
+        : routed_scaling_factor;
     for (int k = 0; k < K; ++k) out_w[k] *= scale;
 }
 
@@ -134,24 +131,26 @@ void launch_topk_sqrtsoftplus_bf16(
 void launch_hash_route_lookup(
     const std::int32_t* token_ids,
     const std::int64_t* tid2eid,
-    const void* router_logits,
+    const void* logits,
     std::int32_t* topk_idx,
     float* topk_w,
     int tokens,
     int vocab_size,
     int num_experts,
     int top_k,
+    bool renormalize,
     float routed_scaling_factor,
     cudaStream_t stream)
 {
-    if (tokens <= 0 || num_experts <= 0 || top_k <= 0) return;
+    if (tokens <= 0 || top_k <= 0) return;
     constexpr int BLOCK = 256;
     const int grid = (tokens + BLOCK - 1) / BLOCK;
     hash_route_lookup_kernel<<<grid, BLOCK, 0, stream>>>(
         token_ids, tid2eid,
-        static_cast<const __nv_bfloat16*>(router_logits),
+        static_cast<const __nv_bfloat16*>(logits),
         topk_idx, topk_w,
-        tokens, vocab_size, num_experts, top_k, routed_scaling_factor);
+        tokens, vocab_size, num_experts, top_k,
+        renormalize, routed_scaling_factor);
 }
 
 }  // namespace pie_cuda_driver::kernels

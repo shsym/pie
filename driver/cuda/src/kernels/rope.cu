@@ -1,8 +1,10 @@
 #include "kernels/rope.hpp"
 
-#include <algorithm>
-#include <cmath>
+#include <cstdint>
+
 #include <cuda_bf16.h>
+
+#include "kernels/rope_device.cuh"
 
 namespace pie_cuda_driver::kernels {
 
@@ -11,25 +13,8 @@ namespace {
 // One block per token; threads cover the full QK head_dim grid:
 // (head, dim_pair_idx). For Qwen the convention pairs index `i` with
 // `i + head_dim/2`, with frequency theta^(-2*i / head_dim).
-__device__ __forceinline__ void rotate_pair(
-    __nv_bfloat16* h_ptr, int half, int dim_pair, float cos_v, float sin_v)
-{
-    const float a = __bfloat162float(h_ptr[dim_pair]);
-    const float b = __bfloat162float(h_ptr[dim_pair + half]);
-    h_ptr[dim_pair]        = __float2bfloat16(a * cos_v - b * sin_v);
-    h_ptr[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
-}
-
-// GPT-J / interleaved pairing: rotate adjacent dims (2i, 2i+1). Required by
-// GLM (`rope_interleave=true`). Same per-pair frequency as the half variant.
-__device__ __forceinline__ void rotate_pair_interleaved(
-    __nv_bfloat16* h_ptr, int dim_pair, float cos_v, float sin_v)
-{
-    const float a = __bfloat162float(h_ptr[2 * dim_pair]);
-    const float b = __bfloat162float(h_ptr[2 * dim_pair + 1]);
-    h_ptr[2 * dim_pair]     = __float2bfloat16(a * cos_v - b * sin_v);
-    h_ptr[2 * dim_pair + 1] = __float2bfloat16(b * cos_v + a * sin_v);
-}
+// `rotate_pair` / `rotate_pair_interleaved` live in rope_device.cuh so the
+// fused MLA-prepare kernel rotates through byte-identical code.
 
 __global__ void rope_standard_table_kernel(
     const std::int32_t* __restrict__ positions,
@@ -60,7 +45,9 @@ __global__ void rope_bf16_kernel(
     int num_kv_heads,
     int head_dim,
     float theta,
-    bool interleaved)
+    bool interleaved,
+    int cache_pairs,
+    int heads_per_block)
 {
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
@@ -68,16 +55,43 @@ __global__ void rope_bf16_kernel(
     const int half = head_dim / 2;
     const int pos = positions[n];
 
-    // Each thread handles one (head, dim_pair_idx).
-    for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
-        const int head_idx = t / half;
-        const int dim_pair = t % half;
-
-        const float freq = powf(theta, -2.f * static_cast<float>(dim_pair) /
+    // The rotation angle depends only on (pos, dim_pair): every head of this
+    // token shares it. Computing it inside the element loop ran a full-precision
+    // `powf` plus a `__sincosf` once per (head, pair) -- for GLM's 65 QK heads
+    // that is 65 evaluations of the same 32 transcendentals, and it made this
+    // kernel cost more than the attention it feeds. Hoisting them into shared
+    // memory keeps the arithmetic identical, so the outputs are bit-for-bit
+    // what the per-element form produced.
+    extern __shared__ float rope_cs[];
+    const int cached = cache_pairs;
+    for (int dp = threadIdx.x; dp < cached; dp += blockDim.x) {
+        const float freq = powf(theta, -2.f * static_cast<float>(dp) /
                                        static_cast<float>(head_dim));
         const float ang = static_cast<float>(pos) * freq;
+        float c, s;
+        __sincosf(ang, &s, &c);
+        rope_cs[dp] = c;
+        rope_cs[cached + dp] = s;
+    }
+    if (cached > 0) __syncthreads();
+
+    // Each thread handles one (head, dim_pair_idx).
+    const int head_base = blockIdx.y * heads_per_block;
+    const int heads_here = min(heads_per_block, total_heads - head_base);
+    for (int t = threadIdx.x; t < heads_here * half; t += blockDim.x) {
+        const int head_idx = head_base + t / half;
+        const int dim_pair = t % half;
+
         float cos_v, sin_v;
-        __sincosf(ang, &sin_v, &cos_v);
+        if (dim_pair < cached) {
+            cos_v = rope_cs[dim_pair];
+            sin_v = rope_cs[cached + dim_pair];
+        } else {
+            const float freq = powf(theta, -2.f * static_cast<float>(dim_pair) /
+                                           static_cast<float>(head_dim));
+            const float ang = static_cast<float>(pos) * freq;
+            __sincosf(ang, &sin_v, &cos_v);
+        }
 
         if (head_idx < num_q_heads) {
             __nv_bfloat16* qp = q + (static_cast<long long>(n) * num_q_heads +
@@ -343,13 +357,114 @@ void launch_rope_bf16(
     bool interleaved)
 {
     constexpr int BLOCK = 256;
-    dim3 grid(num_tokens);
+    // 32 KB caps the table at head_dim 8192; past that the pairs are recomputed.
+    constexpr int kMaxCachedPairs = 4096;
+    const int half = head_dim / 2;
+    if (half <= 0) return;
+    const int cache_pairs = half <= kMaxCachedPairs ? half : 0;
+    const std::size_t smem = static_cast<std::size_t>(cache_pairs) * 2 * sizeof(float);
+    // Splitting the heads across blockIdx.y keeps every SM fed at decode, where
+    // `num_tokens` is 1 and a 1-D grid would run a single block on 148 SMs.
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int heads_per_block = half >= BLOCK ? 1 : (BLOCK / half);
+    dim3 grid(num_tokens, (total_heads + heads_per_block - 1) / heads_per_block);
     dim3 block(BLOCK);
-    rope_bf16_kernel<<<grid, block, 0, stream>>>(
+    rope_bf16_kernel<<<grid, block, smem, stream>>>(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
-        num_q_heads, num_kv_heads, head_dim, theta, interleaved);
+        num_q_heads, num_kv_heads, head_dim, theta, interleaved, cache_pairs,
+        heads_per_block);
+}
+
+// Peel device-window variant (the device-window campaign): the row
+// window rides in device memory; the grid spans the full lane count and
+// out-of-window rows early-out (uniform per block — blockIdx.x is the
+// row — so the shared-memory reduction below never diverges). Buffers
+// and positions are BASE pointers.
+template <int BLOCK>
+__global__ void qk_rmsnorm_rope_bf16_devwin_kernel(
+    __nv_bfloat16* __restrict__ q,
+    __nv_bfloat16* __restrict__ k,
+    const __nv_bfloat16* __restrict__ q_weight,
+    const __nv_bfloat16* __restrict__ k_weight,
+    const std::int32_t* __restrict__ positions,
+    const std::uint32_t* __restrict__ win,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float eps)
+{
+    const int n = blockIdx.x;
+    {
+        const int w0 = static_cast<int>(win[0]);
+        const int w1 = static_cast<int>(win[1]);
+        if (n < w0 || n >= w0 + w1) return;
+    }
+    const int head_idx = blockIdx.y;
+    const bool is_q = head_idx < num_q_heads;
+    const int local_head = is_q ? head_idx : (head_idx - num_q_heads);
+    __nv_bfloat16* row = is_q
+        ? q + (static_cast<long long>(n) * num_q_heads + local_head) * head_dim
+        : k + (static_cast<long long>(n) * num_kv_heads + local_head) * head_dim;
+    const __nv_bfloat16* weight = is_q ? q_weight : k_weight;
+
+    float local = 0.f;
+    for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
+        const float v = __bfloat162float(row[i]);
+        local += v * v;
+    }
+
+    __shared__ float buf[BLOCK];
+    buf[threadIdx.x] = local;
+    __syncthreads();
+    for (int off = BLOCK / 2; off > 0; off >>= 1) {
+        if (threadIdx.x < off) buf[threadIdx.x] += buf[threadIdx.x + off];
+        __syncthreads();
+    }
+
+    const float inv_rms = rsqrtf(buf[0] / static_cast<float>(head_dim) + eps);
+    const int half = head_dim / 2;
+    const int pos = positions[n];
+    for (int dim_pair = threadIdx.x; dim_pair < half; dim_pair += BLOCK) {
+        const float a = __bfloat162float(row[dim_pair]) *
+            inv_rms * __bfloat162float(weight[dim_pair]);
+        const float b = __bfloat162float(row[dim_pair + half]) *
+            inv_rms * __bfloat162float(weight[dim_pair + half]);
+        const float freq = powf(theta,
+            -2.f * static_cast<float>(dim_pair) / static_cast<float>(head_dim));
+        const float ang = static_cast<float>(pos) * freq;
+        float cos_v, sin_v;
+        __sincosf(ang, &sin_v, &cos_v);
+        row[dim_pair] = __float2bfloat16(a * cos_v - b * sin_v);
+        row[dim_pair + half] = __float2bfloat16(b * cos_v + a * sin_v);
+    }
+}
+
+void launch_qk_rmsnorm_rope_bf16_devwin(
+    void* q, void* k,
+    const void* q_weight, const void* k_weight,
+    const std::int32_t* positions,
+    const std::uint32_t* win_d,
+    int n_max,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_dim,
+    float theta,
+    float eps,
+    cudaStream_t stream)
+{
+    if (n_max <= 0) return;
+    constexpr int BLOCK = 128;
+    dim3 grid(n_max, num_q_heads + num_kv_heads);
+    qk_rmsnorm_rope_bf16_devwin_kernel<BLOCK><<<grid, BLOCK, 0, stream>>>(
+        static_cast<__nv_bfloat16*>(q),
+        static_cast<__nv_bfloat16*>(k),
+        static_cast<const __nv_bfloat16*>(q_weight),
+        static_cast<const __nv_bfloat16*>(k_weight),
+        positions, win_d,
+        num_q_heads, num_kv_heads, head_dim, theta, eps);
 }
 
 void launch_qk_rmsnorm_rope_bf16(
@@ -364,6 +479,10 @@ void launch_qk_rmsnorm_rope_bf16(
     float eps,
     cudaStream_t stream)
 {
+    // Zero-row guard: a grid.x of 0 is an invalid launch that poisons
+    // the sticky error state (caught by the peel-window A/B harness's
+    // empty-window case; production call sites gate on row counts).
+    if (num_tokens <= 0) return;
     constexpr int BLOCK = 128;
     dim3 grid(num_tokens, num_q_heads + num_kv_heads);
     qk_rmsnorm_rope_bf16_kernel<BLOCK><<<grid, BLOCK, 0, stream>>>(
@@ -429,15 +548,18 @@ __global__ void rope_yarn_bf16_kernel(
     int num_q_heads, int num_kv_heads, int head_dim,
     float theta, float factor,
     float low_freq_factor, float high_freq_factor,
-    float orig_max_pos)
+    float orig_max_pos,
+    int heads_per_block)
 {
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
     const int half = head_dim / 2;
     const int pos = positions[n];
 
-    for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
-        const int head_idx = t / half;
+    const int head_base = blockIdx.y * heads_per_block;
+    const int heads_here = min(heads_per_block, total_heads - head_base);
+    for (int t = threadIdx.x; t < heads_here * half; t += blockDim.x) {
+        const int head_idx = head_base + t / half;
         const int dim_pair = t % half;
 
         const float base_freq = powf(theta,
@@ -475,36 +597,28 @@ void launch_rope_yarn_bf16(
     cudaStream_t stream)
 {
     constexpr int BLOCK = 256;
-    rope_yarn_bf16_kernel<<<num_tokens, BLOCK, 0, stream>>>(
+    const int half = head_dim / 2;
+    if (half <= 0) return;
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int heads_per_block = half >= BLOCK ? 1 : (BLOCK / half);
+    const dim3 grid(num_tokens,
+                    (total_heads + heads_per_block - 1) / heads_per_block);
+    rope_yarn_bf16_kernel<<<grid, BLOCK, 0, stream>>>(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
         num_q_heads, num_kv_heads, head_dim,
         theta, factor, low_freq_factor, high_freq_factor,
-        static_cast<float>(original_max_position));
+        static_cast<float>(original_max_position),
+        heads_per_block);
 }
 
 // ── Original YaRN variant (OLMo-3, gpt-oss) ───────────────────────────────
 
 namespace {
 
-// Linear ramp over dim index: 0 below low_dim, 1 above high_dim. Used
-// to blend between unscaled (high freq) and `1/factor`-scaled (low
-// freq) inv_freq, in the dim-index domain rather than the wavelen
-// domain that Llama-3 YaRN uses.
-__device__ __forceinline__ float yarn_original_freq(
-    float base_freq, float factor,
-    float low_dim, float high_dim, int dim_pair)
-{
-    const float denom = (high_dim == low_dim) ? (high_dim + 1e-3f - low_dim)
-                                              : (high_dim - low_dim);
-    float ramp = (static_cast<float>(dim_pair) - low_dim) / denom;
-    if (ramp < 0.f) ramp = 0.f;
-    if (ramp > 1.f) ramp = 1.f;
-    // Below low_dim (ramp=0): extrapolation = base. Above high_dim
-    // (ramp=1): interpolation = base / factor. Linear blend between.
-    return base_freq * ((1.f - ramp) + ramp / factor);
-}
+// `yarn_original_freq` lives in rope_device.cuh, shared with the fused
+// MLA-prepare kernel.
 
 __global__ void rope_yarn_original_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
@@ -513,36 +627,54 @@ __global__ void rope_yarn_original_bf16_kernel(
     int num_q_heads, int num_kv_heads, int head_dim,
     float theta, float factor,
     float low_dim, float high_dim,
-    float mscale)
+    float mscale,
+    bool interleaved,
+    int heads_per_block,
+    int cache_pairs)
 {
+    extern __shared__ float2 yarn_cs[];
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
     const int half = head_dim / 2;
     const int pos = positions[n];
 
-    for (int t = threadIdx.x; t < total_heads * half; t += blockDim.x) {
-        const int head_idx = t / half;
-        const int dim_pair = t % half;
-
+    // The rotation angle depends only on `dim_pair` and the token's position,
+    // not on the head -- so a block that covers many heads was recomputing the
+    // same `powf` and `__sincosf` once per head. Do it `half` times instead of
+    // `heads_per_block * half` times and share the result.
+    auto angle = [&](int d) -> float2 {
         const float base_freq = powf(theta,
-            -2.f * static_cast<float>(dim_pair) / static_cast<float>(head_dim));
+            -2.f * static_cast<float>(d) / static_cast<float>(head_dim));
         const float freq = yarn_original_freq(base_freq, factor,
-                                              low_dim, high_dim, dim_pair);
-        const float ang = static_cast<float>(pos) * freq;
+                                              low_dim, high_dim, d);
         float cos_v, sin_v;
-        __sincosf(ang, &sin_v, &cos_v);
-        cos_v *= mscale;
-        sin_v *= mscale;
+        __sincosf(static_cast<float>(pos) * freq, &sin_v, &cos_v);
+        return make_float2(cos_v * mscale, sin_v * mscale);
+    };
+    for (int d = threadIdx.x; d < cache_pairs; d += blockDim.x) {
+        yarn_cs[d] = angle(d);
+    }
+    if (cache_pairs > 0) __syncthreads();
+
+    const int head_base = blockIdx.y * heads_per_block;
+    const int heads_here = min(heads_per_block, total_heads - head_base);
+    for (int t = threadIdx.x; t < heads_here * half; t += blockDim.x) {
+        const int head_idx = head_base + t / half;
+        const int dim_pair = t % half;
+        const float2 cs = dim_pair < cache_pairs ? yarn_cs[dim_pair]
+                                                 : angle(dim_pair);
 
         if (head_idx < num_q_heads) {
             __nv_bfloat16* qp = q + (static_cast<long long>(n) * num_q_heads +
                                      head_idx) * head_dim;
-            rotate_pair(qp, half, dim_pair, cos_v, sin_v);
+            if (interleaved) rotate_pair_interleaved(qp, dim_pair, cs.x, cs.y);
+            else             rotate_pair(qp, half, dim_pair, cs.x, cs.y);
         } else {
             const int kv_h = head_idx - num_q_heads;
             __nv_bfloat16* kp = k + (static_cast<long long>(n) * num_kv_heads +
                                      kv_h) * head_dim;
-            rotate_pair(kp, half, dim_pair, cos_v, sin_v);
+            if (interleaved) rotate_pair_interleaved(kp, dim_pair, cs.x, cs.y);
+            else             rotate_pair(kp, half, dim_pair, cs.x, cs.y);
         }
     }
 }
@@ -558,34 +690,41 @@ void launch_rope_yarn_original_bf16(
     float beta_fast, float beta_slow,
     float attention_factor,
     int original_max_position,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    bool interleaved)
 {
-    constexpr float TWO_PI = 6.2831853071795864769f;
-    // correction_dim(rot) = head_dim * ln(max_pos / (rot * 2π)) / (2 * ln(theta))
-    const float ln_theta = logf(theta);
-    auto corr_dim = [&](float rot) -> float {
-        return head_dim * logf(static_cast<float>(original_max_position) /
-                               (rot * TWO_PI)) / (2.f * ln_theta);
-    };
-    // beta_slow → "low rotation count" → larger correction_dim → upper
-    // bound on the ramp (above this, fully interpolated). beta_fast →
-    // smaller correction_dim → lower bound (below this, fully
-    // extrapolated). HF clamps to [0, head_dim/2 - 1] (we ramp over
-    // dim_pair which has range [0, head_dim/2)).
-    float low_dim  = floorf(corr_dim(beta_fast));
-    float high_dim = ceilf(corr_dim(beta_slow));
-    if (low_dim < 0.f) low_dim = 0.f;
-    const float max_pair = static_cast<float>(head_dim / 2) - 1.f;
-    if (high_dim > max_pair) high_dim = max_pair;
-    if (high_dim < low_dim)  high_dim = low_dim;
+    // correction_dim(rot) = head_dim * ln(max_pos / (rot * 2π)) / (2 * ln(theta)).
+    // beta_slow → "low rotation count" → larger correction_dim → upper bound on
+    // the ramp (above this, fully interpolated). beta_fast → smaller
+    // correction_dim → lower bound (below this, fully extrapolated). HF clamps
+    // to [0, head_dim/2 - 1].
+    float low_dim = 0.f, high_dim = 0.f;
+    yarn_original_ramp_bounds(head_dim, theta, beta_fast, beta_slow,
+                              original_max_position, low_dim, high_dim);
 
     constexpr int BLOCK = 256;
-    rope_yarn_original_bf16_kernel<<<num_tokens, BLOCK, 0, stream>>>(
+    // One block per token leaves 147 of the B200's 148 SMs idle during decode,
+    // where `num_tokens` is 1. Give each block a slice of the heads instead, so
+    // the grid grows with the head count rather than the batch, and each thread
+    // owns exactly one element -- one load/store round trip rather than a chain
+    // of them.
+    constexpr int kMaxCachedPairs = 4096;   // 32 KB of float2
+    const int half = head_dim / 2;
+    if (half <= 0) return;
+    const int cache_pairs = half <= kMaxCachedPairs ? half : 0;
+    const int total_heads = num_q_heads + num_kv_heads;
+    const int heads_per_block = half >= BLOCK ? 1 : (BLOCK / half);
+    const dim3 grid(num_tokens,
+                    (total_heads + heads_per_block - 1) / heads_per_block);
+    const std::size_t shared =
+        static_cast<std::size_t>(cache_pairs) * sizeof(float2);
+    rope_yarn_original_bf16_kernel<<<grid, BLOCK, shared, stream>>>(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
         num_q_heads, num_kv_heads, head_dim,
-        theta, factor, low_dim, high_dim, attention_factor);
+        theta, factor, low_dim, high_dim, attention_factor, interleaved,
+        heads_per_block, cache_pairs);
 }
 
 // ── Partial rotary (Gemma-4 full-attention layers) ─────────────────────────
@@ -708,15 +847,6 @@ void launch_rope_partial_bf16_position_delta(
 
 namespace {
 
-// DeepSeek-V4 tail RoPE. Rotates ADJACENT dim pairs (2p, 2p+1) — GPT-J /
-// interleaved convention — matching the checkpoint's native layout and the
-// reference `rope_tail_ext_inplace`. Pair p carries frequency
-// theta^(-2p / rotary_dim).
-//
-// YaRN long-context interpolation (compressed layers): the rotation angle
-// blends between the interpolated angle (pos * freq_scale * freq) and the
-// extrapolated angle (pos * freq) with a per-dim ramp between corr_low and
-// corr_high, weighted by ext_factor.
 __global__ void rope_partial_last_bf16_kernel(
     __nv_bfloat16* __restrict__ q,
     __nv_bfloat16* __restrict__ k,
@@ -726,11 +856,11 @@ __global__ void rope_partial_last_bf16_kernel(
     int head_dim,
     int rotary_dim,
     float theta,
-    float freq_scale,
-    float ext_factor,
-    float corr_low,
-    float corr_high,
-    bool inverse)
+    bool inverse,
+    bool interleaved,
+    float yarn_factor,
+    float yarn_low_dim,
+    float yarn_high_dim)
 {
     const int n = blockIdx.x;
     const int total_heads = num_q_heads + num_kv_heads;
@@ -742,20 +872,14 @@ __global__ void rope_partial_last_bf16_kernel(
         const int head_idx = t / rope_half;
         const int dim_pair = t % rope_half;
 
-        const float freq = powf(theta,
+        float freq = powf(theta,
             -2.f * static_cast<float>(dim_pair) /
                    static_cast<float>(rotary_dim));
-        const float theta_extrap = static_cast<float>(pos) * freq;
-        float ang = freq_scale * theta_extrap;
-        if (ext_factor != 0.f) {
-            // rope_yarn_ramp over pair index.
-            const float y = (static_cast<float>(dim_pair) - corr_low) /
-                            fmaxf(0.001f, corr_high - corr_low);
-            const float ramp =
-                (1.f - fminf(1.f, fmaxf(0.f, y))) * ext_factor;
-            ang = ang * (1.f - ramp) + theta_extrap * ramp;
+        if (yarn_factor > 1.f) {
+            freq = yarn_original_freq(freq, yarn_factor,
+                                      yarn_low_dim, yarn_high_dim, dim_pair);
         }
-        if (inverse) ang = -ang;
+        const float ang = (inverse ? -1.f : 1.f) * static_cast<float>(pos) * freq;
         float cos_v, sin_v;
         __sincosf(ang, &sin_v, &cos_v);
 
@@ -764,24 +888,16 @@ __global__ void rope_partial_last_bf16_kernel(
             ? q + static_cast<long long>(n * num_q_heads + head_idx) * head_dim
             : k + static_cast<long long>(n * num_kv_heads + (head_idx - num_q_heads)) * head_dim;
 
-        const int i = offset + 2 * dim_pair;
-        const int j = i + 1;
+        // GPT-J pairing (adjacent dims) for DeepSeek-V4 (`is_neox_style=False`
+        // in vLLM `build_deepseek_v4_rope`); NeoX half/half otherwise.
+        const int i = interleaved ? offset + 2 * dim_pair : offset + dim_pair;
+        const int j = interleaved ? offset + 2 * dim_pair + 1
+                                  : offset + dim_pair + rope_half;
         const float a = __bfloat162float(base[i]);
         const float b = __bfloat162float(base[j]);
         base[i] = __float2bfloat16(a * cos_v - b * sin_v);
         base[j] = __float2bfloat16(b * cos_v + a * sin_v);
     }
-}
-
-// YaRN correction dim (same formula as the reference `rope_yarn_corr_dim`):
-// the rotary index at which a wavelength completes `n_rot` cycles over
-// `orig_ctx` tokens.
-float yarn_corr_dim(int rotary_dim, int orig_ctx, float n_rot, float base)
-{
-    return static_cast<float>(rotary_dim) *
-           std::log(static_cast<float>(orig_ctx) /
-                    (n_rot * 2.0f * 3.14159265358979323846f)) /
-           (2.0f * std::log(base));
 }
 
 }  // namespace
@@ -797,33 +913,38 @@ void launch_rope_partial_last_bf16(
     float theta,
     cudaStream_t stream,
     bool inverse,
-    float freq_scale,
-    float ext_factor,
-    float beta_fast,
-    float beta_slow,
-    int original_max_position)
+    bool interleaved,
+    float yarn_factor,
+    float yarn_beta_fast,
+    float yarn_beta_slow,
+    int   yarn_original_max_position)
 {
+    // Same ramp as `launch_rope_yarn_original_bf16`, but the correction range
+    // is over `rotary_dim` (the rotated slice), not the full head_dim.
+    float low_dim = 0.f, high_dim = 0.f;
+    if (yarn_factor > 1.f && yarn_original_max_position > 0) {
+        constexpr float TWO_PI = 6.2831853071795864769f;
+        const float ln_theta = logf(theta);
+        auto corr_dim = [&](float rot) -> float {
+            return rotary_dim * logf(static_cast<float>(yarn_original_max_position) /
+                                     (rot * TWO_PI)) / (2.f * ln_theta);
+        };
+        low_dim  = floorf(corr_dim(yarn_beta_fast));
+        high_dim = ceilf(corr_dim(yarn_beta_slow));
+        if (low_dim < 0.f) low_dim = 0.f;
+        const float max_pair = static_cast<float>(rotary_dim / 2) - 1.f;
+        if (high_dim > max_pair) high_dim = max_pair;
+        if (high_dim < low_dim)  high_dim = low_dim;
+    }
     constexpr int BLOCK = 256;
     dim3 grid(num_tokens);
     dim3 block(BLOCK);
-
-    float corr_low = 0.f;
-    float corr_high = 0.f;
-    if (ext_factor != 0.f) {
-        const float start = std::floor(
-            yarn_corr_dim(rotary_dim, original_max_position, beta_fast, theta));
-        const float end = std::ceil(
-            yarn_corr_dim(rotary_dim, original_max_position, beta_slow, theta));
-        corr_low = std::max(0.f, start);
-        corr_high = std::min(static_cast<float>(rotary_dim - 1), end);
-    }
-
     rope_partial_last_bf16_kernel<<<grid, block, 0, stream>>>(
         static_cast<__nv_bfloat16*>(q),
         static_cast<__nv_bfloat16*>(k),
         positions,
-        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta,
-        freq_scale, ext_factor, corr_low, corr_high, inverse);
+        num_q_heads, num_kv_heads, head_dim, rotary_dim, theta, inverse,
+        interleaved, yarn_factor, low_dim, high_dim);
 }
 
 }  // namespace pie_cuda_driver::kernels

@@ -38,14 +38,13 @@ enum class DType : std::uint8_t {
     // reads `(M, N, K)` from the QuantMeta companion (group_size /
     // channel_axis) plus the tensor shape rather than from the dtype.
     INT4_PACKED = 9,
-    // Raw HF / OCP MXFP4 nibble packs (E2M1 values + E8M0 block scales).
-    // GEMM dequants to BF16 unless an explicit Marlin path is selected.
+    // Marlin-packed MXFP4 (E2M1 values with E8M0 block scales). The tensor
+    // stores the packed FP4 bytes in Marlin's tile layout; a QuantMeta /
+    // WeightView side tensor carries the E8M0 per-32-K scales.
     MXFP4_PACKED = 10,
-    // Marlin tile-packed MXFP4 (same FE2M1/E8M0 values, Marlin W4 layout).
-    // Produced by load-time Repack / expert-pack builders; GEMM runs Marlin
-    // W4A16 directly. Distinct from MXFP4_PACKED — same storage width, different
-    // byte layout.
-    MXFP4_MARLIN = 11,
+    // OCP Microscaling's exponent-only scale byte: `b` denotes `2^(b - 127)`.
+    // Only ever a block-scale companion, never a weight.
+    E8M0 = 11,
 };
 
 inline std::size_t dtype_bytes(DType d) {
@@ -61,7 +60,7 @@ inline std::size_t dtype_bytes(DType d) {
         case DType::FP8_E5M2: return 1;
         case DType::INT4_PACKED: return 1;  // 1 byte holds 2 nibbles
         case DType::MXFP4_PACKED: return 1;
-        case DType::MXFP4_MARLIN: return 1;
+        case DType::E8M0: return 1;
     }
     throw std::runtime_error("unknown dtype");
 }
@@ -79,7 +78,7 @@ inline const char* dtype_name(DType d) {
         case DType::FP8_E5M2: return "fp8e5m2";
         case DType::INT4_PACKED: return "int4-packed";
         case DType::MXFP4_PACKED: return "mxfp4-packed";
-        case DType::MXFP4_MARLIN: return "mxfp4-marlin";
+        case DType::E8M0: return "e8m0";
     }
     return "?";
 }
@@ -88,6 +87,15 @@ inline const char* dtype_name(DType d) {
 DType dtype_from_safetensors(const std::string& s);
 
 using DeviceTensorMemoryCallback = void (*)(void* context);
+using DeviceMemoryAllocateCallback = void* (*)(
+    void* context,
+    std::size_t bytes,
+    std::size_t alignment);
+
+struct DeviceMemoryAllocatorBinding {
+    DeviceMemoryAllocateCallback allocate = nullptr;
+    void* context = nullptr;
+};
 
 // Thread-local hook used by the loader to capture CUDA memory high-water
 // during materialization, including transient transform scratch allocated
@@ -95,6 +103,38 @@ using DeviceTensorMemoryCallback = void (*)(void* context);
 void set_device_tensor_memory_callback(
     DeviceTensorMemoryCallback callback,
     void* context) noexcept;
+
+DeviceMemoryAllocatorBinding set_device_memory_allocator(
+    DeviceMemoryAllocateCallback allocate,
+    void* context) noexcept;
+
+class ScopedDeviceAllocationCounter {
+public:
+    ScopedDeviceAllocationCounter() noexcept;
+    ~ScopedDeviceAllocationCounter();
+    ScopedDeviceAllocationCounter(const ScopedDeviceAllocationCounter&) = delete;
+    ScopedDeviceAllocationCounter& operator=(
+        const ScopedDeviceAllocationCounter&) = delete;
+
+    std::size_t allocated_bytes() const noexcept { return allocated_bytes_; }
+
+private:
+    static void* allocate(
+        void* context, std::size_t bytes, std::size_t alignment);
+
+    DeviceMemoryAllocatorBinding previous_{};
+    std::size_t allocated_bytes_ = 0;
+};
+
+struct DeviceMemoryBlock {
+    void* ptr = nullptr;
+    bool arena_owned = false;
+};
+
+DeviceMemoryBlock allocate_device_memory(
+    std::size_t bytes,
+    std::size_t alignment = 256);
+void free_device_memory(DeviceMemoryBlock block) noexcept;
 
 class DeviceTensor {
 public:
@@ -119,11 +159,13 @@ public:
           shape_(std::move(other.shape_)),
           numel_(other.numel_),
           nbytes_(other.nbytes_),
-          owns_memory_(other.owns_memory_) {
+          owns_memory_(other.owns_memory_),
+          arena_owned_(other.arena_owned_) {
         other.ptr_ = nullptr;
         other.numel_ = 0;
         other.nbytes_ = 0;
         other.owns_memory_ = false;
+        other.arena_owned_ = false;
     }
 
     DeviceTensor& operator=(DeviceTensor&& other) noexcept {
@@ -135,10 +177,12 @@ public:
             numel_ = other.numel_;
             nbytes_ = other.nbytes_;
             owns_memory_ = other.owns_memory_;
+            arena_owned_ = other.arena_owned_;
             other.ptr_ = nullptr;
             other.numel_ = 0;
             other.nbytes_ = 0;
             other.owns_memory_ = false;
+            other.arena_owned_ = false;
         }
         return *this;
     }
@@ -167,6 +211,7 @@ private:
     // True for `allocate`d tensors (own + free on destruct), false for
     // non-owning views (`view(...)`). Move semantics propagate ownership.
     bool owns_memory_ = false;
+    bool arena_owned_ = false;
 };
 
 }  // namespace pie_cuda_driver

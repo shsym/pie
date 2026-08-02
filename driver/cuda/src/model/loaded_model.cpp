@@ -5,90 +5,23 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 #include <cuda_runtime.h>
 
 #include "cuda_check.hpp"
 #include "distributed.hpp"
-#include "expert_stream_cache.hpp"
 #include "ops/gemm.hpp"
-#include "loader/rust_loader_bridge.hpp"
-#include "loader/rust_storage_executor.hpp"
+#include "loader/load_plan_bridge.hpp"
+#include "loader/load_plan_executor.hpp"
+#include "model/registry.hpp"
 #include "model/weight_artifact_cache.hpp"
-#include "model/expert_pack_cache.hpp"
 #include "tensor.hpp"
 
 namespace pie_cuda_driver {
 
 namespace {
-
-// Whitelist of model_types we currently support TP for. The shard plan is
-// llama-like and assumes the standard name layout — gemma/mixtral/MoE need
-// their own plan (per-expert weights, dual-norm, etc.).
-bool supports_tp(const std::string& mt) {
-    return mt == "qwen3"
-        || mt == "qwen2"
-        || mt == "llama" || mt == "llama3"
-        || mt == "mistral" || mt == "mistral3" || mt == "ministral3"
-        || mt == "phi3"
-        || mt == "olmo2" || mt == "olmo3"
-        || mt == "gemma2"
-        || mt == "gemma3" || mt == "gemma3_text"
-        || mt == "gemma4" || mt == "gemma4_text"
-        || mt == "mixtral"
-        || mt == "gemma3n" || mt == "gemma3n_text"
-        || mt == "gpt_oss"
-        || mt == "qwen3_5" || mt == "qwen3_5_text"
-        || mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
-        || mt == "qwen3_moe"
-        || mt == "nemotron_h"
-        || mt == "kimi_k2"
-        || mt == "deepseek_v2" || mt == "deepseek_v3" || mt == "deepseek_v4"
-        || mt == "glm_moe_dsa";
-}
-
-// True for any MoE model whose forward path lives in qwen3_5_moe_forward.
-// All members share an all-MoE MLP layout (no dense `intermediate_size`),
-// so the engine's TP divisibility checks on `intermediate_size` should
-// be skipped for them.
-bool is_qwen3_5_moe_arch(const std::string& mt) {
-    return mt == "qwen3_5_moe" || mt == "qwen3_5_moe_text"
-        || mt == "qwen3_moe";
-}
-
-Mxfp4MoeLowering select_mxfp4_moe_lowering(
-    const ModelConfig& model_cfg,
-    const BackendTarget& target)
-{
-    const std::string& policy = model_cfg.mxfp4_moe;
-    if (policy.empty() || policy == "auto") {
-        return target.mxfp4_native_gemm
-            ? Mxfp4MoeLowering::NativeGemm
-            : Mxfp4MoeLowering::RoutedDequant;
-    }
-    if (policy == "routed_dequant" || policy == "packed") {
-        return Mxfp4MoeLowering::RoutedDequant;
-    }
-    if (policy == "bf16" || policy == "dequant" ||
-        policy == "eager_bf16") {
-        return Mxfp4MoeLowering::Bf16Dequant;
-    }
-    if (policy == "native") {
-        // GPT-OSS "native" is Marlin-repacked MXFP4 (W4A16), available whenever
-        // Marlin is linked. Blackwell FP4 hardware is a stricter subset.
-        if (!target.mxfp4_native_gemm && !target.gptq_marlin_int4) {
-            throw std::runtime_error(
-                "engine: model.mxfp4_moe='native' requested a true MXFP4 "
-                "MoE GEMM backend, but this build has no registered native "
-                "MXFP4 / Marlin expert GEMM kernels");
-        }
-        return Mxfp4MoeLowering::NativeGemm;
-    }
-    throw std::runtime_error(
-        "engine: model.mxfp4_moe must be one of "
-        "{auto,routed_dequant,packed,bf16,dequant,eager_bf16,native}");
-}
 
 struct LoadMemorySampler {
     LoadExecutionStats* stats = nullptr;
@@ -139,7 +72,12 @@ private:
 
 }  // namespace
 
-LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
+LoadedModel LoadedModel::load(
+    const Config& boot_cfg,
+    NcclComm* tp_comm,
+    std::string_view runtime_quant,
+    model::Mxfp4MoeRequest mxfp4_moe,
+    model::Component component) {
     (void)tp_comm;
 
     if (boot_cfg.model.snapshot_dir.empty()) {
@@ -186,119 +124,92 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     CUDA_CHECK(cudaGetDeviceProperties(&dev_prop, dev_id));
     const bool fp8_native = (dev_prop.major > 8) ||
                             (dev_prop.major == 8 && dev_prop.minor >= 9);
-    if (boot_cfg.model.runtime_quant == "fp8" && !fp8_native) {
-        std::cerr << "[pie-driver-cuda] runtime_quant=fp8 skipped: "
-                  << "sm" << dev_prop.major << dev_prop.minor
-                  << " has no native FP8 GEMM. Weights stay bf16 "
-                  << "(use runtime_quant=int8 or marlin Int4 / GPTQ "
-                  << "for memory + perf wins on this generation).\n";
-    }
 #ifdef PIE_CUDA_HAS_MARLIN
-    const bool gptq_marlin_int4 = true;
     // Native MXFP4 expert execution requires a Blackwell-class FP4 path.
     // Older GPUs keep packed MXFP4 resident but use routed BF16 dequant
     // scratch for the selected experts.
     const bool mxfp4_native_gemm = dev_prop.major >= 10;
 #else
-    const bool gptq_marlin_int4 = false;
     const bool mxfp4_native_gemm = false;
 #endif
-    BackendTarget backend_target{
-        .device_major = dev_prop.major,
-        .device_minor = dev_prop.minor,
-        .fp8_native = fp8_native,
-        .gptq_marlin_int4 = gptq_marlin_int4,
-        .mxfp4_native_gemm = mxfp4_native_gemm,
+
+    // Compile the plan for *this* device. The driver states what the device can
+    // do and the loader answers with a plan that stays inside it, so there is
+    // nothing to re-validate afterwards: the mxfp4 lowering below is read back
+    // as the loader's decision, not checked against a second opinion
+    // (`loader/architecture.md` §9).
+    log_stage("compile LoadPlan begin");
+    const pie_loader::DeviceTarget device_target = [&] {
+        auto target = cuda_device_target();
+        target.tp_rank = static_cast<std::uint32_t>(boot_cfg.distributed.tp_rank);
+        target.tp_size = static_cast<std::uint32_t>(boot_cfg.distributed.tp_size);
+        target.native_mxfp4_moe = mxfp4_native_gemm;
+        return target;
+    }();
+
+    // Read the tensor table once. The contract is written against it and the
+    // compile consumes the same handle, so the two cannot be about different
+    // parses of the same directory.
+    std::string open_error;
+    pie_loader::Checkpoint checkpoint =
+        pie_loader::Checkpoint::open(boot_cfg.model.snapshot_dir, &open_error);
+    if (!checkpoint) {
+        throw std::runtime_error("engine: failed to read checkpoint: " + open_error);
+    }
+
+    // What this driver will bind, stated before anything is loaded. The row is
+    // the same one `Context` will later call `bind` on, so the contract and the
+    // binder cannot be about different models; the loader type-checks the
+    // contract against what the files contain and lowers it, but does not
+    // decide *what* to build, which is why a family it has never heard of loads
+    // exactly as well as one it has (§12 row 12).
+    const model::ArchEntry* arch = model::find_arch_entry(e.hf_.model_type);
+    if (arch == nullptr || !arch->author_contract) {
+        throw std::runtime_error("engine: unsupported model_type '" + e.hf_.model_type +
+                                 "'; no row in the arch table declares what it binds");
+    }
+    const model::ModelFacts facts{
+        .model_type = e.hf_.model_type,
+        .quant_method = e.hf_.quant_method,
+        .num_hidden_layers = static_cast<std::uint32_t>(std::max(0, e.hf_.num_hidden_layers)),
+        .num_experts = static_cast<std::uint32_t>(std::max(0, e.hf_.num_experts)),
+        .head_dim = static_cast<std::uint32_t>(std::max(0, e.hf_.head_dim)),
+        .mamba_groups = static_cast<std::uint32_t>(std::max(0, e.hf_.mamba_n_groups)),
     };
-    backend_target.mxfp4_moe =
-        select_mxfp4_moe_lowering(boot_cfg.model, backend_target);
-    e.mxfp4_moe_lowering_ = backend_target.mxfp4_moe;
-    backend_target.stream_routed_experts = boot_cfg.model.stream_routed_experts;
+    pie_loader::ModelContract contract;
+    model::Mxfp4MoePolicy mxfp4_moe_policy = model::Mxfp4MoePolicy::RoutedDecode;
+    {
+        model::ContractBuilder builder(
+            checkpoint, facts, device_target,
+            model::resolve_runtime_quant(runtime_quant, fp8_native),
+            mxfp4_moe, component, contract);
+        arch->author_contract(builder);
+        builder.finish();
+        mxfp4_moe_policy = builder.mxfp4_moe();
+    }
+
+    // The policy is the *author's* answer, not the plan's -- and it is read
+    // back off the builder rather than recomputed, so there is one answer
+    // rather than two that have to be kept agreeing. An expert weight is MXFP4
+    // in the plan because a contract node says so, and this is the decision
+    // that node was written from.
+    e.mxfp4_moe_policy_ = mxfp4_moe_policy;
+
+    LoadPlanResult planned_load = prepare_load_plan(checkpoint, contract, device_target);
+    log_stage("compile LoadPlan done");
 
     log_stage("open safetensors begin");
-    auto loader = SafetensorsCheckpointSource::open(snapshot);
+    pie_loader::CheckpointSource loader(planned_load.plan.view());
     log_stage("open safetensors done");
 
-    const int tp_size = boot_cfg.distributed.tp_size;
-    const int tp_rank = boot_cfg.distributed.tp_rank;
-    if (tp_size > 1 && !supports_tp(e.hf_.model_type)) {
-        throw std::runtime_error(
-            "engine: tensor-parallelism not yet supported for model_type='" +
-            e.hf_.model_type +
-            "'. Currently TP-enabled: qwen2/qwen3, llama/llama3, mistral/"
-            "mistral3, phi3, olmo2/olmo3, gemma2/gemma3.");
-    }
-    // Sharding along the head dim requires the head/expert counts and
-    // intermediate widths to all divide cleanly by tp_size. Reject early
-    // with a useful message instead of failing inside `load_to_device_sharded`
-    // (which sees only one tensor at a time and can't explain why).
-    if (tp_size > 1) {
-        const auto& hf = e.hf_;
-        auto require_divisible = [&](int v, const char* name) {
-            if (v <= 0 || v % tp_size != 0) {
-                throw std::runtime_error(
-                    std::string("engine: ") + name + "=" + std::to_string(v) +
-                    " is not divisible by tp_size=" + std::to_string(tp_size) +
-                    ". Sharding the head/intermediate axis requires this; "
-                    "use a smaller tp_size or run single-GPU.");
-            }
-        };
-        require_divisible(hf.num_attention_heads, "num_attention_heads");
-        // V4 has num_key_value_heads=1 (MQA) — the single KV head is
-        // replicated, not sharded. Skip the divisibility check.
-        if (hf.model_type != "deepseek_v4") {
-            require_divisible(hf.num_key_value_heads, "num_key_value_heads");
-        }
-        // Qwen3.5-MoE / Qwen3-MoE have no dense `intermediate_size`; the
-        // MLP lives entirely in `moe_intermediate_size` (+ `shared_expert_
-        // intermediate_size` for the 3.5/3.6 family — Qwen3-MoE has no
-        // shared expert).
-        const bool is_kimi_k2 = hf.model_type == "kimi_k2"
-            || hf.model_type == "deepseek_v2" || hf.model_type == "deepseek_v3"
-            || hf.model_type == "glm_moe_dsa";
-        const bool is_dsv4 = hf.model_type == "deepseek_v4";
-        const bool is_q35_moe = is_qwen3_5_moe_arch(hf.model_type);
-        const bool is_nemotron_h = hf.model_type == "nemotron_h";
-        if (!is_q35_moe && !is_kimi_k2 && !is_dsv4) {
-            require_divisible(hf.intermediate_size, "intermediate_size");
-        }
-        if (is_kimi_k2) {
-            require_divisible(hf.q_lora_rank, "q_lora_rank");
-            require_divisible(hf.kv_lora_rank, "kv_lora_rank");
-            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
-            if (hf.shared_expert_intermediate_size > 0) {
-                require_divisible(hf.shared_expert_intermediate_size,
-                                  "shared_expert_intermediate_size");
-            }
-        }
-        if (is_dsv4) {
-            require_divisible(hf.q_lora_rank, "q_lora_rank");
-            if (hf.dsv4_o_lora_rank > 0) {
-                require_divisible(hf.dsv4_o_lora_rank, "o_lora_rank");
-            }
-            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
-        }
-        // Qwen3.5 / 3.6-MoE: linear-attention head counts must shard too.
-        // Qwen3-MoE has no linear-attn layers, so this check is skipped.
-        const bool has_linear_attn =
-            (hf.model_type == "qwen3_5" || hf.model_type == "qwen3_5_text" ||
-             hf.model_type == "qwen3_5_moe" ||
-             hf.model_type == "qwen3_5_moe_text");
-        if (has_linear_attn) {
-            require_divisible(hf.linear_num_key_heads, "linear_num_key_heads");
-            require_divisible(hf.linear_num_value_heads, "linear_num_value_heads");
-        }
-        if (is_q35_moe || is_nemotron_h) {
-            require_divisible(hf.moe_intermediate_size, "moe_intermediate_size");
-            // shared_expert_intermediate_size is 0 for Qwen3-MoE (no shared
-            // expert); only enforce divisibility when the family actually
-            // has one.
-            if (hf.shared_expert_intermediate_size > 0) {
-                require_divisible(hf.shared_expert_intermediate_size,
-                                  "shared_expert_intermediate_size");
-            }
-        }
-    }
+    // What used to sit here: `supports_tp()` — a list of twenty-odd model_type
+    // strings — followed by eighty lines of per-family divisibility rules read
+    // off `config.json`. Every one of them restated something the loader had
+    // already decided by the time this ran: it is the loader that partitions a
+    // tensor, so it is the loader that discovers an axis tp_size does not
+    // divide, and it names the tensor when it says so (`frontend.rs`,
+    // `arch.rs::local_range`). A family missing from the list got no check at
+    // all; a family in it got two.
 
     if (e.hf_.kv_cache_scheme_present) {
         std::cerr << "[pie-driver-cuda] WARNING: ckpt's "
@@ -311,21 +222,11 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
 
     const auto t0 = std::chrono::steady_clock::now();
 
-    WeightStoreBuilder(e.weights_).reserve(loader.num_tensors());
-
-    std::string runtime_quant = boot_cfg.model.runtime_quant;
-    if (runtime_quant == "fp8" && !fp8_native) {
-        runtime_quant.clear();
-    }
-    log_stage("compile rust loader plan begin");
-    RustLoaderCompileResult rust_plan =
-        compile_rust_loader_plan_from_metadata(
-            e.hf_, loader, runtime_quant, tp_rank, tp_size,
-            64ull * 1024ull * 1024ull,
-            /*preferred_alignment=*/256,
-            backend_target);
-    log_stage("compile rust loader plan done");
-    const auto rust_view = rust_plan.program.view();
+    // The store holds what the plan *produces*, which is more than the contract
+    // demands: the declaration is a lower bound the loader must meet, not an
+    // inventory (an undeclared family demands nothing at all).
+    WeightStoreBuilder(e.weights_).reserve(planned_load.planned_tensor_count);
+    const auto load_view = planned_load.plan.view();
     if (const char* dump_path =
             std::getenv("PIE_CUDA_RUST_LAYOUT_PLAN_DUMP");
         dump_path && dump_path[0] != '\0') {
@@ -335,63 +236,17 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                 "engine: failed to open PIE_CUDA_RUST_LAYOUT_PLAN_DUMP "
                 "path: " + std::string(dump_path));
         }
-        out << dump_rust_storage_program_json(
-            rust_view,
-            rust_plan.source_tensor_count,
-            rust_plan.covered_contract_count,
-            rust_plan.runtime_tensor_count);
+        out << pie_loader::bytes_to_string(load_view.stats_json);
     }
     if (verbose) {
         std::cerr
             << "[pie-driver-cuda] layout compiler: rust RuntimeABI -> "
-               "algebra -> storage program\n";
+               "algebra -> LoadPlan\n";
         std::cerr << "[pie-driver-cuda] rust loader compiler: "
-                  << describe_rust_storage_program(
-                         rust_view,
-                         rust_plan.source_tensor_count,
-                         rust_plan.covered_contract_count,
-                         rust_plan.runtime_tensor_count)
-                  << "\n";
+                  << pie_loader::bytes_to_string(load_view.summary) << "\n";
     }
-    if (rust_plan.covered_contract_count != rust_plan.runtime_tensor_count) {
-        throw std::runtime_error(
-            "engine: Rust loader did not cover the full RuntimeABI; covered " +
-            std::to_string(rust_plan.covered_contract_count) + "/" +
-            std::to_string(rust_plan.runtime_tensor_count) +
-            " runtime tensors. Add schema/RuntimeABI coverage before enabling "
-            "this model.");
-    }
-
-    // SSD expert streaming: the compiled program excluded routed experts
-    // from the resident schedule and attached a deferred stream plan
-    // (template ExtentWrites + per-expert source bindings). Materialize
-    // that plan into the runtime extent table while the program view is live.
-    if (boot_cfg.model.stream_routed_experts) {
-        log_stage("build streamed expert table begin");
-        e.streamed_experts_ = streamed_expert_table_from_program(rust_view);
-        // Offline packs (native Marlin / eager BF16): build/remap with
-        // bounded staging *before* resident materialize so peak VRAM stays
-        // O(one expert). Kind is set by the stream arch recipe.
-        log_stage("ensure streamed expert pack begin");
-        ensure_streamed_expert_pack(
-            e.streamed_experts_, rust_plan.cache_key, loader, verbose);
-        log_stage("ensure streamed expert pack done");
-        log_stage("build streamed expert table done");
-        if (verbose) {
-            std::cerr << "[pie-driver-cuda] expert streaming: "
-                      << e.streamed_experts_.num_layers << "x"
-                      << e.streamed_experts_.num_experts << " experts, "
-                      << (e.streamed_experts_.payload_bytes_per_expert() /
-                          (1024 * 1024))
-                      << " MiB/expert, "
-                      << (e.streamed_experts_.total_payload_bytes() /
-                          (1024ull * 1024ull * 1024ull))
-                      << " GiB total kept on SSD (deferred loader template)\n";
-        }
-    }
-
     // Materialized-weight artifact cache (WEIGHT_LOADER_TODO.md A3.1). The
-    // materialized weights are a deterministic function of rust_plan.cache_key,
+    // materialized weights are a deterministic function of the load-plan cache key,
     // so on a hit we reload them straight into device memory and skip the
     // executor pass below. The compile above is cheap (~tens of ms) and still
     // runs every boot, validating the key + full ABI coverage.
@@ -402,7 +257,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         try {
             WeightStoreBuilder cache_builder(e.weights_);
             weight_cache_hit = read_weight_artifact_cache(
-                cache_builder, rust_plan.cache_key, weight_cache_dir);
+                cache_builder, planned_load.cache_key, weight_cache_dir);
         } catch (const std::exception& ex) {
             std::cerr << "[pie-driver-cuda] weight cache: reload failed ("
                       << ex.what() << "); falling back to materialize\n";
@@ -422,12 +277,11 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         // (DeviceTensor RAII). A no-op when the restore left nothing.
         e.weights_ = WeightStore{};
         WeightStoreBuilder rust_builder(e.weights_);
-        RustStorageProgramExecutor rust_executor(
+        LoadPlanExecutor load_executor(
             loader,
             rust_builder,
-            std::move(rust_plan.source_tensor_names),
-            std::move(rust_plan.quant_attachments));
-        log_stage("materialize storage program begin");
+            std::move(planned_load.quant_attachments));
+        log_stage("materialize LoadPlan begin");
         LoadExecutionStats load_memory_stats;
         const bool sample_load_memory =
             verbose || std::getenv("PIE_CUDA_PROFILE_LOAD_MEMORY") != nullptr;
@@ -438,10 +292,10 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         {
             ScopedDeviceTensorMemoryCallback callback(
                 sample_load_memory ? &load_memory_sampler : nullptr);
-            materialized = rust_executor.execute(rust_view);
+            materialized = load_executor.execute(load_view);
         }
         CUDA_CHECK(cudaDeviceSynchronize());
-        log_stage("materialize storage program done");
+        log_stage("materialize LoadPlan done");
         if (sample_load_memory) {
             std::size_t free_after = 0;
             std::size_t total_after = 0;
@@ -473,7 +327,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
             bool wrote = false;
             try {
                 wrote = write_weight_artifact_cache(
-                    e.weights_, rust_plan.cache_key, weight_cache_dir);
+                    e.weights_, planned_load.cache_key, weight_cache_dir);
             } catch (const std::exception& ex) {
                 std::cerr << "[pie-driver-cuda] weight cache: write failed ("
                           << ex.what() << ")\n";
@@ -490,8 +344,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
         const double mib_after =
             static_cast<double>(materialized.runtime_quant_bytes_after) /
             (1024.0 * 1024.0);
-        std::cerr << "[pie-driver-cuda] runtime_quant="
-                  << boot_cfg.model.runtime_quant << " quantised "
+        std::cerr << "[pie-driver-cuda] LoadPlan quantised "
                   << materialized.runtime_quantized_weights
                   << " projections: "
                   << static_cast<std::uint64_t>(mib_before) << " -> "
@@ -524,36 +377,28 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
                   << " MiB across "
                   << materialized.cuda_memory_samples << " samples\n";
     }
-    if (const char* profile = std::getenv("PIE_WEIGHT_LOADER_PROFILE");
+    if (const char* profile = std::getenv("PIE_LOAD_EXECUTOR_PROFILE");
         profile != nullptr && profile[0] != '\0' && profile[0] != '0') {
         const auto to_mib = [](std::uint64_t bytes) {
             return bytes / (1024ull * 1024ull);
         };
-        std::cerr << "[pie-driver-cuda] weight loader profile: h2d_copies="
+        std::cerr << "[pie-driver-cuda] load executor profile: h2d_copies="
                   << materialized.h2d_copy_count
                   << " bulk_copies=" << materialized.h2d_bulk_copy_count
                   << " pinned_copies="
                   << materialized.h2d_pinned_copy_count
-                  << " slab_scatter="
-                  << materialized.slab_scatter_count
-                  << " slab_placements="
-                  << materialized.slab_scatter_placements
                   << " h2d_bytes=" << to_mib(materialized.h2d_copy_bytes)
                   << " MiB bulk_bytes="
                   << to_mib(materialized.h2d_bulk_copy_bytes)
                   << " MiB pinned_bytes="
                   << to_mib(materialized.h2d_pinned_copy_bytes)
-                  << " MiB slab_source_bytes="
-                  << to_mib(materialized.slab_scatter_source_bytes)
-                  << " MiB slab_payload_bytes="
-                  << to_mib(materialized.slab_scatter_payload_bytes)
                   << " MiB copy_flushes="
                   << materialized.copy_stream_flushes
                   << " batch_calls="
                   << materialized.h2d_batch_calls
                   << " max_pending="
                   << materialized.max_pending_copies_seen << "\n";
-        std::cerr << "[pie-driver-cuda] weight loader phases: alloc="
+        std::cerr << "[pie-driver-cuda] load executor phases: alloc="
                   << static_cast<int>(materialized.phase_alloc_ms)
                   << "ms transfer=" << static_cast<int>(materialized.phase_transfer_ms)
                   << "ms (pinned_alloc="
@@ -572,7 +417,7 @@ LoadedModel LoadedModel::load(const Config& boot_cfg, NcclComm* tp_comm) {
     if (verbose) {
         std::cerr << "[pie-driver-cuda] loaded " << e.weights_.size() << " tensors ("
                   << static_cast<std::uint64_t>(mib) << " MiB on this rank, "
-                  << "tp=" << tp_size << ") in " << static_cast<int>(ms)
+                  << "tp=" << boot_cfg.distributed.tp_size << ") in " << static_cast<int>(ms)
                   << " ms; arch=" << e.hf_.arch_name << " (" << e.hf_.model_type << ")\n";
     }
 
@@ -635,24 +480,59 @@ ops::RuntimeQuantScratchSpec runtime_quant_scratch_spec(const LoadedModel& engin
         auto it = store.find(name);
         if (it == store.end()) continue;
         const auto& tensor = it->second.tensor;
-        if (tensor.shape().size() != 2) continue;
-
-        if (tensor.dtype() == DType::FP8_E4M3) {
+        std::size_t rows = 0;
+        std::size_t cols = 0;
+        const bool is_mxfp4 =
+            item.second.group_size == 32 &&
+            (tensor.dtype() == DType::MXFP4_PACKED ||
+             tensor.dtype() == DType::UINT8);
+        if (is_mxfp4 && tensor.shape().size() == 1) {
+            spec.has_fp8 = true;
+            if (tensor.nbytes() >
+                std::numeric_limits<std::size_t>::max() / 2) {
+                throw std::runtime_error(
+                    "runtime quant MXFP4 dimensions overflow");
+            }
+            spec.max_dequant_weight_elems = std::max(
+                spec.max_dequant_weight_elems, tensor.nbytes() * 2);
+            spec.max_weight_rows =
+                std::max<std::size_t>(spec.max_weight_rows, 1);
+            spec.max_weight_cols =
+                std::max<std::size_t>(spec.max_weight_cols, 1);
+            continue;
+        } else if (is_mxfp4 && tensor.shape().size() == 2) {
+            rows = static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[0]));
+            cols = static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[1])) * 2;
+            spec.has_fp8 = true;
+        } else if (tensor.shape().size() != 2) {
+            continue;
+        } else if (tensor.dtype() == DType::FP8_E4M3) {
             spec.has_fp8 = true;
         } else if (tensor.dtype() == DType::INT8) {
             spec.has_int8 = true;
         } else {
             continue;
         }
+        if (rows == 0) {
+            rows = static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[0]));
+            cols = static_cast<std::size_t>(std::max<std::int64_t>(
+                0, tensor.shape()[1]));
+        }
+        if (cols > 0 &&
+            rows > std::numeric_limits<std::size_t>::max() / cols) {
+            throw std::runtime_error(
+                "runtime quant scratch dimensions overflow");
+        }
 
         spec.max_weight_rows = std::max<std::size_t>(
-            spec.max_weight_rows,
-            static_cast<std::size_t>(std::max<std::int64_t>(
-                0, tensor.shape()[0])));
+            spec.max_weight_rows, rows);
         spec.max_weight_cols = std::max<std::size_t>(
-            spec.max_weight_cols,
-            static_cast<std::size_t>(std::max<std::int64_t>(
-                0, tensor.shape()[1])));
+            spec.max_weight_cols, cols);
+        spec.max_dequant_weight_elems = std::max(
+            spec.max_dequant_weight_elems, rows * cols);
     }
 
     return spec;

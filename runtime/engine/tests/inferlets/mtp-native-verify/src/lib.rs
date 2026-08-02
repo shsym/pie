@@ -1,0 +1,309 @@
+//! **MTP Stage 2 — PTIR-native explicit draft→verify→accept** (bravo), on the
+//! `inferlet::ptir` bridge. The speculative decode is a single traced eDSL
+//! epilogue per window — the target VERIFY (match + bonus tail) AND the next
+//! window's DRAFTING (native MTP argmax) in ONE lowered graph:
+//!
+//!   `picked = logits[k+1, vocab].argmax()`         // [k+1] target greedy (k verify + bonus)
+//!   `head   = gather(picked, lanes_k)`              // picked[0..k]
+//!   `hit    = head.eq(draft)`                       // [k] bool — verify vs the EMBEDDED drafts
+//!   `n_acc  = reduce_sum(cumprod(hit))`              // scalar accepted count 0..k
+//!   `keep   = broadcast(n_acc).ge(lanes_k1)`          // [k+1] i <= n_acc
+//!   commit  = select(keep, picked, -1)                // accepted prefix + BONUS@n_acc, then -1
+//!   drafts' = argmax(mtp_logits(k))                   // [k] FRESH drafts — NEXT window's proposals
+//!
+//! `draft` is read DEVICE-ALIAS off the SAME embedded window tokens (`toks.read()`,
+//! non-consuming peek — rows `1..=k`, the previous step's MTP proposals fed as
+//! this window's input), not a separately submitted draft channel; each fresh
+//! pass seeds its `toks` channel from the host's running commit/draft bookkeeping
+//! (the ptir-bridge equivalent of the deleted
+//! `sampling::program::mtp_native_verify` + `resolve_bindings` blob-submit
+//! surface — there is no lower-level "device-resident retain" primitive on the
+//! current `inferlet::ptir` surface, so drafts round-trip through host state
+//! each iteration, exactly mirroring this inferlet's ORIGINAL host-round-trip
+//! dataflow, contrasted with `mtp-specdecode`'s attempted device residency).
+//!
+//! Bootstrap fire: `prompt + (k-1)` fillers ⇒ the last k positions carry k
+//! logit rows ⇒ both `logits` (target) and `mtp_logits` (drafts) get REAL k-row
+//! data (no anchor-row collapse) — yields the seed (row-0 target argmax) + the
+//! first REAL drafts (mtp argmax) for window 1.
+//!
+//! JSON/plain input: optional draft window `k` (default 4).
+
+use inferlet::ptir::prelude::*;
+use inferlet::{Result, model as wit_model};
+
+const PROMPT: &str = "The quick brown fox jumps over";
+const MAX_TOKENS: u32 = 16;
+const PAGE_T: u32 = 16;
+
+/// Decode a `[k]`/`[k+1]` i32 host vector.
+async fn get_i32(t: inferlet::ptir::Taken) -> Result<Vec<i32>> {
+    t.get::<i32>()
+        .await
+        .map_err(|e| format!("tensor take: {e}"))
+}
+
+/// Committed length of a sentinel `[k+1]` tail = the count before the first
+/// `-1` (accepted prefix + the bonus at lane `n_acc`), always ≥ 1.
+fn committed_len(tail: &[i32]) -> usize {
+    tail.iter().take_while(|&&t| t >= 0).count()
+}
+
+fn bind_single_sequence(
+    pass: &ForwardPass,
+    ws: &WorkingSet,
+    toks: &Channel,
+    kv_len: &Channel,
+    token_count: u32,
+    pool_pages: u32,
+    readout: &[u32],
+) -> Result<()> {
+    let embed_indptr = Channel::from(vec![0u32, token_count]).named("embed_indptr");
+    let positions = Channel::from((0..token_count).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..pool_pages).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, token_count.div_ceil(PAGE_T)]).named("page_indptr");
+    let w_slot =
+        Channel::from((0..token_count).map(|p| p / PAGE_T).collect::<Vec<_>>()).named("w_slot");
+    let w_off =
+        Channel::from((0..token_count).map(|p| p % PAGE_T).collect::<Vec<_>>()).named("w_off");
+    let readout = Channel::from(readout.to_vec()).named("readout");
+    pass.embed(toks, &embed_indptr)?;
+    pass.readout(&readout)?;
+    pass.attention(
+        ws,
+        ..,
+        ..,
+        kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )
+}
+
+fn bind_verify_window(
+    pass: &ForwardPass,
+    ws: &WorkingSet,
+    toks: &Channel,
+    kv_len: &Channel,
+    seq_len: u32,
+    rows: u32,
+    pool_pages: u32,
+) -> Result<()> {
+    // ONE request row spanning the k+1 window tokens (the prefill-shaped
+    // verify fire the driver expects), not k+1 single-token rows: the
+    // recurrent-state contract is one working set per REQUEST row, and
+    // the window is one sequence. Per-token explicit-write descriptors
+    // (B2: N cells from the N-entry WSlot/WOff) and a k+1-entry readout
+    // keep the epilogue's [k+1, vocab] logits view intact.
+    let n_final = seq_len + rows;
+    let pages_needed = n_final.div_ceil(PAGE_T).min(pool_pages);
+    let embed_indptr = Channel::from(vec![0u32, rows]).named("embed_indptr");
+    let positions = Channel::from((seq_len..n_final).collect::<Vec<_>>()).named("positions");
+    let pages = Channel::from((0..pages_needed).collect::<Vec<_>>()).named("pages");
+    let page_indptr = Channel::from(vec![0u32, pages_needed]).named("page_indptr");
+    let w_slot = Channel::from(
+        (seq_len..n_final)
+            .map(|p| p / PAGE_T)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_slot");
+    let w_off = Channel::from(
+        (seq_len..n_final)
+            .map(|p| p % PAGE_T)
+            .collect::<Vec<_>>(),
+    )
+    .named("w_off");
+    let readout = Channel::from((0..rows).collect::<Vec<_>>()).named("readout");
+    pass.embed(toks, &embed_indptr)?;
+    pass.readout(&readout)?;
+    pass.attention(
+        ws,
+        ..,
+        ..,
+        kv_len,
+        &pages,
+        &page_indptr,
+        &w_slot,
+        &w_off,
+        &positions,
+        None,
+    )
+}
+
+/// Bootstrap fire over `prompt + (k-1)` fillers: yields the seed (row-0 target
+/// argmax at the prompt's REAL last position) + the first REAL `[k]` drafts
+/// (native MTP argmax) for window 1. No verify (nothing to verify yet).
+async fn bootstrap(
+    ws: &WorkingSet,
+    rs: &RsWorkingSet,
+    pipeline: &Pipeline,
+    prompt: &[u32],
+    k: u32,
+    max_pages: u32,
+) -> Result<(i32, Vec<i32>)> {
+    let l = prompt.len() as u32;
+    let mut window: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    window.extend(std::iter::repeat(0i32).take((k - 1) as usize));
+    let n = l + k - 1;
+
+    let toks = Channel::from(window).named("b_toks");
+    let seed_out = Channel::new([1], dtype::i32).named("b_seed");
+    let drafts_out = Channel::new([k], dtype::i32).named("b_drafts");
+
+    // k read-out rows (the last k positions) ⇒ intrinsics::logits() AND
+    // intrinsics::mtp_logits(k) both declare [k, vocab] — real k-row data.
+    let readout: Vec<u32> = (0..k).map(|i| l - 1 + i).collect();
+
+    let fwd = ForwardPass::new();
+    let kv_len = Channel::from(vec![n]).named("b_kv_len");
+    bind_single_sequence(&fwd, ws, &toks, &kv_len, n, max_pages, &readout)?;
+    fwd.rs_working_sets(std::slice::from_ref(rs))?;
+    fwd.epilogue(move || {
+        let picked = reduce_argmax(intrinsics::logits()); // [k] target argmax
+        let seed = gather(&picked, Tensor::constant(vec![0u32])); // [1] row-0
+        let mtp = intrinsics::mtp_logits(k); // [k, vocab]
+        let drafts = reduce_argmax(mtp); // [k] fresh drafts
+        seed_out.put(&seed);
+        drafts_out.put(&drafts);
+    });
+
+    fwd.submit(pipeline)
+        .map_err(|e| format!("bootstrap submit: {e}"))?;
+    let seed = get_i32(seed_out.take())
+        .await?
+        .first()
+        .copied()
+        .ok_or_else(|| "bootstrap: empty seed".to_string())?;
+    let drafts = get_i32(drafts_out.take()).await?;
+    Ok((seed, drafts))
+}
+
+/// One `[k+1]`-wide verify window: embed `[seed, draft]` (a freshly seeded
+/// channel each iteration) at positions derived from the pre-envelope
+/// `seq_len` cursor, verify `draft` (device-alias
+/// peeked off the SAME embedded tokens) against the target's per-row argmax,
+/// and draft the NEXT window natively off `mtp_logits`. Returns `(commit
+/// [k+1], next_drafts [k])`.
+async fn verify_window(
+    ws: &WorkingSet,
+    rs: &RsWorkingSet,
+    pipeline: &Pipeline,
+    k: u32,
+    seed: i32,
+    draft: &[i32],
+    seq_len: u32,
+    max_pages: u32,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    let kp1 = k + 1;
+    let mut window: Vec<i32> = vec![seed];
+    window.extend_from_slice(draft);
+
+    let toks = Channel::from(window).named("v_toks");
+    let commit_out = Channel::new([kp1], dtype::i32).named("v_commit");
+    let drafts_out = Channel::new([k], dtype::i32).named("v_drafts");
+
+    let fwd = ForwardPass::new();
+    let kv_len = Channel::from(vec![seq_len + kp1]).named("v_kv_len");
+    bind_verify_window(&fwd, ws, &toks, &kv_len, seq_len, kp1, max_pages)?;
+    fwd.rs_working_sets(std::slice::from_ref(rs))?;
+    fwd.epilogue(move || {
+        // Device-alias read: peek the embedded window (NOT a resubmitted draft
+        // channel) and gather rows 1..=k as the verify operand.
+        let win = toks.read().tensor(); // [k+1] i32
+        let draft_v = gather(&win, Tensor::constant((1..=k).collect::<Vec<u32>>())); // [k]
+        let picked = reduce_argmax(intrinsics::logits()); // [k+1] target (k verify + bonus)
+        let head = gather(&picked, iota(k)); // [k] picked[0..k]
+        let hit = eq(&head, &draft_v); // [k] bool
+        let ones = broadcast(Tensor::constant(1.0f32), [k]);
+        let zeros = broadcast(Tensor::constant(0.0f32), [k]);
+        let run = cumprod(select(&hit, &ones, &zeros)); // [k]
+        let n_acc = cast(reduce_sum(run), DType::U32); // accepted-prefix length
+        let keep = ge(broadcast(&n_acc, [kp1]), iota(kp1)); // [k+1] i <= n_acc
+        let neg1 = broadcast(Tensor::constant(-1i32), [kp1]);
+        let commit = select(&keep, &picked, &neg1); // accepted prefix + bonus + -1s
+
+        let mtp = intrinsics::mtp_logits(k); // [k, vocab]
+        let next_drafts = reduce_argmax(mtp); // [k] fresh drafts — NEXT window
+
+        commit_out.put(&commit);
+        drafts_out.put(&next_drafts);
+    });
+
+    fwd.submit(pipeline)
+        .map_err(|e| format!("verify submit: {e}"))?;
+    let commit = get_i32(commit_out.take()).await?;
+    let drafts = get_i32(drafts_out.take()).await?;
+    Ok((commit, drafts))
+}
+
+#[inferlet::main]
+async fn main(input: String) -> Result<String> {
+    let k: u32 = input.trim().parse().unwrap_or(4).max(2);
+    let ws = WorkingSet::new();
+    let rs = RsWorkingSet::new();
+
+    let mut prompt = wit_model::encode(PROMPT);
+    if prompt.is_empty() {
+        prompt.push(0);
+    }
+    let max_pages = (prompt.len() as u32 + MAX_TOKENS + k + 1).div_ceil(PAGE_T);
+    ws.reserve(max_pages)
+        .map_err(|e| format!("ws.reserve: {e}"))?;
+
+    // ONE pipeline for the whole stream (R4-4): the bootstrap and every
+    // verify window continue the same sequential decode, so all their fires
+    // submit here. The loop is acceptance-driven (the last submit is not
+    // knowable at submit time), so the stream ends with a close after the
+    // final drain instead of a final-submit marker.
+    let pipeline = Pipeline::new();
+
+    // Bootstrap: real seed + real first drafts off the prompt's REAL last position.
+    let (seed0, draft0) = bootstrap(&ws, &rs, &pipeline, &prompt, k, max_pages).await?;
+    let mut seq_len: u32 = prompt.len() as u32 + k - 1;
+
+    let mut committed: Vec<u32> = prompt.clone();
+    committed.push(seed0 as u32);
+    let mut seed = seed0;
+    let mut draft = draft0;
+    let mut accepted_lengths: Vec<usize> = Vec::new();
+    let mut generated: u32 = 1;
+
+    // North-star spec-decode loop: verify the embedded drafts against the
+    // target → commit the [k+1] tail (accepted + bonus) → take the fresh
+    // native-MTP drafts as the NEXT window's proposals → repeat.
+    while generated < MAX_TOKENS {
+        let (commit, drafts) =
+            verify_window(&ws, &rs, &pipeline, k, seed, &draft, seq_len, max_pages).await?;
+        let clen = committed_len(&commit); // n_acc accepted + 1 bonus (≥ 1)
+        seq_len += clen as u32;
+        let n_acc = clen.saturating_sub(1);
+        accepted_lengths.push(n_acc);
+        let commit_toks: Vec<u32> = commit.iter().take(clen).map(|&t| t as u32).collect();
+        committed.extend(&commit_toks);
+        generated += clen.max(1) as u32;
+
+        draft = drafts;
+        seed = *committed.last().unwrap_or(&0) as i32;
+    }
+    // Every window's takes have drained: this close cancels nothing.
+    pipeline.close();
+
+    let total_acc: usize = accepted_lengths.iter().sum();
+    let steps = accepted_lengths.len();
+    let mean_acc = if steps > 0 {
+        total_acc as f64 / steps as f64
+    } else {
+        0.0
+    };
+    let result = format!(
+        "mtp-native-verify: k={k} steps={steps} accepted_lengths={accepted_lengths:?} \
+         mean_accept={mean_acc:.2} committed={} (PTIR-native verify+draft: verify vs embedded \
+         drafts, next-drafts from mtp_logits argmax, [k+1] bonus tail, all traced)",
+        committed.len()
+    );
+    eprintln!("{result}");
+    Ok(result)
+}
