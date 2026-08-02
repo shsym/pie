@@ -85,6 +85,23 @@ struct ModelCapabilities {
     // capture on this plus the fire-side eligibility (pure decode, no
     // hooks/lora/score, window == -2).
     bool supports_supergraph           = false;
+    // Whether `body()` honours `ForwardInputs::logits_argmax_chunk_tokens` and
+    // writes `ws.sampled_tokens` instead of `ws.logits` when it is set
+    // (§20.37). Most families ignore the field, so the default must be false:
+    // the driver commits the epilogue's token source before the forward runs,
+    // and a family that quietly materialised logits anyway would leave the
+    // epilogue publishing uninitialised memory as token ids.
+    bool supports_fused_lm_head_argmax = false;
+    // Whether the boot-time graph lattice (synthetic geometry: one shared
+    // page, kv_len=1) may pre-capture this deployment's decode buckets.
+    // On plan-free force_prefill deployments (GQA ratio keeps the decode
+    // kernel out; decode rides BatchPrefill) the capture-time attention
+    // launch is configured for the synthetic shape and REPLAYS ~700x slow
+    // against real geometry (7.2 ms/layer measured on Qwen2.5-14B/L40S —
+    // the "bimodal collapse", dev_merge_playbook.md). First-use capture
+    // with real metadata is correct — the nemotron_h precedent, declared
+    // as a capability instead of a name check.
+    bool upfront_capture_safe          = true;
 };
 
 // Polymorphic per-model interface. Implementations hold refs to per-arch
@@ -152,6 +169,19 @@ public:
     // dispatch against. Defaults to the plain layout for models without a
     // supergraph build.
     virtual std::uint32_t supergraph_graph_layout() { return graph_layout(); }
+
+    // Optional: whether the fire just planned by `prepare` carries a PREFILL
+    // whose dispatch has content-independent launch geometry, i.e. one the
+    // batch engine may capture and replay.
+    //
+    // `forward_graph_replay_eligible` gates on `is_pure_decode`, so a wave with
+    // a single arriving request loses replay for all of its decode lanes too --
+    // measured at 7.3 ms of host enqueue against 10 us for the same width when
+    // pure (see the campaign notes). The planner already computes the answer
+    // per fire (`PrefillPlanCache::graph_capturable`); this is the vtable seam
+    // that lets the gate read it. Default false keeps every arch that has not
+    // opted in on exactly the old path.
+    virtual bool prefill_graph_capturable() const { return false; }
 
     virtual bool encode_media(const MediaEncodeInputs&, cudaStream_t) { return false; }
 

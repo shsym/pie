@@ -248,6 +248,14 @@ struct HfConfig {
     // standard `num_key_value_heads` and have their own v_proj.
     bool gemma4_attention_k_eq_v = false;
     int  gemma4_num_global_key_value_heads = 0;
+    // Two more Gemma-4 keys this driver does not read, carried because
+    // `pie.model/1` is generated from this struct and the Metal driver does
+    // read them: the full-attention head width (sliding layers use `head_dim`)
+    // and whether the MLP is double-wide. Without them a Metal artifact would
+    // have to fall back to `config.json` for the whole family, which is the
+    // half-normalized state the descriptor exists to avoid.
+    int  gemma4_global_head_dim = 0;
+    bool gemma4_double_wide_mlp = false;
 
     // GPT-OSS-specific knobs. Inert on every other model.
     //   * `swiglu_limit` — clipping threshold applied to gate values
@@ -396,6 +404,51 @@ struct HfConfig {
     std::vector<int>   gemma3n_per_layer_intermediate;
     std::vector<float> gemma3n_activation_sparsity;
 
+    // ── Kimi-K3 (hybrid KDA / MLA-NoPE + LatentMoE + AttnRes) ───────
+    // K3 wraps a `kimi_linear` text tower in a `kimi_k3` multimodal
+    // shell. `layer_types` holds "linear_attention" (KDA) or
+    // "full_attention" (MLA) per layer, rebuilt from the config's
+    // **1-indexed** `linear_attn_config.kda_layers` / `full_attn_layers`.
+    // Everything here is zero/false on every other architecture.
+    //
+    // KDA reuses the `linear_*` dimensions above (96 heads x 128, conv 4).
+    // `kda_gate_lower_bound` switches the decay gate from the softplus form
+    // to `bound * sigmoid(exp(A_log) * (g + dt_bias))`, which is what K3
+    // ships; `kda_full_rank_gate` says the output gate is a single
+    // `g_proj` rather than the low-rank `g_a_proj`/`g_b_proj` pair.
+    float kda_gate_lower_bound = 0.f;   // -5.0 on K3 (0 => unbounded/softplus)
+    bool  kda_full_rank_gate = false;
+
+    // MLA without any rotation: the `qk_rope_head_dim` halves are still
+    // projected and concatenated (the key half shared MQA-style) but never
+    // rotated. `mla_output_gate` adds `sigmoid(g_proj(x))` on the attention
+    // output before `o_proj`.
+    bool  mla_use_nope = false;
+    bool  mla_output_gate = false;
+
+    // Stable LatentMoE: routed experts run at `routed_expert_hidden_size`
+    // instead of `hidden_size`, reached through `routed_expert_down_proj`
+    // and returned through `routed_expert_up_proj`, with an optional
+    // RMSNorm between them. Zero => the experts run at full width.
+    int   routed_expert_hidden_size = 0;
+    bool  latent_moe_use_norm = false;
+
+    // AttnRes: a new residual block is opened every `attn_res_block_size`
+    // layers and every sub-block blends the running sum with the stack of
+    // open blocks through a softmax. Zero => no attention residuals.
+    int   attn_res_block_size = 0;
+
+    // SiTU activation (`hidden_act == "situ"`):
+    //   situ(gate, up) = beta*tanh(gate/beta)*sigmoid(gate)
+    //                    * linear_beta*tanh(up/linear_beta)
+    // `situ_linear_beta <= 0` leaves `up` untransformed.
+    float situ_beta = 0.f;
+    float situ_linear_beta = 0.f;
+
+    // Router activation for grouped top-k ("sigmoid" on K3, "softmax"
+    // elsewhere) and whether the selected weights are renormalised.
+    std::string moe_router_activation_func;
+
     // ── GLM-5.1 DSA (Differential Sparse Attention) indexer ────────
     // Per-layer indexer selects top-k tokens for sparse attention.
     // Zero/empty on non-GLM models.
@@ -480,7 +533,15 @@ struct HfConfig {
     int qwen3_vl_vision_end_token_id = -1;
 };
 
-// Parse `<snapshot_dir>/config.json`. Throws on missing required fields.
-HfConfig parse_hf_config(const std::filesystem::path& path);
+// `parse_hf_config` used to be declared here, and `config.cpp` was its 855-line
+// implementation. Both are gone: `config.json` is normalized once, in Rust, at
+// import (or by the worker for a plain snapshot), and what a driver reads is
+// the `pie.model/1` descriptor — see `model/descriptor.hpp`.
+//
+// This header stays because the struct above is the *schema*, not the parser.
+// Three things generate from it: `descriptor.cpp` (the reader),
+// `model/config/src/schema.rs` (the Rust normalizer's output type), and
+// the golden dumper in `tests/hf_config_dump/`. Adding a field here is still
+// how a new fact reaches the driver; deriving it from raw HF JSON is not.
 
 }  // namespace pie_cuda_driver

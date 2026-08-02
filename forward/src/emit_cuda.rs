@@ -234,6 +234,23 @@ fn emit_class_fn(
         b.line("            \"depth union (generated): planned split without \"");
         b.line("            \"a usable prefix plan (gate drift)\");");
         b.line("    }");
+        b.line("    // ④ Act 1 (banded depth): >= 2 distinct-k bands from the");
+        b.line("    // prepare's stamp; per-layer scopes below resolve the");
+        b.line("    // band containing their static layer. Banded fires");
+        b.line("    // derive max_layers FULL, so the union logic stays idle.");
+        b.line("    const int band_count =");
+        b.line("        static_cast<int>(plan_state.depth_band_count);");
+        b.line("    const bool depth_banded = band_count >= 2;");
+        b.line("    if (depth_banded) {");
+        b.line("        for (int j = 0; j < band_count; ++j) {");
+        b.line("            if (plan_state.depth_band_rows[j] > 0 &&");
+        b.line("                !plan_state.depth_band_plans[j]) {");
+        b.line("                throw std::runtime_error(");
+        b.line("                    \"depth bands (generated): stamped band \"");
+        b.line("                    \"without a usable prefix plan\");");
+        b.line("            }");
+        b.line("        }");
+        b.line("    }");
     }
     b.line("    const int H = cfg.hidden_size;");
     b.line("    const int Hq = cfg.num_attention_heads * cfg.head_dim;");
@@ -503,17 +520,36 @@ fn emit_range_scoped(
             if cur_layer.is_some() {
                 close_scope(b);
             }
-            if let Some(l) = op.layer {
+            if let Some(l) = op.layer.filter(|_| plan.depth_windowed(op)) {
                 b.stmt("{");
                 b.stmt(&format!(
                     "const bool depth_tail = depth_k <= {l};"
                 ));
-                b.stmt("if (!depth_tail || depth_union) {");
+                // ④ banded: resolve this static layer's band (deepest
+                // first — the first band whose k the layer reached).
+                b.stmt("int band_j = -1; int band_live = total_tokens;");
+                b.stmt("if (depth_banded) {");
+                b.stmt("    for (int j = 0; j < band_count; ++j) {");
+                b.stmt(&format!(
+                    "        if ({l} >= static_cast<int>(plan_state.depth_band_k[j])) {{"
+                ));
+                b.stmt("            band_live = static_cast<int>(");
+                b.stmt("                plan_state.depth_band_rows[j]);");
+                b.stmt("            band_j = j;");
+                b.stmt("            break;");
+                b.stmt("        }");
+                b.stmt("    }");
+                b.stmt("    if (band_live == total_tokens) band_j = -1;");
+                b.stmt("}");
+                b.stmt("(void)band_j;");
                 b.stmt(
-                    "const int N = depth_tail ? depth_split : total_tokens;",
+                    "if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {",
                 );
                 b.stmt(
-                    "const int R = depth_tail ? depth_split : num_requests;",
+                    "const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);",
+                );
+                b.stmt(
+                    "const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);",
                 );
                 b.stmt("(void)N; (void)R;");
             }
@@ -847,38 +883,38 @@ fn emit_op(
                     } else {
                         "ws.norm_y.data()"
                     };
-                    // The binding dispatch, transliterated: fused when the
-                    // deployment materialised the packed weight AND the
-                    // workspace carries the buffer (the interpreter's
-                    // `gate_up_used_fused`, which the Swiglu right after
-                    // this reads — emitted as one combined block there).
-                    b.stmt(&format!(
-                        "const bool gate_up_fused_{layer} ="
-                    ));
-                    b.stmt(&format!(
-                        "    w.layers[{layer}].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();"
-                    ));
-                    b.stmt(&format!("if (gate_up_fused_{layer}) {{"));
-                    b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt(&format!("        {mlp_in},"));
-                    b.stmt(&format!(
-                        "        ops::WeightView(*w.layers[{layer}].gate_up_proj_fused),"
-                    ));
-                    b.stmt("        ws.gate_up_fused.data(), N, 2 * I, H);");
-                    b.stmt("} else {");
-                    b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt(&format!("        {mlp_in},"));
-                    b.stmt(&format!(
-                        "        make_weight_view(require(w.layers[{layer}].gate_proj, \"{weight}\"), w.layers[{layer}].gate_proj_quant),"
-                    ));
-                    b.stmt("        ws.gate.data(), N, I, H);");
-                    b.stmt("    ops::gemm_act_x_w(cublas.handle(),");
-                    b.stmt(&format!("        {mlp_in},"));
-                    b.stmt(&format!(
-                        "        make_weight_view(require(w.layers[{layer}].up_proj, \"{weight}\"), w.layers[{layer}].up_proj_quant),"
-                    ));
-                    b.stmt("        ws.up.data(), N, I, H);");
-                    b.stmt("}");
+                    // The binding dispatch, RESOLVED — not transliterated.
+                    // It used to be a per-layer `const bool ... != nullptr
+                    // && !ws.gate_up_fused.empty()` and an `if` around
+                    // both GEMM forms, in a file whose whole point is that
+                    // this deployment's choices are already made. The
+                    // second term was always true (`workspace.cpp`
+                    // allocates that buffer unconditionally), and the
+                    // first is the load-time fact the trace now carries,
+                    // so only the taken branch is emitted. The `require`
+                    // on the unfused side is what refuses a binding that
+                    // disagrees with the fact.
+                    if cuda.gate_up_fused {
+                        b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                        b.stmt(&format!("    {mlp_in},"));
+                        b.stmt(&format!(
+                            "    ops::WeightView(*require(w.layers[{layer}].gate_up_proj_fused, \"{weight}\")),"
+                        ));
+                        b.stmt("    ws.gate_up_fused.data(), N, 2 * I, H);");
+                    } else {
+                        b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                        b.stmt(&format!("    {mlp_in},"));
+                        b.stmt(&format!(
+                            "    make_weight_view(require(w.layers[{layer}].gate_proj, \"{weight}\"), w.layers[{layer}].gate_proj_quant),"
+                        ));
+                        b.stmt("    ws.gate.data(), N, I, H);");
+                        b.stmt("ops::gemm_act_x_w(cublas.handle(),");
+                        b.stmt(&format!("    {mlp_in},"));
+                        b.stmt(&format!(
+                            "    make_weight_view(require(w.layers[{layer}].up_proj, \"{weight}\"), w.layers[{layer}].up_proj_quant),"
+                        ));
+                        b.stmt("    ws.up.data(), N, I, H);");
+                    }
                 }
                 ("down", true) => {
                     b.stmt("ops::gemm_act_x_w(cublas.handle(),");
@@ -1005,22 +1041,15 @@ fn emit_op(
             b.stmt("    }");
             b.stmt("}");
         }
-        OpKind::Swiglu { .. } => {
-            // Paired with the gate_up binding dispatch emitted just above;
-            // the flag name carries the layer, so nested blocks stay
-            // scope-correct in the unrolled file.
-            let layer = op
-                .layer
-                .expect("swiglu is a layer op in every llama_like trace");
-            b.stmt(&format!("if (gate_up_fused_{layer}) {{"));
-            b.stmt("    kernels::launch_chunked_swiglu_bf16(");
-            b.stmt("        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);");
-            b.stmt("} else {");
-            b.stmt("    kernels::launch_swiglu_bf16(");
-            b.stmt("        ws.gate.data(), ws.up.data(), ws.gate.data(),");
-            b.stmt("        N * I, stream);");
-            b.stmt("}");
-        }
+        // The semantic kind cannot reach a lowered cuda text — the
+        // activation states its kernel (`dsl::cuda::swiglu`), so this
+        // emission would be drift between the declaration and the file
+        // generated from it. Same refusal the executor makes for the
+        // semantic `Attention` and `KvAppend`.
+        OpKind::Swiglu { .. } => panic!(
+            "emitter: semantic Swiglu in a cuda class trace \
+             (the declaration states the activation kernel)"
+        ),
         OpKind::LmHead { weight } => {
             let member = match weight.as_str() {
                 "embed" => "w.embed",
@@ -1141,9 +1170,15 @@ fn emit_masked_pages_bracket(b: &mut Body, layer: u32, takes_paged_decode: bool)
         b.stmt("            \"attn_page_mask requires a page-count-independent \"");
         b.stmt("            \"decode plan; this fire planned split-KV\");");
         b.stmt("    }");
+        // `num_requests`, NOT the layer scope's depth-narrowed `R`: the
+        // mask sink is carved once for the FIRE, so its compaction is a
+        // fire-wide operation and a tail layer's live-row count makes
+        // `FirePageMask::compact` refuse. A narrowed layer then reads a
+        // PREFIX of the compacted CSR, which is exactly its rows — the
+        // seriation keeps live rows first and `indptr` is prefix-summed.
         b.stmt("    page_mask.compact(");
         b.stmt("        kv_page_indices, kv_page_indptr, kv_last_page_lens,");
-        b.stmt("        static_cast<std::uint32_t>(R), stream);");
+        b.stmt("        static_cast<std::uint32_t>(num_requests), stream);");
         b.stmt("    attn_page_indices = page_mask.page_indices();");
         b.stmt("    attn_page_indptr = page_mask.page_indptr();");
         b.stmt("    attn_last_page_lens = page_mask.last_page_lens();");
@@ -1194,6 +1229,25 @@ fn emit_launch(
         }
     };
     match kernel {
+        // The MLP activation, no longer a per-layer `if` in the emitted
+        // file: the binding decided this at load and the trace states
+        // which spelling. The output is the traced value's slot — the
+        // island `arm_swiglu` already stood on.
+        // The MLP activation, no longer a per-layer `if` in the emitted
+        // file: the binding decided this at load and the trace states
+        // which spelling. The destination stays this family's `ws.gate`
+        // convention, character for character what the `OpKind::Swiglu`
+        // emission wrote — the island moves when the down_proj that
+        // reads it moves, not before.
+        "launch_chunked_swiglu_bf16" => {
+            b.stmt("kernels::launch_chunked_swiglu_bf16(");
+            b.stmt("    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);");
+        }
+        "launch_swiglu_bf16" => {
+            b.stmt("kernels::launch_swiglu_bf16(");
+            b.stmt("    ws.gate.data(), ws.up.data(), ws.gate.data(),");
+            b.stmt("    N * I, stream);");
+        }
         "launch_rope_standard_table" => {
             b.stmt("if (ws.rope_table.empty()) {");
             b.stmt("    throw std::runtime_error(");
@@ -1508,6 +1562,42 @@ fn emit_launch(
             b.stmt("        kv_last_page_lens,");
             b.stmt("        attn_ws, stream, /*logits_soft_cap=*/0.f,");
             b.stmt(&format!("        {scale});"));
+            if win == Some(Win::MaskPrefix) {
+                // NO-DEMOTION (3-way, generated leg): when prepare armed
+                // the middle decode plan, the causal above was re-planned
+                // to the prefill lanes — the plain-decode middle takes
+                // the decode kernel (the interpreter's launch verbatim).
+                b.stmt("    if (plan_state.mixed_mid_decode_plan &&");
+                b.stmt("        plan_state.mixed_mid_start >= 0) {");
+                b.stmt("        const int mid_P = plan_state.mixed_mid_start;");
+                b.stmt("        const int mid_row =");
+                b.stmt("            static_cast<int>(qo_indptr_h[mid_P]);");
+                b.stmt("        const int mid_wl =");
+                b.stmt("            (!fwd_cfg.per_layer_window_left.empty() &&");
+                b.stmt(&format!(
+                    "             {layer} < static_cast<int>(fwd_cfg.per_layer_window_left.size()))"
+                ));
+                b.stmt(&format!(
+                    "                ? fwd_cfg.per_layer_window_left[{layer}]"
+                ));
+                b.stmt("                : fwd_cfg.sliding_window;");
+                b.stmt("        ops::dispatch_attention_flashinfer_decode(");
+                b.stmt("            *plan_state.mixed_mid_decode_plan,");
+                b.stmt(&format!(
+                    "            bf16_row({q_buf}, mid_row, Hq), kv_view,"
+                ));
+                b.stmt(&format!(
+                    "            bf16_row({out_buf}, mid_row, Hq),"
+                ));
+                b.stmt("            kv_page_indices,");
+                b.stmt("            kv_page_indptr + mid_P,");
+                b.stmt("            kv_last_page_lens + mid_P,");
+                b.stmt("            attn_ws, stream, mid_wl,");
+                b.stmt(&format!(
+                    "            /*logits_soft_cap=*/0.f, {scale});"
+                ));
+                b.stmt("    }");
+            }
             strip(b);
             b.stmt("}");
         }
@@ -1560,12 +1650,17 @@ fn emit_launch(
             // Per-layer window resolution is RUNTIME cfg reads
             // (per_layer_window_left / sliding_window) — placement-
             // independent, so post-norm deployments emit it unchanged.
-            if depth_active {
-                // STRUCTURAL S-4: a depth-tail layer's attention pairs
-                // the PREFIX plan with its dedicated workspace (the
-                // plan/workspace pairing rule); `depth_tail` is the
-                // enclosing layer scope's static-L bool.
-                b.stmt("const ops::DecodePlanCache* depth_dp = depth_tail");
+            if depth_active
+                && op.layer.is_some()
+                && crate::kernels::sig(kernel).is_some_and(|k| k.depth_prefix_plan)
+            {
+                // The KERNEL says this launch swaps to the prefix plan
+                // on union tail layers (migration step 5: the fact left
+                // the per-op wire word and joined the kernel table,
+                // where it was always a property of).
+                b.stmt("const ops::DecodePlanCache* depth_dp = band_j >= 0");
+                b.stmt("    ? plan_state.depth_band_plans[band_j].get()");
+                b.stmt("    : depth_tail");
                 b.stmt("    ? plan_state.depth_prefix_decode_plan.get()");
                 b.stmt("    : plan_state.decode_plan.get();");
                 b.stmt("if (depth_dp == nullptr) {");
@@ -1602,7 +1697,8 @@ fn emit_launch(
                 b.stmt(&format!("        {q_buf}, kv_view, {out_buf},"));
                 b.stmt("        attn_page_indices, attn_page_indptr,");
                 b.stmt("        attn_last_page_lens,");
-                b.stmt("        depth_tail ? spatial_suffix_attn_ws() : attn_ws,");
+                b.stmt("        band_j >= 0 ? depth_band_attn_ws_public(band_j)");
+                b.stmt("        : depth_tail ? spatial_suffix_attn_ws() : attn_ws,");
                 b.stmt("        stream, layer_window_left,");
                 b.stmt(&format!(
                     "        /*logits_soft_cap=*/0.f, {scale});"
@@ -1663,11 +1759,7 @@ fn emit_launch(
                     // the mixed/prefill class into the dedicated
                     // suffix workspace (its prefix causal plan owns
                     // attn_ws).
-                    let ws = if is_decode {
-                        "attn_ws"
-                    } else {
-                        "spatial_suffix_attn_ws()"
-                    };
+                    let ws = "spatial_suffix_attn_ws()";
                     b.stmt("    ops::dispatch_attention_flashinfer_prefill_custom(");
                     b.stmt(&format!("        *{plan_cache},"));
                     b.stmt(&format!(

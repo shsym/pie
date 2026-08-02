@@ -20,7 +20,7 @@
 //! glue is bypassed entirely, the table's clone is the only reference left
 //! and ITS `Drop` performs the release — the process-teardown fallback.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use super::page_table::WorkingSetId;
@@ -218,6 +218,10 @@ pub struct KvWorkingSet {
     pub id: WorkingSetId,
     /// Tokens per KV page (cached from the store registry at construction).
     pub page_size: u32,
+    /// Lock-free mirror of this WorkingSet's logical page extent. Read it
+    /// through [`Self::page_len`]; see `WorkingSetEntry::page_len_mirror`
+    /// for why the locked read was worth removing.
+    page_len: Arc<AtomicU64>,
     translation: Arc<crate::store::kv::KvTranslation>,
     lifecycle: Arc<KvLifecycle>,
 }
@@ -238,16 +242,21 @@ impl KvWorkingSet {
         pipeline_scope: Option<crate::store::PipelineScope>,
     ) -> Self {
         let stores = crate::store::registry::get(model, driver as usize);
-        let translation =
+        let (translation, page_len) =
             crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-                kv.translation(id)
-                    .expect("new working set has a translation state")
+                (
+                    kv.translation(id)
+                        .expect("new working set has a translation state"),
+                    kv.page_len_mirror(id)
+                        .expect("new working set has a page-length mirror"),
+                )
             });
         KvWorkingSet {
             model,
             driver,
             id,
             page_size,
+            page_len,
             translation,
             lifecycle: Arc::new(KvLifecycle {
                 released: AtomicBool::new(false),
@@ -263,6 +272,21 @@ impl KvWorkingSet {
         }
     }
 
+    /// This WorkingSet's logical page extent, read WITHOUT the global KV
+    /// mutex.
+    ///
+    /// The extent moves only under this process's own `reserve`, adoption,
+    /// and `drop`/`discard` — the residency planner relocates physical
+    /// backings and leaves it alone — so the reader never races its own
+    /// writer and an `Acquire` load pairs with the `Release` store made
+    /// under the mutex the writer just left.
+    pub fn page_len(&self) -> Result<u64, crate::store::kv::KvTableError> {
+        match self.page_len.load(Ordering::Acquire) {
+            u64::MAX => Err(crate::store::kv::KvTableError::UnknownWorkingSet),
+            page_len => Ok(page_len),
+        }
+    }
+
     pub fn forked(&self, id: WorkingSetId) -> Self {
         let scope = self.lifecycle.pipeline_scope.lock().unwrap().clone();
         Self::new_with_scope(self.model, self.driver, id, self.page_size, scope)
@@ -275,6 +299,17 @@ impl KvWorkingSet {
         let mut owner = self.lifecycle.pipeline_scope.lock().unwrap();
         match owner.as_ref() {
             Some(existing) if existing.id() == scope.id() => Ok(()),
+            // Succession, on exactly the RS rule (`rs::WorkingSet`): a scope
+            // that is closed AND drained has no fire left that could still
+            // reference this mapping, so handing the working set to a live
+            // pipeline races with nothing. Without this a context is
+            // single-use — the guest's second `generate` on the same pool
+            // opens a new pipeline (one per generate) and would be refused,
+            // which is every multi-turn conversation.
+            Some(existing) if !scope.is_closed() && existing.is_releasable() => {
+                *owner = Some(scope.clone());
+                Ok(())
+            }
             Some(existing) => Err(existing.id()),
             None if scope.is_closed() => Err(scope.id()),
             None => {
@@ -358,8 +393,7 @@ mod tests {
             })
             .collect();
         let (seq, intents) = kv.publish_prepared(prepared, &commits).unwrap();
-        kv.settle(intents, true);
-        kv.retire_through(seq);
+        kv.settle(seq, intents, true);
     }
 
     #[test]
@@ -454,7 +488,11 @@ mod tests {
         let stores = registry::get(model, 0);
         let parent_id = stores.kv.lock().create_working_set();
         commit_fresh_pages(model, parent_id, 2, 1);
-        let child_id = stores.kv.lock().fork(parent_id).unwrap();
+        let child_id = stores
+            .kv
+            .lock()
+            .fork(parent_id, Default::default())
+            .unwrap();
 
         let parent = KvWorkingSet::new(model, 0, parent_id, 16);
         let child = KvWorkingSet::new(model, 0, child_id, 16);
@@ -476,21 +514,38 @@ mod tests {
     }
 
     #[test]
-    fn pipeline_scope_is_permanent_and_inherited_by_forks() {
+    fn pipeline_scope_succeeds_only_once_drained_and_is_inherited_by_forks() {
         let model = fresh_model(4);
         let stores = registry::get(model, 0);
         let parent_id = stores.kv.lock().create_working_set();
-        let child_id = stores.kv.lock().fork(parent_id).unwrap();
+        let child_id = stores
+            .kv
+            .lock()
+            .fork(parent_id, Default::default())
+            .unwrap();
         let parent = KvWorkingSet::new(model, 0, parent_id, 16);
-        let first = crate::store::PipelineScope::new(|| true);
+        let drained = Arc::new(AtomicBool::new(false));
+        let drained_probe = Arc::clone(&drained);
+        let first = crate::store::PipelineScope::new(move || drained_probe.load(Ordering::Acquire));
         let second = crate::store::PipelineScope::new(|| true);
 
         parent.claim_pipeline_scope(&first).unwrap();
+        // A live scope owns the mapping outright.
+        assert_eq!(parent.claim_pipeline_scope(&second), Err(first.id()));
         first.close();
+        // Closed is not enough: a fire of the old pipeline may still be in
+        // flight against this mapping.
         assert_eq!(parent.claim_pipeline_scope(&second), Err(first.id()));
 
+        // Drained: the working set is reusable, which is what lets a guest
+        // run a second `generate` (a new pipeline) on the same context.
+        drained.store(true, Ordering::Release);
+        assert_eq!(parent.claim_pipeline_scope(&second), Ok(()));
+
+        // A fork inherits the parent's current scope rather than starting free.
         let child = parent.forked(child_id);
-        assert_eq!(child.claim_pipeline_scope(&second), Err(first.id()));
+        let third = crate::store::PipelineScope::new(|| true);
+        assert_eq!(child.claim_pipeline_scope(&third), Err(second.id()));
         child.release();
         parent.release();
     }

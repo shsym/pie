@@ -16,9 +16,9 @@ pub(crate) use ctx::OutputMode;
 pub use ctx::ProcessCtx;
 pub(crate) use residency::ProcessResidency;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -35,6 +35,82 @@ use crate::service::{ServiceHandler, ServiceMap};
 
 use super::linker;
 use super::program::ProgramName;
+
+/// The versioned component export every inferlet provides. wasmtime's export
+/// name map is semver-aware, so this must be the EXACT package version declared
+/// in `interface/inferlet/world.wit` — an unversioned or stale-versioned lookup
+/// silently finds nothing and every program fails to start. Kept honest by
+/// `tests::run_interface_version_matches_wit`.
+const RUN_INTERFACE: &str = "pie:inferlet/run@0.3.0";
+
+/// Processes whose guest called `system.declare-restartable`, and the ones
+/// the planner has since asked to restart.
+///
+/// Two sets rather than one flag on the actor because both are read from
+/// outside the actor's mailbox: the planner picks a starvation victim while
+/// holding neither the process lock nor the actor, and it must know *before*
+/// it destroys an allocation whether that destruction is recoverable.
+static RESTARTABLE: LazyLock<RwLock<HashSet<ProcessId>>> = LazyLock::new(Default::default);
+static RESTART_REQUESTED: LazyLock<RwLock<HashSet<ProcessId>>> = LazyLock::new(Default::default);
+
+/// The guest declared this run re-runnable (`system.declare-restartable`).
+pub(crate) fn declare_restartable(process_id: ProcessId) {
+    RESTARTABLE.write().unwrap().insert(process_id);
+}
+
+pub(crate) fn is_restartable(process_id: ProcessId) -> bool {
+    RESTARTABLE.read().unwrap().contains(&process_id)
+}
+
+/// Ask that `process_id` be re-run from the beginning once it unwinds,
+/// instead of its failure being delivered to the caller. Returns false if
+/// the process never declared itself restartable, in which case the caller
+/// must fall back to failing it loud.
+pub(crate) fn request_restart(process_id: ProcessId) -> bool {
+    if !is_restartable(process_id) {
+        return false;
+    }
+    RESTART_REQUESTED.write().unwrap().insert(process_id);
+    true
+}
+
+/// Original (client-facing) process id -> the live process currently running
+/// that work, for requests that have been restarted.
+///
+/// A restart cannot reuse the process id: the schedulers keep a terminate
+/// tombstone for a retiring pid until its quiesce lands, so a reused id would
+/// have the re-run's fires rejected by its predecessor's tombstone. The
+/// re-run therefore gets a fresh internal id and inherits only the *external*
+/// one, which is all a client ever sees.
+static RESTART_ALIAS: LazyLock<RwLock<HashMap<ProcessId, ProcessId>>> =
+    LazyLock::new(Default::default);
+
+/// Map a client-supplied process id onto the process that is currently
+/// running that work. The identity for anything that never restarted.
+pub fn resolve(process_id: ProcessId) -> ProcessId {
+    RESTART_ALIAS
+        .read()
+        .unwrap()
+        .get(&process_id)
+        .copied()
+        .unwrap_or(process_id)
+}
+
+fn restart_requested(process_id: ProcessId) -> bool {
+    RESTART_REQUESTED.read().unwrap().contains(&process_id)
+}
+
+fn forget_restart_state(process_id: ProcessId) {
+    RESTARTABLE.write().unwrap().remove(&process_id);
+    RESTART_REQUESTED.write().unwrap().remove(&process_id);
+}
+
+/// Number of restarts honoured since boot; surfaced by the metrics probe.
+static RESTART_TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+pub fn restart_total() -> usize {
+    RESTART_TOTAL.load(Relaxed)
+}
 
 // =============================================================================
 // ProcessEvent
@@ -117,6 +193,15 @@ static EXECUTION_SLOT_CAPACITY: OnceLock<Option<usize>> = OnceLock::new();
 
 pub(crate) fn execution_slot_capacity() -> Option<usize> {
     EXECUTION_SLOT_CAPACITY.get().copied().flatten()
+}
+
+/// Processes currently registered — i.e. guests that may still submit.
+///
+/// The quiesce test for `crate::scheduler::reconfigure`: the batching knobs
+/// include one a guest has already been told (`model.frame-size()`), so they
+/// can only move when there is no guest holding the old answer.
+pub fn live_count() -> usize {
+    SERVICES.len()
 }
 
 /// The calling thread's OS id, for correlating timing records across threads.
@@ -303,6 +388,24 @@ pub fn init_admission(max_concurrent: Option<usize>) {
         .expect("prewarm admission controller already initialized");
 }
 
+/// RAII membership in the execution-admission FIFO. The frame policy mirrors
+/// this queue so its successor earmark is a named process rather than a
+/// count; see [`FramePolicy::is_joining`].
+struct AdmissionQueued(ProcessId);
+
+impl AdmissionQueued {
+    fn enter(pid: ProcessId) -> Self {
+        crate::scheduler::worker::notify_admission_queued(pid);
+        Self(pid)
+    }
+}
+
+impl Drop for AdmissionQueued {
+    fn drop(&mut self) {
+        crate::scheduler::worker::notify_admission_dequeued(self.0);
+    }
+}
+
 pub(crate) fn execution_admission_is_capped() -> bool {
     ADMISSION.get().is_some_and(Option::is_some)
 }
@@ -415,7 +518,6 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     // conveyor only buys the next arrival the right to instantiate work
     // nothing is waiting for. The conveyor is one cohort wide, so a
     // turnover still hands its whole successor cohort through in one go.
-    let started = Instant::now();
     let permit = match BIND_ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => Some(
             Arc::clone(semaphore)
@@ -427,16 +529,6 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
     };
     ctx.release_prewarm_permit();
     ctx.admit_bind(permit);
-    if crate::scheduler::fire_timing_enabled() {
-        crate::scheduler::fire_timing_write(&serde_json::json!({
-            "schema": 1,
-            "source": "runtime",
-            "event": "process_bind_admitted",
-            "process_id": ctx.id(),
-            "bind_admitted_us": crate::scheduler::fire_timing_now_us(),
-            "bind_admission_wait_us": duration_us(started.elapsed()),
-        }));
-    }
 }
 
 /// Strict-admission gate: acquire the execution permit lazily at fire
@@ -444,7 +536,6 @@ pub(crate) async fn ensure_bind_admitted(ctx: &mut ProcessCtx) {
 /// same order everywhere: bind, then execution — permits are only ever
 /// acquired in that order, so the two gates cannot deadlock).
 pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
-    let entered = Instant::now();
     ensure_bind_admitted(ctx).await;
     if ctx.execution_admitted() {
         return;
@@ -452,6 +543,15 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
     let started = Instant::now();
     let permit = match ADMISSION.get().and_then(|value| value.as_ref()) {
         Some(semaphore) => {
+            // Announce the wait BEFORE blocking on it. `tokio::Semaphore` is
+            // FIFO-fair, so a process queued here is the identified taker of
+            // a slot that is free or about to be: the frame seal can name
+            // whom it is holding for instead of inferring it from "some slot
+            // is free" AND "some process is staged", which pairs nobody with
+            // nobody and is permanently true once the pool is oversubscribed.
+            // Dropped on cancellation too, so a process that goes away while
+            // queued stops being earmarked.
+            let _queued = AdmissionQueued::enter(ctx.id());
             let permit = Arc::clone(semaphore)
                 .acquire_owned()
                 .await
@@ -465,36 +565,20 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
             // policy's slot balance must see each consumed permit whether it
             // came from a retirement or the initial pool (the semaphore
             // launders them together); the notification precedes the first
-            // fire on this same task, so the frame seal waits for exactly
-            // this lane's join instead of sealing a narrow boundary epoch.
+            // fire on this same task, so the policy sees consume-then-fire
+            // and can name this lane as the join that is in flight.
             crate::scheduler::worker::notify_execution_slot_consumed(ctx.id());
             Some(permit)
         }
         None => None,
     };
-    let sem_done = Instant::now();
     ctx.admit_execution(permit, duration_us(started.elapsed()));
     // The planner registers at spawn (registration order is the FCFS clock),
     // but only from here on can this process hold pooled pages. Its wedge
     // predicate needs that distinction: an unadmitted process is neither
     // running nor able to free anything.
-    let note_started = Instant::now();
     if let Some(planner) = crate::planner::planner() {
         planner.note_admitted(ctx.id());
-    }
-    if crate::scheduler::fire_timing_enabled() {
-        crate::scheduler::fire_timing_write(&serde_json::json!({
-            "schema": 1,
-            "source": "runtime",
-            "event": "process_admitted",
-            "process_id": ctx.id(),
-            "admitted_us": crate::scheduler::fire_timing_now_us(),
-            "admission_wait_us": ctx.admission_wait_us(),
-            "bind_wait_us": duration_us(started.duration_since(entered)),
-            "sem_us": duration_us(sem_done.duration_since(started)),
-            "note_us": duration_us(note_started.elapsed()),
-            "tid": os_thread_id(),
-        }));
     }
 }
 
@@ -507,22 +591,46 @@ pub fn spawn(
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
 ) -> Result<ProcessId> {
+    spawn_inner(
+        username,
+        program_name,
+        input,
+        client_id,
+        capture_outputs,
+        Arc::new(Mutex::new(result_tx)),
+        None,
+        None,
+    )
+}
+
+/// `inherit_seq` carries a previous process's position in the planner's FCFS
+/// clock across a restart instead of taking a fresh (youngest) one.
+///
+/// Keeping the position is the whole liveness argument. Starvation victims
+/// are chosen youngest-first, so a restart that re-entered as the youngest
+/// process would be re-chosen immediately and forever. Inheriting the
+/// original position means the restarted run ages exactly as it would have,
+/// eventually becomes the queue head, and the head is never a victim.
+fn spawn_inner(
+    username: String,
+    program_name: ProgramName,
+    input: String,
+    client_id: Option<ClientId>,
+    capture_outputs: bool,
+    result_tx: SharedResultTx,
+    inherit_seq: Option<u64>,
+    inherit_client_pid: Option<ProcessId>,
+) -> Result<ProcessId> {
     let id = Uuid::new_v4();
-    if crate::scheduler::fire_timing_enabled() {
-        crate::scheduler::fire_timing_write(&serde_json::json!({
-            "schema": 1,
-            "source": "runtime",
-            "event": "process_spawned",
-            "process_id": id,
-            "spawned_us": crate::scheduler::fire_timing_now_us(),
-            "spawned_unix_us": crate::scheduler::fire_timing_unix_us(),
-        }));
-    }
     if let Some(planner) = crate::planner::planner() {
-        planner.register(id);
+        match inherit_seq {
+            Some(seq) => planner.register_with_seq(id, seq),
+            None => planner.register(id),
+        }
     }
     let process = Process::new(
         id,
+        inherit_client_pid.unwrap_or(id),
         username,
         program_name,
         input,
@@ -542,6 +650,7 @@ pub fn spawn(
 
 /// Attach a client to a process.
 pub async fn attach(process_id: ProcessId, client_id: ClientId) -> Result<()> {
+    let process_id = resolve(process_id);
     let (tx, rx) = oneshot::channel();
     SERVICES.send(
         &process_id,
@@ -555,11 +664,12 @@ pub async fn attach(process_id: ProcessId, client_id: ClientId) -> Result<()> {
 
 /// Detach the current client from a process (fire-and-forget).
 pub fn detach(process_id: ProcessId) {
-    let _ = SERVICES.send(&process_id, Message::DetachClient);
+    let _ = SERVICES.send(&resolve(process_id), Message::DetachClient);
 }
 
 /// Terminate a process (fire-and-forget).
 pub fn terminate(process_id: ProcessId, result: Result<String, String>) {
+    let process_id = resolve(process_id);
     // Early wait-set drop for a LIVE process: the scheduler stops holding
     // waves for this pid immediately instead of at the teardown's own
     // leave. Guarded on registry delivery so a terminate aimed at an
@@ -663,6 +773,10 @@ const OUTPUT_BUFFER_CAP: usize = 4096;
 /// Actor managing a single WASM instance lifecycle.
 struct Process {
     process_id: ProcessId,
+    /// The id this work is known by OUTSIDE the engine. Equal to
+    /// `process_id` except after a restart, where the re-run inherits the
+    /// original so a client's handle keeps resolving to it.
+    client_pid: ProcessId,
     username: String,
     program: ProgramName,
     input: String,
@@ -680,15 +794,14 @@ impl Process {
     /// Creates a new Process, generating a UUID, and spawns its WASM execution task.
     fn new(
         process_id: ProcessId,
+        client_pid: ProcessId,
         username: String,
         program: ProgramName,
         input: String,
         client_id: Option<ClientId>,
         capture_outputs: bool,
-        result_tx: Option<oneshot::Sender<Result<String, String>>>,
+        result_tx: SharedResultTx,
     ) -> Self {
-        let result_tx: SharedResultTx = Arc::new(Mutex::new(result_tx));
-
         let task = Self::run(
             process_id,
             username.clone(),
@@ -697,17 +810,11 @@ impl Process {
             capture_outputs,
             result_tx.clone(),
         );
-        let handle = if crate::scheduler::fire_timing_enabled() {
-            tokio::spawn(crate::scheduler::CpuMetered::new(
-                crate::scheduler::CpuClass::Process,
-                task,
-            ))
-        } else {
-            tokio::spawn(task)
-        };
+        let handle = tokio::spawn(task);
 
         Process {
             process_id,
+            client_pid,
             username,
             program,
             input,
@@ -724,7 +831,7 @@ impl Process {
     fn deliver_event(&mut self, event: ProcessEvent) {
         // Deliver to attached client
         if let Some(client_id) = self.client_id {
-            if server::send_event(client_id, self.process_id, &event).is_err() {
+            if server::send_event(client_id, self.client_pid, &event).is_err() {
                 self.client_id = None;
                 self.buffer_event(event);
             }
@@ -748,7 +855,7 @@ impl Process {
             return;
         };
         while let Some(event) = self.output_buffer.pop_front() {
-            if server::send_event(client_id, self.process_id, &event).is_err() {
+            if server::send_event(client_id, self.client_pid, &event).is_err() {
                 self.client_id = None;
                 self.output_buffer.push_front(event);
                 break;
@@ -770,12 +877,6 @@ impl Process {
         // executes. The REAL concurrency permit is acquired lazily by
         // `ensure_execution_admitted` at the first per-instance driver or
         // pooled-resource operation, and held for the rest of the run.
-        let launch_timing = crate::scheduler::fire_timing_enabled().then(|| {
-            (
-                crate::scheduler::fire_timing_now_us(),
-                crate::scheduler::fire_timing_unix_us(),
-            )
-        });
         let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
             Some(sem) => Some(
                 Arc::clone(sem)
@@ -785,19 +886,6 @@ impl Process {
             ),
             None => None,
         };
-        if let Some((launched_us, launched_unix_us)) = launch_timing {
-            let acquired_us = crate::scheduler::fire_timing_now_us();
-            crate::scheduler::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "runtime",
-                "event": "process_launch",
-                "process_id": process_id,
-                "launched_us": launched_us,
-                "launched_unix_us": launched_unix_us,
-                "prewarm_admitted_us": acquired_us,
-                "prewarm_wait_us": acquired_us.saturating_sub(launched_us),
-            }));
-        }
         let mut admission_wait_us = 0u64;
         let mut instantiate_us = 0u64;
         let context_register_us = 0u64;
@@ -825,7 +913,10 @@ impl Process {
             // unversioned lookup does NOT match a versioned component export in
             // wasmtime's semver-aware name map, so this must track the
             // `pie:inferlet@<version>` package version declared in world.wit.
-            let run_interface = "pie:inferlet/run@0.2.0";
+            // `run_interface_version_matches_wit` pins the two together — the
+            // 0.2.0 -> 0.3.0 bump was missed once and made EVERY inferlet
+            // unloadable, a break only an e2e run could surface.
+            let run_interface = RUN_INTERFACE;
 
             let (_, run_export) = instance
                 .get_export(&mut store, None, run_interface)
@@ -839,22 +930,9 @@ impl Process {
                 .get_typed_func::<(&str,), (Result<String, String>,)>(&mut store, &run_func_export)
                 .map_err(|e| format!("Failed to get 'run' function: {e:?}"))?;
 
-            if crate::scheduler::fire_timing_enabled() {
-                crate::scheduler::fire_timing_write(&serde_json::json!({
-                    "schema": 1,
-                    "source": "runtime",
-                    "event": "guest_main_entered",
-                    "process_id": process_id,
-                    "entered_us": crate::scheduler::fire_timing_now_us(),
-                }));
-            }
             let wasm_run_start = Instant::now();
             let call = run_func.call_async(&mut store, (&input,));
-            let called = if crate::scheduler::fire_timing_enabled() {
-                crate::scheduler::CpuMetered::new(crate::scheduler::CpuClass::Guest, call).await
-            } else {
-                call.await
-            };
+            let called = call.await;
             let result = match called {
                 Ok((Ok(output),)) => {
                     wasm_run_us = duration_us(wasm_run_start.elapsed());
@@ -869,36 +947,12 @@ impl Process {
                     Err(format!("Call error: {call_err}"))
                 }
             };
-            if crate::scheduler::fire_timing_enabled() {
-                crate::scheduler::fire_timing_write(&serde_json::json!({
-                    "schema": 1,
-                    "source": "runtime",
-                    "event": "guest_main_returned",
-                    "process_id": process_id,
-                    "returned_us": crate::scheduler::fire_timing_now_us(),
-                }));
-            }
             admission_wait_us = store.data().admission_wait_us();
             // Drop the store HERE rather than at the end of this block, so
             // the wasmtime teardown it triggers (`ProcessCtx::drop` and the
             // instance's own memory) is visible: at a cohort boundary 512 of
             // these run at once and the record is the only way to see them.
-            if crate::scheduler::fire_timing_enabled() {
-                let store_drop_started_us = crate::scheduler::fire_timing_now_us();
-                drop(store);
-                crate::scheduler::fire_timing_write(&serde_json::json!({
-                    "schema": 1,
-                    "source": "runtime",
-                    "event": "process_store_drop",
-                    "process_id": process_id,
-                    "started_us": store_drop_started_us,
-                    "store_drop_us":
-                        crate::scheduler::fire_timing_now_us() - store_drop_started_us,
-                    "tid": os_thread_id(),
-                }));
-            } else {
-                drop(store);
-            }
+            drop(store);
             result
         }
         .await;
@@ -914,23 +968,63 @@ impl Process {
         }
 
         // Fire result channel if a parent is waiting (and an external
-        // terminate hasn't already claimed it).
-        if let Some(tx) = result_tx.lock().unwrap().take() {
+        // terminate hasn't already claimed it). A process the planner has
+        // asked to restart leaves the channel in place: its failure is not
+        // this request's outcome, and the actor's `terminate` hands the
+        // channel to the re-run.
+        if !restart_requested(process_id)
+            && let Some(tx) = result_tx.lock().unwrap().take()
+        {
             let _ = tx.send(result.clone());
         }
 
-        let terminate_started_us =
-            crate::scheduler::fire_timing_enabled().then(crate::scheduler::fire_timing_now_us);
         terminate(process_id, result);
-        if let Some(started_us) = terminate_started_us {
-            crate::scheduler::fire_timing_write(&serde_json::json!({
-                "schema": 1,
-                "source": "runtime",
-                "event": "process_terminate",
-                "process_id": process_id,
-                "started_us": started_us,
-                "terminate_us": crate::scheduler::fire_timing_now_us() - started_us,
-            }));
+    }
+
+    /// Re-run this program from the beginning, carrying the caller's reply
+    /// channel, the client-facing process id and the planner's FCFS position
+    /// across to the new process.
+    ///
+    /// Nothing outside the engine observes the handover: an attached client
+    /// keeps receiving events under the id it launched, and a parent waiting
+    /// on the launch handle still gets exactly one result, because the reply
+    /// cell is shared rather than moved. If the spawn fails the sender is
+    /// still in that cell, so a failed restart degrades to today's fail-loud
+    /// behaviour instead of losing the request.
+    fn restart(&mut self) -> bool {
+        let seq = crate::planner::planner().and_then(|planner| planner.spawn_seq(self.process_id));
+        let spawned = spawn_inner(
+            self.username.clone(),
+            self.program.clone(),
+            self.input.clone(),
+            self.client_id,
+            self.capture_outputs,
+            self.result_tx.clone(),
+            seq,
+            Some(self.client_pid),
+        );
+        match spawned {
+            Ok(new_id) => {
+                // Published before this process finishes tearing down, so a
+                // client message aimed at the original id in the handover
+                // window reaches the re-run rather than the corpse.
+                RESTART_ALIAS
+                    .write()
+                    .unwrap()
+                    .insert(self.client_pid, new_id);
+                RESTART_TOTAL.fetch_add(1, Relaxed);
+                tracing::info!(
+                    old = %self.process_id,
+                    new = %new_id,
+                    client_pid = %self.client_pid,
+                    "process restarted after KV reclaim",
+                );
+                true
+            }
+            Err(error) => {
+                tracing::error!(pid = %self.process_id, %error, "process restart failed");
+                false
+            }
         }
     }
 
@@ -938,17 +1032,28 @@ impl Process {
     fn terminate(&mut self, result: Result<String, String>) {
         self.handle.abort();
 
-        // Deliver `result` to any parent waiting on the launch handle, if the
-        // run loop didn't already send it (e.g., external Terminate fires
-        // before the WASM task finished). First taker wins.
-        if let Some(tx) = self.result_tx.lock().unwrap().take() {
-            let _ = tx.send(result.clone());
-        }
+        // The planner reclaimed this process's pages and asked for a re-run
+        // rather than a failure. A fresh process takes over the caller's
+        // reply channel and this one's FCFS position; nothing is delivered
+        // for the abandoned attempt. Teardown below is unchanged and
+        // unconditional — the restart is only worth anything if this
+        // process's pages actually go back to the pool.
+        let restarted = restart_requested(self.process_id) && self.restart();
+        forget_restart_state(self.process_id);
 
-        // Notify attached client / workflow
-        match result {
-            Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
-            Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),
+        if !restarted {
+            // Deliver `result` to any parent waiting on the launch handle, if
+            // the run loop didn't already send it (e.g., external Terminate
+            // fires before the WASM task finished). First taker wins.
+            if let Some(tx) = self.result_tx.lock().unwrap().take() {
+                let _ = tx.send(result.clone());
+            }
+
+            // Notify attached client / workflow
+            match result {
+                Ok(output) => self.deliver_event(ProcessEvent::Return(output)),
+                Err(msg) => self.deliver_event(ProcessEvent::Error(msg)),
+            }
         }
 
         let _ = server::inbox::clear(self.process_id.to_string());
@@ -964,6 +1069,9 @@ impl Process {
         // wakes gate waiters for teardown, and re-plans — the exiting
         // process's KV frees follow via the WS-drop hook). Single exit
         // funnel: covers natural completion AND external terminate.
+        if !restarted {
+            RESTART_ALIAS.write().unwrap().remove(&self.client_pid);
+        }
         if let Some(planner) = crate::planner::planner() {
             planner.unregister(self.process_id);
         }
@@ -1018,5 +1126,38 @@ impl ServiceHandler for Process {
                 }));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RUN_INTERFACE;
+
+    /// `RUN_INTERFACE` is a hand-written string that must track the WIT package
+    /// version. When the package went 0.2.0 -> 0.3.0 this constant was left
+    /// behind, and because the lookup fails at component-instantiation time the
+    /// only symptom was every program dying with "No 'run' interface found" —
+    /// invisible to `cargo test` and visible only on a box with real weights.
+    #[test]
+    fn run_interface_version_matches_wit() {
+        let wit = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../interface/inferlet/world.wit"),
+        )
+        .expect("read interface/inferlet/world.wit");
+
+        let declared = wit
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("package pie:inferlet@"))
+            .map(|v| v.trim_end_matches(';').trim().to_string())
+            .expect("world.wit declares `package pie:inferlet@<version>;`");
+
+        let expected = format!("pie:inferlet/run@{declared}");
+        assert_eq!(
+            RUN_INTERFACE, expected,
+            "process.rs RUN_INTERFACE is stale: world.wit declares \
+             pie:inferlet@{declared}. wasmtime's export lookup is semver-exact, \
+             so a mismatch makes EVERY inferlet fail to start."
+        );
     }
 }

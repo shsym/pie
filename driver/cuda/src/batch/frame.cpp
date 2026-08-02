@@ -1,4 +1,5 @@
 #include "batch/frame.hpp"
+#include "pie/driver/region_plans.hpp"
 
 #include <algorithm>
 #include <array>
@@ -10,6 +11,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <span>
@@ -22,6 +24,7 @@
 #include "batch/brle.hpp"
 #include "batch/fire_timing.hpp"
 #include "batch/forward.hpp"
+#include "batch/forward_graph.hpp"
 #include "batch/tp.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
@@ -49,6 +52,10 @@ int tensor_rows(const DeviceTensor& t) {
     if (t.shape().empty()) return 0;
     return static_cast<int>(t.shape()[0]);
 }
+
+// Vocabulary slab width for the fused LM head + greedy argmax (§20.37) lives in
+// batch/forward.cpp: the graph-capture path needs the same value, and a second
+// copy of the `static` here would be a second chance to disagree with it.
 
 struct MtpDraftWork {
     std::size_t program = 0;
@@ -92,40 +99,37 @@ struct TpFireCommit {
 // Bounded TP fire pipeline.
 //
 // Rank 0 may NOT run arbitrarily far ahead of the follower: `pi.*` and the
-// NCCL communicator are one shared set, and with `PIE_FRAME_SIZE` > 1 a frame's
+// NCCL communicator are one shared set, and with k > 1 a frame's
 // steps are enqueued back to back with no rendezvous, so rank 0 would post fire
 // N+1's payload group while the follower is still inside fire N's forward on
 // that same communicator. That deadlocked the pair (the follower's decode
 // attention kernel never retired).
 //
-// Debug lever, disabled by default. Before posting fire N's collectives, wait
-// for fire N-D to have retired; D=0 means no bound. This existed to work around
-// a TP hang at `PIE_FRAME_SIZE` > 1 that turned out to be the follower skipping
-// the attention plan-staging protocol — fixed there instead. Retained because
-// forcing D=1 collapses a whole class of cross-rank overlap bug into a clean
-// yes/no answer, which is how that one was isolated.
-int tp_fire_runahead_depth() {
-    static const int depth = [] {
-        if (const char* v = std::getenv("PIE_TP_RUNAHEAD_DEPTH")) {
-            const int parsed = std::atoi(v);
-            if (parsed >= 0 && parsed <= 8) return parsed;
-        }
-        // Depth 1 (one TP fire in flight on the device).
-        //
-        // The follower's missing attention plan-staging slot was ONE cause of
-        // the k>1 TP deadlock and is fixed at its source, but it was not the
-        // only one: with bind-time projection packing enabled the hang comes
-        // back at k=1 and k=2 (and not at k=4), which is the signature of a
-        // second overlap hazard that packing's different timing exposes. Until
-        // that one is found too, keep the bound.
-        //
-        // Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4),
-        // small because rank 0 is the rank with slack — the follower is
-        // reactive and already waits inside the payload broadcast.
-        return 1;
-    }();
-    return depth;
-}
+// ONE TP fire in flight on the device: before posting fire N's collectives,
+// wait for fire N-1 to have retired.
+//
+// This is NOT a debug lever, whatever its history says. It is a live
+// workaround for a deadlock nobody has found yet. The follower's missing
+// attention plan-staging slot was ONE cause of the k>1 TP hang and is fixed at
+// its source, but it was not the only one: with bind-time projection packing
+// enabled the hang comes back at k=1 and k=2 — and not at k=4 — which is the
+// signature of a second overlap hazard that packing's different timing
+// exposes. Until that one is found too, the bound stays.
+//
+// Cost measured at 1.9% (39,182 vs 39,941 tok/s at 448-wide, k=4), small
+// because rank 0 is the rank with slack: the follower is reactive and already
+// waits inside the payload broadcast.
+//
+// A constant rather than `PIE_TP_RUNAHEAD_DEPTH`, because 0 meant "no bound"
+// and no bound is the hang. A value that hangs the engine must not be a
+// supported input — the same rule that retired `PIE_FRAME_REBIND_ESCAPE`,
+// whose mode 0 was the pre-fix behaviour that wedged. Raising it when the
+// second hazard is found is a code change, and should be: it needs the
+// measurement that justifies it.
+//
+// The ring below is left generic (`kMaxDepth` slots) so that change is a
+// one-line edit here rather than a rewrite.
+constexpr int tp_fire_runahead_depth() { return 1; }
 
 // Two halves: WAIT before this fire's collectives are posted, RECORD after its
 // forward has been enqueued. Waiting on the event `depth` fires back means rank
@@ -173,13 +177,7 @@ void record_slot(cudaStream_t stream) {
 
 }  // namespace tp_runahead
 
-bool tp_device_compose_disabled() {
-    static const bool off = [] {
-        const char* v = std::getenv("PIE_TP_DISABLE_DEVICE_COMPOSE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return off;
-}
+constexpr bool tp_device_compose_disabled() { return false; }
 
 MtpDraftPlan preflight_mtp_draft_logits(
     BatchEngine& engine,
@@ -643,7 +641,7 @@ struct StepTiming {
 // pointers alias; the Impl is heap-held so those addresses are stable
 // under PreparedStep moves.
 struct PreparedStep::Impl {
-    const pie_native::LaunchView* view = nullptr;
+    const pie::driver::fire::LaunchView* view = nullptr;
     std::unique_ptr<pipeline::StagedLaunch> staged;
 
     // Resolution + composition.
@@ -653,7 +651,11 @@ struct PreparedStep::Impl {
     bool composed_ready = false;
     std::vector<std::uint32_t> prog_sample_csr;
     std::vector<std::uint32_t> program_token_starts;
-    pie_native::LaunchView dispatch_view{};
+    pie::driver::fire::LaunchView dispatch_view{};
+    // ④ Act 1: distinct-k truncation bands (deepest-first) from the
+    // region table; empty = unbanded.
+    std::vector<std::uint32_t> depth_band_k;
+    std::vector<std::uint32_t> depth_band_rows;
 
     // Shape + mode flags.
     int R = 0;
@@ -675,6 +677,10 @@ struct PreparedStep::Impl {
     pipeline::FixedDecodeDeviceBuffers fixed_buffers{};
     pipeline::DecodeEnvelopeDeviceBuffers envelope_buffers{};
     bool compact_logits = false;
+    // Vocabulary slab width for the fused LM head + greedy argmax, or 0 when
+    // this fire materializes logits the ordinary way. See
+    // `ForwardInputs::logits_argmax_chunk_tokens`.
+    int logits_argmax_chunk_tokens = 0;
 
     // Masks.
     bool have_custom_mask = false;
@@ -705,6 +711,12 @@ struct PreparedStep::Impl {
     std::span<const std::uint32_t> rs_fold_len_view;
     std::span<const std::uint32_t> rs_buf_id_view;
     std::span<const std::uint32_t> rs_buf_indptr_view;
+    // The buffered prefix replayed ahead of this fire's own tokens.
+    std::span<const std::uint32_t> rs_buf_read_id_view;
+    std::span<const std::uint32_t> rs_buf_read_indptr_view;
+    std::span<const std::uint32_t> rs_buf_read_len_view;
+    std::span<const std::uint32_t> rs_buf_head_view;
+    bool rs_has_buffer_read = false;
     std::vector<std::int32_t> slot_ids_h;
     std::vector<std::uint8_t> is_fresh_h;
 
@@ -746,6 +758,10 @@ struct PreparedStep::Impl {
     std::vector<std::uint32_t> plan_kv_page_indptr;
     std::vector<std::uint32_t> plan_kv_last_lens;
     int graph_pad_requests = 0;
+    // Total tokens the pad lanes carry. Equals `graph_pad_requests` on the
+    // decode path (one token each) and exceeds it when a prefill wave pads N
+    // to the token lattice.
+    int graph_pad_tokens = 0;
     int pad_real_mask_bytes = 0;
     std::vector<std::uint32_t> pad_qo_indptr;
     std::vector<std::uint32_t> pad_kv_page_indices;
@@ -777,6 +793,10 @@ struct PreparedStep::Impl {
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_fold_lens{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_buf_indptr{};
     DeviceBuffer<std::uint32_t>::StagedUpload up_rs_buf_ids{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_ids{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_indptr{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_read_lens{};
+    DeviceBuffer<std::uint32_t>::StagedUpload up_rs_heads{};
     DeviceBuffer<std::int32_t>::StagedUpload up_sample_idx{};
 
     // Diagnostics. Declared last so its emission (at destruction) runs
@@ -826,7 +846,7 @@ bool plan_inputs_identical(
 
 void prepare_step(
     BatchEngine& engine,
-    const pie_native::LaunchView& view,
+    const pie::driver::fire::LaunchView& view,
     PreparedStep& step,
     const PreparedStep* previous) {
     PreparedStep::Impl& s = *step.impl();
@@ -1031,7 +1051,7 @@ void prepare_step(
             : nullptr;
     bool use_structured_mask = false;
     bool pack_structured_mask = false;
-    std::vector<pie_native::launch::StructuredMaskDescriptor>
+    std::vector<pie::driver::fire::StructuredMaskDescriptor>
         effective_structured_masks = s.composed.structured_masks;
     const auto mask_coverage = pipeline::structured_mask_coverage(
         effective_structured_masks);
@@ -1056,7 +1076,7 @@ void prepare_step(
         for (auto& descriptor : effective_structured_masks) {
             if (!descriptor) {
                 descriptor.kind =
-                    pie_native::launch::StructuredMaskKind::Causal;
+                    pie::driver::fire::StructuredMaskKind::Causal;
             }
         }
         filled_causal_coverage = true;
@@ -1105,45 +1125,45 @@ void prepare_step(
     }
     s.dispatch_view = view;
     if (s.composed_ready) {
-        s.dispatch_view.rs_slot_ids = pie_native::slice_from_u32(
+        s.dispatch_view.rs_slot_ids = pie::driver::slice_from_u32(
             s.composed.rs_slot_ids.data(), s.composed.rs_slot_ids.size());
-        s.dispatch_view.rs_slot_flags = pie_native::slice_from_u8(
+        s.dispatch_view.rs_slot_flags = pie::driver::slice_from_u8(
             s.composed.rs_slot_flags.data(),
             s.composed.rs_slot_flags.size());
-        s.dispatch_view.rs_fold_lens = pie_native::slice_from_u32(
+        s.dispatch_view.rs_fold_lens = pie::driver::slice_from_u32(
             s.composed.rs_fold_lens.data(), s.composed.rs_fold_lens.size());
-        s.dispatch_view.rs_buffer_slot_ids = pie_native::slice_from_u32(
+        s.dispatch_view.rs_buffer_slot_ids = pie::driver::slice_from_u32(
             s.composed.rs_buffer_slot_ids.data(),
             s.composed.rs_buffer_slot_ids.size());
-        s.dispatch_view.rs_buffer_slot_indptr = pie_native::slice_from_u32(
+        s.dispatch_view.rs_buffer_slot_indptr = pie::driver::slice_from_u32(
             s.composed.rs_buffer_slot_indptr.data(),
             s.composed.rs_buffer_slot_indptr.size());
-        s.dispatch_view.sampling_indices = pie_native::slice_from_u32(
+        s.dispatch_view.sampling_indices = pie::driver::slice_from_u32(
             sidx_view.data(), sidx_view.size());
-        s.dispatch_view.sampling_indptr = pie_native::slice_from_u32(
+        s.dispatch_view.sampling_indptr = pie::driver::slice_from_u32(
             s.prog_sample_csr.data(), s.prog_sample_csr.size());
-        s.dispatch_view.ptir_sample_starts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_sample_starts = pie::driver::slice_from_u32(
             s.composed.prog_sample_starts.data(),
             s.composed.prog_sample_starts.size());
-        s.dispatch_view.ptir_sample_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_sample_counts = pie::driver::slice_from_u32(
             s.composed.prog_sample_counts.data(),
             s.composed.prog_sample_counts.size());
-        s.dispatch_view.ptir_row_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_row_counts = pie::driver::slice_from_u32(
             s.composed.prog_row_counts.data(),
             s.composed.prog_row_counts.size());
-        s.dispatch_view.ptir_token_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_token_counts = pie::driver::slice_from_u32(
             s.composed.prog_token_counts.data(),
             s.composed.prog_token_counts.size());
-        s.dispatch_view.ptir_kv_lens = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_kv_lens = pie::driver::slice_from_u32(
             s.composed.prog_kv_lens.data(),
             s.composed.prog_kv_lens.size());
-        s.dispatch_view.ptir_page_counts = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_page_counts = pie::driver::slice_from_u32(
             s.composed.prog_page_counts.data(),
             s.composed.prog_page_counts.size());
-        s.dispatch_view.ptir_query_lens = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_query_lens = pie::driver::slice_from_u32(
             s.composed.prog_query_lens.data(),
             s.composed.prog_query_lens.size());
-        s.dispatch_view.ptir_key_lens = pie_native::slice_from_u32(
+        s.dispatch_view.ptir_key_lens = pie::driver::slice_from_u32(
             s.composed.prog_key_lens.data(),
             s.composed.prog_key_lens.size());
     }
@@ -1232,6 +1252,22 @@ void prepare_step(
         ? std::span<const std::uint32_t>(s.composed.rs_fold_lens)
         : view.rs_fold_lens.as<std::uint32_t>();
     std::string rs_binding_error;
+    // A device-resident fold length is SUBSTITUTED during composition, where
+    // the resolved `rs_fold_len` port is clamped to the host's bound. If the
+    // fire never went through composition, that substitution never happened
+    // and the wire array still holds the placeholder -- which would fold the
+    // entire buffer instead of the accepted prefix. Refuse rather than fold
+    // too much: the tokens are unrecoverable once absorbed.
+    if (!s.composed_ready &&
+        std::any_of(
+            s.rs_flag_view.begin(), s.rs_flag_view.end(),
+            [](std::uint8_t f) {
+                return (f & PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0;
+            })) {
+        throw std::runtime_error(
+            "a fire claims a device-resident RS fold length but was not "
+            "descriptor-composed, so the resolved value never reached it");
+    }
     if (!pipeline::validate_folded_rs_bindings(
             s.rs_slot_view,
             s.rs_flag_view,
@@ -1251,6 +1287,29 @@ void prepare_step(
     s.rs_buf_indptr_view = s.composed_ready
         ? std::span<const std::uint32_t>(s.composed.rs_buffer_slot_indptr)
         : view.rs_buffer_slot_indptr.as<std::uint32_t>();
+    // Read side: host-only, so no device staging -- a replay span is a
+    // property of the working set's occupancy, which a channel-resolved
+    // rs-geometry cannot name. It still travels through composition, because
+    // composition REORDERS requests (wire programs first, device-geometry
+    // ones after) and the read rows have to follow their own requests.
+    s.rs_buf_read_id_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_slot_ids)
+        : view.rs_buffer_read_slot_ids.as<std::uint32_t>();
+    s.rs_buf_read_indptr_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_indptr)
+        : view.rs_buffer_read_indptr.as<std::uint32_t>();
+    s.rs_buf_read_len_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_read_lens)
+        : view.rs_buffer_read_lens.as<std::uint32_t>();
+    s.rs_buf_head_view = s.composed_ready
+        ? std::span<const std::uint32_t>(s.composed.rs_buffer_heads)
+        : view.rs_buffer_heads.as<std::uint32_t>();
+    s.rs_has_buffer_read =
+        !s.rs_buf_read_len_view.empty() &&
+        std::any_of(
+            s.rs_buf_read_len_view.begin(),
+            s.rs_buf_read_len_view.end(),
+            [](std::uint32_t n) { return n != 0; });
     if (!pipeline::plan_rs_execution(
             s.rs_slot_view,
             s.rs_flag_view,
@@ -1869,9 +1928,24 @@ void prepare_step(
     s.has_attention_stages =
         engine.dispatch->launch_has_attention_stages(s.dispatch_view);
     {
+        // The padding decision runs BEFORE `prepare()` plans this wave, so it
+        // cannot ask whether the plan came out capturable -- that answer
+        // belongs to the previous fire, and on this workload the previous fire
+        // is pure decode 84% of the time, which is why every prefill wave read
+        // back "not capturable" and never padded. Capturability is also
+        // downstream of the shape this decision chooses, so consulting it here
+        // would be circular.
+        //
+        // Pad on geometry alone instead. Over-padding is cheap and safe: a
+        // wave that the plan later demotes just runs eager over a few percent
+        // of extra rows, exactly as it would have unpadded. Under-padding is
+        // what costs -- it is what leaves the shape off-lattice and forces the
+        // one-off capture.
+        const bool prefill_pad_ok =
+            prefill_graph_enabled() && !s.have_custom_mask;
         const bool eligible = forward_graph_replay_eligible(
             engine,
-            is_pure_decode,
+            is_pure_decode || prefill_pad_ok,
             s.have_custom_mask,
             s.rs_is_write,
             s.rs_is_fold,
@@ -1891,15 +1965,68 @@ void prepare_step(
         if (eligible && engine.graph_pad_page >= 0) {
             const int max_requests = std::min(
                 engine.max_forward_requests, engine.max_workspace_tokens);
-            const int bucket =
+            int bucket =
                 forward_graph_request_bucket(s.fR_real, max_requests);
-            const int padding = bucket - s.fR_real;
+            int padding = bucket - s.fR_real;
+            // Decode pads one token per lane, so N follows R for free.
+            int pad_tokens = std::max(padding, 0);
+
+            // A prefill-carrying wave has to bucket N as well, and N is not
+            // pinned to R the way decode pins it. One pad lane can absorb up
+            // to a page of tokens -- holding kv_len == qo_len == tok_j gives
+            // the lane the same causal geometry a real fresh prefill has -- so
+            // the two lattices are solved together: pick N's bucket, take
+            // enough lanes to carry the tokens, and buy more tokens if the
+            // lane count outran them (every lane needs at least one token; a
+            // zero-length lane has no valid qo range).
+            //
+            // Custom-mask waves stay on the one-token-per-lane path: the
+            // packed mask is per (qo, kv) pair, so a multi-token lane would
+            // have to synthesize a mask block, and structured decoding does
+            // not carry a prefill through here.
+            const int page = kv_cache.page_size();
+            if (!is_pure_decode && !s.have_custom_mask && page > 0) {
+                int n_bucket = forward_graph_token_bucket(
+                    s.fN_real, engine.max_workspace_tokens);
+                bool solved = false;
+                for (int iter = 0; iter < 8 && n_bucket > 0; ++iter) {
+                    const int want = n_bucket - s.fN_real;
+                    const int lanes_needed =
+                        want > 0 ? (want + page - 1) / page : 0;
+                    const int r_bucket = forward_graph_request_bucket(
+                        s.fR_real + lanes_needed, max_requests);
+                    if (r_bucket <= 0) break;
+                    const int lanes = r_bucket - s.fR_real;
+                    if (lanes <= want && want <= lanes * page) {
+                        bucket = r_bucket;
+                        padding = lanes;
+                        pad_tokens = want;
+                        solved = true;
+                        break;
+                    }
+                    if (lanes > want) {
+                        n_bucket = forward_graph_token_bucket(
+                            s.fN_real + lanes, engine.max_workspace_tokens);
+                        continue;
+                    }
+                    break;
+                }
+                // No feasible pair (N at the workspace ceiling, R at the
+                // request ceiling): leave the wave unpadded and let it capture
+                // its exact shape, exactly as it did before this path existed.
+                if (!solved) {
+                    padding = 0;
+                    pad_tokens = 0;
+                }
+            }
+
             const std::size_t padded_tokens =
                 static_cast<std::size_t>(s.fN_real) +
-                static_cast<std::size_t>(std::max(padding, 0));
-            const bool fits = padding > 0 &&
+                static_cast<std::size_t>(std::max(pad_tokens, 0));
+            const bool fits = padding > 0 && pad_tokens >= padding &&
                 padded_tokens <= pi.tokens.size() &&
                 padded_tokens <= pi.row_valid.size() &&
+                padded_tokens <= pi.positions.size() &&
                 padded_tokens <=
                     static_cast<std::size_t>(tensor_rows(ws.logits)) &&
                 static_cast<std::size_t>(bucket) + 1 <=
@@ -1915,6 +2042,7 @@ void prepare_step(
                       pi.custom_mask_indptr.size()));
             if (fits) {
                 s.graph_pad_requests = padding;
+                s.graph_pad_tokens = pad_tokens;
             }
         }
     }
@@ -1961,6 +2089,25 @@ void prepare_step(
             s.up_rs_buf_ids =
                 pi.rs_buffer_slot_ids.stage_from_host(s.rs_buf_id_view);
         }
+        // The read side is host-only for the model, but a TP follower never
+        // sees the launch descriptor -- it recovers every per-request array by
+        // reading it back off the device. So it has to be staged like the rest.
+        if (!s.rs_buf_read_id_view.empty()) {
+            s.up_rs_read_ids = pi.rs_buffer_read_slot_ids.stage_from_host(
+                s.rs_buf_read_id_view);
+        }
+        if (!s.rs_buf_read_indptr_view.empty()) {
+            s.up_rs_read_indptr = pi.rs_buffer_read_indptr.stage_from_host(
+                s.rs_buf_read_indptr_view);
+        }
+        if (!s.rs_buf_read_len_view.empty()) {
+            s.up_rs_read_lens = pi.rs_buffer_read_lens.stage_from_host(
+                s.rs_buf_read_len_view);
+        }
+        if (!s.rs_buf_head_view.empty()) {
+            s.up_rs_heads =
+                pi.rs_buffer_heads.stage_from_host(s.rs_buf_head_view);
+        }
     }
 
     if (!s.rs_is_fold &&
@@ -1996,6 +2143,68 @@ void prepare_step(
         s.mtp_plan.work.empty() &&
         num_sampling > 0 &&
         num_sampling < s.fN_real;
+    // Fold the greedy argmax into the LM head GEMM when every epilogue in the
+    // launch is a bare argmax over `logits`, so the vocabulary is reduced as
+    // it is produced instead of making a round trip through HBM (§20.37).
+    // MTP drafts read the logits for their own reasons, so they opt out.
+    //
+    // The slab width is a device+model property with a real optimum, so it has
+    // no default here: the path stays off until something measures one. It
+    // belongs in the planner's calibration, and the environment variable is
+    // the bridge until it lands there.
+    s.logits_argmax_chunk_tokens = 0;
+    // A fire that samples nothing has no logits to fuse into, and is also the
+    // fire whose answer would say nothing about the steady state, so it is
+    // skipped rather than reported on.
+    if (logits_argmax_chunk_tokens() > 0 && num_sampling > 0) {
+        const auto vocab =
+            static_cast<std::uint32_t>(
+                engine.loaded_model.hf_config().vocab_size);
+        // Cheap, launch-shape reasons to decline, checked before the epilogue
+        // analysis so a declining fire never pays for it.
+        const bool shape_ok =
+            s.mtp_plan.work.empty() &&
+            // Under TP the LM head is sharded and the logits are gathered
+            // across ranks, so a rank cannot reduce its own slab to a token id.
+            engine.tp_comm == nullptr &&
+            // Most model families ignore the slab width and materialize logits
+            // regardless. Fusing on one of those would hand the epilogue a
+            // buffer nobody wrote, so the model has to opt in.
+            engine.forward_fn.supports_fused_lm_head_argmax;
+        if (shape_ok && engine.dispatch->launch_epilogue_is_greedy_argmax(
+                            s.dispatch_view, vocab)) {
+            s.logits_argmax_chunk_tokens = logits_argmax_chunk_tokens();
+        }
+        // The request was made explicitly, so say whether it was honoured: a
+        // silent no-op is indistinguishable from a fused run that did nothing.
+        //
+        // Both outcomes get their own latch. The verdict is per-fire -- it
+        // depends on this launch's guest programs -- so a single flag would
+        // report whichever fire happened to be first as if it were the steady
+        // state. Reports only values already in hand; re-deriving the epilogue
+        // verdict here would run the analysis on fires that `shape_ok`
+        // deliberately excluded.
+        const bool engaged = s.logits_argmax_chunk_tokens > 0;
+        static std::once_flag announced_engaged;
+        static std::once_flag announced_declined;
+        std::call_once(engaged ? announced_engaged : announced_declined, [&] {
+            std::cerr << "[pie-driver-cuda] logits argmax chunking "
+                      << (engaged ? "engaged" : "requested but not engaged")
+                      << " chunk=" << logits_argmax_chunk_tokens()
+                      << " sampling=" << num_sampling
+                      << " mtp=" << !s.mtp_plan.work.empty()
+                      << " tp=" << (engine.tp_comm != nullptr)
+                      << " model_supports="
+                      << engine.forward_fn.supports_fused_lm_head_argmax
+                      << " greedy_epilogue=";
+            if (shape_ok) {
+                std::cerr << engaged;
+            } else {
+                std::cerr << "n/a";
+            }
+            std::cerr << "\n";
+        });
+    }
     if (s.rs_is_fold && !s.mtp_plan.work.empty()) {
         throw std::runtime_error(
             "state-only buffered RS fold cannot produce MTP drafts");
@@ -2225,13 +2434,25 @@ void prepare_step(
             s.h_kvpi_forward, s.h_kvpi_forward + pages);
         s.pad_kv_last_page_lens.assign(
             s.h_kvlpl_forward, s.h_kvlpl_forward + s.fR_real);
-        for (int r = 0; r < s.graph_pad_requests; ++r) {
-            s.pad_qo_indptr.push_back(s.pad_qo_indptr.back() + 1);
+        // Tokens spread as evenly as the lanes allow; the first
+        // `pad_tokens % lanes` lanes carry one extra. The device kernel
+        // recomputes this from the same two integers rather than reading a
+        // host array, so the two cannot drift.
+        const int lanes = s.graph_pad_requests;
+        const int base = s.graph_pad_tokens / lanes;
+        const int extra = s.graph_pad_tokens % lanes;
+        for (int r = 0; r < lanes; ++r) {
+            const int tok = base + (r < extra ? 1 : 0);
+            s.pad_qo_indptr.push_back(
+                s.pad_qo_indptr.back() + static_cast<std::uint32_t>(tok));
             s.pad_kv_page_indices.push_back(
                 static_cast<std::uint32_t>(engine.graph_pad_page));
             s.pad_kv_page_indptr.push_back(
                 s.pad_kv_page_indptr.back() + 1);
-            s.pad_kv_last_page_lens.push_back(1);
+            // kv_len == qo_len for the lane: one page holds `tok` tokens
+            // because `tok <= kv_cache.page_size()` by construction.
+            s.pad_kv_last_page_lens.push_back(
+                static_cast<std::uint32_t>(tok));
         }
         s.h_qo_forward = s.pad_qo_indptr.data();
         s.h_kvpi_forward = s.pad_kv_page_indices.data();
@@ -2239,7 +2460,7 @@ void prepare_step(
         s.h_kvpp_forward = s.pad_kv_page_indptr.data();
         s.h_kvlpl_forward = s.pad_kv_last_page_lens.data();
         s.forward_R = s.fR_real + s.graph_pad_requests;
-        s.forward_N = s.fN_real + s.graph_pad_requests;
+        s.forward_N = s.fN_real + s.graph_pad_tokens;
     }
 
     // Compact-logit direct rows for settlement (the epilogue slices each
@@ -2261,7 +2482,6 @@ void prepare_step(
     // already covers this one — mark the hook skippable.
     if (previous != nullptr) {
         s.skip_plan = plan_inputs_identical(s, *previous->impl());
-        if (std::getenv("PIE_DISABLE_SKIP_PLAN")) s.skip_plan = false;
     }
 
     if (dbg_fire) s.timing.prepare_end = fire_timing::Clock::now();
@@ -2282,21 +2502,8 @@ struct EnqProfile {
     // rotation) that swamp the per-step averages and made `enq.attn_plan`
     // read as a 2.5ms steady cost when its steady value is ~2us.
     std::uint64_t steps = 0;
-    static std::uint64_t warmup() {
-        static const std::uint64_t n = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE_WARMUP");
-            return (v != nullptr && v[0] != '\0')
-                ? std::strtoull(v, nullptr, 10) : 32ull;
-        }();
-        return n;
-    }
-    static bool enabled() {
-        static const bool on = [] {
-            const char* v = std::getenv("PIE_STEP_PROFILE");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
-        return on;
-    }
+    static constexpr std::uint64_t warmup() { return 32ull; }
+    static constexpr bool enabled() { return false; }
     static EnqProfile& instance() { static EnqProfile p; return p; }
     ~EnqProfile() {
         if (!enabled()) return;
@@ -2402,7 +2609,8 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             s.structured_window_left,
             s.rs_plan.mode,
             static_cast<int>(s.rs_fold_len_view.size()),
-            static_cast<int>(s.rs_buf_id_view.size()));
+            static_cast<int>(s.rs_buf_id_view.size()),
+            static_cast<int>(s.rs_buf_read_id_view.size()));
         tp_commit.key = &engine.tp_cpu_gate_key;
     }
     if (s.empty_step) {
@@ -2463,6 +2671,10 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         pi.rs_fold_lens.commit_staged(s.up_rs_fold_lens);
         pi.rs_buffer_slot_indptr.commit_staged(s.up_rs_buf_indptr);
         pi.rs_buffer_slot_ids.commit_staged(s.up_rs_buf_ids);
+        pi.rs_buffer_read_slot_ids.commit_staged(s.up_rs_read_ids);
+        pi.rs_buffer_read_indptr.commit_staged(s.up_rs_read_indptr);
+        pi.rs_buffer_read_lens.commit_staged(s.up_rs_read_lens);
+        pi.rs_buffer_heads.commit_staged(s.up_rs_heads);
     }
     pi.sample_idx.commit_staged(s.up_sample_idx);
     if (engine.rs_cache != nullptr) {
@@ -2508,6 +2720,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             s.fR_real,
             s.fN_real,
             s.graph_pad_requests,
+            s.graph_pad_tokens,
             static_cast<std::uint32_t>(engine.graph_pad_page),
             cublas.stream());
     }
@@ -2544,13 +2757,14 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                             s.rs_plan.mode,
                             static_cast<int>(s.rs_fold_len_view.size()),
                             static_cast<int>(s.rs_buf_id_view.size()),
+                            static_cast<int>(s.rs_buf_read_id_view.size()),
                             /*stream=*/nullptr);
         tp_commit.completed = true;
         pie_cuda_driver::tp_watchdog_mark_phase(2);
         // One TP fire in flight on the device at a time.
         //
         // The persistent input buffers (`pi.*`) and the NCCL communicator are
-        // a SINGLE set shared by every fire. With `PIE_FRAME_SIZE` > 1 a frame
+        // a SINGLE set shared by every fire. With k > 1 a frame
         // holds several steps and `launch` enqueues them back to back with no
         // rendezvous between them, so rank 0 would post fire N+1's payload
         // group while the follower is still executing fire N's forward — whose
@@ -2575,6 +2789,104 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
     // Plan-once-per-frame: a step whose every plan input is content-
     // identical to the frame's previous step skips the hook — the
     // workspace already holds the identical plan.
+    // V2 rung ④ Act 1 (banded depth, PIE_DEPTH_BANDS): distinct-k
+    // truncation bands from the region table, deepest-first. OUTSIDE
+    // the plan-skip conditional: the graph gate consumes the band
+    // count every step, and a skip-plan step (content-identical plan
+    // inputs — the 14B envelope's steady state) must not read an empty
+    // vector and replay a demoted graph (caught live at 14B: R=8
+    // co-fires, no [depth-bands], no DECLINE). Armed
+    // only on plain pure-decode fires (no mask/hook/multi-token
+    // region anywhere, no trunc×lora lane), 2..3 distinct k, bands
+    // contiguous after the plain prefix (the seriation's order —
+    // anything else declines to today's full-depth degradation).
+    s.depth_band_k.clear();
+    s.depth_band_rows.clear();
+    {
+        // DEFAULT ON since the 7B pricing (the demotion was the
+        // bug — a co-fired lane's k is honored, layer-skip pays
+        // 1.26x on draft fleets); PIE_DEPTH_BANDS=0 disarms.
+        static const bool bands_on = [] {
+            const char* v = std::getenv("PIE_DEPTH_BANDS");
+            return v == nullptr || v[0] != '0';
+        }();
+        const auto& ind = s.dispatch_view.region_row_indptr;
+        if (bands_on && s.is_pure_decode && !s.have_custom_mask &&
+            !ind.empty()) {
+            // ④/Act 3: SINGLE SOURCE — the same derivation that
+            // suppresses the split/uniform stamps for banded fires
+            // (region_plans.hpp derive_depth_bands) produces the band
+            // arrays here; the gate and the planned words can no longer
+            // disagree.
+            std::uint32_t bk[3];
+            std::uint32_t brows[3];
+            const std::uint32_t m = pie::driver::fire::derive_depth_bands(
+                s.dispatch_view, bk, brows);
+            for (std::uint32_t j = 0; j < m; ++j) {
+                s.depth_band_k.push_back(bk[j]);
+                s.depth_band_rows.push_back(brows[j]);
+            }
+            // Tier-1 contract backstop: a hooked fire with two or more
+            // distinct truncations has exactly one correct server — the
+            // banded walk. The engine's admission gate (worker.rs, hook x
+            // depth) only groups such fires in band-servable shapes, so an
+            // unarmed arrival here is an admission bug; the fallback paths
+            // would demote a lane's k silently, so refuse loudly instead.
+            {
+                const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
+                const std::uint32_t* rk2 = s.dispatch_view.region_k.data();
+                const std::size_t nreg = ind.size() - 1;
+                bool seen_hook = false;
+                // DISTINCT truncations, not truncated regions: a hooked
+                // and a plain region at the SAME k (sigs differ, depth
+                // agrees) is the uniform-stamp shape, served without
+                // bands — the region count would misfire on it (caught
+                // by the extended soak: wire hook@k8 + devgeo k8).
+                std::uint32_t k_seen[3] = {0, 0, 0};
+                std::size_t distinct_k = 0;
+                for (std::size_t r = 0; r < nreg; ++r) {
+                    if (rsig[r] & PIE_REGION_SIG_HOOK) seen_hook = true;
+                    if (rsig[r] & PIE_REGION_SIG_TRUNCATED) {
+                        bool known = false;
+                        for (std::size_t q = 0; q < distinct_k; ++q) {
+                            if (k_seen[q] == rk2[r]) known = true;
+                        }
+                        if (!known && distinct_k < 3) {
+                            k_seen[distinct_k++] = rk2[r];
+                        }
+                    }
+                }
+                if (seen_hook && distinct_k >= 2 &&
+                    s.depth_band_k.empty()) {
+                    throw std::runtime_error(
+                        "hooked multi-depth fire reached the driver without "
+                        "armed bands (" + std::to_string(distinct_k) +
+                        " distinct truncations) — the admission gate should "
+                        "have split it");
+                }
+            }
+            if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+                const std::uint32_t* rsig = s.dispatch_view.region_sig.data();
+                const std::uint32_t* rk = s.dispatch_view.region_k.data();
+                const std::size_t nreg = ind.size() - 1;
+                std::fprintf(stderr,
+                             "[band-gate] bands=%zu",
+                             s.depth_band_k.size());
+                for (std::size_t r = 0; r < nreg; ++r) {
+                    std::fprintf(stderr, " sig%zu=%u k=%u", r, rsig[r],
+                                 rk[r]);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        } else if (std::getenv("PIE_REGION_TRACE") != nullptr) {
+            std::fprintf(stderr,
+                         "[band-gate] skip on=%d pure=%d mask=%d "
+                         "empty=%d\n",
+                         bands_on ? 1 : 0, s.is_pure_decode ? 1 : 0,
+                         s.have_custom_mask ? 1 : 0,
+                         ind.empty() ? 1 : 0);
+        }
+    }
     if (!s.rs_is_fold && !s.skip_plan) {
         compose_timer.stop();
         EnqTimer plan_timer(EnqProfile::kAttnPlan);
@@ -2608,6 +2920,12 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                     s.dispatch_view.planned_unmasked_prefix_rows,
                 .full_depth_rows =
                     s.dispatch_view.planned_full_depth_rows,
+                .depth_band_k = s.depth_band_k.empty()
+                    ? nullptr : s.depth_band_k.data(),
+                .depth_band_rows = s.depth_band_rows.empty()
+                    ? nullptr : s.depth_band_rows.data(),
+                .depth_band_count =
+                    static_cast<std::uint32_t>(s.depth_band_k.size()),
                 .mask_suffix_page_counts_h =
                     s.spatial_suffix_page_counts.empty()
                         ? nullptr
@@ -2633,8 +2951,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         std::cerr.flush();
     }
     auto dump_rs = [&](const char* tag) {
-        if (!std::getenv("PIE_RS_TRACE") || engine.rs_cache == nullptr ||
-            !s.use_slots || s.R < 1) return;
+        return;
         const int slot = static_cast<int>(s.rs_slot_view[0]);
         std::uint32_t rw[4] = {0, 0, 0, 0}, cw[4] = {0, 0, 0, 0};
         cudaMemcpy(rw, engine.rs_cache->recurrent_state_raw(0, slot),
@@ -2690,6 +3007,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         std::uint32_t hook_free_prefix_rows = 0;
         bool wants_attn_score = false;
         bool wants_page_mask = false;
+        std::uint32_t planned_layers = 0xffffffffu;
     } stage_hook_context{
         engine.dispatch,
         s.staged.get(),
@@ -2700,6 +3018,21 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
         engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
         engine.dispatch->launch_wants_attn_score(s.dispatch_view),
         engine.dispatch->launch_wants_page_mask(s.dispatch_view),
+        // ANY planned depth split — full_depth_rows PLANNED, including
+        // 0 (no full prefix, but a mask/hook TAIL that runs every
+        // layer) — walks the full model; only the uniform stamp
+        // (full_depth_rows UNPLANNED with a planned k) shortens the
+        // ledger. The 0-prefix case burned once: [trunc-k, hook-tail]
+        // planned full_depth_rows=0, the tail's hooks invoked at
+        // layers [k, L), and a k-sized ledger threw at entry k.
+        // Tier 2 bound: a truncated hook region caps its own ledger at
+        // its k regardless of the fire-wide plan (a banded fire carries
+        // FULL planned words; the hook rows still stop at their band).
+        std::min(
+            s.dispatch_view.planned_full_depth_rows != 0xffffffffu
+                ? 0xffffffffu
+                : s.dispatch_view.planned_max_layers,
+            pie::driver::fire::hook_region_k(s.dispatch_view)),
     };
     const model::StageHooks stage_hooks{
         .context = &stage_hook_context,
@@ -2710,6 +3043,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             engine.dispatch->launch_wants_page_mask(s.dispatch_view),
         .hook_free_prefix_rows =
             engine.dispatch->launch_hook_free_prefix_rows(s.dispatch_view),
+        .hook_rows_k = pie::driver::fire::hook_region_k(s.dispatch_view),
         .sideband_arena = engine.sideband_arena,
         .execute = [](
             void* opaque,
@@ -2749,6 +3083,7 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                     .wants_attn_score = context.wants_attn_score,
                     .wants_page_mask = context.wants_page_mask,
                     .stream = stream,
+                    .planned_layers = context.planned_layers,
                 });
         },
         .verify_replay_capture = [](void* opaque) {
@@ -2775,7 +3110,14 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
             .planned_max_layers = s.dispatch_view.planned_max_layers,
             .planned_full_depth_rows =
                 s.dispatch_view.planned_full_depth_rows,
+            .depth_band_k = s.depth_band_k.empty()
+                ? nullptr : s.depth_band_k.data(),
+            .depth_band_rows = s.depth_band_rows.empty()
+                ? nullptr : s.depth_band_rows.data(),
+            .depth_band_count =
+                static_cast<std::uint32_t>(s.depth_band_k.size()),
             .compact_logits = s.compact_logits,
+            .logits_argmax_chunk_tokens = s.logits_argmax_chunk_tokens,
             .structured_window_left = s.structured_window_left,
             .has_write_desc = s.has_write_desc,
             .use_slots = s.use_slots,
@@ -2794,6 +3136,18 @@ void enqueue_step(BatchEngine& engine, PreparedStep& step) {
                 (s.rs_is_write || s.rs_is_fold)
                     ? s.rs_buf_indptr_view.data()
                     : nullptr,
+            .rs_buffer_read_slot_ids_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_id_view.data()
+                : nullptr,
+            .rs_buffer_read_indptr_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_indptr_view.data()
+                : nullptr,
+            .rs_buffer_read_lens_h = s.rs_has_buffer_read
+                ? s.rs_buf_read_len_view.data()
+                : nullptr,
+            .rs_buffer_heads_h = s.rs_buf_head_view.empty()
+                ? nullptr
+                : s.rs_buf_head_view.data(),
             .rs_fold_lens_h = !s.rs_fold_len_view.empty()
                 ? s.rs_fold_len_view.data()
                 : nullptr,
@@ -2882,6 +3236,10 @@ void settle_step(
             static_cast<std::uint32_t>(tensor_rows(engine.ws.logits)),
             engine.inputs.row_valid.data(),
             s.program_token_starts,
+            s.logits_argmax_chunk_tokens > 0
+                ? static_cast<const std::int32_t*>(
+                      engine.ws.sampled_tokens.data())
+                : nullptr,
             dbg_fire ? &s.timing.finish_breakdown : nullptr);
     }
     if (dbg_fire) {

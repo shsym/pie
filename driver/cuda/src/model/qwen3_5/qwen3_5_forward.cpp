@@ -1,4 +1,5 @@
 #include "model/qwen3_5/qwen3_5_forward.hpp"
+#include "model/act_dump.hpp"
 #include "model/stage_hooks.hpp"
 
 #include <algorithm>
@@ -65,97 +66,19 @@ Qwen3_5LinearAttnWorkspace Qwen3_5LinearAttnWorkspace::allocate(
     ws.k_pre = DeviceBuffer<float>::alloc(N * (std::size_t)k_h * k_d);
     ws.fa_qg_packed = DeviceBuffer<std::uint16_t>::alloc(N * (std::size_t)2 * hq);
     ws.fa_gate      = DeviceBuffer<std::uint16_t>::alloc(N * (std::size_t)hq);
+    ws.qo_ext       = DeviceBuffer<std::uint32_t>::alloc(N + 1);
+    ws.rs_write_state_mask = DeviceBuffer<std::uint8_t>::alloc(N + 1);
+    ws.qo_split        = DeviceBuffer<std::uint32_t>::alloc(2 * N + 1);
+    ws.split_slot_head = DeviceBuffer<std::int32_t>::alloc(2 * N);
+    ws.split_slot_tail = DeviceBuffer<std::int32_t>::alloc(2 * N);
+    ws.split_mask_head = DeviceBuffer<std::uint8_t>::alloc(2 * N);
+    ws.max_tokens   = max_tokens;
     return ws;
-}
-
-// GDN prefill recurrence-family knobs. NOT in the anonymous namespace: the
-// declared executor (declared_forward.cpp) must select the same prefill
-// lowering the hand-written body selects, so both read these single
-// definitions — a duplicated getenv would be a silent divergence channel.
-int qwen35_gdn_cached_prefill_max_tokens() {
-    static const int max_tokens = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_CACHED_PREFILL_MAX_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 0;
-        return std::max(0, std::atoi(v));
-    }();
-    return max_tokens;
-}
-
-int qwen35_gdn_warp_tiled_max_tokens() {
-    static const int max_tokens = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_MAX_TOKENS");
-        if (v == nullptr || v[0] == '\0') return 64;
-        return std::max(0, std::atoi(v));
-    }();
-    return max_tokens;
-}
-
-// STOPGAP escape hatch (see the warp-tiled STOPGAP note in
-// linear_attn_layer_body): re-enables the warp-tiled recurrent prefill on
-// the state-persisting path once its multi-token fold is fixed.
-bool qwen35_gdn_warp_tiled_state_persist_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
 }
 
 namespace {
 
-bool mtp_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_MTP_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-std::uint64_t mtp_profile_print_limit() {
-    static const std::uint64_t limit = [] {
-        const char* v = std::getenv("PIE_MTP_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{8};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return limit;
-}
-
-bool qwen35_forward_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_FORWARD_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
-
-std::uint64_t qwen35_forward_profile_print_limit() {
-    static const std::uint64_t limit = [] {
-        const char* v = std::getenv("PIE_QWEN35_FORWARD_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{8};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return limit;
-}
-
-bool qwen35_mtp_fused_gemv_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MTP_FUSED_GEMV");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
-
-bool qwen35_mtp_shift_prefix_cache() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_QWEN35_MTP_SHIFT_PREFIX_CACHE");
-        if (v == nullptr || v[0] == '\0') return false;
-        return v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr int kQwen35GdnWarpTiledMaxTokens = 64;
 
 void qwen35_dense_mlp_block(
     const Qwen3_5LayerWeights& Lw,
@@ -235,8 +158,8 @@ struct MtpProfile {
     }
 
     void begin(int n, cudaStream_t stream) {
-        enabled = mtp_profile_enabled();
-        if (!enabled) return;
+        enabled = false;
+        return;
         ensure_events();
         N = n;
         input_fc_ms = attn_ms = mlp_ms = lm_head_ms = total_ms = 0.0;
@@ -273,25 +196,7 @@ void profile_mtp_stage(
     dst += static_cast<double>(ms);
 }
 
-void maybe_print_mtp_profile(const MtpProfile& p) {
-    if (!p.enabled) return;
-    static std::uint64_t seq = 0;
-    ++seq;
-    const std::uint64_t limit = mtp_profile_print_limit();
-    if (limit == 0 || seq > limit) return;
-    const double named = p.input_fc_ms + p.attn_ms + p.mlp_ms + p.lm_head_ms;
-    const double other = p.total_ms > named ? p.total_ms - named : 0.0;
-    std::cerr
-        << "[pie-mtp-profile] seq=" << seq
-        << " N=" << p.N
-        << " total_ms=" << p.total_ms
-        << " input_fc_ms=" << p.input_fc_ms
-        << " attn_ms=" << p.attn_ms
-        << " mlp_ms=" << p.mlp_ms
-        << " lm_head_ms=" << p.lm_head_ms
-        << " other_ms=" << other
-        << "\n";
-}
+void maybe_print_mtp_profile(const MtpProfile&) {}
 
 struct ForwardProfile {
     bool enabled = false;
@@ -345,8 +250,8 @@ struct ForwardProfile {
         int logit_rows,
         cudaStream_t stream)
     {
-        enabled = qwen35_forward_profile_enabled();
-        if (!enabled) return;
+        enabled = false;
+        return;
         cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
         CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
         if (capture_status != cudaStreamCaptureStatusNone) {
@@ -411,45 +316,7 @@ void profile_forward_stage_ptr(
     profile_forward_stage(*profile, (*profile).*field, stream, std::forward<F>(fn));
 }
 
-void maybe_print_forward_profile(const ForwardProfile& p) {
-    if (!p.enabled) return;
-    static std::uint64_t seq = 0;
-    ++seq;
-    const std::uint64_t limit = qwen35_forward_profile_print_limit();
-    if (limit == 0 || seq > limit) return;
-    const double named =
-        p.reset_ms + p.embed_ms + p.attn_norm_ms + p.linear_attn_ms +
-        p.full_attn_ms + p.mlp_norm_ms + p.mlp_ms + p.final_norm_ms +
-        p.lm_head_ms + p.final_copy_ms;
-    const double other = p.total_ms > named ? p.total_ms - named : 0.0;
-    std::cerr
-        << "[pie-qwen35-forward-profile] seq=" << seq
-        << " N=" << p.N
-        << " R=" << p.R
-        << " pure_decode=" << (p.pure_decode ? 1 : 0)
-        << " logit_rows=" << p.num_logit_rows
-        << " linear_layers=" << p.linear_layers
-        << " full_layers=" << p.full_layers
-        << " total_ms=" << p.total_ms
-        << " reset_ms=" << p.reset_ms
-        << " embed_ms=" << p.embed_ms
-        << " attn_norm_ms=" << p.attn_norm_ms
-        << " linear_attn_ms=" << p.linear_attn_ms
-        << " linear_proj_ms=" << p.linear_proj_ms
-        << " linear_conv_ms=" << p.linear_conv_ms
-        << " linear_prep_ms=" << p.linear_prep_ms
-        << " linear_recur_ms=" << p.linear_recur_ms
-        << " linear_post_ms=" << p.linear_post_ms
-        << " linear_out_ms=" << p.linear_out_ms
-        << " full_attn_ms=" << p.full_attn_ms
-        << " mlp_norm_ms=" << p.mlp_norm_ms
-        << " mlp_ms=" << p.mlp_ms
-        << " final_norm_ms=" << p.final_norm_ms
-        << " lm_head_ms=" << p.lm_head_ms
-        << " final_copy_ms=" << p.final_copy_ms
-        << " other_ms=" << other
-        << "\n";
-}
+void maybe_print_forward_profile(const ForwardProfile&) {}
 
 // Linear-attn layer body. Reads `ws.norm_x` (post-input-layernorm
 // activations) and writes the layer's contribution into `ws.norm_y`
@@ -466,6 +333,36 @@ void maybe_print_forward_profile(const ForwardProfile& p) {
 // device memory respectively. When both are nullptr (parity /
 // single-request callers), every kernel takes its legacy single-request
 // path against slot 0 — matches the R=1 layout exactly.
+// The 2R-segment split that lets a fold boundary land STRICTLY INSIDE a
+// fire's own tokens.
+//
+// `commit_len` cannot express this: the kernels implement it as
+// `if (c < Nr) Nr = c`, which TRUNCATES the sequence. That is right for a
+// state-only commit replay, which discards its outputs, but a fire folding at
+// an interior boundary still owes logits for every token it carries, and the
+// ones past the boundary would get none.
+//
+// So the row is cut in two instead. Segment `2r` is `[qo[r], qo[r]+n_r)` and
+// segment `2r+1` is `[qo[r]+n_r, qo[r+1])`; together they tile the extended
+// array exactly, so `core_out` is filled once and completely. The HEAD call
+// runs with `slot_tail` negated and `write_state=true`, so its ordinary
+// end-of-sequence writeback lands on the boundary. The TAIL call then runs on
+// the same stream with `slot_head` negated and `write_state=false`, reading
+// the state the head just wrote -- which is exactly the folded state its
+// tokens must continue from -- and producing their outputs without moving the
+// boundary again.
+//
+// A row with no interior boundary sets `n_r = T_r`: its tail segment is empty
+// and the head call is byte-for-byte the single-call path, so mixed fires need
+// no special case.
+struct Qwen3_5RsFoldSplit {
+    int segments = 0;                            // 2R
+    const std::uint32_t* qo_d = nullptr;
+    const std::int32_t*  slot_head_d = nullptr;  // [2R]
+    const std::int32_t*  slot_tail_d = nullptr;  // [2R]
+    const std::uint8_t*  mask_head_d = nullptr;  // [2R]
+};
+
 void linear_attn_layer_body(
     const Qwen3_5LayerWeights& Lw,
     const HfConfig& cfg,
@@ -475,12 +372,12 @@ void linear_attn_layer_body(
     RecurrentStateCache& state_cache,
     int layer_idx,
     int linear_idx,   // compact linear-layer index (activation-replay stash key)
-    int N, int R,
+    int N_new, int R,
     bool is_pure_decode,
     const std::int32_t*  slot_ids_h,
     const std::int32_t*  slot_ids_d,
-    const std::uint32_t* qo_indptr_h,
-    const std::uint32_t* qo_indptr_d,
+    const std::uint32_t* qo_new_h,
+    const std::uint32_t* qo_new_d,
     ops::CublasHandle& cublas,
     cudaStream_t stream,
     ForwardProfile* profile = nullptr,
@@ -496,9 +393,62 @@ void linear_attn_layer_body(
     const std::uint32_t* rs_buffer_slot_ids_h = nullptr,
     const std::uint32_t* rs_buffer_slot_indptr_h = nullptr,
     bool rs_buffer_write = false,
+    // The buffered write folds the WHOLE extended row into the state.
+    bool rs_fold_after_write = false,
     bool rs_buffer_fold = false,
-    const StageHooks* hooks = nullptr)
+    // Buffer READ path: the prefix of already-buffered tokens each request
+    // must replay before its own. `qo_ext_*` is the resulting per-request
+    // token layout, `[B_r | T_r]` per row, and `N_ext` its total.
+    const std::uint32_t* rs_buffer_read_slot_ids_h = nullptr,
+    const std::uint32_t* rs_buffer_read_indptr_h = nullptr,
+    const std::uint32_t* rs_buffer_read_lens_h = nullptr,
+    const std::uint32_t* rs_buffer_heads_h = nullptr,
+    const std::uint32_t* qo_ext_h = nullptr,
+    const std::uint32_t* qo_ext_d = nullptr,
+    int N_ext = 0,
+    // MIXED pass only: one byte per request, non-zero where this row's
+    // recurrent/conv state must persist. Null means every row agrees and
+    // `write_state` alone decides.
+    const std::uint8_t* rs_write_state_mask = nullptr,
+    // INTERIOR fold boundary only. Null on every other path, and when null
+    // this function is unchanged.
+    const Qwen3_5RsFoldSplit* fold_split = nullptr)
 {
+    // ── The linear layers run over an EXTENDED token layout ───────────
+    // A recurrence cannot start in the middle of a sequence: its initial
+    // state is `recurrent_state[slot]`, the state at the FOLDED boundary F.
+    // When a request already has B_r tokens buffered past F, its new tokens
+    // do not begin at F -- they begin at `folded (+) replay(buffer)`. So the
+    // linear layers process `B_r + T_r` rows for request r: rows [0, B_r)
+    // gathered from the buffer slabs, rows [B_r, B_r+T_r) from this fire's
+    // own in-projection. Attention, the MLP and everything downstream stay
+    // in the fire's OWN token space, because only the recurrence has memory.
+    //
+    // `N` and `qo_indptr_*` below are rebound to that extended space, so
+    // every conv / prep / FLA launch inherits it untouched. The places that
+    // must stay in the fire's own space -- the in-projection source, `z`, and
+    // the whole post-recurrence epilogue -- name `N_new` / `qo_new_h`.
+    const bool has_buffer_read =
+        rs_buffer_read_lens_h != nullptr && qo_ext_h != nullptr &&
+        qo_ext_d != nullptr && N_ext > 0;
+    const int N = has_buffer_read ? N_ext : N_new;
+    const std::uint32_t* qo_indptr_h = has_buffer_read ? qo_ext_h : qo_new_h;
+    const std::uint32_t* qo_indptr_d = has_buffer_read ? qo_ext_d : qo_new_d;
+    auto read_len_for = [&](int r) -> int {
+        return has_buffer_read
+            ? static_cast<int>(rs_buffer_read_lens_h[r])
+            : 0;
+    };
+    // Logical buffer token L of request r lives at physical `head + L`. A fold
+    // absorbs tokens off the FRONT of the buffer but can only release WHOLE
+    // covered pages, so a fold that lands mid-page leaves the survivors where
+    // they were. Reading or writing at the logical index would then re-scan
+    // tokens that are already inside the folded state, or overwrite live ones.
+    auto head_for = [&](int r) -> int {
+        return rs_buffer_heads_h != nullptr
+            ? static_cast<int>(rs_buffer_heads_h[r])
+            : 0;
+    };
     // TP-local dims for linear-attention. tp_size == 1 keeps everything
     // unsharded. The K/V head counts must divide tp_size (checked at
     // engine load); each rank operates on its 1/T head share.
@@ -512,7 +462,10 @@ void linear_attn_layer_body(
     const int V_dim    = V_h * V_d;
     const int conv_dim = 2 * K_dim + V_dim;
     const int conv_K   = cfg.linear_conv_kernel_dim;
-    const bool linear_decode = is_pure_decode && !rs_buffer_write;
+    // An extended layout has N != R, so the one-token-per-request decode
+    // kernels cannot describe it.
+    const bool linear_decode =
+        is_pure_decode && !rs_buffer_write && !has_buffer_read;
 
     auto slot_for = [&](int r) -> int {
         return slot_ids_h ? slot_ids_h[r] : 0;
@@ -523,7 +476,15 @@ void linear_attn_layer_body(
     // state as usual. Activation replay is the sole spec path now: the FLA, conv
     // and warp-tiled all honor write_state uniformly — frozen verify persists
     // nothing, the commit-advance replay (verify_frozen reset to false) writes.
-    const bool write_state = !state_cache.verify_frozen() && !rs_buffer_write;
+    // A buffered write leaves the folded state alone -- UNLESS it also folds.
+    // The extended `[buffered | new]` layout IS the row's buffer token space,
+    // so when the fold takes the WHOLE of it the boundary is the last extended
+    // token and the ordinary end-of-sequence writeback already lands there.
+    // (A boundary strictly inside is a different problem: `commit_len`
+    // truncates the sequence rather than just moving the snapshot, so the
+    // tokens past it would get no outputs. The planner refuses that.)
+    const bool write_state =
+        !state_cache.verify_frozen() && (!rs_buffer_write || rs_fold_after_write);
 
     // ── In-projections (or activation-replay load) ────────────────
     // Activation-replay stash layout per linear layer (bf16, max_tokens stride):
@@ -560,12 +521,23 @@ void linear_attn_layer_body(
                 for (int r = 0; r < R; ++r) {
                     const int qo0 = static_cast<int>(qo_indptr_h[r]);
                     const int nr  = static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                    // The fold replays LOGICAL tokens [0, nr), which live at
+                    // physical [head, head+nr). The CSR starts at the page
+                    // CONTAINING head, so the first page can begin earlier.
+                    const int head = head_for(r);
+                    const int page_first = (head / page) * page;
                     const std::uint32_t s0 = rs_buffer_slot_indptr_h[r];
                     const std::uint32_t s1 = rs_buffer_slot_indptr_h[r + 1];
                     for (std::uint32_t j = 0; s0 + j < s1; ++j) {
-                        const int tok0 = static_cast<int>(j) * page;
-                        const int cnt = std::min(page, nr - tok0);
+                        const int page_tok0 =
+                            page_first + static_cast<int>(j) * page;
+                        const int phys0 = std::max(page_tok0, head);
+                        const int cnt =
+                            std::min(page_tok0 + page, head + nr) - phys0;
                         if (cnt <= 0) break;
+                        const std::size_t in_page =
+                            static_cast<std::size_t>(phys0 - page_tok0);
+                        const int tok0 = phys0 - head;
                         auto* slab = static_cast<std::uint16_t*>(
                             state_cache.rs_buffer_slab(
                                 linear_idx,
@@ -574,21 +546,21 @@ void linear_attn_layer_body(
                         CUDA_CHECK(cudaMemcpyAsync(
                             la.mixed_qkv.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * conv_dim,
-                            slab,
+                            slab + in_page * conv_dim,
                             static_cast<std::size_t>(cnt) * conv_dim *
                                 sizeof(std::uint16_t),
                             cudaMemcpyDeviceToDevice, stream));
                         CUDA_CHECK(cudaMemcpyAsync(
                             la.a.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h,
-                            slab + slab_a,
+                            slab + slab_a + in_page * V_h,
                             static_cast<std::size_t>(cnt) * V_h *
                                 sizeof(std::uint16_t),
                             cudaMemcpyDeviceToDevice, stream));
                         CUDA_CHECK(cudaMemcpyAsync(
                             la.b.data() +
                                 static_cast<std::size_t>(qo0 + tok0) * V_h,
-                            slab + slab_b,
+                            slab + slab_b + in_page * V_h,
                             static_cast<std::size_t>(cnt) * V_h *
                                 sizeof(std::uint16_t),
                             cudaMemcpyDeviceToDevice, stream));
@@ -608,37 +580,113 @@ void linear_attn_layer_body(
             return;
         }
         // The qkv/z and b/a fusions are independent (see the loader).
-        if (Lw.la_in_proj_qkvz != nullptr) {
+        //
+        // `src0` indexes the fire's OWN tokens (norm_x, z); `dst0` indexes the
+        // extended recurrence layout (mixed_qkv, a, b). They coincide unless a
+        // buffer read is shifting each request's new tokens right by its B_r.
+        auto in_proj_rows = [&](int src0, int dst0, int rows) {
+            if (rows <= 0) return;
+            const auto* x =
+                static_cast<const std::uint16_t*>(ws.norm_x.data()) +
+                static_cast<std::size_t>(src0) * H;
+            // mixed_qkv [rows, conv_dim] = norm_x @ in_proj_qkv.T
             ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_qkvz,
-                la.mixed_qkvz.data(), N, conv_dim + V_dim, H);
-            kernels::launch_split_bf16_rows(
-                la.mixed_qkvz.data(), la.mixed_qkv.data(), la.z.data(),
-                N, conv_dim, V_dim, stream);
+                x, *Lw.la_in_proj_qkv,
+                la.mixed_qkv.data() +
+                    static_cast<std::size_t>(dst0) * conv_dim,
+                rows, conv_dim, H);
+            // z [rows, V_dim] = norm_x @ in_proj_z.T
+            ops::gemm_act_x_w(cublas.handle(),
+                x, *Lw.la_in_proj_z,
+                la.z.data() + static_cast<std::size_t>(src0) * V_dim,
+                rows, V_dim, H);
+            // a [rows, V_h] = norm_x @ in_proj_a.T   (b symmetric)
+            ops::gemm_act_x_w(cublas.handle(),
+                x, *Lw.la_in_proj_a,
+                la.a.data() + static_cast<std::size_t>(dst0) * V_h,
+                rows, V_h, H);
+            ops::gemm_act_x_w(cublas.handle(),
+                x, *Lw.la_in_proj_b,
+                la.b.data() + static_cast<std::size_t>(dst0) * V_h,
+                rows, V_h, H);
+        };
+        if (!has_buffer_read) {
+            in_proj_rows(0, 0, N);
         } else {
-            // mixed_qkv [N, conv_dim] = norm_x @ in_proj_qkv.T
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_qkv,
-                la.mixed_qkv.data(), N, conv_dim, H);
-            // z [N, V_dim] = norm_x @ in_proj_z.T
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_z,
-                la.z.data(), N, V_dim, H);
+            // One GEMM per request: the destination rows are no longer
+            // contiguous across requests. R is small on this path (it is the
+            // speculative / chunked-append path), so the launch count is too.
+            for (int r = 0; r < R; ++r) {
+                const int src0 = static_cast<int>(qo_new_h[r]);
+                const int rows = static_cast<int>(qo_new_h[r + 1]) - src0;
+                in_proj_rows(src0,
+                             static_cast<int>(qo_indptr_h[r]) + read_len_for(r),
+                             rows);
+            }
         }
-        if (Lw.la_in_proj_ba != nullptr) {
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_ba,
-                la.ba.data(), N, 2 * V_h, H);
-            kernels::launch_split_qwen_gdn_ba_bf16(
-                la.ba.data(), la.b.data(), la.a.data(), N, V_h, stream);
-        } else {
-            // a [N, V_h] = norm_x @ in_proj_a.T   (b symmetric)
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_a,
-                la.a.data(), N, V_h, H);
-            ops::gemm_act_x_w(cublas.handle(),
-                ws.norm_x.data(), *Lw.la_in_proj_b,
-                la.b.data(), N, V_h, H);
+        if (has_buffer_read) {
+            // Gather each request's already-buffered in-proj activations into
+            // rows [qo_ext[r], qo_ext[r] + B_r) -- the prefix the recurrence
+            // must replay before it reaches this fire's own tokens. Same
+            // page-major slab layout as the fold gather above; the difference
+            // is only which pages (read = the whole live buffer, write = the
+            // span this fire appends) and that these rows are NOT rewritten.
+            const int page = state_cache.rs_buffer_page_tokens();
+            const std::size_t slab_a =
+                static_cast<std::size_t>(page) * conv_dim;
+            const std::size_t slab_b =
+                slab_a + static_cast<std::size_t>(page) * V_h;
+            for (int r = 0; r < R; ++r) {
+                const int qo0 = static_cast<int>(qo_indptr_h[r]);
+                const int br  = read_len_for(r);
+                if (br <= 0) continue;
+                const int head = head_for(r);
+                const int page_first = (head / page) * page;
+                const std::uint32_t s0 = rs_buffer_read_indptr_h[r];
+                const std::uint32_t s1 = rs_buffer_read_indptr_h[r + 1];
+                for (std::uint32_t j = 0; s0 + j < s1; ++j) {
+                    const int page_tok0 =
+                        page_first + static_cast<int>(j) * page;
+                    const int phys0 = std::max(page_tok0, head);
+                    const int cnt =
+                        std::min(page_tok0 + page, head + br) - phys0;
+                    if (cnt <= 0) break;
+                    const std::size_t in_page =
+                        static_cast<std::size_t>(phys0 - page_tok0);
+                    const int tok0 = phys0 - head;
+                    auto* slab = static_cast<std::uint16_t*>(
+                        state_cache.rs_buffer_slab(
+                            linear_idx,
+                            static_cast<int>(
+                                rs_buffer_read_slot_ids_h[s0 + j])));
+                    if (slab == nullptr) {
+                        throw std::runtime_error(
+                            "RS buffer read names a slab this layer has not "
+                            "allocated");
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        la.mixed_qkv.data() +
+                            static_cast<std::size_t>(qo0 + tok0) * conv_dim,
+                        slab + in_page * conv_dim,
+                        static_cast<std::size_t>(cnt) * conv_dim *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        la.a.data() +
+                            static_cast<std::size_t>(qo0 + tok0) * V_h,
+                        slab + slab_a + in_page * V_h,
+                        static_cast<std::size_t>(cnt) * V_h *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        la.b.data() +
+                            static_cast<std::size_t>(qo0 + tok0) * V_h,
+                        slab + slab_b + in_page * V_h,
+                        static_cast<std::size_t>(cnt) * V_h *
+                            sizeof(std::uint16_t),
+                        cudaMemcpyDeviceToDevice, stream));
+                }
+            }
         }
         if (stash_write) {
             // Cache the cheap in-proj activations for the replay.
@@ -665,12 +713,28 @@ void linear_attn_layer_body(
             for (int r = 0; r < R; ++r) {
                 const int qo0 = static_cast<int>(qo_indptr_h[r]);
                 const int nr  = static_cast<int>(qo_indptr_h[r + 1]) - qo0;
+                // Buffer tokens [w0, w0+wn) are the ones this fire APPENDS.
+                // Extended row index == buffer token index, so only rows at or
+                // past w0 are ours to write -- rows below it were gathered from
+                // the buffer and writing them back would be a no-op at best.
+                const int head = head_for(r);
+                const int w0 = head + read_len_for(r);
+                const int wn = nr - read_len_for(r);
+                if (wn <= 0) continue;
+                // page_span() starts at the page CONTAINING w0, so the first
+                // listed page can begin before this fire's span.
+                const int page_first = (w0 / page) * page;
                 const std::uint32_t s0 = rs_buffer_slot_indptr_h[r];
                 const std::uint32_t s1 = rs_buffer_slot_indptr_h[r + 1];
                 for (std::uint32_t j = 0; s0 + j < s1; ++j) {
-                    const int tok0 = static_cast<int>(j) * page;
-                    const int cnt = std::min(page, nr - tok0);
+                    const int page_tok0 = page_first + static_cast<int>(j) * page;
+                    const int phys0 = std::max(page_tok0, w0);
+                    const int cnt =
+                        std::min(page_tok0 + page, w0 + wn) - phys0;
                     if (cnt <= 0) break;
+                    const std::size_t in_page =
+                        static_cast<std::size_t>(phys0 - page_tok0);
+                    const int tok0 = phys0 - head;
                     auto* slab = static_cast<std::uint16_t*>(
                         state_cache.rs_buffer_slab(
                             linear_idx,
@@ -680,7 +744,8 @@ void linear_attn_layer_body(
                         reinterpret_cast<const std::uint8_t*>(
                             la.mixed_qkv.data() +
                             static_cast<std::size_t>(qo0 + tok0) * conv_dim),
-                        reinterpret_cast<std::uint8_t*>(slab),
+                        reinterpret_cast<std::uint8_t*>(
+                            slab + in_page * conv_dim),
                         static_cast<std::size_t>(cnt) * conv_dim *
                             sizeof(std::uint16_t),
                         slot_ids_d, r, stream);
@@ -688,7 +753,8 @@ void linear_attn_layer_body(
                         reinterpret_cast<const std::uint8_t*>(
                             la.a.data() +
                             static_cast<std::size_t>(qo0 + tok0) * V_h),
-                        reinterpret_cast<std::uint8_t*>(slab + slab_a),
+                        reinterpret_cast<std::uint8_t*>(
+                            slab + slab_a + in_page * V_h),
                         static_cast<std::size_t>(cnt) * V_h *
                             sizeof(std::uint16_t),
                         slot_ids_d, r, stream);
@@ -696,7 +762,8 @@ void linear_attn_layer_body(
                         reinterpret_cast<const std::uint8_t*>(
                             la.b.data() +
                             static_cast<std::size_t>(qo0 + tok0) * V_h),
-                        reinterpret_cast<std::uint8_t*>(slab + slab_b),
+                        reinterpret_cast<std::uint8_t*>(
+                            slab + slab_b + in_page * V_h),
                         static_cast<std::size_t>(cnt) * V_h *
                             sizeof(std::uint16_t),
                         slot_ids_d, r, stream);
@@ -740,15 +807,35 @@ void linear_attn_layer_body(
             // into the request's slot. Falls back to host-loop for the
             // legacy single-request parity entrypoint.
             if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                kernels::launch_causal_conv1d_prefill_batched_bf16(
-                    qkv_in_base, Lw.la_conv1d_w->data(),
-                    Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
-                    qkv_post_base,
-                    state_cache.conv_state(layer_idx, /*slot=*/0),
-                    slot_ids_d, qo_indptr_d,
-                    static_cast<long long>(state_cache.conv_kernel()) *
-                        state_cache.conv_dim(),
-                    R, conv_dim, conv_K, stream, write_state, commit_len);
+                auto conv_pass = [&](int R, const std::int32_t* slot_ids_d,
+                                     const std::uint32_t* qo_indptr_d,
+                                     bool write_state,
+                                     const std::uint8_t* rs_write_state_mask) {
+                    kernels::launch_causal_conv1d_prefill_batched_bf16(
+                        qkv_in_base, Lw.la_conv1d_w->data(),
+                        Lw.la_conv1d_b ? Lw.la_conv1d_b->data() : nullptr,
+                        qkv_post_base,
+                        state_cache.conv_state(layer_idx, /*slot=*/0),
+                        slot_ids_d, qo_indptr_d,
+                        static_cast<long long>(state_cache.conv_kernel()) *
+                            state_cache.conv_dim(),
+                        R, conv_dim, conv_K, stream, write_state, commit_len,
+                        rs_write_state_mask);
+                };
+                if (fold_split != nullptr) {
+                    // Head then tail, same stream. The tail's left context is
+                    // the trailing K-window the head just persisted, which the
+                    // kernel reads out of the slot for `src_t < 0` -- so the
+                    // cut is invisible to the convolution's arithmetic.
+                    conv_pass(fold_split->segments, fold_split->slot_head_d,
+                              fold_split->qo_d, /*write_state=*/true,
+                              fold_split->mask_head_d);
+                    conv_pass(fold_split->segments, fold_split->slot_tail_d,
+                              fold_split->qo_d, /*write_state=*/false, nullptr);
+                } else {
+                    conv_pass(R, slot_ids_d, qo_indptr_d, write_state,
+                              rs_write_state_mask);
+                }
             } else {
                 for (int r = 0; r < R; ++r) {
                     const int t0 = static_cast<int>(qo_indptr_h[r]);
@@ -772,86 +859,6 @@ void linear_attn_layer_body(
     // after the prefill and after each of the first few decodes — to route the
     // rs_cache GDN glitch (4 spurious tokens == conv_K=4 window shift-out)
     // between alpha's rs wiring and the driver's N<K conv persist/pad.
-    if (std::getenv("PIE_CONV_TRACE") != nullptr && linear_idx == 0) {
-        static std::atomic<int> s_decode_fire{0};
-        const int fire = linear_decode
-            ? s_decode_fire.fetch_add(1)
-            : -1;  // -1 = prefill
-        // Guard: D2H/sync are ILLEGAL during CUDA-graph capture (would hang).
-        // Skip captured fires (run with PIE_CUDA_PREFILL_DECODE_NOGRAPHS=1 to
-        // force eager decode so every fire dumps).
-        cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
-        cudaStreamIsCapturing(stream, &cap);
-        if ((!linear_decode || fire < 6) && cap == cudaStreamCaptureStatusNone) {
-            const int slot = slot_for(0);
-            const long long elems =
-                static_cast<long long>(conv_K) * conv_dim;
-            std::vector<std::uint16_t> host(static_cast<std::size_t>(elems));
-            CUDA_CHECK(cudaStreamSynchronize(stream));
-            CUDA_CHECK(cudaMemcpy(
-                host.data(), state_cache.conv_state(layer_idx, slot),
-                static_cast<std::size_t>(elems) * sizeof(std::uint16_t),
-                cudaMemcpyDeviceToHost));
-            auto bf16 = [](std::uint16_t h) -> float {
-                std::uint32_t u = static_cast<std::uint32_t>(h) << 16;
-                float f; std::memcpy(&f, &u, sizeof(f)); return f;
-            };
-            double l1 = 0.0;
-            for (auto h : host) l1 += std::fabs(static_cast<double>(bf16(h)));
-            std::string cl = "null";
-            if (commit_len != nullptr) {
-                std::vector<int> hcl(static_cast<std::size_t>(R));
-                CUDA_CHECK(cudaMemcpy(hcl.data(), commit_len,
-                    static_cast<std::size_t>(R) * sizeof(int),
-                    cudaMemcpyDeviceToHost));
-                cl.clear();
-                for (int r = 0; r < R; ++r)
-                    cl += (r ? "," : "") + std::to_string(hcl[static_cast<std::size_t>(r)]);
-            }
-            std::cerr << "[conv-trace] " << (linear_decode ? "decode#" : "PREFILL")
-                      << (linear_decode ? std::to_string(fire) : std::string())
-                      << " N=" << N << " R=" << R
-                      << " layer=" << layer_idx
-                      << " slot=" << slot
-                      << " conv_K=" << conv_K << " conv_dim=" << conv_dim
-                      << " write_state=" << (write_state ? 1 : 0)
-                      << " rs_buffer_write=" << (rs_buffer_write ? 1 : 0)
-                      << " rs_buffer_fold=" << (rs_buffer_fold ? 1 : 0)
-                      << " commit_len=[" << cl << "]"
-                      << " conv_state.L1=" << l1;
-            // Per-K-position channel-0..2 sample: answers alpha's "left-pad
-            // [0,0,t0,t1] vs mis-aligned" — pos k lives at offset k*conv_dim
-            // (layout [conv_K, conv_dim], position-major).
-            std::cerr << " posK[c0,c1,c2]=";
-            for (int k = 0; k < conv_K; ++k) {
-                const long long base = static_cast<long long>(k) * conv_dim;
-                std::cerr << (k ? " " : "") << "p" << k << "[";
-                for (int c = 0; c < 3 && base + c < elems; ++c)
-                    std::cerr << (c ? "," : "")
-                              << bf16(host[static_cast<std::size_t>(base + c)]);
-                std::cerr << "]";
-            }
-            // Recurrent (gated-delta) state L1 — the OTHER GDN state half.
-            const long long rs_elems =
-                static_cast<long long>(V_h) * K_d * V_d;
-            void* rs_ptr = state_cache.recurrent_state_raw(layer_idx, slot);
-            double rl1 = 0.0;
-            if (state_cache.recurrent_state_bf16()) {
-                std::vector<std::uint16_t> rhost(static_cast<std::size_t>(rs_elems));
-                CUDA_CHECK(cudaMemcpy(rhost.data(), rs_ptr,
-                    static_cast<std::size_t>(rs_elems) * sizeof(std::uint16_t),
-                    cudaMemcpyDeviceToHost));
-                for (auto h : rhost) rl1 += std::fabs(static_cast<double>(bf16(h)));
-            } else {
-                std::vector<float> rhost(static_cast<std::size_t>(rs_elems));
-                CUDA_CHECK(cudaMemcpy(rhost.data(), rs_ptr,
-                    static_cast<std::size_t>(rs_elems) * sizeof(float),
-                    cudaMemcpyDeviceToHost));
-                for (float x : rhost) rl1 += std::fabs(static_cast<double>(x));
-            }
-            std::cerr << " recur_state.L1=" << rl1 << "\n";
-        }
-    }
 
     // ── Split mixed_qkv_post + prep recurrent inputs ─────────────
     // mixed_qkv_post[N, conv_dim] packs [q_raw | k_raw | v_raw]. The fused
@@ -865,22 +872,29 @@ void linear_attn_layer_body(
     // frozen-verify (write_state=false → persists nothing, so the fold bug cannot
     // manifest) and all decode. Re-enable the warp-tiled state path via
     // PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST=1 once the kernel's fold is fixed.
-    const bool warp_tiled_state_persist_ok =
-        qwen35_gdn_warp_tiled_state_persist_enabled();
     const bool use_warp_tiled_recurrent =
         !linear_decode &&
         slot_ids_d != nullptr &&
         qo_indptr_d != nullptr &&
-        N <= qwen35_gdn_warp_tiled_max_tokens() &&
+        N <= kQwen35GdnWarpTiledMaxTokens &&
         K_d <= 256 &&
         // The commit-advance threads commit_len only through the FLA path.
         commit_len == nullptr &&
         // STOPGAP: skip warp-tiled when it must PERSIST state (the buggy fold).
-        (!write_state || warp_tiled_state_persist_ok);
+        !write_state;
+    // V_h == K_h is the repeat=1 case, not a separate shape: the GQA kernel
+    // computes h_k = h/1 = h and indexes q at (r*K_h + h)*K_d, which is the
+    // non-GQA kernel's (r*V_h + h)*K_d exactly. The two branches also hand it
+    // the same pointer, since `q_recur_full` IS `la.q_pre` when V_h == K_h and
+    // the repeat_interleave above is skipped. Excluding equal head counts
+    // therefore bought nothing and cost everything: the tuned SMEM step kernel
+    // is reachable only through this launcher, so a model with equal linear
+    // key/value head counts (Qwen3.5-0.8B: 16 and 16) silently fell back to
+    // the legacy 2R/2W-per-element step. Measured on one L40S at R=1:
+    // 41.6 us/layer -> 10.4 us/layer, 18 linear layers, ~22% of the decode.
     const bool use_decode_gqa_recurrent =
         linear_decode &&
         slot_ids_d != nullptr &&
-        V_h != K_h &&
         V_h % K_h == 0;
     // The batched FLA prefill path (the high-concurrency verify/repair kernel)
     // is now GQA-aware: it reads the compact K_h-head q/k directly, so it too
@@ -888,13 +902,24 @@ void linear_attn_layer_body(
     // prefill that is neither warp-tiled (N small) nor cached (env-gated, off
     // by default), i.e. exactly the c≥64 spec path. The branches are mutually
     // exclusive and chosen globally from N, so skipping is safe.
+    // Same STOPGAP as use_warp_tiled_recurrent above, for the same reason:
+    // this kernel is that one's GQA twin -- the identical single-block scan,
+    // differing only in deriving qk_h itself instead of reading a materialised
+    // repeat -- so it under-folds the persisted state in exactly the same way.
+    // The original fix gated only the non-GQA arm, which left every GQA model
+    // (V_h != K_h is this path's own entry condition) still routed into the
+    // bug. Qwen3.6-27B decoded pure punctuation from the first token; sending
+    // its state-persisting prefills down the proven chunk path fixes it at a
+    // cost of 0.1 tok/s. Frozen verify (write_state=false) persists nothing,
+    // so the fold cannot manifest there and keeps the faster kernel.
     const bool use_batched_fla_gqa =
+        !write_state &&
         !linear_decode &&
         slot_ids_d != nullptr &&
         qo_indptr_d != nullptr &&
         !use_warp_tiled_recurrent &&
         V_h != K_h &&
-        N > qwen35_gdn_cached_prefill_max_tokens();
+        N > 0;
     profile_forward_stage_ptr(profile, &ForwardProfile::linear_prep_ms, stream, [&] {
         kernels::launch_qwen_gdn_post_conv_prep_bf16(
             qkv_base, la.a.data(), la.b.data(),
@@ -914,53 +939,23 @@ void linear_attn_layer_body(
                 la.k_pre.data(), la.k_norm.data(), N, K_h, V_h, K_d, stream);
         }
     });
-    invoke_stage_hook(
-        hooks,
-        StageHookPoint::OnAttnProj, la.q_pre.data(),
-        static_cast<std::uint32_t>(N),
-        static_cast<std::uint32_t>(K_h * K_d),
-        static_cast<std::uint32_t>(layer_idx), stream,
-        /*query_is_f32=*/true);
+    // forward-hybrid.wit ruling (2026-08-05): the attention taps fire on
+    // ATTENTION layers only — this GDN layer invokes no hook stage.
     const float* q_recur_full =
         (V_h == K_h) ? la.q_pre.data() : la.q_norm.data();
     const float* k_recur_full =
         (V_h == K_h) ? la.k_pre.data() : la.k_norm.data();
+    // The GQA kernels do their own repeat: they index q/k at the COMPACT
+    // K_h stride and derive the head themselves (qk_h = h / repeat). They
+    // must therefore be handed the compact buffers, never the *_full pair.
+    const float* q_recur_compact = la.q_pre.data();
+    const float* k_recur_compact = la.k_pre.data();
 
     // ── PIE_GDN_PREP_TRACE: FLA-fold probe ───────────────────────────
     // Dumps the recurrence INPUTS per prefill token (g_log = gating log-decay,
     // beta, ‖v‖, ‖k‖) — to pinpoint whether the multi-token fold under-accumulates
     // because a per-token INPUT is wrong (for example g_log[t1]) vs the fold math.
     // g_log/beta are [N,V_h] fp32; v_fp32 [N,V_h,V_d]; k_pre [N,K_h,K_d] fp32.
-    if (std::getenv("PIE_GDN_PREP_TRACE") != nullptr && linear_idx == 0 &&
-        !linear_decode) {
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        std::vector<float> hg(static_cast<std::size_t>(N) * V_h);
-        std::vector<float> hb(static_cast<std::size_t>(N) * V_h);
-        std::vector<float> hv(static_cast<std::size_t>(N) * V_h * V_d);
-        std::vector<float> hk(static_cast<std::size_t>(N) * K_h * K_d);
-        CUDA_CHECK(cudaMemcpy(hg.data(), la.g_log.data(), hg.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(hb.data(), la.beta.data(), hb.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(hv.data(), la.v_fp32.data(), hv.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        CUDA_CHECK(cudaMemcpy(hk.data(), la.k_pre.data(), hk.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        for (int t = 0; t < N; ++t) {
-            double gsum = 0, gmin = 1e30, gmax = -1e30, bsum = 0;
-            for (int h = 0; h < V_h; ++h) {
-                double g = hg[static_cast<std::size_t>(t) * V_h + h];
-                gsum += g; gmin = std::min(gmin, g); gmax = std::max(gmax, g);
-                bsum += hb[static_cast<std::size_t>(t) * V_h + h];
-            }
-            double vn = 0, kn = 0;
-            for (int i = 0; i < V_h * V_d; ++i) { double x = hv[static_cast<std::size_t>(t) * V_h * V_d + i]; vn += x * x; }
-            for (int i = 0; i < K_h * K_d; ++i) { double x = hk[static_cast<std::size_t>(t) * K_h * K_d + i]; kn += x * x; }
-            std::cerr << "[gdn-prep] layer=" << layer_idx << " N=" << N
-                      << " t=" << t
-                      << " g_log{mean=" << (gsum / V_h) << ",min=" << gmin << ",max=" << gmax << "}"
-                      << " beta{mean=" << (bsum / V_h) << "}"
-                      << " |v|=" << std::sqrt(vn)
-                      << " |k|=" << std::sqrt(kn)
-                      << " (g_log head0=" << hg[static_cast<std::size_t>(t) * V_h] << ")\n";
-        }
-    }
 
         // ── Recurrent update ───────────────────────────────────────────
         // Both decode and prefill: one batched launch over (R, V_h) blocks
@@ -1056,127 +1051,10 @@ void linear_attn_layer_body(
                     }
                 }
             } else {
-                if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
-                    if (use_warp_tiled_recurrent && V_h != K_h) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d,
-                                stream, write_state);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d,
-                                stream, write_state);
-                        }
-                    } else if (use_warp_tiled_recurrent) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state);
-                        }
-                    } else if (
-                        commit_len == nullptr &&
-                        N <= qwen35_gdn_cached_prefill_max_tokens()) {
-                        if (state_bf16) {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached_state_bf16(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched_cached(
-                                q_recur_full,
-                                k_recur_full,
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, V_h, K_d, V_d,
-                                stream, write_state);
-                        }
-                    } else {
-                        if (state_bf16) {
-                            // GQA-aware FLA: pass the compact K_h-head q/k
-                            // (q_pre == q_recur_full when V_h==K_h). The kernel
-                            // maps each V-head to its K-head, so repeat_interleave
-                            // is skipped above (use_batched_fla_gqa).
-                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                state_slot0,
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d, stream, write_state,
-                                commit_len);
-                        } else {
-                            kernels::launch_chunk_gated_delta_prefill_batched(
-                                la.q_pre.data(),
-                                la.k_pre.data(),
-                                la.v_fp32.data(),
-                                la.g_log.data(),
-                                la.beta.data(),
-                                static_cast<float*>(state_slot0),
-                                slot_ids_d, qo_indptr_d,
-                                slot_stride,
-                                la.core_out.data(),
-                                R, K_h, V_h, K_d, V_d, stream, write_state,
-                                commit_len);
-                        }
-                    }
-                } else {
+                // The non-warp-tiled chunk path, per request. Named because
+                // two callers need it: the unslotted branch below, and the
+                // slotted branch when the warp-tiled kernel is gated off.
+                auto chunk_prefill_per_request = [&] {
                     for (int r = 0; r < R; ++r) {
                         const int t0 = static_cast<int>(qo_indptr_h[r]);
                         const int Nr = static_cast<int>(qo_indptr_h[r + 1]) - t0;
@@ -1208,18 +1086,177 @@ void linear_attn_layer_body(
                                 Nr, V_h, K_d, V_d, /*chunk_size=*/64, stream);
                         }
                     }
+                };
+                if (slot_ids_d != nullptr && qo_indptr_d != nullptr) {
+                    auto fla_pass = [&](int R, const std::int32_t* slot_ids_d,
+                                        const std::uint32_t* qo_indptr_d,
+                                        bool write_state,
+                                        const std::uint8_t* rs_write_state_mask) {
+                    // One arm per state dtype, and nothing else to choose.
+                    //
+                    // This was four arms: GQA and non-GQA, each with an fp32
+                    // and a bf16 state. The two kernels behind them differed
+                    // only in how they index q/k -- with `K_h == V_h` the GQA
+                    // kernel's `repeat` is 1, `qk_h` is `h`, and its index
+                    // reduces to the other's exactly -- so the non-GQA pair
+                    // was a second copy of the same arithmetic, and the
+                    // `V_h != K_h` test picked between identical results.
+                    //
+                    // Feed it the compact buffers. `q_recur_full` happens to
+                    // BE compact when the heads are equal, which is why it read
+                    // as a safe argument here, but that is the degenerate case:
+                    // when the heads differ it is the V_h-expanded buffer, and
+                    // these paths skip the repeat_interleave that fills it. The
+                    // kernel then walked stale memory at a K_h stride, which is
+                    // what made Qwen3.6-27B (repeat 3) emit pure punctuation.
+                    if (use_warp_tiled_recurrent) {
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, rs_write_state_mask);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, rs_write_state_mask);
+                        }
+                    } else {
+                        // The hole upstream documents, filled — with the
+                        // BATCHED kernel, not the per-request one its note
+                        // rules out.
+                        //
+                        // Both of that note's objections are to
+                        // `chunk_prefill_per_request` standing in here: it
+                        // walks the fire's own `qo_indptr_h`, so on a fold
+                        // pass it folds the wrong ranges into the wrong
+                        // slots, and it cannot express the tail pass's
+                        // `write_state=false`. Neither is true of this
+                        // kernel: it takes `slot_ids` and `qo_indptr` as
+                        // ARGUMENTS — the fold's own, whichever pass is
+                        // calling — and it takes `write_state`. So the fold
+                        // head and tail get a real recurrence instead of
+                        // nothing.
+                        //
+                        // Compact buffers, for the reason the comment above
+                        // gives: `q_recur_full` is the V_h-expanded one when
+                        // the heads differ, and this path skips the
+                        // repeat_interleave that fills it.
+                        //
+                        // Measured on `cuda_gdn_foldcommit`, one test per
+                        // process (`pie_engine::bootstrap` is single-use).
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        }
+                    }
+                    };
+                    if (fold_split != nullptr) {
+                        // The head writes the state AT the boundary; the tail
+                        // reads it back as its own initial state and produces
+                        // the outputs past it without moving it again.
+                        fla_pass(fold_split->segments, fold_split->slot_head_d,
+                                 fold_split->qo_d, /*write_state=*/true,
+                                 fold_split->mask_head_d);
+                        fla_pass(fold_split->segments, fold_split->slot_tail_d,
+                                 fold_split->qo_d, /*write_state=*/false,
+                                 nullptr);
+                    } else if (use_warp_tiled_recurrent) {
+                        fla_pass(R, slot_ids_d, qo_indptr_d, write_state,
+                                 rs_write_state_mask);
+                    } else {
+                        // The route the state-persist stopgap says it takes
+                        // and never wired: with the warp-tiled kernel gated
+                        // off, a plain slotted prefill goes to the proven
+                        // per-request chunk path.
+                        chunk_prefill_per_request();
+                    }
+                } else {
+                    chunk_prefill_per_request();
                 }
             }
         }
     });
-    invoke_stage_hook(
-        hooks,
-        StageHookPoint::OnAttn, la.q_pre.data(),
-        static_cast<std::uint32_t>(N),
-        static_cast<std::uint32_t>(K_h * K_d),
-        static_cast<std::uint32_t>(layer_idx), stream,
-        /*query_is_f32=*/true);
+    // ── PIE_RS_SPLIT_TRACE: post-recurrence state probe ──────────────
+    // Never syncs under graph capture -- the decode path captures this stream
+    // and a sync there is an outright CUDA error, not just a stall.
+    // The interior-boundary split is the only path that writes the state from
+    // a segment that is not the row's own end, so a divergence shows up HERE
+    // (in the state the fire leaves behind) long before it reaches a logit.
+    // Gated on the compact LINEAR index, like every sibling trace here: on a
+    // hybrid stack layer 0 may be an attention layer, and this body would then
+    // never run for it.
+    // forward-hybrid.wit ruling: no hook stage on GDN layers (above).
     if (commit_len != nullptr) return;
+
+    // ── back to the fire's own token space ────────────────────────
+    // The recurrence produced `core_out` over the extended layout. Everything
+    // below -- the gate `z`, out_proj, the residual -- is indexed by the
+    // fire's own tokens, so drop the replayed prefix by compacting rows
+    // [qo_ext[r]+B_r, qo_ext[r+1]) of each request down to [qo_new[r], ...).
+    //
+    // The destination overlaps the source (it is the same array shifted left),
+    // so it cannot be an in-place memcpy. `v_fp32` is exactly the same shape
+    // and is dead the moment the FLA returns, which makes it a free landing
+    // pad -- no extra allocation for a path most fires never take.
+    const float* core_rows = la.core_out.data();
+    if (has_buffer_read) {
+        float* packed = la.v_fp32.data();
+        for (int r = 0; r < R; ++r) {
+            const int src0 =
+                static_cast<int>(qo_indptr_h[r]) + read_len_for(r);
+            const int dst0 = static_cast<int>(qo_new_h[r]);
+            const int rows = static_cast<int>(qo_new_h[r + 1]) - dst0;
+            if (rows <= 0) continue;
+            CUDA_CHECK(cudaMemcpyAsync(
+                packed + static_cast<std::size_t>(dst0) * V_dim,
+                la.core_out.data() + static_cast<std::size_t>(src0) * V_dim,
+                static_cast<std::size_t>(rows) * V_dim * sizeof(float),
+                cudaMemcpyDeviceToDevice, stream));
+        }
+        core_rows = packed;
+    }
 
     // ── core_out (fp32) → fused RMSNormGated → bf16 ────────────────
     // core_out has [N, V_h, V_d] layout = [N, V_dim] flat. We want
@@ -1233,9 +1270,9 @@ void linear_attn_layer_body(
     // Qwen3.5-4B 512×128).
     profile_forward_stage_ptr(profile, &ForwardProfile::linear_post_ms, stream, [&] {
         kernels::launch_rmsnorm_gated_fp32_in_bf16(
-            la.core_out.data(), la.z.data(), Lw.la_norm_w_fp32,
+            core_rows, la.z.data(), Lw.la_norm_w_fp32,
             la.core_out_bf16.data(),
-            N * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
+            N_new * V_h, V_d, /*eps=*/cfg.rms_norm_eps, stream);
     });
 
     // ── out_proj: [N, V_dim] → [N, H]. On TP=1 we fuse the residual via
@@ -1246,16 +1283,16 @@ void linear_attn_layer_body(
         if (T == 1) {
             ops::gemm_act_x_w(cublas.handle(),
                 la.core_out_bf16.data(), *Lw.la_out_proj,
-                ws.y.data(), N, H, V_dim, /*beta=*/1.f);
+                ws.y.data(), N_new, H, V_dim, /*beta=*/1.f);
         } else {
             ops::gemm_act_x_w(cublas.handle(),
                 la.core_out_bf16.data(), *Lw.la_out_proj,
-                ws.norm_y.data(), N, H, V_dim, /*beta=*/0.f);
+                ws.norm_y.data(), N_new, H, V_dim, /*beta=*/0.f);
             tp->all_reduce_bf16(ws.norm_y.data(),
-                static_cast<std::size_t>(N) * H, ncclSum, stream);
+                static_cast<std::size_t>(N_new) * H, ncclSum, stream);
             kernels::launch_residual_add_bf16(
                 ws.y.data(), ws.norm_y.data(),
-                static_cast<std::size_t>(N) * H, stream);
+                static_cast<std::size_t>(N_new) * H, stream);
         }
     });
 }
@@ -1287,8 +1324,7 @@ void full_attn_layer_body(
     const std::uint8_t* row_valid_d,
     bool has_write_desc,
     ops::CublasHandle& cublas,
-    cudaStream_t stream,
-    const StageHooks* hooks)
+    cudaStream_t stream)
 {
     const int T  = std::max(1, fwd_cfg.tp_size);
     const int H  = cfg.hidden_size;
@@ -1350,7 +1386,6 @@ void full_attn_layer_body(
     // observer scoring it against the cached keys -- which are stored
     // post-rope -- compares in the same space.
     invoke_stage_hook(
-        hooks,
         StageHookPoint::OnAttnProj, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -1409,7 +1444,6 @@ void full_attn_layer_body(
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
     invoke_stage_hook(
-        hooks,
         StageHookPoint::OnAttn, ws.q.data(),
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
@@ -1554,9 +1588,13 @@ void qwen3_5_forward_paged(
     const std::uint32_t* rs_buffer_slot_ids_h,
     const std::uint32_t* rs_buffer_slot_indptr_h,
     const std::int32_t* rs_fold_lens,
+    const std::uint32_t* rs_fold_lens_h,
     bool rs_buffer_write,
     bool rs_buffer_fold,
-    const StageHooks* hooks)
+    const std::uint32_t* rs_buffer_read_slot_ids_h,
+    const std::uint32_t* rs_buffer_read_indptr_h,
+    const std::uint32_t* rs_buffer_read_lens_h,
+    const std::uint32_t* rs_buffer_heads_h)
 {
     const int H  = cfg.hidden_size;
     const int V  = cfg.vocab_size;
@@ -1589,6 +1627,42 @@ void qwen3_5_forward_paged(
         commit_advance_gather != nullptr || rs_buffer_fold;
     const std::int32_t* commit_lens =
         rs_buffer_fold ? rs_fold_lens : commit_advance_gather;
+    // A buffered write that ALSO folds: the boundary is a `commit_len` over
+    // the extended layout rather than a separate replay pass, so it rides the
+    // ordinary write path. `rs_fold_lens` is emitted for every row of every
+    // buffered pass, so an all-zero one means "pure append" and must not turn
+    // the pass into a fold.
+    //
+    // A MIXED fire is the same thing per row: one request folds while another
+    // only appends. The rows share an initial state, an extended layout and
+    // their outputs -- they differ ONLY in whether the recurrence persists.
+    // So the pass-level `write_state` becomes "does ANY row persist", refined
+    // by a per-row device mask. A row persists when it folds, or when it has
+    // no buffer of its own at all (an empty write CSR span), which is the
+    // plain in-forward advance riding along in a buffered fire.
+    std::vector<std::uint8_t> rs_write_mask_h;
+    const std::uint8_t* rs_write_state_mask_d = nullptr;
+    bool write_folds = false;
+    if (rs_buffer_write && rs_fold_lens_h != nullptr &&
+        rs_buffer_slot_indptr_h != nullptr) {
+        rs_write_mask_h.resize(static_cast<std::size_t>(R));
+        bool all_persist = true;
+        for (int r = 0; r < R; ++r) {
+            const bool row_buffered =
+                rs_buffer_slot_indptr_h[r + 1] > rs_buffer_slot_indptr_h[r];
+            const bool persists = rs_fold_lens_h[r] != 0 || !row_buffered;
+            rs_write_mask_h[r] = persists ? 1 : 0;
+            write_folds = write_folds || persists;
+            all_persist = all_persist && persists;
+        }
+        if (write_folds && !all_persist) {
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.rs_write_state_mask.data(), rs_write_mask_h.data(),
+                rs_write_mask_h.size() * sizeof(std::uint8_t),
+                cudaMemcpyHostToDevice, stream));
+            rs_write_state_mask_d = la_ws.rs_write_state_mask.data();
+        }
+    }
     if ((rs_buffer_write || rs_buffer_fold) &&
         (rs_buffer_slot_ids_h == nullptr ||
          rs_buffer_slot_indptr_h == nullptr ||
@@ -1600,6 +1674,141 @@ void qwen3_5_forward_paged(
     if (rs_buffer_fold && commit_lens == nullptr) {
         throw std::runtime_error(
             "buffered RS fold is missing per-request commit lengths");
+    }
+
+    // ── the extended token layout for the buffer-read path ────────────
+    // Built once per fire (not per layer) because every linear layer runs
+    // over the same rows. A request that replays B_r buffered tokens before
+    // its own T_r contributes B_r + T_r rows; requests with B_r == 0 are
+    // unaffected, which is why an all-zero read side is dropped on the wire.
+    std::vector<std::uint32_t> qo_ext_h;
+    const std::uint32_t* qo_ext_d = nullptr;
+    int n_ext = 0;
+    const bool has_buffer_read =
+        rs_buffer_read_lens_h != nullptr &&
+        rs_buffer_read_indptr_h != nullptr &&
+        rs_buffer_read_slot_ids_h != nullptr &&
+        std::any_of(rs_buffer_read_lens_h, rs_buffer_read_lens_h + R,
+                    [](std::uint32_t len) { return len != 0; });
+    if (has_buffer_read) {
+        if (rs_buffer_fold) {
+            throw std::runtime_error(
+                "an RS fold replays the buffer itself; it cannot also carry a "
+                "buffer read");
+        }
+        if (qo_indptr_h == nullptr) {
+            throw std::runtime_error(
+                "RS buffer read needs the host-side qo_indptr to place each "
+                "request's replayed prefix");
+        }
+        qo_ext_h.resize(static_cast<std::size_t>(R) + 1);
+        qo_ext_h[0] = 0;
+        for (int r = 0; r < R; ++r) {
+            const std::uint32_t rows =
+                (qo_indptr_h[r + 1] - qo_indptr_h[r]) + rs_buffer_read_lens_h[r];
+            qo_ext_h[r + 1] = qo_ext_h[r] + rows;
+        }
+        n_ext = static_cast<int>(qo_ext_h[R]);
+        // Every linear-attn scratch buffer is sized to max_tokens, and the
+        // replayed prefix consumes rows out of exactly those buffers.
+        if (la_ws.max_tokens > 0 && n_ext > la_ws.max_tokens) {
+            throw std::runtime_error(
+                "RS buffer replay plus new tokens (" + std::to_string(n_ext) +
+                ") exceeds the linear-attention workspace capacity (" +
+                std::to_string(la_ws.max_tokens) + ")");
+        }
+        CUDA_CHECK(cudaMemcpyAsync(
+            la_ws.qo_ext.data(), qo_ext_h.data(),
+            qo_ext_h.size() * sizeof(std::uint32_t),
+            cudaMemcpyHostToDevice, stream));
+        qo_ext_d = la_ws.qo_ext.data();
+    }
+
+    // ── the 2R-segment split for an INTERIOR fold boundary ────────────
+    // A buffered write whose fold length lands strictly inside the extended
+    // row. `rs_fold_lens` is already in extended (buffer-token) space, so the
+    // boundary is simply `n_r` rows into `[qo[r], qo[r+1])`.
+    //
+    // Built once per fire, like `qo_ext`, and only when some row actually
+    // needs it: with no interior boundary the single-call path is left exactly
+    // as it was rather than paying a second launch per layer for nothing.
+    Qwen3_5RsFoldSplit fold_split;
+    const Qwen3_5RsFoldSplit* fold_split_p = nullptr;
+    std::vector<std::uint32_t> qo_split_h;
+    std::vector<std::int32_t> split_slot_head_h;
+    std::vector<std::int32_t> split_slot_tail_h;
+    std::vector<std::uint8_t> split_mask_head_h;
+    const std::uint32_t* qo_pass_h =
+        has_buffer_read ? qo_ext_h.data() : qo_indptr_h;
+    if (rs_buffer_write && rs_fold_lens_h != nullptr && write_folds &&
+        qo_pass_h != nullptr && slot_ids_h != nullptr) {
+        bool any_interior = false;
+        for (int r = 0; r < R; ++r) {
+            const std::uint32_t rows = qo_pass_h[r + 1] - qo_pass_h[r];
+            const std::uint32_t n =
+                static_cast<std::uint32_t>(rs_fold_lens_h[r]);
+            if (n > 0 && n < rows) {
+                any_interior = true;
+                break;
+            }
+        }
+        if (any_interior) {
+            const int segs = 2 * R;
+            qo_split_h.resize(static_cast<std::size_t>(segs) + 1);
+            split_slot_head_h.resize(segs);
+            split_slot_tail_h.resize(segs);
+            split_mask_head_h.resize(segs);
+            qo_split_h[0] = qo_pass_h[0];
+            for (int r = 0; r < R; ++r) {
+                const std::uint32_t lo = qo_pass_h[r];
+                const std::uint32_t hi = qo_pass_h[r + 1];
+                const std::uint32_t n =
+                    static_cast<std::uint32_t>(rs_fold_lens_h[r]);
+                // A row with no interior boundary puts everything in its head
+                // segment and leaves the tail empty, so it runs exactly once
+                // and exactly as it would have without the split.
+                const std::uint32_t cut =
+                    (n > 0 && n < hi - lo) ? lo + n : hi;
+                qo_split_h[2 * r + 1] = cut;
+                qo_split_h[2 * r + 2] = hi;
+                const std::int32_t slot =
+                    static_cast<std::int32_t>(slot_ids_h[r]);
+                split_slot_head_h[2 * r] = slot;
+                split_slot_head_h[2 * r + 1] = -1;
+                split_slot_tail_h[2 * r] = -1;
+                split_slot_tail_h[2 * r + 1] = slot;
+                // The head persists on the same terms as the unsplit pass:
+                // this row folds, or it is a plain in-forward advance riding
+                // along in a buffered fire.
+                split_mask_head_h[2 * r] =
+                    rs_write_mask_h.empty()
+                        ? static_cast<std::uint8_t>(1)
+                        : rs_write_mask_h[r];
+                split_mask_head_h[2 * r + 1] = 0;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.qo_split.data(), qo_split_h.data(),
+                qo_split_h.size() * sizeof(std::uint32_t),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.split_slot_head.data(), split_slot_head_h.data(),
+                split_slot_head_h.size() * sizeof(std::int32_t),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.split_slot_tail.data(), split_slot_tail_h.data(),
+                split_slot_tail_h.size() * sizeof(std::int32_t),
+                cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(
+                la_ws.split_mask_head.data(), split_mask_head_h.data(),
+                split_mask_head_h.size() * sizeof(std::uint8_t),
+                cudaMemcpyHostToDevice, stream));
+            fold_split.segments = segs;
+            fold_split.qo_d = la_ws.qo_split.data();
+            fold_split.slot_head_d = la_ws.split_slot_head.data();
+            fold_split.slot_tail_d = la_ws.split_slot_tail.data();
+            fold_split.mask_head_d = la_ws.split_mask_head.data();
+            fold_split_p = &fold_split;
+        }
     }
 
     // Per-slot reset for any request whose slot was just (re)assigned.
@@ -1647,12 +1856,14 @@ void qwen3_5_forward_paged(
             : nullptr;
 
     // 1. Embed.
+    act_dump_step_begin(stream);
     if (!commit_advance) {
         profile_forward_stage(profile, profile.embed_ms, stream, [&] {
             kernels::launch_embed_bf16(
                 token_ids, w.embed->data(), ws.y.data(),
                 N, H, cfg.vocab_size, stream);
         });
+        act_dump_bf16("embed", ws.y.data(), N, H, stream);
     }
 
     // 2. Per-layer.
@@ -1676,7 +1887,12 @@ void qwen3_5_forward_paged(
                 slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
                 cublas, stream, &profile, /*commit_len=*/commit_lens,
                 rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                /*rs_buffer_write=*/false, rs_buffer_fold, hooks);
+                /*rs_buffer_write=*/false, /*rs_fold_after_write=*/false,
+                rs_buffer_fold,
+                // A fold IS the replay; it never carries a read as well. It
+                // still needs the head: its own gather is physical.
+                nullptr, nullptr, nullptr, rs_buffer_heads_h,
+                nullptr, nullptr, 0);
             ++linear_idx;
             continue;
         }
@@ -1701,7 +1917,14 @@ void qwen3_5_forward_paged(
                     slot_ids_h, slot_ids_d, qo_indptr_h, qo_indptr,
                     cublas, stream, &profile, /*commit_len=*/nullptr,
                     rs_buffer_slot_ids_h, rs_buffer_slot_indptr_h,
-                    rs_buffer_write, /*rs_buffer_fold=*/false, hooks);
+                    rs_buffer_write, /*rs_fold_after_write=*/write_folds,
+                    /*rs_buffer_fold=*/false,
+                    has_buffer_read ? rs_buffer_read_slot_ids_h : nullptr,
+                    has_buffer_read ? rs_buffer_read_indptr_h : nullptr,
+                    has_buffer_read ? rs_buffer_read_lens_h : nullptr,
+                    rs_buffer_heads_h,
+                    has_buffer_read ? qo_ext_h.data() : nullptr,
+                    qo_ext_d, n_ext, rs_write_state_mask_d, fold_split_p);
             });
         } else {
             ++profile.full_layers;
@@ -1714,7 +1937,7 @@ void qwen3_5_forward_paged(
                     positions, qo_indptr, kv_page_indices, kv_page_indptr,
                     kv_last_page_lens, qo_indptr_h, kv_page_indptr_h,
                     w_page_d, w_off_d, row_valid_d, has_write_desc,
-                    cublas, stream, hooks);
+                    cublas, stream);
             });
         }
 
@@ -1732,6 +1955,10 @@ void qwen3_5_forward_paged(
         profile_forward_stage(profile, profile.mlp_ms, stream, [&] {
             qwen35_dense_mlp_block(Lw, cfg, fwd_cfg, ws, cublas, N, stream);
         });
+        act_dump_bf16(
+            act_dump_layer_tag(is_linear ? "out_linear" : "out_full",
+                               static_cast<int>(L)).c_str(),
+            ws.y.data(), N, H, stream);
     }
 
     // 3. Final norm.
@@ -1751,6 +1978,7 @@ void qwen3_5_forward_paged(
             ws.y.data(), w.final_norm->data(), ws.norm_x.data(),
             N, H, eps, stream);
     });
+    act_dump_bf16("final_norm", ws.norm_x.data(), N, H, stream);
 
     // 4. lm_head. For prompt/prefill-style fires the runtime may need
     // logits for only a small sampler subset. Keep the full hidden stream in
@@ -1964,26 +2192,14 @@ void qwen3_5_mtp_process_cache(
     kernels::launch_rmsnorm_gemma_bf16(
         ws.k.data(), Lw.fa_k_norm->data(), ws.k.data(),
         total_tokens * kv_heads, d, eps, stream);
-    const bool shifted_prefix_cache = qwen35_mtp_shift_prefix_cache();
-    if (shifted_prefix_cache) {
-        kernels::launch_rope_partial_bf16_position_delta(
-            /*q=*/nullptr, ws.k.data(), positions, -1,
-            total_tokens, 0, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
-        kernels::launch_write_kv_to_pages_at_positions_bf16(
-            cache.layer_view(Lw.kv_layer),
-            ws.k.data(), ws.v.data(), positions, -1,
-            qo_indptr, kv_page_indices, kv_page_indptr,
-            total_tokens, num_requests, stream);
-    } else {
-        kernels::launch_rope_partial_bf16(
-            /*q=*/nullptr, ws.k.data(), positions,
-            total_tokens, 0, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
-        kernels::launch_write_kv_to_pages(
-            cache.layer_view(Lw.kv_layer),
-            ws.k.data(), ws.v.data(), qo_indptr, kv_page_indices,
-            kv_page_indptr, kv_last_page_lens, total_tokens, num_requests,
-            stream);
-    }
+    kernels::launch_rope_partial_bf16(
+        /*q=*/nullptr, ws.k.data(), positions,
+        total_tokens, 0, kv_heads, d, rotary_dim, cfg.rope_theta, stream);
+    kernels::launch_write_kv_to_pages(
+        cache.layer_view(Lw.kv_layer),
+        ws.k.data(), ws.v.data(), qo_indptr, kv_page_indices,
+        kv_page_indptr, kv_last_page_lens, total_tokens, num_requests,
+        stream);
 }
 
 void qwen3_5_mtp_forward(
@@ -2071,13 +2287,7 @@ void qwen3_5_mtp_forward(
         kernels::launch_lm_head_gemv_argmax_int8(
             ws.norm_x.data(),
             static_cast<const std::int8_t*>(lm_head.data),
-            mtp.lm_head_scale_inv->data(),
-            sampled_token_ids, num_tokens, H, V, stream);
-    } else if (sampled_token_ids != nullptr &&
-               qwen35_mtp_fused_gemv_enabled() &&
-               lm_head.dtype == DType::BF16) {
-        kernels::launch_lm_head_gemv_argmax_bf16(
-            ws.norm_x.data(), lm_head.data,
+            static_cast<const float*>(mtp.lm_head_scale_inv->data()),
             sampled_token_ids, num_tokens, H, V, stream);
     } else {
         ops::maybe_bench_lm_head_algos(cublas.handle(),

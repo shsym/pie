@@ -36,12 +36,7 @@ fn main() {
         println!("cargo:rerun-if-changed=../driver/metal/src");
     }
     if cuda || metal {
-            println!("cargo:rerun-if-changed=../driver/abi/include");
-            // The forward crate's committed C header: the drivers walk its
-            // PODs, so a regenerated header must recompile them — without
-            // this line a POD layout change builds green against stale
-            // objects and corrupts at the first plan walk.
-            println!("cargo:rerun-if-changed=../forward/include");
+        println!("cargo:rerun-if-changed=../driver/common/include");
     }
 
     if cuda {
@@ -70,21 +65,21 @@ fn pie_driver_abi_include_dir() -> PathBuf {
 /// this on their include path.
 fn pie_loader_include_dir() -> PathBuf {
     let dir = std::env::var("DEP_PIE_LOADER_INCLUDE").expect(
-        "pie-loader's build.rs did not emit cargo:include — \
-                 check that `links = \"pie_loader\"` is set in loader/Cargo.toml",
+        "pie-loader-capi's build.rs did not emit cargo:include — \
+                 check that `links = \"pie_loader\"` is set in loader/capi/Cargo.toml",
     );
     PathBuf::from(dir)
 }
 
 /// Directory holding `pie_forward.h`, the cbindgen-generated view of the
-/// forward toolchain's FFI. Same handoff as the loader's: the native drivers
-/// trace a family's declaration at cold start and execute the traced form.
-fn pie_forward_include_dir() -> PathBuf {
+/// forward toolchain's FFI (tart). The native drivers trace a family's
+/// declaration at cold start and execute the traced form.
+fn pie_forward_include_dir() -> std::path::PathBuf {
     let dir = std::env::var("DEP_PIE_FORWARD_INCLUDE").expect(
         "pie-forward's build.rs did not emit cargo:include — \
                  check that `links = \"pie_forward\"` is set in forward/Cargo.toml",
     );
-    PathBuf::from(dir)
+    std::path::PathBuf::from(dir)
 }
 
 // -----------------------------------------------------------------------------
@@ -145,6 +140,11 @@ fn build_metal() {
     }
     // Apple frameworks the metal driver pulls. -framework is macOS's -l.
     println!("cargo:rustc-link-lib=framework=Accelerate");
+    // IOKit, for the GPU core count `MTLDevice` does not publish
+    // (`driver/metal/src/device_tuning_apple.mm`). Named here as well as in
+    // `driver/metal/CMakeLists.txt` because CMake's link line does not reach
+    // the Rust test target, which links the static archive itself.
+    println!("cargo:rustc-link-lib=framework=IOKit");
     add_system_libs(/*metal=*/ true);
 
     println!(
@@ -189,6 +189,7 @@ fn build_cuda() {
         "CMAKE_CUDA_ARCHITECTURES",
         "PIE_COMPILER_LAUNCHER",
         "PIE_CUDA_BUILD_MARLIN",
+        "PIE_CUDA_BUILD_MARLIN_MOE",
         "CPM_SOURCE_CACHE",
     ] {
         println!("cargo:rerun-if-env-changed={var}");

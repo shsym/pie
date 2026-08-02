@@ -260,7 +260,7 @@ std::uint32_t symbolic_extent(
 }
 
 bool describe_value(
-    const pie_native::launch::plan::ValueType& type,
+    const pie::driver::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents,
     DeviceValueDesc& descriptor) {
     descriptor = {};
@@ -319,7 +319,7 @@ std::size_t wire_value_bytes(const DeviceValueDesc& descriptor) {
 }
 
 std::uint64_t combined_signature(
-    const std::vector<pie_native::launch::plan::StagePlan>& plans) {
+    const std::vector<pie::driver::launch::plan::StagePlan>& plans) {
     std::vector<std::uint8_t> bytes;
     bytes.reserve(plans.size() * sizeof(std::uint64_t));
     for (const auto& plan : plans) {
@@ -335,7 +335,7 @@ std::uint64_t combined_signature(
 }  // namespace
 
 M1ResolvedShape resolve_m1_shape_for_test(
-    const pie_native::launch::plan::ValueType& type,
+    const pie::driver::launch::plan::ValueType& type,
     const M1RuntimeExtents& extents) {
     DeviceValueDesc descriptor;
     if (!describe_value(type, extents, descriptor)) return {};
@@ -392,13 +392,13 @@ struct M1RegionExecutable {
 };
 
 struct M2FusedRegionExecutable {
-    pie_native::launch::plan::Region region;
+    pie::driver::launch::plan::Region region;
     Pso pso{};
     int ordinal = -1;
 };
 
 struct M3GroupedRegionExecutable {
-    pie_native::launch::plan::Region region;
+    pie::driver::launch::plan::Region region;
     Pso pso{};
     bool parallel_nucleus = false;
     bool parallel_topk = false;
@@ -419,7 +419,7 @@ struct M1StageExecutable {
 
 struct M1ProgramStage {
     std::shared_ptr<M1StageExecutable> executable;
-    pie_native::launch::plan::StagePlan plan;
+    pie::driver::launch::plan::StagePlan plan;
 };
 
 struct M1ProgramExecutable {
@@ -533,6 +533,14 @@ struct M3GroupCommand {
     int readiness_ordinal = -1;
     int commit_ordinal = -1;
     M3GroupStats stats{};
+    // Set by `encode_m3_pre`/`encode_m3_post`. A group is prepared BEFORE the
+    // forward it rides is encoded, and the forward can still refuse the batch
+    // -- in which case nothing ever dispatched, the status buffer keeps its
+    // zero fill, and `finish_m3_group` used to read that back as every lane
+    // faulting. The lie is expensive: it reports a GPU fault for a host-side
+    // refusal and hides the executor's own message, which is the only account
+    // of why the batch was rejected.
+    bool encoded = false;
     void* timestamp_heap = nullptr;
     std::chrono::steady_clock::time_point post_begin{};
 };
@@ -614,7 +622,7 @@ std::string m3_stage_key(
 }
 
 std::size_t m3_used_channel_slots(
-    const pie_native::launch::plan::StagePlan& stage) {
+    const pie::driver::launch::plan::StagePlan& stage) {
     std::size_t count = 0;
     for (const auto& normalized : stage.ops) {
         if (normalized.op.chan >= 0) {
@@ -850,7 +858,7 @@ std::unique_ptr<M1Runtime> M1Runtime::create(
     // no filesystem include lookup, so we splice it in ourselves later.
     const std::filesystem::path rng_path =
         std::filesystem::path(kernels_dir) / "ptir_rng.generated.metal";
-    if (!read_ptir_msl_source(
+    if (!read_metal_source(
             rng_path.string(), impl->ptir_rng_preamble, &error) ||
         impl->ptir_rng_preamble.empty()) {
         return nullptr;
@@ -1127,8 +1135,8 @@ std::shared_ptr<M1ProgramExecutable> M1Runtime::compile_program(
                     transaction)) {
                 return reject_retryable(
                     "Metal M1 compile failed for " +
-                    std::string(pie_native::launch::op_name(
-                        static_cast<pie_native::launch::OpCode>(
+                    std::string(pie::driver::launch::op_name(
+                        static_cast<pie::driver::launch::OpCode>(
                             operations[region].op.tag))) +
                     ": " + error);
             }
@@ -2401,13 +2409,7 @@ M1ExecuteOutcome M1Runtime::finish_m2_command(
 }
 
 // `PIE_METAL_M3_GPU_TIMESTAMPS=1` re-enables the per-fire GPU counter sampling.
-static bool m3_gpu_timestamps_enabled() {
-    static const bool on = [] {
-        const char* e = std::getenv("PIE_METAL_M3_GPU_TIMESTAMPS");
-        return e != nullptr && e[0] != '\0' && e[0] != '0';
-    }();
-    return on;
-}
+static constexpr bool m3_gpu_timestamps_enabled() { return false; }
 
 bool M1Runtime::prepare_m3_group(
     const std::vector<M3LaneCandidate>& candidates,
@@ -3094,6 +3096,7 @@ void M1Runtime::encode_m3_pre(
     const std::shared_ptr<M3GroupCommand>& command,
     StepEncoder& encoder) {
     if (!command) return;
+    command->encoded = true;
     bind_m3_effect(*command, command->readiness_ordinal);
     encoder.set_pso(command->readiness);
     encoder.set_argtable_ordinal(command->readiness_ordinal);
@@ -3125,6 +3128,7 @@ void M1Runtime::encode_m3_post(
     const std::shared_ptr<M3GroupCommand>& command,
     StepEncoder& encoder) {
     if (!command) return;
+    command->encoded = true;
     command->post_begin = std::chrono::steady_clock::now();
     encoder.mark_timestamp(command->timestamp_heap, 0);
     for (const auto& stage : command->stages) {
@@ -3171,7 +3175,23 @@ std::vector<M1ExecuteOutcome> M1Runtime::finish_m3_group(
     // and the (lane_count, channel_count) it saw. Dropping it left the driver
     // printing "launch failed:" with nothing after the colon.
     std::string faults;
-    for (std::size_t lane = 0; lane < command->candidates.size(); ++lane) {
+    // A group that was never encoded never dispatched, so every lane's status
+    // still holds the buffer's zero fill. Reading that back lane by lane
+    // produces `state=0 op_tag=0x0 guard=unknown` for all of them -- a GPU
+    // fault report for something the GPU was never asked to do, and one that
+    // replaces the executor's own account of why the forward was refused.
+    if (!command->encoded) {
+        outcomes.assign(
+            command->candidates.size(), M1ExecuteOutcome::Failed);
+        if (error.empty()) {
+            error =
+                "Metal M3 group was prepared but never encoded: the forward "
+                "it rides was not run, so no lane dispatched";
+        }
+    }
+    for (std::size_t lane = 0;
+         command->encoded && lane < command->candidates.size();
+         ++lane) {
         if (statuses[lane].state == 4) {
             outcomes.push_back(M1ExecuteOutcome::Committed);
             continue;

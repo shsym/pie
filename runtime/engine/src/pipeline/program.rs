@@ -238,12 +238,6 @@ impl Registry {
         let channel_accesses = Self::channel_accesses(&decoded);
         let bound = bind(decoded, profile.clone()).map_err(RegisterError::Bind)?;
         let compiled_stages = pie_plan::compile_bound(&bound);
-        if std::env::var_os("PIE_PTIR_DUMP_PLAN").is_some() {
-            for stage in &compiled_stages {
-                eprintln!("{}", pie_plan::debug_stage_plan(stage));
-                eprintln!("  metrics={:?}", stage.metrics());
-            }
-        }
         let launch = std::sync::OnceLock::new();
         let entry = Arc::new(RegisteredProgram {
             bytes,
@@ -365,7 +359,7 @@ pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
 /// page-size + layer caps; model-gated intrinsics + second-party kernels default
 /// conservative until the model surfaces them).
 pub fn model_profile() -> ModelProfile {
-    let m = pie_model::model();
+    let m = crate::model::model();
     profile_from(
         m.vocab_size(),
         crate::store::registry::get(0, 0).kv_page_size,
@@ -380,19 +374,19 @@ fn profile_from(
     vocab: u32,
     page_size: u32,
     num_layers: u32,
-    ptir: pie_model::PtirCaps,
+    ptir: crate::model::PtirCaps,
 ) -> ModelProfile {
     ModelProfile {
         vocab,
         page_size,
         num_layers,
         activation: pie_ir::types::DType::F32,
+        has_lora: ptir.has_lora,
         has_mtp_logits: ptir.has_mtp_logits,
         has_mtp_drafts: ptir.has_mtp_drafts,
         has_value_head: ptir.has_value_head,
         has_attn_score: ptir.has_attn_score,
         has_attn_page_mask: ptir.has_attn_page_mask,
-        has_lora: ptir.has_lora,
         // Second-party kernels the backend advertises. `envelope_dot` is
         // replayable (a pure function of the query and the page envelopes) and
         // has no sink scope: it produces a value, it does not consume one.
@@ -544,14 +538,14 @@ mod tests {
 
     #[test]
     fn quest_tap_binds_only_against_a_backend_with_kv_envelopes() {
-        let caps = |has: bool| pie_model::PtirCaps {
+        let caps = |has: bool| crate::model::PtirCaps {
+            has_lora: false,
             has_mtp_logits: false,
             has_mtp_drafts: false,
             has_value_head: false,
             has_kv_envelopes: has,
             has_attn_score: false,
             has_attn_page_mask: false,
-            has_lora: false,
         };
         let bytes = quest_tap(VOCAB, 4).encode();
 
@@ -641,14 +635,14 @@ mod tests {
 
     #[test]
     fn kv_envelope_capability_gates_the_envelope_dot_kernel() {
-        let caps = |has: bool| pie_model::PtirCaps {
+        let caps = |has: bool| crate::model::PtirCaps {
+            has_lora: false,
             has_mtp_logits: false,
             has_mtp_drafts: false,
             has_value_head: false,
             has_kv_envelopes: has,
             has_attn_score: false,
             has_attn_page_mask: false,
-            has_lora: false,
         };
         // A backend that cannot honour the envelope contract must advertise NO
         // second-party kernel, so a Quest program fails to bind rather than

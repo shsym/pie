@@ -4,10 +4,10 @@ use std::collections::HashMap;
 
 use pie_driver_abi::PieTerminalCell;
 
-use super::fire_plan;
 use super::stats::SchedulerStats;
 use super::wire;
 use super::worker::PendingRequest;
+use super::fire_plan;
 use crate::driver::{FrameSubmission, LaunchPlan, SchedulerLimits, StepSubmission};
 
 /// One step's assembled wire request: the per-batch merge of its member
@@ -24,222 +24,6 @@ pub(crate) struct StepBuild {
     pub(crate) channel_expected_head: Vec<u64>,
     pub(crate) channel_expected_tail: Vec<u64>,
     pub(crate) channel_ticket_indptr: Vec<u32>,
-}
-
-/// `PIE_FIRE_CENSUS=1` prints one line per sealed step group (size, solo
-/// contract, join refusals by clause) — the C measurement's surface.
-fn fire_census_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("PIE_FIRE_CENSUS").is_ok_and(|v| !v.is_empty() && v != "0")
-    })
-}
-
-/// The fire plan's qkv_postprocess lowering, converted from MEMBER counts
-/// to WIRE request rows through the step's attribution CSR — the value
-/// [`StepSubmission::planned_hook_free_prefix_rows`] carries. The
-/// semantics mirror `Dispatch::launch_hook_free_prefix_rows` EXACTLY (it
-/// walks compiled PTIR stage plans where this walks the admission-time
-/// `hook_program` stamps over the SAME spans) so the driver's cross-check
-/// can refuse on drift instead of guessing which side is right:
-///   * malformed/absent attribution → UNPLANNED (driver derives alone);
-///   * a hook member with an empty wire span cannot be located among the
-///     rows → 0, no fast prefix;
-///   * otherwise the first hook member's row start IS the prefix (spans
-///     are contiguous in planned order — hooks-last is what makes it
-///     maximal), and with no hook members every row is in it.
-fn planned_prefix_wire_rows(
-    plan: &fire_plan::FirePlan,
-    ordered: &[Box<PendingRequest>],
-    row_indptr: &[u32],
-) -> u32 {
-    // A plan is sent only when it DECIDES something: at least one hook
-    // member (the site's Prefix arm). Hook stamps come from tracked
-    // registration, so on every planned step the driver's compiled-plan
-    // walk sees the same programs and the cross-check compares like with
-    // like; a hook-free step (including prebuilt/untracked fires, whose
-    // programs the driver may not know) keeps the driver's own
-    // derivation, whose answer is consumed by nothing anyway.
-    if !ordered.iter().any(|req| req.hook_program) {
-        return pie_driver_abi::PIE_HOOK_FREE_PREFIX_UNPLANNED;
-    }
-    if row_indptr.len() != ordered.len() + 1 {
-        return pie_driver_abi::PIE_HOOK_FREE_PREFIX_UNPLANNED;
-    }
-    let total = *row_indptr.last().expect("indptr has a total");
-    if total == 0 {
-        return 0;
-    }
-    let mut first_hook_row = total;
-    for (member, req) in ordered.iter().enumerate() {
-        if !req.hook_program {
-            continue;
-        }
-        let (lo, hi) = (row_indptr[member], row_indptr[member + 1]);
-        if hi <= lo {
-            return 0;
-        }
-        first_hook_row = first_hook_row.min(lo);
-    }
-    // The site IS the source; the row scan above is its span binding. The
-    // two must agree by construction (fast_rows counts the leading
-    // non-hook members of the same planned order).
-    if let Some(site) = plan
-        .sites
-        .iter()
-        .find(|site| site.name == fire_plan::SITE_QKV_POSTPROCESS)
-    {
-        // ≥1 hook member, so the site is always the Prefix arm here.
-        let fast_members = match site.lowering {
-            fire_plan::Lowering::Prefix { fast_rows } => fast_rows as usize,
-            _ => unreachable!("a hooked step always plans the Prefix arm"),
-        };
-        debug_assert_eq!(
-            first_hook_row,
-            row_indptr[fast_members.min(ordered.len())],
-            "the plan's member prefix and the row-span scan must agree"
-        );
-    }
-    first_hook_row
-}
-
-/// NS-2: the attention_mask site's unmasked prefix, converted to WIRE
-/// rows through the attribution CSR — the value
-/// [`StepSubmission::planned_unmasked_prefix_rows`] carries. Meaningful
-/// only on hook-free steps with at least one masked member (the
-/// seriation nests mask under hooks, so a hooked step's masked members
-/// are not contiguous); everything else is UNPLANNED and the driver
-/// keeps the fire-level mask arm.
-/// STRUCTURAL S-2: the depth union's REQUEST split — the count of
-/// leading full-depth members. Planned only for the v0 shape: at least
-/// one truncated member AND at least one full member, every member a
-/// plain 1-token decode lane (no hooks/lora/masks/multi-token), all
-/// truncated members sharing ONE k and seriated as the contiguous tail
-/// (the sort key guarantees it; the scan verifies loudly-silently by
-/// declining).
-fn planned_full_depth_request_split(ordered: &[Box<PendingRequest>]) -> u32 {
-    if !depth_union_enabled() {
-        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-    }
-    let truncated = ordered
-        .iter()
-        .filter(|r| r.request.max_layers.is_some())
-        .count();
-    if truncated == 0 || truncated == ordered.len() {
-        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-    }
-    let mut k: Option<u32> = None;
-    for req in ordered.iter() {
-        // AC-3 (lora x depth): an UNTRUNCATED lora member rides the
-        // full-depth prefix freely — the correction is span-grouped and
-        // window-free, and the seriation keeps it out of the truncated
-        // tail. A single lane carrying BOTH axes still declines (its
-        // correction span would cross the depth window — the PQ-tree
-        // class, refused as safe degradation for now).
-        if (req.hook_program && req.request.max_layers.is_some())
-            || (req.lora_program && req.request.max_layers.is_some())
-            // AC-1: a lane on BOTH window axes is the PQ-tree class.
-            || (req.request.has_user_mask && req.request.max_layers.is_some())
-            || req.request.token_ids.len() > ordered.len()
-            || req
-                .request
-                .qo_indptr
-                .windows(2)
-                .any(|w| w[1] - w[0] > 1)
-        {
-            return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-        }
-        if let Some(this_k) = req.request.max_layers {
-            if *k.get_or_insert(this_k) != this_k {
-                return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-            }
-        }
-    }
-    // AC-1 order [plain | truncated | masked]: the truncated block is a
-    // MIDDLE window ending where the masked suffix starts; every member
-    // after it must be masked (full-depth), every truncated member
-    // contiguous. dsplit = the block's start; its end derives from the
-    // mask word driver-side.
-    // AC-4/AC-5: the full-depth suffix behind the truncated middle may
-    // hold hooked lanes then masked lanes (the seriation's order) —
-    // both are full-depth. The driver's stash window anchors on the
-    // mask word when present, the hook word otherwise.
-    let masked_tail = ordered
-        .iter()
-        .rev()
-        .take_while(|r| r.request.has_user_mask || r.hook_program)
-        .count();
-    let split = ordered.len() - masked_tail - truncated;
-    if ordered[split..ordered.len() - masked_tail]
-        .iter()
-        .any(|r| r.request.max_layers.is_none())
-    {
-        return pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED;
-    }
-    split as u32
-}
-
-/// The depth union's arm switch — DEFAULT ON (`PIE_DEPTH_UNION=0`
-/// disarms and restores the S-1 solo rule). The union oracle and the
-/// wide battery (R=4, mixed-k decline, all-truncated control) passed
-/// on the armed boots before the flip.
-pub(crate) fn depth_union_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !std::env::var("PIE_DEPTH_UNION").is_ok_and(|v| v == "0")
-    })
-}
-
-fn planned_unmasked_prefix_wire_rows(
-    plan: &fire_plan::FirePlan,
-    ordered: &[Box<PendingRequest>],
-    row_indptr: &[u32],
-) -> u32 {
-    // AC-4: hooks no longer suppress the plan either — the order is
-    // [plain | truncated | hooked | masked], so the mask window is
-    // still the suffix and hooked lanes sit in the unmasked prefix. A
-    // lane on BOTH axes (a masked hook program) remains the refusal.
-    if ordered
-        .iter()
-        .any(|req| req.hook_program && req.request.has_user_mask)
-        || !ordered.iter().any(|req| req.request.has_user_mask)
-    {
-        return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
-    }
-    if row_indptr.len() != ordered.len() + 1 {
-        return pie_driver_abi::PIE_UNMASKED_PREFIX_UNPLANNED;
-    }
-    let total = *row_indptr.last().expect("indptr has a total");
-    if total == 0 {
-        return 0;
-    }
-    let mut first_masked_row = total;
-    for (member, req) in ordered.iter().enumerate() {
-        if !req.request.has_user_mask {
-            continue;
-        }
-        let (lo, hi) = (row_indptr[member], row_indptr[member + 1]);
-        if hi <= lo {
-            return 0;
-        }
-        first_masked_row = first_masked_row.min(lo);
-    }
-    if let Some(site) = plan
-        .sites
-        .iter()
-        .find(|site| site.name == fire_plan::SITE_ATTENTION_MASK)
-    {
-        let unmasked_members = match site.lowering {
-            fire_plan::Lowering::Prefix { fast_rows } => fast_rows as usize,
-            _ => unreachable!("a masked step always plans the Prefix arm"),
-        };
-        debug_assert_eq!(
-            first_masked_row,
-            row_indptr[unmasked_members.min(ordered.len())],
-            "the plan's member prefix and the row-span scan must agree"
-        );
-    }
-    first_masked_row
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -434,6 +218,56 @@ pub(crate) fn build_batch_request(
     })
 }
 
+
+/// tart rung ③ (re-ported onto the 0.3 scheduler): the region table —
+/// the seriation's output stated ONCE; the driver derives every planned
+/// split from it (region_plans.hpp). Maximal runs of members sharing an
+/// axis signature (PIE_REGION_SIG_*) and a depth operand k; boundaries
+/// in WIRE rows through the attribution CSR. Declined (empty) when the
+/// attribution is absent or any member owns zero wire rows.
+fn planned_region_table(
+    ordered: &[Box<PendingRequest>],
+    row_indptr: &[u32],
+) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
+    if row_indptr.len() != ordered.len() + 1
+        || row_indptr.windows(2).any(|w| w[1] <= w[0])
+    {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
+    let mut indptr: Vec<u32> = vec![row_indptr[0]];
+    let mut sigs: Vec<u32> = Vec::new();
+    let mut ks: Vec<u32> = Vec::new();
+    for (member, req) in ordered.iter().enumerate() {
+        let sig = u32::from(
+            req.request
+                .qo_indptr
+                .windows(2)
+                .any(|w| w[1] - w[0] > 1),
+        ) * pie_driver_abi::PIE_REGION_SIG_MULTI_TOKEN
+            | u32::from(req.hook_program) * pie_driver_abi::PIE_REGION_SIG_HOOK
+            | u32::from(req.request.has_user_mask)
+                * pie_driver_abi::PIE_REGION_SIG_MASK
+            | u32::from(req.request.max_layers.is_some())
+                * pie_driver_abi::PIE_REGION_SIG_TRUNCATED
+            | u32::from(req.lora_program) * pie_driver_abi::PIE_REGION_SIG_LORA
+            | u32::from(req.hook_program && req.request.hook_page_mask)
+                * pie_driver_abi::PIE_REGION_SIG_HOOK_PAGE_MASK;
+        let k = req
+            .request
+            .max_layers
+            .unwrap_or(pie_driver_abi::PIE_MAX_LAYERS_FULL);
+        let end = row_indptr[member + 1];
+        if sigs.last() == Some(&sig) && ks.last() == Some(&k) {
+            *indptr.last_mut().expect("indptr starts nonempty") = end;
+        } else {
+            sigs.push(sig);
+            ks.push(k);
+            indptr.push(end);
+        }
+    }
+    (indptr, sigs, ks)
+}
+
 /// Assemble one sealed frame's submission (ABI v14) from its waves' picked
 /// requests, in slot order. Returns the submission plus the flattened
 /// requests in POST order (step order, member order within a step) — the
@@ -457,7 +291,6 @@ pub(crate) fn build_frame_submission(
     limits: SchedulerLimits,
     page_size: u32,
     stats: &SchedulerStats,
-    model_sites: &[fire_plan::Site],
 ) -> (FrameSubmission, Vec<Box<PendingRequest>>) {
     let mut step_groups: Vec<Vec<Box<PendingRequest>>> = Vec::new();
     for wave in waves {
@@ -472,53 +305,13 @@ pub(crate) fn build_frame_submission(
             let mut group: Vec<Box<PendingRequest>> = Vec::new();
             let mut rest: Vec<Box<PendingRequest>> = Vec::new();
             let mut closed = false;
-            let mut refusals: Vec<&'static str> = Vec::new();
             for req in deferred {
-                if closed {
-                    refusals.push("group-closed");
-                    rest.push(req);
-                    continue;
-                }
-                if let Some(reason) = grouping.refusal(&req, limits, page_size) {
-                    refusals.push(reason);
+                if closed || !grouping.accepts(&req, limits, page_size) {
                     rest.push(req);
                     continue;
                 }
                 closed = grouping.push(&req, limits, page_size);
                 group.push(req);
-            }
-            // The fire census (C): one line per sealed step group — size,
-            // the head's solo contract if any, and every join refusal by
-            // clause. This is the measurement surface for "what does the
-            // remaining partition cost": a workload whose census shows only
-            // contract-bound reasons has nothing left for the scheduler to
-            // relax.
-            if fire_census_enabled() {
-                let solo = group
-                    .first()
-                    .and_then(|req| req.solo_reason())
-                    .unwrap_or("-");
-                // Per-member fingerprint (fire id × row count): whether two
-                // runs composed the SAME logical fires is what separates a
-                // composition-timing difference from a numeric one when
-                // their outputs disagree.
-                let members: Vec<String> = group
-                    .iter()
-                    .map(|req| {
-                        format!(
-                            "{}x{}",
-                            req.logical_fire_id,
-                            req.request.token_ids.len()
-                        )
-                    })
-                    .collect();
-                eprintln!(
-                    "[fire-census] step members={} [{}] solo={} deferred={:?}",
-                    group.len(),
-                    members.join(","),
-                    solo,
-                    refusals,
-                );
             }
             debug_assert!(!group.is_empty(), "grouping always admits the head");
             if group.is_empty() {
@@ -541,17 +334,15 @@ pub(crate) fn build_frame_submission(
         // Ordered sub-batches: wire (Host-class) members first, the
         // device-resolved envelope suffix last — the driver's offset
         // fixed-decode compose requires the envelope lanes to be a
-        // contiguous program suffix. That contract stays PRIMARY. Within
-        // each class, attention-hook-carrying programs sort last: the
-        // driver's hook-free prefix (`StageHooks::hook_free_prefix_rows`)
-        // is the fused fast path, and a leading hook-free run that spans
-        // ALL hook-free lanes makes that prefix maximal instead of ending
-        // at whichever hook lane happened to arrive first. Stable order
-        // keeps arrival otherwise. The permutation comes from the fire
-        // planner — the same key the inline sort here used to apply,
-        // generalized so the next divergence axis lands as planner data
-        // (`fire_plan::MemberFacts`) instead of a wider sort key; the
-        // plan's per-site lowerings are not consumed yet (v0).
+        // contiguous program suffix. Stable sort keeps arrival order
+        // within each class.
+        let mut group = group;
+        // tart (0.3 re-port step 1): the fire planner's seriation — the
+        // key's PRIMARY term is device_resolved_geometry, so the
+        // envelope-suffix invariant this sort used to provide is
+        // preserved, and the mask/hook/depth windows the driver's
+        // planned splits need become contiguous. Stable, arrival-order
+        // within equal keys, exactly the pre-merge behavior.
         let facts: Vec<fire_plan::MemberFacts> = group
             .iter()
             .enumerate()
@@ -560,48 +351,19 @@ pub(crate) fn build_frame_submission(
                 lora: req.lora_program,
                 custom_mask: req.request.has_user_mask,
                 truncated: req.request.max_layers.is_some(),
+                max_layers: req.request.max_layers,
+                multi_token: req
+                    .request
+                    .qo_indptr
+                    .windows(2)
+                    .any(|w| w[1] - w[0] > 1),
                 device_resolved_geometry: req.request.device_resolved_geometry,
                 arrival,
             })
             .collect();
-        // `model_sites` is the driver's own statement, from its validated
-        // declared plan through the capabilities handshake (the site_table
-        // module doc's wiring; `fire_plan::site_table::summary_sites` maps
-        // the reported summary into the vocabulary). Empty — every dense
-        // model, every driver without a declared plan — reduces this to
-        // the old `plan_fire` exactly. The qkv_postprocess site is
-        // CONSUMED since B (`planned_prefix_wire_rows` below): its
-        // Prefix{fast_rows} crosses the wire as
-        // `planned_hook_free_prefix_rows` and the driver's Peel split
-        // uses it after a cross-check. The other sites remain
-        // informational.
-        let plan = fire_plan::plan_fire_with_model(&facts, model_sites);
-        debug_assert_eq!(
-            plan.sites.len(),
-            3 + model_sites.len(),
-            "the merged plan carries both member-fact sites and every model site"
-        );
-        debug_assert_eq!(
-            plan.member_order,
-            {
-                let mut order: Vec<usize> = (0..group.len()).collect();
-                order.sort_by_key(|&i| {
-                    (
-                        group[i].request.device_resolved_geometry,
-                        group[i].request.has_user_mask,
-                        group[i].hook_program,
-                        // STRUCTURAL S-2 (found by AC-0: the lora x
-                        // depth pair PANICKED this parity assert — the
-                        // reference comparator must carry every
-                        // seriation term the plan's key carries).
-                        group[i].request.max_layers.is_some(),
-                    )
-                });
-                order
-            },
-            "fire plan order must equal the stable sort it replaced"
-        );
-        let mut slots: Vec<Option<Box<PendingRequest>>> = group.into_iter().map(Some).collect();
+        let plan = fire_plan::plan_fire_with_model(&facts, &[]);
+        let mut slots: Vec<Option<Box<PendingRequest>>> =
+            group.into_iter().map(Some).collect();
         let group: Vec<Box<PendingRequest>> = plan
             .member_order
             .iter()
@@ -650,51 +412,37 @@ pub(crate) fn build_frame_submission(
             );
         }
         required_kv_pages = required_kv_pages.max(build.plan.required_kv_pages);
-        // The planner's first CONSUMED lowering (fire_plan module doc):
-        // the qkv_postprocess site's Prefix{fast_rows} — member counts —
-        // converted to WIRE request rows through the attribution CSR and
-        // handed across; the driver cross-checks it against its own
-        // compiled-plan derivation and refuses the launch on drift.
-        let planned_hook_free_prefix_rows =
-            planned_prefix_wire_rows(&plan, &group, &build.program_row_indptr);
-        let planned_unmasked_prefix_rows =
-            planned_unmasked_prefix_wire_rows(&plan, &group, &build.program_row_indptr);
-        // STRUCTURAL S-2: a planned depth union stamps the SUFFIX's
-        // uniform k onto the merged plan (the wire merge does not carry
-        // per-member max_layers); a DECLINED composed shape leaves it
-        // None — every member runs full depth, the safe degradation of
-        // an advisory truncation.
-        let planned_full_depth_rows = planned_full_depth_request_split(&group);
-        let mut merged_plan = build.plan;
-        if planned_full_depth_rows != pie_driver_abi::PIE_FULL_DEPTH_UNPLANNED {
-            merged_plan.max_layers = group
+        let (region_row_indptr, region_sig, region_k) =
+            planned_region_table(&group, &build.program_row_indptr);
+        // Engine-side region observability: the driver's [band-gate] trace
+        // skips masked/multi-token frames before printing sigs, so batteries
+        // that need per-step region truth (the AC-5 census) read this line.
+        if super::worker::wave_trace() {
+            let sigs: Vec<String> = region_sig
                 .iter()
-                .find_map(|r| r.request.max_layers);
-        } else if let Some(k) = group[0].request.max_layers {
-            // The uniform half of the PQ-tree cell: when EVERY member
-            // shares one truncation, the fire-level layer bound cuts
-            // every row — mask-compatible (the attention arms operate
-            // inside [0, k) unchanged) — so a declined SPLIT must not
-            // silently drop the members' k (found by the arc-78 probe:
-            // the wire merge discards per-member max_layers).
-            if group.iter().all(|r| r.request.max_layers == Some(k)) {
-                merged_plan.max_layers = Some(k);
-            }
+                .zip(&region_k)
+                .map(|(sig, k)| format!("{sig}:{k}"))
+                .collect();
+            eprintln!(
+                "[step-regions] rows={} regions={}",
+                group.len(),
+                sigs.join(",")
+            );
         }
         steps.push(StepSubmission {
-            plan: merged_plan,
+            plan: build.plan,
             roster_rows,
             sub_batch_indptr,
             sub_batch_class,
             terminal_cells: build.terminal_cells,
             program_row_indptr: build.program_row_indptr,
-            planned_hook_free_prefix_rows,
-            planned_unmasked_prefix_rows,
-            planned_full_depth_rows,
             logical_fire_ids: build.logical_fire_ids,
             channel_expected_head: build.channel_expected_head,
             channel_expected_tail: build.channel_expected_tail,
             channel_ticket_indptr: build.channel_ticket_indptr,
+            region_row_indptr,
+            region_sig,
+            region_k,
         });
         flattened.extend(group);
     }
@@ -725,6 +473,8 @@ mod tests {
 
     fn pending(request: LaunchPlan, instance_id: u64, prebuilt: bool) -> Box<PendingRequest> {
         Box::new(PendingRequest {
+            hook_program: false,
+            lora_program: false,
             logical_fire_id: 1,
             last_page_len: 1,
             request,
@@ -733,13 +483,9 @@ mod tests {
             process_id: None,
             pipeline_id: None,
             prebuilt,
-            hook_program: false,
-            lora_program: false,
-            page_mask_program: false,
             prelaunch_copy: None,
             prelaunch_state_copy: None,
             frame: None,
-            timing: None,
         })
     }
 
@@ -757,44 +503,6 @@ mod tests {
             single_token_mode: true,
             ..LaunchPlan::default()
         }
-    }
-
-    /// The driver-reported model sites are INFORMATIONAL this increment
-    /// (nothing consumes a fire plan's site vec downstream — v0): sealing a
-    /// frame with an MoE summary's expert site merged produces a submission
-    /// identical to sealing without it, while the debug assert inside
-    /// `build_frame_submission` pins that the merged plan really carried
-    /// the site through `plan_fire_with_model`.
-    #[test]
-    fn model_sites_are_informational_for_the_submission() {
-        let limits = SchedulerLimits {
-            max_forward_requests: 8,
-            max_forward_tokens: 64,
-            max_page_refs: 64,
-        };
-        let waves = || {
-            vec![vec![
-                pending(wire_decode(11, 3), 1, false),
-                pending(wire_decode(22, 4), 2, false),
-            ]]
-        };
-        let stats = SchedulerStats::default();
-        let (without_sites, retired) = build_frame_submission(waves(), limits, 16, &stats, &[]);
-        assert_eq!(retired.len(), 2);
-
-        let model_sites = [fire_plan::expert_weights_site(256, 8)];
-        let (with_sites, retired) =
-            build_frame_submission(waves(), limits, 16, &stats, &model_sites);
-        assert_eq!(retired.len(), 2);
-        // Terminal cells are per-completion heap pointers, distinct between
-        // the two constructions by nature; everything else must agree.
-        let scrub = |mut submission: FrameSubmission| {
-            for step in &mut submission.steps {
-                step.terminal_cells.clear();
-            }
-            submission
-        };
-        assert_eq!(scrub(without_sites), scrub(with_sites));
     }
 
     #[test]

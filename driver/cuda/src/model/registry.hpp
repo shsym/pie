@@ -37,7 +37,7 @@
 #include <string>
 #include <vector>
 
-#include "model/contract.hpp"
+#include "model/facts.hpp"
 #include "model/imodel.hpp"
 
 namespace pie_cuda_driver {
@@ -63,6 +63,7 @@ struct NemotronHWorkspace;
 struct DsV4Workspace;
 struct KimiWorkspace;
 struct Glm5Workspace;
+struct KimiK3Workspace;
 
 // Every architecture family the registry can construct. Distinct from the
 // `model_type` string: several strings alias onto the same family (e.g.
@@ -81,6 +82,7 @@ enum class Family {
     Qwen3_5Moe,
     NemotronH,
     Kimi,
+    KimiK3,
     DeepSeekV4,
     Glm5,
     Qwen3VL,
@@ -201,6 +203,11 @@ struct ModelResources {
     DsV4CompressCache* dsv4_comp_cache = nullptr;
     KimiWorkspace* kimi_ws = nullptr;
     Glm5Workspace* glm5_ws = nullptr;
+    // Kimi-K3 is the only family that needs an MLA cache and a recurrent
+    // state cache at once, so it takes its own scratch plus the state cache
+    // Qwen3.5 also uses.
+    KimiK3Workspace* kimi_k3_ws = nullptr;
+    RecurrentStateCache* kimi_k3_state_cache = nullptr;
 };
 
 // One row in the arch table. Every supported `model_type` string is its
@@ -243,14 +250,6 @@ struct ArchEntry {
     // *program* half of `plan = compile(source_facts, program, target)`. The
     // implementation lives in the family's own directory next to its forward
     // pass, and the loader type-checks it against what the files actually
-    // contain (`model/contract.hpp`).
-    //
-    // It belongs on the same row as `bind` because the two are one statement
-    // said twice — the contract names the tensors, `bind` reads them, and a row
-    // whose halves disagree fails at bind time with a missing weight instead of
-    // at compile time with a message. It used to be a second `model_type` table
-    // in `driver/common/`, and the two had drifted by six strings.
-    std::function<void(ContractBuilder&)> author_contract;
 };
 
 // The single arch table, one row per supported `model_type` string.

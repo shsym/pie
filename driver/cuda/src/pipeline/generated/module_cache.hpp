@@ -23,6 +23,9 @@
 #include <nvrtc.h>
 
 #include <ptir_abi.h>
+
+#include "config.hpp"
+
 #include "pipeline/region_support.hpp"
 
 namespace pie_cuda_driver::pipeline::generated {
@@ -157,7 +160,7 @@ class ModuleCache {
 
     std::shared_ptr<const FusedProgramExecutable> compile_program(
         std::uint64_t program_hash,
-        const std::vector<pie_native::launch::plan::StagePlan>& plans,
+        const std::vector<pie::driver::launch::plan::StagePlan>& plans,
         CompileFailureKind& failure_kind,
         std::string& error,
         HostSource host_source = nullptr,
@@ -420,13 +423,13 @@ class ModuleCache {
 
   private:
     static std::filesystem::path default_cache_directory() {
-        if (std::getenv("PIE_DISABLE_PTIR_DISK_CACHE") != nullptr) {
-            return {};
-        }
-        if (const char* configured = std::getenv("PIE_PTIR_CACHE_DIR")) {
-            return *configured == '\0'
-                ? std::filesystem::path{}
-                : std::filesystem::path(configured);
+        // Location is convention, not configuration. The convention is
+        // `$PIE_HOME/cache`, which the engine sends in `[cache] dir` -- one
+        // root for everything pie writes. The XDG fallback below is for a
+        // driver run against a hand-written TOML that says nothing.
+        const std::string& root = pie_cuda_driver::cache_dir();
+        if (!root.empty()) {
+            return std::filesystem::path(root) / "ptir-cuda";
         }
         if (const char* xdg = std::getenv("XDG_CACHE_HOME")) {
             if (*xdg != '\0') {
@@ -675,7 +678,7 @@ class ModuleCache {
     }
 
     static std::string stage_key(
-        const pie_native::launch::plan::StagePlan& plan,
+        const pie::driver::launch::plan::StagePlan& plan,
         int major,
         int minor,
         int nvrtc_major,
@@ -780,7 +783,7 @@ class ModuleCache {
     }
 
     static bool complete_stage_coverage(
-        const pie_native::launch::plan::StagePlan& plan,
+        const pie::driver::launch::plan::StagePlan& plan,
         const FusedStageExecutable& stage,
         std::string& error) {
         if (plan.fused.whole_stage_fallback ||

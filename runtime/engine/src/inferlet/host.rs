@@ -39,14 +39,6 @@ impl crate::pipeline::fire::FireContext for ProcessCtx {
         self.id()
     }
 
-    fn fire_timing_requested(&self) -> bool {
-        ProcessCtx::fire_timing_requested(self)
-    }
-
-    fn commit_fire_timing(&mut self, enabled: bool) {
-        ProcessCtx::commit_fire_timing(self, enabled);
-    }
-
     async fn settle_pipeline_tail(&mut self) -> anyhow::Result<()> {
         crate::inferlet::process::gate::drain_pending_fires(self).await
     }
@@ -73,10 +65,18 @@ wasmtime::component::bindgen!({
         // pie:inferlet/grammar
         "pie:inferlet/grammar.grammar": grammar::Grammar,
         "pie:inferlet/grammar.matcher": grammar::Matcher,
-        // pie:inferlet/forward — first-class channels + forward-pass
-        // submission (the registry surface folded into forward-pass.new).
-        "pie:inferlet/forward.channel": forward::Channel,
+        // pie:inferlet/channel — hoisted out of forward so all three
+        // forward-pass interfaces can name the same channel type.
+        "pie:inferlet/channel.channel": forward::Channel,
+        // pie:inferlet/forward — forward-pass submission (the registry surface
+        // folded into forward-pass.new).
         "pie:inferlet/forward.forward-pass": forward::ForwardPass,
+        // All three forward interfaces map their `forward-pass` to the SAME
+        // Rust type: WIT scopes resource names per interface, so the guest
+        // still cannot pass a hybrid pass to an attention-only call, while the
+        // host keeps one implementation (`ProcessCtx::core_*`).
+        "pie:inferlet/forward-recurrent.forward-pass": forward::ForwardPass,
+        "pie:inferlet/forward-hybrid.forward-pass": forward::ForwardPass,
         // pie:inferlet/pipeline — the ordering domain (hoisted out of forward
         // so working-set mutators can take borrow<pipeline> without a cycle).
         "pie:inferlet/pipeline.pipeline": pipeline::Pipeline,
@@ -110,7 +110,10 @@ pub fn add_to_linker(
     pie::inferlet::model::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::tokenizer::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::grammar::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::channel::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::forward::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::forward_recurrent::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
+    pie::inferlet::forward_hybrid::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::session::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::media::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::speech::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;

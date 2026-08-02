@@ -23,10 +23,10 @@ use std::path::PathBuf;
 
 use pie_forward::family::{
     llama_like, llama_like_cuda, qwen3_5_full_attn_block, qwen3_5_gdn_block, qwen3_5_hybrid,
-    qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block,
+    gemma4_cuda, gpt_oss_cuda, qwen3_5_hybrid_cuda, qwen3_5_moe_mlp_block, qwen3_5_moe_mlp_block_cuda,
 };
 use pie_forward::{
-    FireClass, ForwardPlan, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
+    FireClass, Gemma4CudaFacts, Gemma4Facts, ForwardPlan, GptOssCudaFacts, GptOssFacts, HookStage, LlamaLikeCudaFacts, LlamaLikeFacts, OpKind, Qwen35CudaFacts,
     Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
 };
 
@@ -136,6 +136,7 @@ fn qwen2_5_1_5b_cuda_decode() {
                 rope_table: true,
                 force_prefill_path: true,
                 head_dim_padded: false,
+                gate_up_fused: true,
             },
             FireClass::Decode,
         ),
@@ -154,6 +155,7 @@ fn qwen2_5_1_5b_cuda_prefill() {
                 rope_table: true,
                 force_prefill_path: true,
                 head_dim_padded: false,
+                gate_up_fused: true,
             },
             FireClass::Prefill,
         ),
@@ -176,6 +178,7 @@ fn phi3_mini_cuda_decode() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: true,
+                gate_up_fused: true,
             },
             FireClass::Decode,
         ),
@@ -194,6 +197,7 @@ fn phi3_mini_cuda_prefill() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: true,
+                gate_up_fused: true,
             },
             FireClass::Prefill,
         ),
@@ -227,6 +231,59 @@ fn qwen3_5_moe_mlp_35b_a3b() {
     check_plan(
         "qwen3_5_moe_mlp_35b_a3b",
         &qwen3_5_moe_mlp_block(&Qwen35MoeMlpFacts::qwen3_5_35b_a3b()),
+    );
+}
+
+/// Qwen3.6-27B, the dense hybrid — the SAME traced form as 0.8B at a
+/// different geometry, which is the claim worth pinning: this checkpoint
+/// needs no new vocabulary, only its dims.
+///
+/// It is the first fixture whose GDN half is GQA (48 value heads over 16
+/// key heads), so it is also the first golden where the `_gqa`
+/// recurrence and the head-repeat are the stated form rather than a
+/// branch nothing takes.
+#[test]
+fn qwen3_6_27b_cuda_decode() {
+    check_plan(
+        "qwen3_6_27b_cuda_decode",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_6_27b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::Decode,
+        ),
+    );
+}
+
+#[test]
+fn qwen3_6_27b_cuda_prefill() {
+    check_plan(
+        "qwen3_6_27b_cuda_prefill",
+        &qwen3_5_hybrid_cuda(
+            &Qwen35HybridFacts::qwen3_6_27b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+/// The same fragment's CUDA reading: the fused CUTLASS leg, which is the
+/// one the decode path takes and the only one of `run_moe_mlp`'s four
+/// that is a single rectangle.
+///
+/// Read it against the semantic golden above and the difference IS the
+/// argument: the selector's two `matmul_per_token`s, the routed swiglu
+/// and the `WeightedSum` collapse into ONE launch that produces
+/// `[Tokens, hidden]`, and the trailing `ResidualAdd` becomes an
+/// explicit `launch_residual_add_bf16` because the fused runner
+/// overwrites its output rather than accumulating.
+#[test]
+fn qwen3_5_moe_mlp_35b_a3b_cuda() {
+    check_plan(
+        "qwen3_5_moe_mlp_35b_a3b_cuda",
+        &qwen3_5_moe_mlp_block_cuda(
+            &Qwen35MoeMlpFacts::qwen3_5_35b_a3b(),
+            &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
+        ),
     );
 }
 
@@ -497,6 +554,7 @@ fn mistral_7b_v03_cuda_decode() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: false,
+                gate_up_fused: true,
             },
             FireClass::Decode,
         ),
@@ -515,7 +573,80 @@ fn mistral_7b_v03_cuda_prefill() {
                 rope_table: true,
                 force_prefill_path: false,
                 head_dim_padded: false,
+                gate_up_fused: true,
             },
+            FireClass::Prefill,
+        ),
+    );
+}
+
+/// gemma-4-E4B's decode reading — the third family's first golden.
+///
+/// Worth reading for three shapes no earlier golden has: the input norm
+/// appears ONCE (layer 0's; every other layer's arrives fused into the
+/// previous layer's PLE landing), the trailing 18 layers carry no k/v
+/// projection or cache write at all, and the two layer kinds differ by
+/// head WIDTH rather than by which statements run.
+#[test]
+fn gemma_4_e4b_cuda_decode() {
+    check_plan(
+        "gemma_4_e4b_cuda_decode",
+        &gemma4_cuda(
+            &Gemma4Facts::gemma_4_e4b(),
+            &Gemma4CudaFacts::gemma_4_e4b_synthetic(),
+            FireClass::Decode,
+        ),
+    );
+}
+
+/// gemma-4-E4B's PREFILL reading. Identical to the decode golden save
+/// for the dispatch line, which is where the whole class difference
+/// lives: the fused qkv epilogue is decode-only (so every layer takes
+/// the unfused five), and the dispatch itself splits again on head
+/// WIDTH — the 512-wide full layers take a naive paged kernel that
+/// flashinfer's prefill template cannot be instantiated for.
+#[test]
+fn gemma_4_e4b_cuda_prefill() {
+    check_plan(
+        "gemma_4_e4b_cuda_prefill",
+        &gemma4_cuda(
+            &Gemma4Facts::gemma_4_e4b(),
+            &Gemma4CudaFacts::gemma_4_e4b_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+/// gpt-oss-20b's decode reading — the fourth family's first golden, and
+/// the first whose MoE block is stated end to end.
+///
+/// Worth reading for the sink pair (the attention statement produces two
+/// values, and the second is fp32 `[Tokens, q_heads]`) and for the
+/// routed leg's seven rectangles, whose two GEMVs carry the expert axis
+/// as a third dim rather than as a launch count.
+#[test]
+fn gpt_oss_20b_cuda_decode() {
+    check_plan(
+        "gpt_oss_20b_cuda_decode",
+        &gpt_oss_cuda(
+            &GptOssFacts::gpt_oss_20b(),
+            &GptOssCudaFacts::gpt_oss_20b_synthetic(),
+            FireClass::Decode,
+        ),
+    );
+}
+
+/// gpt-oss's PREFILL reading. One statement apart from the decode golden
+/// — the dispatch — because the fused MXFP4 leg is admitted by ROUTES
+/// (`N * top_k <= max_routes`) and not by class, so a prefill under the
+/// cap runs the same seven rectangles the decode class does.
+#[test]
+fn gpt_oss_20b_cuda_prefill() {
+    check_plan(
+        "gpt_oss_20b_cuda_prefill",
+        &gpt_oss_cuda(
+            &GptOssFacts::gpt_oss_20b(),
+            &GptOssCudaFacts::gpt_oss_20b_synthetic(),
             FireClass::Prefill,
         ),
     );

@@ -27,9 +27,14 @@ pub struct ModelDrivers {
     pub groups: Vec<GroupDriver>,
 }
 
+/// The one place config units become the engine's plain numbers. `Duration`
+/// and `ByteSize` carry their unit through the config layer; `pie_engine`'s
+/// bootstrap structs still take `_secs`/`_us`/`_mb` scalars, so the conversion
+/// happens here and only here.
 pub fn build(
     user: &config::Config,
     drivers: ModelDrivers,
+    metadata: pie_model::ModelMetadata,
 ) -> Result<pie_engine::bootstrap::Config> {
     if drivers.groups.is_empty() {
         anyhow::bail!(
@@ -43,7 +48,7 @@ pub fn build(
     let cache_dir = pie_home.join("programs");
     let log_dir = Some(pie_home.join("logs"));
 
-    let model = build_model(&user.model, drivers)?;
+    let model = build_model(&user.model, drivers, metadata)?;
 
     Ok(pie_engine::bootstrap::Config {
         host: user.server.host.clone(),
@@ -60,14 +65,14 @@ pub fn build(
         runtime: pie_engine::bootstrap::RuntimeConfig {
             worker_threads: user.runtime.worker_threads,
             wasm_max_instances: user.runtime.wasm_max_instances,
-            wasm_max_memory_mb: user.runtime.wasm_max_memory_mb,
-            wasm_warm_memory_mb: user.runtime.wasm_warm_memory_mb,
+            wasm_max_memory_mb: user.runtime.wasm_max_memory.as_mib() as usize,
+            wasm_warm_memory_mb: user.runtime.wasm_warm_memory.as_mib() as usize,
             wasm_warm_slots: user.runtime.wasm_warm_slots,
             allow_fs: user.runtime.allow_fs,
             fs_scratch_dir: user.runtime.fs_scratch_dir.clone(),
             allow_network: user.runtime.allow_network,
             network_allowed_hosts: user.runtime.network_allowed_hosts.clone(),
-            max_upload_mb: user.runtime.max_upload_mb,
+            max_upload_mb: user.runtime.max_upload.as_mib() as usize,
             py_runtime_dir: pie_home.join("py-runtime"),
         },
         model,
@@ -82,17 +87,25 @@ pub fn build(
 fn build_model(
     m: &config::ModelConfig,
     drivers: ModelDrivers,
+    metadata: pie_model::ModelMetadata,
 ) -> Result<pie_engine::bootstrap::ModelConfig> {
     // Arch + kv_page_size + tokenizer come from group 0; all groups
     // serve the same model so they agree. Per-group caps can differ in
     // memory-derived capacities — those flow through the per-driver entries.
     let group0_caps = drivers.groups[0].caps.clone();
     let snapshot_dir = PathBuf::from(&group0_caps.snapshot_dir);
-    let tokenizer_json = snapshot_dir.join("tokenizer.json");
-    let tokenizer_path = if tokenizer_json.exists() {
-        tokenizer_json
+    // The metadata was lifted once when the model was resolved; this only
+    // decides which of the two shapes the runtime is being handed. Only the
+    // tokenizer half varies -- the descriptor is there either way.
+    let tokenizer_path = if metadata.tokenizer.is_some() {
+        snapshot_dir.clone()
     } else {
-        snapshot_dir.join("tiktoken.model")
+        let tokenizer_json = snapshot_dir.join("tokenizer.json");
+        if tokenizer_json.exists() {
+            tokenizer_json
+        } else {
+            snapshot_dir.join("tiktoken.model")
+        }
     };
 
     let drivers = drivers
@@ -115,9 +128,8 @@ fn build_model(
                 has_value_head: g.caps.has_value_head,
                 has_kv_envelopes: g.caps.has_kv_envelopes,
                 has_attn_page_mask: g.caps.has_attn_page_mask,
-                has_lora: g.caps.has_lora,
                 has_attn_score: g.caps.has_attn_score,
-                model_site_summary: g.caps.model_site_summary.clone(),
+                has_lora: g.caps.has_lora,
                 device_geometry_port_mask: g.caps.device_geometry_port_mask,
                 limits: pie_engine::driver::SchedulerLimits {
                     max_forward_requests: g.caps.max_forward_requests as usize,
@@ -134,9 +146,15 @@ fn build_model(
         arch_name: group0_caps.arch_name,
         kv_page_size: group0_caps.kv_page_size as usize,
         tokenizer_path,
+        metadata,
         drivers,
         scheduler: pie_engine::bootstrap::SchedulerConfig {
-            request_timeout_secs: m.scheduler.request_timeout_secs,
+            request_timeout_secs: m.scheduler.request_timeout.as_secs(),
+            submit_deadline_us: m.scheduler.submit_deadline.as_micros(),
+            silence_timeout_secs: m.scheduler.silence_timeout.as_secs(),
+            frame_size: m.scheduler.frame_size,
+            frame_submit_depth: m.scheduler.frame_submit_depth,
+            frame_dispatch_depth: m.scheduler.frame_dispatch_depth,
         },
     })
 }
@@ -144,6 +162,19 @@ fn build_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The smallest `pie.model/1` a boot is valid with.
+    ///
+    /// `build` only carries the metadata through; the two fields the runtime
+    /// reads out of it (`vocab_size`, `num_hidden_layers`) are exercised where
+    /// they are read, in `pie_model::register`.
+    fn fixture_metadata() -> pie_model::ModelMetadata {
+        pie_model::ModelMetadata {
+            tokenizer: None,
+            descriptor: br#"{"version":"pie.model/1","vocab_size":32,"num_hidden_layers":2}"#
+                .to_vec(),
+        }
+    }
 
     fn fixture_caps() -> DriverCapabilities {
         DriverCapabilities {
@@ -172,12 +203,10 @@ mod tests {
             has_value_head: false,
             has_kv_envelopes: false,
             has_attn_page_mask: false,
-            has_lora: false,
             has_attn_score: false,
-            model_site_summary: pie_driver_abi::ModelSiteSummary::default(),
             device_geometry_port_mask: pie_driver_abi::PIE_DEVICE_GEOMETRY_PORTS,
-            kv_handle: None,
             codegen_backend: String::new(),
+            kv_handle: None,
         }
     }
 
@@ -198,7 +227,6 @@ mod tests {
             has_mtp_drafts: caps.has_mtp_drafts,
             has_value_head: caps.has_value_head,
             has_attn_score: caps.has_attn_score,
-            model_site_summary: caps.model_site_summary.clone(),
             callback_delay_ms: 0,
             reject_launches: false,
             reject_launches_remaining: 0,
@@ -219,7 +247,7 @@ mod tests {
         let toml_text = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
 [model.driver]
 type = "dummy"
@@ -246,6 +274,7 @@ arch_name = "qwen3"
             ModelDrivers {
                 groups: vec![fixture_group(caps)],
             },
+            fixture_metadata(),
         )
         .unwrap();
         assert_eq!(cfg.host, "127.0.0.1");
@@ -265,55 +294,12 @@ arch_name = "qwen3"
         );
     }
 
-    /// A driver-reported site summary passes through to the engine's
-    /// per-driver config untouched — the capabilities half of the
-    /// driver→engine site-summary handshake.
-    #[test]
-    fn model_site_summary_passes_through_to_driver_config() {
-        let toml_text = r#"
-[model]
-name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
-
-[model.driver]
-type = "dummy"
-device = ["cpu"]
-
-[model.driver.options]
-vocab_size = 151936
-arch_name = "qwen3"
-"#;
-        let user: config::Config = toml::from_str(toml_text).unwrap();
-        user.validate().unwrap();
-
-        let snap = tempfile::tempdir().unwrap();
-        std::fs::write(snap.path().join("tokenizer.json"), b"{}").unwrap();
-        let mut caps = fixture_caps();
-        caps.snapshot_dir = snap.path().to_string_lossy().into_owned();
-        caps.model_site_summary = pie_driver_abi::ModelSiteSummary {
-            expert_sites: vec![pie_driver_abi::ExpertSiteSummary {
-                experts: 256,
-                top_k: 8,
-            }],
-        };
-        let expected = caps.model_site_summary.clone();
-
-        let cfg = build(
-            &user,
-            ModelDrivers {
-                groups: vec![fixture_group(caps)],
-            },
-        )
-        .unwrap();
-        assert_eq!(cfg.model.drivers[0].model_site_summary, expected);
-    }
-
     #[test]
     fn translates_dp_two_groups() {
         let toml_text = r#"
 [model]
 name = "default"
-hf_repo = "Qwen/Qwen3-0.6B"
+model = "Qwen/Qwen3-0.6B"
 
 [model.driver]
 type = "dummy"
@@ -335,6 +321,7 @@ arch_name = "qwen3"
             ModelDrivers {
                 groups: vec![fixture_group(fixture_caps()), fixture_group(g1)],
             },
+            fixture_metadata(),
         )
         .unwrap();
         let m = &cfg.model;
@@ -349,14 +336,14 @@ arch_name = "qwen3"
             r#"
 [model]
 name = "a"
-hf_repo = "x"
+model = "x"
 [model.driver]
 type = "dummy"
 device = ["cpu"]
 "#,
         )
         .unwrap();
-        let err = build(&user, ModelDrivers { groups: vec![] })
+        let err = build(&user, ModelDrivers { groups: vec![] }, fixture_metadata())
             .err()
             .unwrap()
             .to_string();

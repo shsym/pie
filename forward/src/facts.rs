@@ -316,6 +316,68 @@ pub struct LlamaLikeCudaFacts {
     /// Serde-defaulted (append-only discipline).
     #[serde(default)]
     pub head_dim_padded: bool,
+    /// The checkpoint materialised a packed gate‖up bank
+    /// (`w.layers[l].gate_up_proj_fused != nullptr`), so the MLP's packed
+    /// GEMM lands in one buffer and the activation is the CHUNKED swiglu
+    /// over it; without it the projection writes two buffers and the
+    /// activation is the pair form.
+    ///
+    /// A pure WEIGHT-BINDING fact, which is why it belongs here rather
+    /// than in the walk. The executor derived it per layer as
+    /// `gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty()`, but
+    /// the second term is dead: `workspace.cpp` allocates that buffer
+    /// unconditionally ("Always allocated … lets the forward dispatch
+    /// decide per layer"). So the binding alone decides, the binding is
+    /// known at model construction, and the taxonomy's first row applies
+    /// — a load-time fact is a trace-time `match`, erased.
+    ///
+    /// Stating it deletes a runtime branch from three places at once: the
+    /// interpreter's `arm_swiglu`, the generated `.inc`'s
+    /// `if (gate_up_fused_N)` per layer, and the flat list's residue.
+    /// Serde-defaulted (append-only discipline).
+    #[serde(default)]
+    pub gate_up_fused: bool,
+}
+
+/// The METAL backend's load-time facts — what the Metal deployment
+/// resolved before any fire, the way [`LlamaLikeCudaFacts`] carries
+/// CUDA's.
+///
+/// UNVERIFIED (2026-08-05): no Metal deployment has produced these yet.
+/// The Metal driver cannot even build on the box we have (`xcrun --find
+/// metal` fails — the shader compiler ships with full Xcode), so every
+/// field here is read off the driver's SOURCE
+/// (`driver/metal/src/kernels/decode_psos.cpp`, `model/qwen3_5/decode_step.hpp`)
+/// rather than measured. `.wiki/tart/macos.md` records the ladder; the
+/// precedent for refusing to call an unmeasured fact set measured is
+/// [`Qwen35CudaFacts::qwen3_5_0_8b_synthetic`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlamaLikeMetalFacts {
+    /// The projection GEMV folds the block residual in its epilogue
+    /// (`affine_qmv_fast_residual`, `Dispatch::fuse_residual`,
+    /// `PIE_FUSE_RESIDUAL`), so a `beta_one` matmul states one launch
+    /// instead of a projection plus a `residual_add`.
+    pub fuse_residual_gemv: bool,
+    /// The M>1 lane addresses the KV cache through a page table
+    /// (`sdpa_paged_decode` + `kv_append_paged`) rather than the M=1
+    /// contiguous pair (`sdpa_vector_decode` + `kv_append`).
+    pub paged_multi_batch: bool,
+    /// The M>1 projections take MLX's steel quantized GEMM
+    /// (`affine_qmm_t`) instead of the GEMV — the driver's
+    /// `kQmmMinBatch` gate, as a load-time fact of the deployment.
+    pub qmm_multi_batch: bool,
+}
+
+impl LlamaLikeMetalFacts {
+    /// A SYNTHETIC fixture, not a measurement — see the struct comment.
+    /// These are the driver's own defaults as its source reads them.
+    pub fn synthetic() -> Self {
+        Self {
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+        }
+    }
 }
 
 impl LlamaLikeCudaFacts {
@@ -342,6 +404,13 @@ impl LlamaLikeCudaFacts {
             rope_table: true,
             force_prefill_path: false,
             head_dim_padded: false,
+            // The loader's `dense_fused_projection_joins` contract packs
+            // BF16 dense groups and declines quantized ones, so a plain
+            // BF16 deployment carries the bank. VERIFIED LIVE, not
+            // assumed — the boot log's declared-facts line is what says
+            // so, and the digest refuses the deployment if this fixture
+            // and the binding disagree.
+            gate_up_fused: true,
         }
     }
 }
@@ -599,6 +668,13 @@ impl Qwen35FullAttnFacts {
 /// One enum for the whole model because the family applies the same MLP
 /// kind to every layer (`qwen3_5_forward.cpp` has no per-layer MLP switch;
 /// the per-layer axis of this family is the ATTENTION kind).
+///
+/// WHICH ARM A CHECKPOINT TAKES IS A READING OF ITS CONFIG, not of its
+/// `model_type`. Qwen3.6-27B is `model_type: qwen3_5` and takes `Dense`
+/// (no `num_experts`, `intermediate_size` 17408); the MoE arm is the
+/// 35B-A3B-shaped checkpoints'. Worth stating because the opposite was
+/// once assumed here, and it aimed a stretch of work at a branch the
+/// checkpoint in question never reaches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Qwen35MlpKind {
     Dense { intermediate: u32 },
@@ -699,6 +775,47 @@ pub struct Qwen35CudaFacts {
     /// back unchanged (the append-only discipline).
     #[serde(default)]
     pub verify_stash: bool,
+    /// `Qwen3_5MoeMlpWorkspace::cutlass_max_rows` — `min(max_tokens, 512)`
+    /// when `ops::flashinfer_cutlass_moe_enabled()` sized a workspace,
+    /// else 0. Zero means the fused leg does not exist on this
+    /// deployment; non-zero is the ROW BOUND of the MoE text, and fires
+    /// above it decline rather than the declaration guessing which of
+    /// the remaining three legs the pass would have taken.
+    #[serde(default)]
+    pub moe_cutlass_max_rows: u32,
+    /// `add_to_residual` — tp==1, so the MoE block's output lands on the
+    /// residual stream inside this pass. At tp>1 the block writes to
+    /// scratch and an allreduce follows, which is a different (and
+    /// unstated) shape.
+    #[serde(default)]
+    pub moe_residual_fold: bool,
+    /// The shared expert's gate weight is bound and unquantized, so its
+    /// landing is the fused dot form. False sends it to the
+    /// `[Tokens, 1]` GEMM plus a separate scalar-gate add, which this
+    /// text does not state.
+    #[serde(default)]
+    pub moe_shared_gate_dot: bool,
+    /// `Lw.expert_cache != nullptr` — the experts are paged one at a
+    /// time, so every device-side leg that strides a fused slab is off
+    /// the table and the pass takes the host-routed path.
+    #[serde(default)]
+    pub moe_streamed_experts: bool,
+    /// `qwen35_moe_force_general_path()` — the env that pins the pass to
+    /// the host-routed path regardless of shape.
+    #[serde(default)]
+    pub moe_force_general: bool,
+    /// The DENSE MLP's gate_up BINDING — `Lw.gate_up_proj_fused !=
+    /// nullptr`, so the packed GEMM lands in one buffer and the
+    /// activation is the CHUNKED swiglu over it; without it the
+    /// projection writes two and the activation is the pair form.
+    ///
+    /// [`LlamaLikeCudaFacts::gate_up_fused`]'s reasoning applies
+    /// verbatim, including why the workspace term the executor also
+    /// tested is dead. Only the MoE arm's shared expert is unaffected:
+    /// it always binds a packed bank, so its text states the chunked
+    /// form outright.
+    #[serde(default)]
+    pub gate_up_fused: bool,
 }
 
 impl Qwen35CudaFacts {
@@ -728,6 +845,23 @@ impl Qwen35CudaFacts {
             warp_tiled_max: 64,
             cached_max: 4096,
             verify_stash: true,
+            // The MoE fields describe the fused leg as the driver has it
+            // today: the CUTLASS workspace is always sized
+            // (`flashinfer_cutlass_moe_enabled()` returns true
+            // unconditionally), 512 is `kFusedMoeMaxRows`, tp=1 folds the
+            // residual, and neither the streamed-expert cache nor the
+            // force-general env is on by default. Synthetic like the rest
+            // of this fixture — the 0.8B checkpoint is dense and reaches
+            // none of them; they pin the MoE block's golden form.
+            moe_cutlass_max_rows: 512,
+            moe_residual_fold: true,
+            moe_shared_gate_dot: true,
+            moe_streamed_experts: false,
+            moe_force_general: false,
+            // 0.8B binds the packed bank (qwen3_5.cpp's loader takes the
+            // same `dense_fused_projection_joins` contract llama_like's
+            // does), so the chunked form is the golden's shape.
+            gate_up_fused: true,
         }
     }
 }
@@ -772,6 +906,411 @@ impl Qwen35HybridFacts {
             attn: Qwen35FullAttnFacts::qwen3_5_0_8b(),
             gdn: Qwen35GdnFacts::qwen3_5_0_8b(),
             mlp: Qwen35MlpKind::Dense { intermediate: 3584 },
+        }
+    }
+
+    /// Qwen3.6-27B — the DENSE hybrid, read from the checkpoint's own
+    /// `config.json` (`text_config`), not inferred from the family name.
+    ///
+    /// Every value here is a field of that file or the driver's stated
+    /// derivation from one: 64 layers, `full_attention_interval` 4,
+    /// `vocab_size` 248320, `tie_word_embeddings` false,
+    /// `intermediate_size` 17408 (no `num_experts` — this checkpoint
+    /// takes the `Dense` arm, see [`Qwen35MlpKind`]), hidden 5120,
+    /// 24 q heads over 4 kv heads at `head_dim` 256, and
+    /// `partial_rotary_factor` 0.25 → `rotary_dim` 64 by the driver's
+    /// `max(2, 2 * int(0.5 * f * head_dim))`. The GDN half is the
+    /// `linear_*` block: 16 key heads, 48 value heads (a GQA ratio of 3,
+    /// which `family.rs`'s gdn body already branches on), 128/128 head
+    /// dims, `linear_conv_kernel_dim` 4.
+    ///
+    /// `fused_in_proj` / `fused_qkv` are false because both joins are
+    /// env-gated default-off, the same as 0.8B's.
+    ///
+    /// NOT reachable on an L40S at bf16 — 27B is ~55 GB against 46. An
+    /// FP8 checkpoint of the same geometry is what would boot here; the
+    /// traced form is identical either way, which is why the fixture is
+    /// worth having before the hardware is.
+    pub fn qwen3_6_27b() -> Self {
+        Self {
+            layers: 64,
+            full_attn_interval: 4,
+            vocab: 248_320,
+            tied_embeddings: false,
+            norm_variant: NormVariant::Gemma,
+            attn: Qwen35FullAttnFacts {
+                hidden: 5120,
+                q_heads: 24,
+                kv_heads: 4,
+                head_dim: 256,
+                rotary_dim: 64,
+                fused_qkv: false,
+                norm_variant: NormVariant::Gemma,
+            },
+            gdn: Qwen35GdnFacts {
+                hidden: 5120,
+                key_heads: 16,
+                value_heads: 48,
+                key_head_dim: 128,
+                value_head_dim: 128,
+                conv_kernel: 4,
+                fused_in_proj: false,
+                norm_variant: NormVariant::Gemma,
+            },
+            mlp: Qwen35MlpKind::Dense {
+                intermediate: 17_408,
+            },
+        }
+    }
+}
+
+/// Facts for the GEMMA-4 family — the third declared family, and the
+/// first whose per-layer axis carries TWO HEAD DIMS.
+///
+/// # What makes this family its own declaration
+///
+/// gemma-4 alternates sliding and full attention on a regular interval,
+/// like qwen3_5's hybrid — but where qwen3_5's two layer kinds are two
+/// different ATTENTIONS, gemma-4's are the same attention at different
+/// geometry: `head_dim` 256 on a sliding layer, `global_head_dim` 512 on
+/// a full one, with partial rope on the full layers only. The window
+/// itself is not trace vocabulary at all: it is a scalar `window_left`
+/// the driver reads per layer from its own config, which is why nothing
+/// here names it.
+///
+/// Two things ARE structural and have no analogue in the families
+/// declared so far:
+///
+/// * **KV sharing.** The last [`Self::kv_shared_layers`] layers project
+///   no k/v, norm no k/v, rope no k, and write no cache — they attend
+///   through the pages of the last earlier layer of the SAME kind. The
+///   elision is per layer and total, so it is a fact the trace reads to
+///   decide which statements exist, not a runtime branch.
+/// * **PLE** (per-layer embeddings). A prologue that embeds a SECOND
+///   table, projects it to `layers * ple_dim`, norms and scales it, and
+///   transposes so each layer reads a contiguous slice; then a per-layer
+///   epilogue gates that slice into the residual stream. It is the
+///   reason gemma-4 cannot be a `llama_like` configuration.
+///
+/// (There is no altup here. That is gemma3n's mechanism —
+/// `driver/cuda/src/model/gemma4/` never mentions it.)
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Gemma4Facts {
+    pub hidden: u32,
+    pub layers: u32,
+    /// Full attention every `interval`-th layer, `l % interval ==
+    /// interval - 1` — qwen3_5's formula, and the config agrees
+    /// (E4B: full at 5, 11, …, 41 with interval 6).
+    pub full_attn_interval: u32,
+    pub q_heads: u32,
+    pub kv_heads: u32,
+    /// The SLIDING layers' head dim (`head_dim`).
+    pub head_dim: u32,
+    /// The FULL layers' head dim (`global_head_dim`). Different from
+    /// [`Self::head_dim`] on E4B (512 vs 256), which is why the two
+    /// kinds cannot share one width the way qwen3_5's do.
+    pub global_head_dim: u32,
+    /// Partial-rotary width on the FULL layers, resolved the driver's
+    /// way (`max(2, 2 * int(0.5 * factor * head_dim))`): 0.25 × 512
+    /// gives 128. Sliding layers rotate fully.
+    pub global_rotary_dim: u32,
+    pub intermediate: u32,
+    pub vocab: u32,
+    pub tied_embeddings: bool,
+    /// `num_kv_shared_layers` — the count of TRAILING layers that reuse
+    /// an earlier layer's pages. `first_shared = layers - this`.
+    pub kv_shared_layers: u32,
+    /// `hidden_size_per_layer_input` — the PLE slice width per layer.
+    pub ple_dim: u32,
+    /// `use_double_wide_mlp`: the KV-SHARED layers carry an MLP of
+    /// `2 * intermediate`. E2B sets it, E4B does not — the first
+    /// gemma-4 axis where two deployments of one family disagree about
+    /// a WIDTH rather than a count, so it is a fact and the widths it
+    /// implies erase at trace time.
+    pub double_wide_shared: bool,
+    /// `final_logit_softcapping`; 0 means no cap.
+    pub logit_softcap: f32,
+}
+
+impl Gemma4Facts {
+    /// Whether layer `l` runs FULL attention — the same predicate
+    /// [`Qwen35HybridFacts::is_full_attn`] states, because the two
+    /// families schedule their layer kinds the same way.
+    pub fn is_full_attn(&self, l: u32) -> bool {
+        self.full_attn_interval <= 1
+            || l % self.full_attn_interval == self.full_attn_interval - 1
+    }
+
+    /// Whether layer `l` reuses another layer's KV pages, projecting and
+    /// writing none of its own.
+    pub fn is_kv_shared(&self, l: u32) -> bool {
+        l >= self.layers.saturating_sub(self.kv_shared_layers)
+    }
+
+    /// This layer's MLP width. The double-wide variant widens exactly
+    /// the KV-shared layers, which is why it keys on the same predicate
+    /// rather than on a second count.
+    pub fn intermediate_of(&self, l: u32) -> u32 {
+        if self.double_wide_shared && self.is_kv_shared(l) {
+            self.intermediate * 2
+        } else {
+            self.intermediate
+        }
+    }
+
+    /// The layer whose pages `l` attends through: the last EARLIER layer
+    /// of the same kind (`gemma4.cpp`'s load-time search). `None` for a
+    /// layer that owns its pages.
+    pub fn kv_source(&self, l: u32) -> Option<u32> {
+        if !self.is_kv_shared(l) {
+            return None;
+        }
+        let first_shared = self.layers - self.kv_shared_layers;
+        (0..first_shared)
+            .rev()
+            .find(|&j| self.is_full_attn(j) == self.is_full_attn(l))
+    }
+
+    /// This layer's head dim — the per-layer axis that makes gemma-4 its
+    /// own family.
+    pub fn head_dim_of(&self, l: u32) -> u32 {
+        if self.is_full_attn(l) {
+            self.global_head_dim
+        } else {
+            self.head_dim
+        }
+    }
+
+    /// `google/gemma-4-E4B-it`, read from the checkpoint's own
+    /// `config.json` (`text_config`) — every value a field of that file
+    /// or the driver's stated derivation from one.
+    pub fn gemma_4_e4b() -> Self {
+        Self {
+            hidden: 2560,
+            layers: 42,
+            full_attn_interval: 6,
+            q_heads: 8,
+            kv_heads: 2,
+            head_dim: 256,
+            global_head_dim: 512,
+            // partial_rotary_factor 0.25 on `global_head_dim` 512.
+            global_rotary_dim: 128,
+            intermediate: 10_240,
+            vocab: 262_144,
+            tied_embeddings: true,
+            kv_shared_layers: 18,
+            ple_dim: 256,
+            double_wide_shared: false,
+            logit_softcap: 30.0,
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemma4_tests {
+    use super::Gemma4Facts;
+
+    /// The layer-kind schedule the checkpoint states, reproduced by the
+    /// formula. `config.json` lists `full_attention` at 5, 11, 17, 23,
+    /// 29, 35, 41 — seven of forty-two — and the interval must generate
+    /// exactly that set, not merely contain it.
+    #[test]
+    fn the_schedule_is_the_one_the_config_lists() {
+        let f = Gemma4Facts::gemma_4_e4b();
+        let full: Vec<u32> = (0..f.layers).filter(|&l| f.is_full_attn(l)).collect();
+        assert_eq!(full, vec![5, 11, 17, 23, 29, 35, 41]);
+    }
+
+    /// KV sharing: the trailing 18 layers own no pages, and each attends
+    /// through the last EARLIER layer of its own kind. On E4B that means
+    /// every shared SLIDING layer lands on 22 and every shared FULL one
+    /// on 23 — the driver's load-time search, as a fact.
+    #[test]
+    fn every_shared_layer_finds_a_source_of_its_own_kind() {
+        let f = Gemma4Facts::gemma_4_e4b();
+        assert_eq!(f.layers - f.kv_shared_layers, 24);
+        for l in 0..f.layers {
+            match f.kv_source(l) {
+                None => assert!(!f.is_kv_shared(l), "layer {l} shares but found no source"),
+                Some(src) => {
+                    assert!(f.is_kv_shared(l));
+                    assert!(src < 24, "layer {l} sources from a sharing layer {src}");
+                    assert_eq!(
+                        f.is_full_attn(src),
+                        f.is_full_attn(l),
+                        "layer {l} sources from the other attention kind"
+                    );
+                }
+            }
+        }
+        assert_eq!(f.kv_source(24), Some(22));
+        assert_eq!(f.kv_source(29), Some(23));
+        assert_eq!(f.kv_source(41), Some(23));
+    }
+
+    /// The two head dims are the per-layer axis. A family that had one
+    /// would not need this fact at all, which is why it is worth a test
+    /// that says the widths actually differ.
+    #[test]
+    fn the_two_layer_kinds_have_different_head_dims() {
+        let f = Gemma4Facts::gemma_4_e4b();
+        assert_ne!(f.head_dim, f.global_head_dim);
+        assert_eq!(f.head_dim_of(0), 256);
+        assert_eq!(f.head_dim_of(5), 512);
+        assert_eq!(f.global_rotary_dim, 2 * (0.5 * 0.25 * 512.0) as u32);
+    }
+}
+
+/// The CUDA backend's load-time facts for gemma-4 — the BINDING
+/// questions its class traces resolve at trace time.
+///
+/// Three, and all three are "what did the loader materialise", which is
+/// the taxonomy's first row: a load-time fact is a trace-time `match`,
+/// erased.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Gemma4CudaFacts {
+    /// The loader bound one packed `[Hq + 2*Hk, hidden]` projection
+    /// (`qkv_proj_fused`) — llama_like's `fused_qkv`, same question.
+    pub fused_qkv: bool,
+    /// The loader bound a packed gate‖up bank — llama_like's
+    /// `gate_up_fused`, same question, different activation behind it.
+    pub gate_up_fused: bool,
+    /// The KV cache is native bf16, so the fused decode post may write
+    /// pages directly. One of the four terms
+    /// `can_fuse_packed_qkv_post` reads; the other three are the
+    /// declaration's own (`partial` is a layer-kind fact, hooks and the
+    /// fire class are class/guard vocabulary).
+    pub kv_native_bf16: bool,
+}
+
+impl Gemma4CudaFacts {
+    /// SYNTHETIC fixture — the same standing caveat every `*CudaFacts`
+    /// constructor here carries: it pins the GOLDEN FORM of the traced
+    /// arms, not a deployment's truth. The live derivation and its
+    /// digest are the executor rung's, and the digest is what corrects a
+    /// guess on first boot.
+    pub fn gemma_4_e4b_synthetic() -> Self {
+        Self {
+            fused_qkv: true,
+            gate_up_fused: true,
+            kv_native_bf16: true,
+        }
+    }
+}
+
+// ── gpt-oss ────────────────────────────────────────────────────────────
+
+/// gpt-oss's shape. The family rides `mixtral.cpp`, so these are the
+/// facts that text reads — not a checkpoint dump.
+///
+/// Two of them are here because the driver ANSWERS them per layer and
+/// the declaration would otherwise have to re-derive them per fire: the
+/// alternating window kind, and whether a layer carries attention sinks.
+/// Both are load-time, so both erase at trace time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GptOssFacts {
+    pub hidden: u32,
+    pub layers: u32,
+    pub q_heads: u32,
+    pub kv_heads: u32,
+    pub head_dim: u32,
+    /// One expert's MLP width (`intermediate_size`). gpt-oss's is equal
+    /// to `hidden`, which is a coincidence of this checkpoint and not a
+    /// rule the text may lean on.
+    pub intermediate: u32,
+    pub experts: u32,
+    pub top_k: u32,
+    pub vocab: u32,
+    pub tied_embeddings: bool,
+    /// `swiglu_limit`; 0 means the plain SwiGLU. gpt-oss clamps at 7.0,
+    /// and the clamp is a DIFFERENT KERNEL, so this decides which
+    /// activation the text states rather than being a runtime scalar.
+    pub swiglu_limit: f32,
+    /// Whether the checkpoint biases q/k/v/o, the router, and the expert
+    /// projections (`attention_bias`). gpt-oss biases all of them; the
+    /// q/k/v biases FOLD INTO the projection's epilogue and the rest are
+    /// their own launches.
+    pub attention_bias: bool,
+    /// Whether this deployment's rope is the YaRN-paper one. gpt-oss's
+    /// config asks for it (factor 32 over an original 4096 context) and
+    /// the driver resolves it at load, so it is a fact and not a fire's
+    /// question — and a WRONG one here is not a crash but a silently
+    /// unscaled rotation, which is how it went unnoticed.
+    pub rope_yarn_original: bool,
+    /// Every layer carries `attn_sinks` on gpt-oss. The driver asks
+    /// `layer.attn_sinks != nullptr` per layer and only requests an LSE
+    /// from attention where the answer is yes — so this is what decides
+    /// whether the attention statement produces one value or two.
+    pub attn_sinks: bool,
+}
+
+impl GptOssFacts {
+    /// Whether layer `l` attends over the SLIDING window. gpt-oss
+    /// alternates from layer 0 (`layer_types` reads
+    /// sliding, full, sliding, full, …), which the driver reaches
+    /// through `per_layer_window_left` — a scalar the text does not
+    /// state, since the window is an argument and not a kernel.
+    pub fn is_sliding(&self, l: u32) -> bool {
+        l % 2 == 0
+    }
+
+    /// openai/gpt-oss-20b, read from the checkpoint's `config.json`
+    /// (2026-08-06). `layer_types` alternates from sliding; the yarn
+    /// `rope_scaling` is NOT in this list because the driver never
+    /// applies it — `mixtral.cpp:320` passes the plain `rope_theta`, a
+    /// latent bug this declaration must not launder into a fact.
+    pub fn gpt_oss_20b() -> Self {
+        Self {
+            hidden: 2880,
+            layers: 24,
+            q_heads: 64,
+            kv_heads: 8,
+            head_dim: 64,
+            intermediate: 2880,
+            experts: 32,
+            top_k: 4,
+            vocab: 201088,
+            tied_embeddings: false,
+            swiglu_limit: 7.0,
+            attention_bias: true,
+            rope_yarn_original: true,
+            attn_sinks: true,
+        }
+    }
+}
+
+/// The CUDA backend's answers for a gpt-oss deployment — the bindings
+/// and the admission thresholds, all resolved at load.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GptOssCudaFacts {
+    /// Whether the layer bank carries the per-expert POINTER ARRAYS the
+    /// fused decode GEMV indexes (`expert_gate_up_packed_ptrs`). Built
+    /// by the `RoutedDecode` MXFP4 policy, which is the engine default;
+    /// the `NativeGemm` policy binds marlin views instead and reaches
+    /// the experts through a per-expert loop no rectangle spells.
+    pub mxfp4_decode_gemv: bool,
+    /// `mxfp4_decode_max_routes` — the fused leg's admission threshold
+    /// in ROUTES (`N * top_k`), default `32 * experts`. A fire past it
+    /// takes the host-routed walk, which this declaration refuses by
+    /// name rather than states.
+    pub mxfp4_decode_max_routes: u32,
+    /// Whether the experts are STREAMED through a slab cache. A streamed
+    /// layer reaches the same fused kernels, but only after a host
+    /// round-trip that decides what to page in — so a streamed
+    /// deployment is outside the flat list until that is stated.
+    pub streamed_experts: bool,
+}
+
+impl GptOssCudaFacts {
+    /// The L40S deployment's set, as the driver derives it: no
+    /// streaming, the default policy's pointer arrays, and the default
+    /// cap. SYNTHETIC until a live digest judges it — the standing
+    /// contract for every `*_synthetic` fixture in this file.
+    pub fn gpt_oss_20b_synthetic() -> Self {
+        Self {
+            mxfp4_decode_gemv: true,
+            mxfp4_decode_max_routes: 32 * 32,
+            streamed_experts: false,
         }
     }
 }

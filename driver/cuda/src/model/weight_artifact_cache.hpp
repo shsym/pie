@@ -10,25 +10,27 @@
 // straight into device memory and skips compile + materialize.
 //
 // This file owns only the *policy*: where the artifact lives (the cache dir +
-// key->path), the durable write (free-space guard + temp file + atomic rename),
-// and the read (mmap the file, restore through the shared staged-H2D engine).
-// The byte format + integrity checksum live in the loader codec
-// (loader/weight_store_codec.hpp); this layer treats them as an opaque stream.
+// key->path) and whether writing one is worth the disk. The file itself --
+// format, placement, digests, the temp-file-and-rename that publishes it -- is
+// the loader codec's (loader/weight_store_codec.hpp), which this layer drives by
+// path and never looks inside.
 //
-// OFF BY DEFAULT — strictly opt-in via PIE_CUDA_WEIGHT_CACHE_DIR. With the env
-// unset/empty the cache never reads or writes (zero disk). Even when enabled,
-// the write declines if free space < blob size + margin (the artifact is the
-// size of the materialized weights — tens to hundreds of GB). Each owned blob
-// carries a fast checksum verified on reload (skip with
-// PIE_CUDA_WEIGHT_CACHE_NO_VERIFY); key/format-version mismatch => miss.
+// Located by `[model] weight_cache_dir`, which the worker resolves to
+// $PIE_HOME/models when the operator leaves it empty. Empty here (the driver
+// was told nothing) disables the cache entirely: zero reads, zero writes. The
+// write declines if free space < blob size + margin, because the artifact is
+// the size of the materialized weights — tens to hundreds of GB. Every owned
+// blob carries a fast checksum, always verified on reload; a key or
+// format-version mismatch is a miss.
 
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fstream>
 #include <string>
+
+#include "config.hpp"
 
 #include "model/weight_store.hpp"
 #include "loader/weight_store_codec.hpp"
@@ -36,10 +38,6 @@
 
 #if __has_include(<cuda_runtime.h>)
 #define PIE_CUDA_WEIGHT_ARTIFACT_CACHE_HAS_CUDA 1
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 #else
 #define PIE_CUDA_WEIGHT_ARTIFACT_CACHE_HAS_CUDA 0
 #endif
@@ -47,14 +45,11 @@
 namespace pie_cuda_driver {
 
 // Returns the configured artifact cache directory, or empty if the feature is
-// disabled (PIE_CUDA_WEIGHT_CACHE_DIR unset/empty).
+// disabled (the driver was given no directory).
 inline std::filesystem::path weight_artifact_cache_dir()
 {
-    const char* dir = std::getenv("PIE_CUDA_WEIGHT_CACHE_DIR");
-    if (dir == nullptr || dir[0] == '\0') {
-        return {};
-    }
-    return std::filesystem::path(dir);
+    const std::string& dir = pie_cuda_driver::weight_cache_dir();
+    return dir.empty() ? std::filesystem::path{} : std::filesystem::path(dir);
 }
 
 // Writes a materialized-weight cache file for `store` keyed by `cache_key` into
@@ -83,8 +78,8 @@ inline bool write_weight_artifact_cache(
         if (!space_ec && space.available < need) {
             std::fprintf(stderr,
                 "[pie-driver-cuda] weight cache: declining write — need %.1f GiB "
-                "but only %.1f GiB free in %s (set a dir with more space, or "
-                "unset PIE_CUDA_WEIGHT_CACHE_DIR)\n",
+                "but only %.1f GiB free in %s (point [model] weight_cache_dir "
+                "at a disk with more space)\n",
                 static_cast<double>(need) / (1024.0 * 1024.0 * 1024.0),
                 static_cast<double>(space.available) / (1024.0 * 1024.0 * 1024.0),
                 dir.string().c_str());
@@ -92,39 +87,8 @@ inline bool write_weight_artifact_cache(
         }
     }
 
-    const auto final_path = dir / (cache_key + ".weights");
-    const auto tmp_path = dir / (cache_key + ".weights.tmp");
-    {
-        std::ofstream os(tmp_path, std::ios::binary | std::ios::trunc);
-        if (!os) {
-            std::fprintf(stderr,
-                "[pie-driver-cuda] weight cache: cannot open %s for write\n",
-                tmp_path.string().c_str());
-            return false;
-        }
-        if (!weight_codec::serialize_weight_store(store, cache_key, os)) {
-            os.close();
-            std::filesystem::remove(tmp_path, ec);
-            return false;
-        }
-        os.flush();
-        if (!os) {
-            std::fprintf(stderr, "[pie-driver-cuda] weight cache: write error\n");
-            os.close();
-            std::filesystem::remove(tmp_path, ec);
-            return false;
-        }
-    }
-
-    std::filesystem::rename(tmp_path, final_path, ec);
-    if (ec) {
-        std::fprintf(stderr,
-            "[pie-driver-cuda] weight cache: rename failed: %s\n",
-            ec.message().c_str());
-        std::filesystem::remove(tmp_path, ec);
-        return false;
-    }
-    return true;
+    return weight_codec::serialize_weight_store(
+        store, cache_key, dir / (cache_key + ".weights"));
 #endif
 }
 
@@ -148,44 +112,19 @@ inline bool read_weight_artifact_cache(
         return false;
     }
 
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        return false;
-    }
-    struct stat st{};
-    if (::fstat(fd, &st) != 0 || st.st_size <= 0) {
-        ::close(fd);
-        return false;
-    }
-    const std::size_t size = static_cast<std::size_t>(st.st_size);
-    void* map = ::mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (map == MAP_FAILED) {
-        return false;
-    }
-    ::madvise(map, size, MADV_SEQUENTIAL);
-
-    const bool verify =
-        std::getenv("PIE_CUDA_WEIGHT_CACHE_NO_VERIFY") == nullptr;
-    const bool profile = []{
-        const char* p = std::getenv("PIE_LOAD_EXECUTOR_PROFILE");
-        return p != nullptr && p[0] != '\0' && p[0] != '0';
-    }();
+    // Always verify. A silently-corrupt weight artifact produces garbage
+    // tokens with no error, which is not a trade any operator should be
+    // offered for a few seconds of load time.
+    constexpr bool verify = true;
+    constexpr bool profile = false;
     const auto t0 = std::chrono::steady_clock::now();
 
     // A local lane pool sized like the cold reader path; restore streams the
-    // blobs through it (pinned + pipelined) the same way materialize does.
+    // payloads through it (pinned + pipelined) the same way materialize does.
     PinnedLanePool pool(std::max<std::size_t>(loader_config::reader_lane_count(), 1),
                         loader_config::reader_buf_bytes());
-    bool ok = false;
-    try {
-        ok = weight_codec::restore_weight_store(
-            static_cast<const std::uint8_t*>(map), size, cache_key, verify,
-            builder, pool);
-    } catch (...) {
-        ::munmap(map, size);
-        throw;
-    }
+    const bool ok = weight_codec::restore_weight_store(
+        path, cache_key, verify, builder, pool);
     const auto t1 = std::chrono::steady_clock::now();
 
     if (ok && profile) {
@@ -199,7 +138,6 @@ inline bool read_weight_artifact_cache(
             gib, ms, ms > 0 ? gib / (ms / 1000.0) : 0.0, verify ? "on" : "off");
     }
 
-    ::munmap(map, size);
     return ok;
 #endif
 }

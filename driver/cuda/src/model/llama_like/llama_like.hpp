@@ -15,6 +15,7 @@
 //   * Qwen-3.5 — hybrid full + linear-attention layers.
 //   * Gemma-4 — KV sharing across layers, per-layer embeds.
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -99,6 +100,14 @@ struct LlamaLikeForwardCfg {
     // all-reduce there are no more collectives, so they can skip rank-0 logits.
     bool emit_logits = true;
 
+    // Per-fire, from `ForwardInputs::logits_argmax_chunk_tokens`. When
+    // non-zero the lm_head is computed one vocabulary slab at a time and each
+    // slab is reduced to a running greedy argmax as it lands, so `ws.logits`
+    // is never filled and `ws.sampled_tokens` carries the result (§20.37).
+    // Only the driver sets it, and only once it has proven every epilogue is a
+    // bare argmax over the logits.
+    int logits_argmax_chunk_tokens = 0;
+
     // ── Qwen3-VL M-RoPE ──────────────────────────────────────────────
     // mrope_section partitions head_dim/2 across the (t,h,w) axes. Consumed
     // only when `rope_kind == MRopeInterleaved`. The 3-axis positions are
@@ -148,6 +157,24 @@ struct LlamaLikePlanState {
     // buffers — the mixed-fire lesson; a depth fire is never also a
     // spatial-mask fire, so the workspace is free).
     ops::DecodePlanCachePtr depth_prefix_decode_plan;
+    // V2 rung ④ Act 1 (banded depth): one PREFIX decode plan per
+    // distinct-k band (deepest-first), each against its OWN dedicated
+    // workspace (the two-plans-one-workspace lesson, per band).
+    // count == 0 = unbanded fire.
+    std::array<ops::DecodePlanCachePtr, 3> depth_band_plans;
+    // Prefill-family band plans (force_prefill / prefill-decode
+    // deployments — their per-band prefix dispatch is the planned
+    // causal prefill, not the decode kernel).
+    std::array<ops::PrefillPlanCachePtr, 3> depth_band_prefill_plans;
+    std::array<std::uint32_t, 3> depth_band_k{};
+    std::array<std::uint32_t, 3> depth_band_rows{};
+    std::uint32_t depth_band_count = 0;
+    // NO-DEMOTION (mixed 3-way): the plain-decode middle's DECODE plan
+    // (requests [P, split_req) of a mixed fire, kvpp-rebased). The
+    // seriation puts prefill lanes first, so P = the first 1-token
+    // request; -1 = no middle (all-prefill prefix or shape declined).
+    ops::DecodePlanCachePtr mixed_mid_decode_plan;
+    int mixed_mid_start = -1;
     // NS-2: when >= 0, this fire's attention splits at this REQUEST
     // index — the prefix plans cover requests [0, split),
     // mask_decode_plan covers the REBASED suffix. -1 = fire-level
@@ -185,6 +212,11 @@ struct LlamaLikePlanState {
 // buffers. Prepare plans the suffix against this; the mixed dispatch
 // sites pair with it.
 AttentionWorkspace& spatial_suffix_attn_ws();
+
+// ④ Act 1 (banded depth): band slot `i`'s dedicated workspace — the
+// prepare plans each band's prefix plan into it, and both walkers'
+// banded tail dispatches pair against it.
+AttentionWorkspace& depth_band_attn_ws_public(int i);
 
 // Refresh the decode plan for the current fire. Caller invokes this
 // BEFORE either a direct forward call OR a graph replay, outside any
@@ -225,7 +257,10 @@ void prepare_llama_like_decode_plan(
     // uniform fire). When planned on a plain pure-decode fire, prepare
     // ALSO builds the prefix decode plan (requests [0, split)) into its
     // dedicated slot against the secondary workspace.
-    std::uint32_t full_depth_rows = 0xffffffffu);
+    std::uint32_t full_depth_rows = 0xffffffffu,
+    const std::uint32_t* depth_band_k = nullptr,
+    const std::uint32_t* depth_band_rows = nullptr,
+    std::uint32_t depth_band_count = 0);
 
 std::uint32_t llama_like_supergraph_graph_layout(
     const LlamaLikePlanState& state);
@@ -239,6 +274,13 @@ std::uint32_t llama_like_decode_graph_layout(
 // the hand-written `fused_decode_qkv_post` branch read ONE gate — the two
 // paths must fuse, or not, together.
 bool decode_fused_post_enabled();
+
+// True when the fire the prepare hook just planned carries a PREFILL the
+// executor may capture: the FA2 causal path planned in graph mode, which is
+// exactly what `PrefillPlanCache::graph_capturable` records. A pure-decode
+// fire answers false here -- it is admitted by the pure-decode rules instead,
+// and conflating the two would hide which rule let a wave through.
+bool llama_like_prefill_graph_capturable(const LlamaLikePlanState& state);
 
 // Wire-driven forward body, plus a `cfg` knob block and an
 // externally-owned `LlamaLikePlanState`. The body never plans — it only
@@ -383,5 +425,18 @@ RopeKind rope_kind_from_hf_config(const HfConfig& hf);
 // HF config in one place — every arch that builds an LlamaLikeForwardCfg
 // in context.cpp pulls in the same eight fields.
 void apply_rope_config(LlamaLikeForwardCfg& fwd_cfg, const HfConfig& hf);
+
+// The rope launch this cfg's `rope_kind` selects — YaRN, original YaRN,
+// or plain. Exported because MIXTRAL SHARES THIS CFG: it is handed the
+// same `LlamaLikeForwardCfg`, so the scaling its checkpoint asks for is
+// already resolved there, and a family that spells its own
+// `launch_rope_bf16` silently drops it. gpt-oss did exactly that.
+void apply_rope(
+    const LlamaLikeForwardCfg& fwd_cfg,
+    const HfConfig& cfg,
+    void* q, void* k,
+    const std::int32_t* positions,
+    int N, int num_q_heads, int num_kv_heads, int head_dim,
+    cudaStream_t stream);
 
 }  // namespace pie_cuda_driver::model

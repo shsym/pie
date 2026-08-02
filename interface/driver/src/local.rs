@@ -30,7 +30,37 @@ use crate::geometry::GeometryClass;
 /// verdicts and intrinsic side-table analysis the CUDA driver derives for
 /// itself in `region_support.hpp`. Additive, and empty means "not supplied",
 /// but the struct grew, so drivers and workers ship together.
-pub const PIE_DRIVER_ABI_VERSION: u32 = 19;
+/// v21: `PieLaunchDesc::rs_buffer_read_*` — the buffered prefix a fire must
+/// REPLAY before its own tokens, so a recurrence can start from
+/// `folded ⊕ replay(buffer)` instead of only from the folded boundary.
+/// Separate from the write CSR because a write may allocate a slab and a read
+/// must not. Additive, and an empty read side means "nothing to replay", but
+/// the struct grew, so drivers and workers ship together.
+/// v22: `PieLaunchDesc::rs_buffer_heads` — where each row's logical buffer
+/// token 0 physically sits. A fold absorbs tokens off the front of the buffer
+/// but can only release WHOLE covered pages, and `fold_granularity` is 1 while
+/// a buffer page is the KV page size, so a fold routinely lands mid-page and
+/// the survivors keep their offsets. Every buffer span the driver walks is
+/// therefore `head + logical`. Zero for a buffer that was never partially
+/// folded, which is why this was invisible until the replay path landed.
+/// v23: `PIE_RS_FLAG_BUFFER_WRITE` — a new bit in `rs_slot_flags` marking a
+/// row whose buffer span is a WRITE. Orthogonal to `PIE_RS_FLAG_FOLD`: a pass
+/// may scatter its own tokens into the buffer AND fold a prefix of the result
+/// in one go, and the two flags together are what tell a write-and-fold (run
+/// the extended `[buffered | new]` layout, snapshot the state at
+/// `rs_fold_lens[r]`) apart from a pure commit (whose rows ARE the replay).
+/// No struct grew, but an older driver rejects the unknown bit, so drivers and
+/// workers ship together.
+/// v24: `PIE_RS_FLAG_FOLD_LEN_DEVICE` — a new bit in `rs_slot_flags` marking a
+/// row whose fold length the WORKER DOES NOT KNOW. The value lives in the
+/// `rs_fold_len` descriptor port, which the driver resolves at compose time,
+/// so a speculative decode's accepted count never has to round-trip through
+/// the host between the fire that computes it and the fire that folds it.
+/// `rs_fold_lens[r]` is a placeholder for such a row and MUST be ignored; the
+/// driver clamps the resolved value to the row's replay length. No struct
+/// grew, but an older driver rejects the unknown bit, so drivers and workers
+/// ship together.
+pub const PIE_DRIVER_ABI_VERSION: u32 = 24;
 pub const PIE_MODEL_COMPONENT_FULL: u32 = 0;
 pub const PIE_MODEL_COMPONENT_TEXT: u32 = 1;
 pub const PIE_MODEL_COMPONENT_ENCODE: u32 = 2;
@@ -78,6 +108,18 @@ const _: () = {
 pub const PIE_RS_FLAG_RESET: u8 = 1;
 /// Fold buffered recurrent-state data into the slot after the pass.
 pub const PIE_RS_FLAG_FOLD: u8 = 2;
+/// The pass SCATTERS its own tokens into the buffer. Orthogonal to `FOLD`: a
+/// pass may write the buffer and fold a prefix of the result in one go, and
+/// the two together are what distinguishes a write-and-fold (which runs the
+/// extended `[buffered | new]` layout and snapshots the state at
+/// `rs_fold_lens[r]`) from a pure commit (whose rows ARE the replay, gathered
+/// straight from the slabs).
+pub const PIE_RS_FLAG_BUFFER_WRITE: u8 = 4;
+/// This row's fold length is NOT host-known. `rs_fold_lens[r]` is a
+/// placeholder and must be ignored; the real value comes from the
+/// `rs_fold_len` descriptor port, which the driver resolves once the fire that
+/// computes it has completed, and clamps to the row's replay length.
+pub const PIE_RS_FLAG_FOLD_LEN_DEVICE: u8 = 8;
 
 /// Concrete F32 channel element type.
 pub const PIE_CHANNEL_DTYPE_F32: u8 = 0;
@@ -1130,6 +1172,25 @@ pub struct PieStepDesc {
     pub rs_fold_lens: PieU32Slice,
     pub rs_buffer_slot_ids: PieU32Slice,
     pub rs_buffer_slot_indptr: PieU32Slice,
+    /// Buffered slabs the fire REPLAYS, with the row CSR (`rows + 1`), and the
+    /// token count to replay from each row's slabs (`rows` entries).
+    ///
+    /// Distinct from `rs_buffer_slot_ids`, which is what the fire WRITES: a
+    /// write may materialize or privatize a slab, a read must not, and a read
+    /// of a merely reserved page would gather uninitialized activations
+    /// straight into the recurrent state. All three are empty when no row has
+    /// anything buffered, which is the common case.
+    pub rs_buffer_read_slot_ids: PieU32Slice,
+    pub rs_buffer_read_indptr: PieU32Slice,
+    pub rs_buffer_read_lens: PieU32Slice,
+    pub rs_buffer_heads: PieU32Slice,
+    /// WorkingSet-relative buffer page -> physical slot for channel-resolved
+    /// `rs-geometry`, concatenated over request rows. `rs_translation_indptr`
+    /// is the row CSR (`rows + 1`). Per ROW, unlike `kv_translation`, because
+    /// a pass binds one RS working set per request rather than one per pass.
+    /// `0xFFFF_FFFF` marks a reserved-but-unmaterialized page.
+    pub rs_translation: PieU32Slice,
+    pub rs_translation_indptr: PieU32Slice,
     pub masks: PieMaskWordsDesc,
     /// Model readout rows, flattened across the batch.
     pub sampling_indices: PieU32Slice,
@@ -1181,34 +1242,49 @@ pub struct PieStepDesc {
     pub channel_expected_head: PieU64Slice,
     pub channel_expected_tail: PieU64Slice,
     pub channel_ticket_indptr: PieU32Slice,
-    /// The fire planner's hook-free prefix for this step, in WIRE request
-    /// rows: rows `[0, n)` belong to no attention-stage program by the
-    /// SCHEDULER's plan (`fire_plan`'s qkv_postprocess site — the
-    /// planner's first consumed lowering). [`PIE_HOOK_FREE_PREFIX_UNPLANNED`]
-    /// means the scheduler sent no plan and the driver derives the prefix
-    /// itself (the pre-plan behavior); any other value the driver
-    /// cross-checks against its own compiled-plan derivation and refuses
-    /// the launch on drift — the declaration-side hook stamp and the
-    /// compiled stage plans must agree.
-    pub planned_hook_free_prefix_rows: u32,
-    /// NS-2: the scheduler-planned count of leading wire rows whose
-    /// members carry NO user mask (meaningful only on hook-free steps;
-    /// the seriation nests mask under hooks).
-    /// [`PIE_UNMASKED_PREFIX_UNPLANNED`] = no plan; the driver must not
-    /// split the attention.
-    pub planned_unmasked_prefix_rows: u32,
-    /// STRUCTURAL v0 (S-1): run only the first `k` transformer layers and
-    /// take the head at layer `k` (the layerskip-draft class).
-    /// [`PIE_MAX_LAYERS_FULL`] = the full model (every pre-S1 step). v0
-    /// steps carrying a truncation are SOLO (the scheduler's blocking
-    /// rule), so one per-step word suffices until the depth union.
-    pub planned_max_layers: u32,
-    /// STRUCTURAL S-2: leading members at FULL depth (the depth
-    /// seriation's request split; the truncated suffix's uniform k is
-    /// `planned_max_layers`). [`PIE_FULL_DEPTH_UNPLANNED`] = a uniform
-    /// fire; the driver must not depth-split.
-    pub planned_full_depth_rows: u32,
+    /// V2 rung ③a (north-star-dsl.md "RUNG ③ SPEC"): the region table —
+    /// the seriation's output stated ONCE. Region `r` spans wire rows
+    /// `[region_row_indptr[r], region_row_indptr[r+1])`;
+    /// `region_sig[r]` is the axis bitset ([`PIE_REGION_SIG_MULTI_TOKEN`]
+    /// etc.); `region_k[r]` is the depth operand
+    /// ([`PIE_MAX_LAYERS_FULL`] = full model). Empty = no table sent
+    /// (the words' UNPLANNED discipline). While the scalar words above
+    /// survive, the driver DERIVES them from a present table and
+    /// refuses the launch on drift — the cross-check discipline.
+    pub region_row_indptr: PieU32Slice,
+    /// Axis bitset per region (see [`PieStepDesc::region_row_indptr`]).
+    pub region_sig: PieU32Slice,
+    /// Depth operand per region (see
+    /// [`PieStepDesc::region_row_indptr`]).
+    pub region_k: PieU32Slice,
 }
+
+/// [`PieStepDesc::region_sig`] bit: the region's members carry
+/// multi-token qo windows (the ragged window class).
+pub const PIE_REGION_SIG_MULTI_TOKEN: u32 = 1 << 0;
+
+/// [`PieStepDesc::region_sig`] bit: attention-stage hook programs.
+pub const PIE_REGION_SIG_HOOK: u32 = 1 << 1;
+
+/// [`PieStepDesc::region_sig`] bit: a user (custom) attention mask.
+pub const PIE_REGION_SIG_MASK: u32 = 1 << 2;
+
+/// [`PieStepDesc::region_sig`] bit: a depth truncation (the region's k
+/// is `region_k`).
+pub const PIE_REGION_SIG_TRUNCATED: u32 = 1 << 3;
+
+/// [`PieStepDesc::region_sig`] bit: a span-grouped correction (lora)
+/// program. Window-free — never a seriation term — but the depth
+/// split's decline rules consult it (a lane carrying BOTH correction
+/// and truncation is the PQ-tree class, refused), so the table states
+/// it (③b: the words' decline rules become derivable).
+pub const PIE_REGION_SIG_LORA: u32 = 1 << 4;
+
+/// [`PieStepDesc::region_sig`] bit: the region's hook programs write the
+/// `attn_page_mask` sink (Track B page substitution) — such a hook needs
+/// the full-R paged decode path, so the banded-depth derivation excludes
+/// it.
+pub const PIE_REGION_SIG_HOOK_PAGE_MASK: u32 = 1 << 5;
 
 /// [`PieStepDesc::planned_hook_free_prefix_rows`]'s "no plan sent"
 /// sentinel. Not zero: zero is a legitimate planned value ("no fast
@@ -1245,7 +1321,13 @@ impl Default for PieStepDesc {
             rs_slot_flags: PieU8Slice::default(),
             rs_fold_lens: PieU32Slice::default(),
             rs_buffer_slot_ids: PieU32Slice::default(),
+            rs_buffer_read_slot_ids: PieU32Slice::default(),
+            rs_buffer_read_indptr: PieU32Slice::default(),
+            rs_buffer_read_lens: PieU32Slice::default(),
+            rs_buffer_heads: PieU32Slice::default(),
             rs_buffer_slot_indptr: PieU32Slice::default(),
+            rs_translation: PieU32Slice::default(),
+            rs_translation_indptr: PieU32Slice::default(),
             masks: PieMaskWordsDesc::default(),
             sampling_indices: PieU32Slice::default(),
             sampling_indptr: PieU32Slice::default(),
@@ -1282,10 +1364,9 @@ impl Default for PieStepDesc {
             channel_expected_head: PieU64Slice::default(),
             channel_expected_tail: PieU64Slice::default(),
             channel_ticket_indptr: PieU32Slice::default(),
-            planned_hook_free_prefix_rows: PIE_HOOK_FREE_PREFIX_UNPLANNED,
-            planned_unmasked_prefix_rows: PIE_UNMASKED_PREFIX_UNPLANNED,
-            planned_max_layers: PIE_MAX_LAYERS_FULL,
-            planned_full_depth_rows: PIE_FULL_DEPTH_UNPLANNED,
+            region_row_indptr: PieU32Slice::default(),
+            region_sig: PieU32Slice::default(),
+            region_k: PieU32Slice::default(),
         }
     }
 }
@@ -2048,6 +2129,10 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
         "launch rs_buffer_slot_ids ptr/len mismatch",
     )?;
     validate_u32_slice(
+        desc.rs_translation,
+        "launch rs_translation ptr/len mismatch",
+    )?;
+    validate_u32_slice(
         desc.sampling_indices,
         "launch sampling_indices ptr/len mismatch",
     )?;
@@ -2188,6 +2273,13 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
             desc.rs_buffer_slot_indptr,
             "launch rs_buffer_slot_indptr malformed",
             desc.rs_buffer_slot_ids.len,
+            wire_row_count,
+            true,
+        )?;
+        validate_csr(
+            desc.rs_translation_indptr,
+            "launch rs_translation_indptr malformed",
+            desc.rs_translation.len,
             wire_row_count,
             true,
         )?;
@@ -2340,7 +2432,10 @@ pub unsafe fn validate_step_desc(desc: &PieStepDesc, roster_len: usize) -> PieAb
             unsafe { std::slice::from_raw_parts(desc.rs_slot_flags.ptr, desc.rs_slot_flags.len) };
         if flags
             .iter()
-            .any(|flag| flag & !(PIE_RS_FLAG_RESET | PIE_RS_FLAG_FOLD) != 0)
+            .any(|flag| flag & !(PIE_RS_FLAG_RESET
+                    | PIE_RS_FLAG_FOLD
+                    | PIE_RS_FLAG_BUFFER_WRITE
+                    | PIE_RS_FLAG_FOLD_LEN_DEVICE) != 0)
         {
             return Err(invalid_argument(
                 "launch rs_slot_flags contains unknown bits",

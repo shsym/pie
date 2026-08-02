@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 
 use crate::bpe::BpeTable;
-use crate::{AddedToken, BpeMode, Pipeline, Tokenizer};
+use crate::{AddedToken, BpeMode, Pipeline, Splitter, Tokenizer};
 
 const KIMI_TIKTOKEN_REGEX: &str = r"[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const KIMI_RESERVED_SPECIAL_TOKENS: u32 = 256;
@@ -108,7 +108,8 @@ pub fn from_file(path: &Path) -> Result<Tokenizer> {
         bpe,
         Pipeline::ByteLevelRegex {
             nfc: false,
-            splitters: vec![crate::Splitter {
+            // tiktoken profiles are exhaustive `Isolated` patterns.
+            splitters: vec![Splitter {
                 regex: split_regex,
                 keep_gaps: true,
             }],

@@ -4269,7 +4269,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 0
@@ -4402,8 +4402,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -4607,7 +4607,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 1
@@ -4740,8 +4740,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -4945,7 +4945,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 2
@@ -5078,8 +5078,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5384,8 +5384,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5589,7 +5589,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 4
@@ -5722,8 +5722,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -5927,7 +5927,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 5
@@ -6060,8 +6060,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6265,7 +6265,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 6
@@ -6398,8 +6398,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6704,8 +6704,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -6909,7 +6909,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 8
@@ -7042,8 +7042,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7247,7 +7247,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 9
@@ -7380,8 +7380,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -7585,7 +7585,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 10
@@ -7718,8 +7718,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8024,8 +8024,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8229,7 +8229,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 12
@@ -8362,8 +8362,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8567,7 +8567,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 13
@@ -8700,8 +8700,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -8905,7 +8905,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 14
@@ -9038,8 +9038,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9344,8 +9344,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9549,7 +9549,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 16
@@ -9682,8 +9682,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -9887,7 +9887,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 17
@@ -10020,8 +10020,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10225,7 +10225,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 18
@@ -10358,8 +10358,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10664,8 +10664,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -10869,7 +10869,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 20
@@ -11002,8 +11002,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11207,7 +11207,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 21
@@ -11340,8 +11340,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11545,7 +11545,7 @@
     {
       "kind": {
         "Launch": {
-          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_state_bf16",
+          "kernel": "launch_chunk_gated_delta_prefill_batched_warp_tiled_gqa_state_bf16",
           "state": {
             "store": "RecurrentState",
             "layer": 22
@@ -11678,8 +11678,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -11984,8 +11984,8 @@
     },
     {
       "kind": {
-        "Swiglu": {
-          "inter": 3584
+        "Launch": {
+          "kernel": "launch_chunked_swiglu_bf16"
         }
       },
       "inputs": [
@@ -12040,6 +12040,254 @@
         428
       ],
       "layer": null
+    }
+  ],
+  "seams": [
+    {
+      "seam": "in"
+    },
+    {
+      "seam": "attn.q",
+      "layer": 0,
+      "op": 9
+    },
+    {
+      "seam": "attn.out",
+      "layer": 0,
+      "op": 14
+    },
+    {
+      "seam": "attn.q",
+      "layer": 1,
+      "op": 29
+    },
+    {
+      "seam": "attn.out",
+      "layer": 1,
+      "op": 34
+    },
+    {
+      "seam": "attn.q",
+      "layer": 2,
+      "op": 49
+    },
+    {
+      "seam": "attn.out",
+      "layer": 2,
+      "op": 54
+    },
+    {
+      "seam": "attn.q",
+      "layer": 3,
+      "op": 69
+    },
+    {
+      "seam": "attn.out",
+      "layer": 3,
+      "op": 75
+    },
+    {
+      "seam": "attn.q",
+      "layer": 4,
+      "op": 89
+    },
+    {
+      "seam": "attn.out",
+      "layer": 4,
+      "op": 94
+    },
+    {
+      "seam": "attn.q",
+      "layer": 5,
+      "op": 109
+    },
+    {
+      "seam": "attn.out",
+      "layer": 5,
+      "op": 114
+    },
+    {
+      "seam": "attn.q",
+      "layer": 6,
+      "op": 129
+    },
+    {
+      "seam": "attn.out",
+      "layer": 6,
+      "op": 134
+    },
+    {
+      "seam": "attn.q",
+      "layer": 7,
+      "op": 149
+    },
+    {
+      "seam": "attn.out",
+      "layer": 7,
+      "op": 155
+    },
+    {
+      "seam": "attn.q",
+      "layer": 8,
+      "op": 169
+    },
+    {
+      "seam": "attn.out",
+      "layer": 8,
+      "op": 174
+    },
+    {
+      "seam": "attn.q",
+      "layer": 9,
+      "op": 189
+    },
+    {
+      "seam": "attn.out",
+      "layer": 9,
+      "op": 194
+    },
+    {
+      "seam": "attn.q",
+      "layer": 10,
+      "op": 209
+    },
+    {
+      "seam": "attn.out",
+      "layer": 10,
+      "op": 214
+    },
+    {
+      "seam": "attn.q",
+      "layer": 11,
+      "op": 229
+    },
+    {
+      "seam": "attn.out",
+      "layer": 11,
+      "op": 235
+    },
+    {
+      "seam": "attn.q",
+      "layer": 12,
+      "op": 249
+    },
+    {
+      "seam": "attn.out",
+      "layer": 12,
+      "op": 254
+    },
+    {
+      "seam": "attn.q",
+      "layer": 13,
+      "op": 269
+    },
+    {
+      "seam": "attn.out",
+      "layer": 13,
+      "op": 274
+    },
+    {
+      "seam": "attn.q",
+      "layer": 14,
+      "op": 289
+    },
+    {
+      "seam": "attn.out",
+      "layer": 14,
+      "op": 294
+    },
+    {
+      "seam": "attn.q",
+      "layer": 15,
+      "op": 309
+    },
+    {
+      "seam": "attn.out",
+      "layer": 15,
+      "op": 315
+    },
+    {
+      "seam": "attn.q",
+      "layer": 16,
+      "op": 329
+    },
+    {
+      "seam": "attn.out",
+      "layer": 16,
+      "op": 334
+    },
+    {
+      "seam": "attn.q",
+      "layer": 17,
+      "op": 349
+    },
+    {
+      "seam": "attn.out",
+      "layer": 17,
+      "op": 354
+    },
+    {
+      "seam": "attn.q",
+      "layer": 18,
+      "op": 369
+    },
+    {
+      "seam": "attn.out",
+      "layer": 18,
+      "op": 374
+    },
+    {
+      "seam": "attn.q",
+      "layer": 19,
+      "op": 389
+    },
+    {
+      "seam": "attn.out",
+      "layer": 19,
+      "op": 395
+    },
+    {
+      "seam": "attn.q",
+      "layer": 20,
+      "op": 409
+    },
+    {
+      "seam": "attn.out",
+      "layer": 20,
+      "op": 414
+    },
+    {
+      "seam": "attn.q",
+      "layer": 21,
+      "op": 429
+    },
+    {
+      "seam": "attn.out",
+      "layer": 21,
+      "op": 434
+    },
+    {
+      "seam": "attn.q",
+      "layer": 22,
+      "op": 449
+    },
+    {
+      "seam": "attn.out",
+      "layer": 22,
+      "op": 454
+    },
+    {
+      "seam": "attn.q",
+      "layer": 23,
+      "op": 469
+    },
+    {
+      "seam": "attn.out",
+      "layer": 23,
+      "op": 475
+    },
+    {
+      "seam": "out"
     }
   ]
 }

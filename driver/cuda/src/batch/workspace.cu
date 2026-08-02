@@ -18,6 +18,7 @@
 #include "config.hpp"
 #include "kernels_manifest.hpp"
 #include "model/config.hpp"
+#include "batch/forward_graph.hpp"
 
 namespace pie_cuda_driver {
 
@@ -30,7 +31,9 @@ bool has_non_full_attention_layers(const HfConfig& hf) {
 
 std::size_t attention_float_workspace_bytes(const HfConfig& hf,
                                             const Config& cfg,
-                                            const cudaDeviceProp& prop) {
+                                            const cudaDeviceProp& prop,
+                                            int max_tokens,
+                                            int max_requests) {
     const bool qwen_hybrid =
         hf.model_type == "qwen3_5" ||
         hf.model_type == "qwen3_5_text" ||
@@ -76,13 +79,24 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
     };
 
     const int tp_size = std::max(1, cfg.distributed.tp_size);
+    // DeepSeek-V4 REPLICATES its attention across TP ranks — `dsv4_shard_axis`
+    // shards the FFN and nothing else, so every rank runs every head and
+    // `DsV4Model::prepare` plans with `num_attention_heads` verbatim. Dividing
+    // here undersized the float workspace by exactly `tp_size`, and the plan
+    // then threw mid-decode ("Buffer overflow ... batch_prefill_tmp_v") the
+    // moment a sequence grew long enough to need a second KV chunk. That
+    // throw kills the TP followers while rank 0 keeps publishing fires, which
+    // presents as an unrecoverable hang rather than an error.
+    const bool attention_replicated_across_tp =
+        hf.model_type == "deepseek_v4";
+    const int attn_tp = attention_replicated_across_tp ? 1 : tp_size;
     // Per-rank head counts. tp cancels in tmp_v (qo_heads shrinks, padded_batch
     // grows as num_kv_heads shrinks), so this is tp-invariant — but compute it
     // honestly so a non-divisible split still produces a safe (larger) bound.
     const std::size_t qo_heads =
-        std::max<std::size_t>(1, hf.num_attention_heads / tp_size);
+        std::max<std::size_t>(1, hf.num_attention_heads / attn_tp);
     const std::size_t kv_heads =
-        std::max<std::size_t>(1, hf.num_key_value_heads / tp_size);
+        std::max<std::size_t>(1, hf.num_key_value_heads / attn_tp);
     const std::size_t head_dim = static_cast<std::size_t>(hf.head_dim_kernel);
     const std::size_t num_sm =
         static_cast<std::size_t>(prop.multiProcessorCount);
@@ -91,8 +105,33 @@ std::size_t attention_float_workspace_bytes(const HfConfig& hf,
         std::numeric_limits<std::int64_t>::max(),
         static_cast<std::uint32_t>(head_dim));
     constexpr std::size_t num_blocks_per_sm = 2;  // literal in PrefillPlan
-    const std::size_t padded_batch =
+    std::size_t padded_batch =
         std::max<std::size_t>(1, (num_blocks_per_sm * num_sm) / kv_heads);
+
+    // The floor above is `max_batch_size_if_split`, and it is the right bound
+    // for the EAGER path only: outside graph-mode planning the chunk search
+    // reports a carve only when the work-item count fits it, so it ceils
+    // `padded_batch_size`. Graph-mode planning does not go through that search
+    // -- it takes `padded_batch = max(floor, total_tiles)` with
+    //
+    //     total_tiles = (N*gqa + cta_tile_q - 1)/cta_tile_q + (R - 1)
+    //
+    // (`ops/attention_flashinfer.cu`), so the REQUEST COUNT dominates. At
+    // R=256 that is ~7-9x this floor, the carve check fails, and the plan
+    // demotes itself out of graph mode -- measured at 233 of 241
+    // prefill-carrying waves on the S cell. The buffer, not the geometry, is
+    // what refuses the graph.
+    //
+    // Sized here only when the prefill graph is armed, so the OFF arm of any
+    // A/B allocates exactly what it allocated before.
+    if (prefill_graph_enabled() && max_tokens > 0 && max_requests > 0) {
+        const std::size_t gqa = std::max<std::size_t>(1, qo_heads / kv_heads);
+        const std::size_t max_r = static_cast<std::size_t>(max_requests);
+        const std::size_t max_n = static_cast<std::size_t>(max_tokens);
+        const std::size_t total_tiles =
+            (max_n * gqa + cta_tile_q - 1) / cta_tile_q + (max_r - 1);
+        padded_batch = std::max(padded_batch, total_tiles);
+    }
 
     const std::size_t tmp_v =
         qo_heads * padded_batch * cta_tile_q * head_dim * sizeof(float);

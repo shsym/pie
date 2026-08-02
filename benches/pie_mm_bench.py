@@ -66,7 +66,6 @@ def bench_inferlet_paths(inferlet_dir: str) -> tuple[Path, Path, str]:
 
 def build_config(args: argparse.Namespace, port: int):
     from pie.config import (
-        AuthConfig,
         Config,
         DriverConfig,
         ModelConfig,
@@ -84,7 +83,7 @@ def build_config(args: argparse.Namespace, port: int):
 
     driver_options = {
         "gpu_mem_utilization": args.gpu_mem_util,
-        "ready_timeout_s": float(args.server_startup_timeout),
+        "ready_timeout": f"{int(args.server_startup_timeout)}s",
     }
     requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
@@ -105,10 +104,13 @@ def build_config(args: argparse.Namespace, port: int):
             verbose=True,
             max_concurrent_processes=max_concurrent,
         ),
-        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
-            wasm_max_instances=max(4096, (args.num_requests + args.warmup) * 4),
+            # See pie_bench.py: a pooling slot costs ~4 GiB of virtual address
+            # space, so this must track the admission cap, not the total
+            # request count, or the reservation exceeds the 128 TiB user VA
+            # limit and the engine panics inside mmap.
+            wasm_max_instances=max(4096, (max_concurrent or 0) * 4),
         ),
         model=ModelConfig(
             name="default",

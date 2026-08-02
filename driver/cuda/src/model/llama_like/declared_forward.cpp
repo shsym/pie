@@ -14,6 +14,9 @@
 
 #include <cuda_runtime.h>
 
+#include "model/declared/value_arena.hpp"
+#include "model/declared/arms.hpp"
+#include "model/declared/weights.hpp"
 #include "batch/supergraph.hpp"
 #include "kernels/add_bias.hpp"
 #include "kernels/embed.hpp"
@@ -44,37 +47,131 @@ using pie_forward::PieForwardOpKind;
 using pie_forward::PieForwardQkNorm;
 using pie_forward::PieForwardRopeKind;
 
-// A plan weight name split into its layer index and field: "layer.3.qkv" →
-// {3, "qkv"}; prologue/epilogue names ("embed", "final_norm") keep layer -1.
-// The vocabulary is `forward/src/family.rs`'s and nothing else; anything the
-// parse cannot place throws, loudly, because a name the resolver does not
-// know means the trace and this executor have drifted.
-struct ParsedWeightName {
-    int layer = -1;
-    std::string_view field;
-};
+// The name grammar is `model/declared/weights.hpp`'s — it was identical in
+// every family executor, which is the first thing that says these executors
+// wanted to be one.
+using declared::ParsedWeightName;
+using declared::parse_weight_name;
+using declared::throw_unknown_weight;
 
-[[noreturn]] void throw_unknown_weight(std::string_view name) {
-    throw std::runtime_error(
-        "declared forward: unknown weight name '" + std::string(name) +
-        "' (trace vocabulary is forward/src/family.rs's)");
-}
-
-ParsedWeightName parse_weight_name(std::string_view name) {
-    constexpr std::string_view prefix = "layer.";
-    if (name.substr(0, prefix.size()) != prefix) {
-        return ParsedWeightName{-1, name};
-    }
-    const std::size_t dot = name.find('.', prefix.size());
-    if (dot == std::string_view::npos) throw_unknown_weight(name);
-    int layer = -1;
-    const char* first = name.data() + prefix.size();
-    const char* last = name.data() + dot;
-    const auto [ptr, ec] = std::from_chars(first, last, layer);
-    if (ec != std::errc() || ptr != last || layer < 0) {
+// This family's half of `declared::WeightBinder`: a traced name against
+// Qwen3Weights. Every arm goes through it, so no arm names a struct field —
+// which is what lets an arm be shared with a family whose field is spelled
+// differently (qwen3_5's `attn_norm_pre` is this family's `attn_norm`).
+const DeviceTensor* bind_llama_like_weight(
+    const void* ctx, const ParsedWeightName& nm, std::string_view name)
+{
+    const auto& w = *static_cast<const Qwen3Weights*>(ctx);
+    if (nm.layer < 0) {
+        if (nm.field == "embed") return w.embed;
+        if (nm.field == "final_norm") return w.final_norm;
+        if (nm.field == "lm_head") return w.lm_head;
         throw_unknown_weight(name);
     }
-    return ParsedWeightName{layer, name.substr(dot + 1)};
+    if (nm.layer >= static_cast<int>(w.layers.size())) {
+        throw_unknown_weight(name);
+    }
+    const Qwen3LayerWeights& l = w.layers[static_cast<std::size_t>(nm.layer)];
+    // The vocabulary is the TRACE's (`forward/src/dsl.rs`'s `Layer`), which
+    // is why this table is the family's whole contribution: `gate_up` is one
+    // traced name whether or not the checkpoint bound a fused bank, and the
+    // arm asks for the split halves by field when it did not.
+    if (nm.field == "attn_norm") return l.attn_norm;
+    if (nm.field == "mlp_norm") return l.mlp_norm;
+    if (nm.field == "q_norm") return l.q_norm;
+    if (nm.field == "k_norm") return l.k_norm;
+    if (nm.field == "qkv") return l.qkv_proj_fused;
+    if (nm.field == "q_proj") return l.q_proj;
+    if (nm.field == "k_proj") return l.k_proj;
+    if (nm.field == "v_proj") return l.v_proj;
+    if (nm.field == "o_proj") return l.o_proj;
+    if (nm.field == "q_bias") return l.q_bias;
+    if (nm.field == "k_bias") return l.k_bias;
+    if (nm.field == "v_bias") return l.v_bias;
+    if (nm.field == "gate_up") return l.gate_up_proj_fused;
+    if (nm.field == "gate_proj") return l.gate_proj;
+    if (nm.field == "up_proj") return l.up_proj;
+    if (nm.field == "down") return l.down_proj;
+    throw_unknown_weight(name);
+}
+
+// This family's PIN PASS: which traced values live in a buffer the rest
+// of the driver reaches BY NAME. Stated once, over the plan, instead of
+// once per arm — LoRA captures the normed activation's pointer at fire
+// setup, the fused decode launch reads the qkv bank, hook sites observe
+// the query, the sampler reads the logits. An arm then just asks the
+// arena by value id and never learns whose convention it is serving.
+void pin_llama_like_values(const pie_forward::ForwardPlan& plan,
+                           Workspace& ws,
+                           bool post_norm,
+                           declared::ValueArena& values)
+{
+    const std::size_t ops = plan.op_count();
+    for (std::size_t i = 0; i < ops; ++i) {
+        const PieForwardOp& op = plan.op(i);
+        const auto outs = plan.outputs(op);
+        if (outs.size == 0) continue;
+        switch (op.kind) {
+        case PieForwardOpKind::Embed:
+        case PieForwardOpKind::ResidualAdd:
+            // The residual stream.
+            values.pin(outs[0], ws.y.data());
+            break;
+        case PieForwardOpKind::Rmsnorm: {
+            const ParsedWeightName nm = parse_weight_name(plan.weight_name(op));
+            if (nm.field == "attn_norm") {
+                // LoRA's `qkv_in`, captured at fire setup.
+                values.pin(outs[0], post_norm ? ws.norm_y.data()
+                                              : ws.norm_x.data());
+            } else if (nm.field == "final_norm") {
+                values.pin(outs[0], ws.norm_y.data());
+            }
+            // `mlp_norm`'s output is read only by the gate/up matmul, so
+            // it stays an arena value (converted island).
+            break;
+        }
+        case PieForwardOpKind::Matmul: {
+            const ParsedWeightName nm = parse_weight_name(plan.weight_name(op));
+            if (nm.field == "qkv") {
+                values.pin(outs[0], ws.qkv_fused.data());
+            } else if (nm.field == "q_proj") {
+                values.pin(outs[0], ws.q.data());
+            } else if (nm.field == "k_proj") {
+                values.pin(outs[0], ws.k.data());
+            } else if (nm.field == "v_proj") {
+                values.pin(outs[0], ws.v.data());
+            } else if (nm.field == "o_proj" || nm.field == "down") {
+                values.pin(outs[0], post_norm ? ws.norm_x.data()
+                                              : ws.y.data());
+                if (nm.field == "o_proj") {
+                    // Pinned by CONSUMER, not producer: a lowered trace
+                    // may state its attention as a stated-kernel Launch
+                    // rather than the semantic `Attention` op, and the
+                    // value it produces still lives in `ws.attn_out`.
+                    // Saying it here covers both spellings.
+                    const auto ins = plan.inputs(op);
+                    if (ins.size > 0) values.pin(ins[0], ws.attn_out.data());
+                }
+            }
+            break;
+        }
+        case PieForwardOpKind::SplitQkv:
+            if (outs.size >= 3) {
+                values.pin(outs[0], ws.q.data());
+                values.pin(outs[1], ws.k.data());
+                values.pin(outs[2], ws.v.data());
+            }
+            break;
+        case PieForwardOpKind::Attention:
+            values.pin(outs[0], ws.attn_out.data());
+            break;
+        case PieForwardOpKind::LmHead:
+            values.pin(outs[0], ws.logits.data());
+            break;
+        default:
+            break;
+        }
+    }
 }
 
 const Qwen3LayerWeights& layer_of(
@@ -117,9 +214,17 @@ enum class LaunchKernel {
     WriteKvExplicit,
     WriteKvToPages,
     LoraQkvCorrection,
+    ChunkedSwiglu,
+    Swiglu,
 };
 
 LaunchKernel resolve_launch_kernel(std::string_view kernel) {
+    if (kernel == "launch_chunked_swiglu_bf16") {
+        return LaunchKernel::ChunkedSwiglu;
+    }
+    if (kernel == "launch_swiglu_bf16") {
+        return LaunchKernel::Swiglu;
+    }
     if (kernel == "launch_rope_standard_table") {
         return LaunchKernel::RopeStandardTable;
     }
@@ -212,6 +317,63 @@ bool generated_forward_enabled() {
 
 }  // namespace
 
+namespace {
+
+// Why a DEPLOYMENT has no declared plan at all.
+//
+// The fire-level `DeclineReason` (`llama_like_model.cpp`) says which
+// fires fall back; this says which DEPLOYMENTS never had the choice.
+// They are different questions with different owners: a decline is
+// driver work, and one of these is DSL VOCABULARY — the trace has no way
+// to say the thing, so the hand-written body is the only executor there
+// and cannot be deleted until it does.
+//
+// It was a comment with an ellipsis in it ("TP, quantized projections,
+// non-standard rope, ..."), which is not a work list. Each `return out`
+// in the gate below now carries its name, and the name is printed once
+// per model load — loud, unconditional, and cheap, because a deployment
+// traces once.
+enum class NoPlanReason {
+    None,
+    RopeNotStandard,      // YaRN / M-RoPE
+    TensorParallel,       // all-reduces the trace does not state
+    LayerBinding,         // no layers, or a count that disagrees with the config
+    QuantizedProjection,  // QuantMeta WeightViews the trace does not describe
+    MixedFusedQkv,        // a per-layer split that makes the fused_qkv fact a lie
+    QkvBiasUnbound,       // the config says bias, the tensors did not arrive
+    QkNormConvention,     // a q/k-norm weight shape that names no convention
+};
+
+const char* no_plan_name(NoPlanReason r) {
+    switch (r) {
+    case NoPlanReason::None:                return "none";
+    case NoPlanReason::RopeNotStandard:     return "rope-not-standard";
+    case NoPlanReason::TensorParallel:      return "tensor-parallel";
+    case NoPlanReason::LayerBinding:        return "layer-binding";
+    case NoPlanReason::QuantizedProjection: return "quantized-projection";
+    case NoPlanReason::MixedFusedQkv:       return "mixed-fused-qkv";
+    case NoPlanReason::QkvBiasUnbound:      return "qkv-bias-unbound";
+    case NoPlanReason::QkNormConvention:    return "qk-norm-convention";
+    }
+    return "?";
+}
+
+}  // namespace
+
+bool llama_like_bands_apply(const LlamaLikeDeclaredPlan& declared,
+                            const LlamaLikePlanState& plan_state,
+                            bool is_pure_decode) {
+    if (plan_state.depth_band_count < 2) return false;
+    // Bands describe a PURE-DECODE fire's rows — the hand path's rule
+    // (`bands_runnable`), and `derive_depth_bands` enforces it from the
+    // other side by refusing any region table with a multi-token region.
+    if (!is_pure_decode) return false;
+    // And the fire's own class has to state the axis, or the arms have
+    // nowhere to put a band.
+    const auto& plan = is_pure_decode ? declared.decode : declared.prefill;
+    return static_cast<bool>(plan) && plan.view().depth_window != 0;
+}
+
 LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     const HfConfig& cfg,
     const LlamaLikeForwardCfg& fwd_cfg,
@@ -219,11 +381,24 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     const KvCache& cache)
 {
     LlamaLikeDeclaredPlan out;
+    // An empty plan is not an error and never was — it means "the
+    // hand-written body is this deployment's executor". Saying WHICH
+    // rule sent it there costs one line at load and turns the gate into
+    // a work list.
+    const auto refuse = [](NoPlanReason reason) -> LlamaLikeDeclaredPlan {
+        std::fprintf(stderr,
+                     "[declared] no plan for this deployment: reason=%s "
+                     "(the hand-written body serves it)\n",
+                     no_plan_name(reason));
+        return LlamaLikeDeclaredPlan{};
+    };
 
     // Representability gate: everything the v0 trace has no vocabulary for
     // returns empty and the model keeps the hand-written path. Each line
     // names the hand-written feature it stands in for.
-    if (fwd_cfg.rope_kind != RopeKind::Standard) return out;   // YaRN/M-RoPE
+    if (fwd_cfg.rope_kind != RopeKind::Standard) {
+        return refuse(NoPlanReason::RopeNotStandard);  // YaRN/M-RoPE
+    }
     // Post-norm placement (olmo2/olmo3) is admitted: the trace carries the
     // matmul(beta=0) → rmsnorm → residual_add triplet and the executor
     // launches the hand-written post-norm block's kernels.
@@ -232,14 +407,16 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // before norms/rope, the executor launches the hand-written
     // `maybe_add_bias` kernels. Guarded below on the tensors actually
     // being bound.
-    if (fwd_cfg.tp_size > 1) return out;                       // all-reduces
+    if (fwd_cfg.tp_size > 1) {
+        return refuse(NoPlanReason::TensorParallel);   // all-reduces
+    }
     // Padded head_dim (Phi-3-mini, 96 → 128) is admitted: the pad/strip
     // launches around KV-write/attention are emitter knowledge (the trace
     // speaks the logical head_dim throughout), handled in the executor
     // exactly as the hand-written `head_dim_padded` branches.
     if (w.layers.empty() ||
         w.layers.size() != static_cast<std::size_t>(cfg.num_hidden_layers)) {
-        return out;
+        return refuse(NoPlanReason::LayerBinding);
     }
     const bool fused_qkv = w.layers[0].qkv_proj_fused != nullptr;
     for (const auto& layer : w.layers) {
@@ -249,16 +426,18 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         if (layer.q_proj_quant || layer.k_proj_quant || layer.v_proj_quant ||
             layer.o_proj_quant || layer.gate_proj_quant ||
             layer.up_proj_quant || layer.down_proj_quant) {
-            return out;
+            return refuse(NoPlanReason::QuantizedProjection);
         }
-        if ((layer.qkv_proj_fused != nullptr) != fused_qkv) return out;
+        if ((layer.qkv_proj_fused != nullptr) != fused_qkv) {
+            return refuse(NoPlanReason::MixedFusedQkv);
+        }
         // A bias config whose tensors did not bind would make the traced
         // AddBias ops unlaunchable; a bias-less config with stray bias
         // tensors would mean the fact lies the other way.
         if (fwd_cfg.use_qkv_bias &&
             (layer.q_bias == nullptr || layer.k_bias == nullptr ||
              layer.v_bias == nullptr)) {
-            return out;
+            return refuse(NoPlanReason::QkvBiasUnbound);
         }
     }
     // q/k-norm convention, from the bound tensor shape — the same evidence
@@ -283,11 +462,13 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
             return PieForwardQkNorm::Off;
         };
         qk_norm = convention_of(w.layers[0].q_norm, Hq_w);
-        if (qk_norm == PieForwardQkNorm::Off) return out;
+        if (qk_norm == PieForwardQkNorm::Off) {
+            return refuse(NoPlanReason::QkNormConvention);
+        }
         for (const auto& layer : w.layers) {
             if (convention_of(layer.q_norm, Hq_w) != qk_norm ||
                 convention_of(layer.k_norm, Hk_w) != qk_norm) {
-                return out;
+                return refuse(NoPlanReason::QkNormConvention);
             }
         }
     }
@@ -351,6 +532,19 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
     // Load-time: the kernel head dim the attention runs at vs the logical
     // one (Phi-3-mini pads 96 -> 128; llama_like.cpp's head_dim_padded).
     cuda.head_dim_padded = (cfg.head_dim != cfg.head_dim_kernel) ? 1 : 0;
+    // The MLP's gate_up BINDING (qwen3.cpp: the loader installs the
+    // packed bank when `contract.hpp::dense_fused_projection_joins`
+    // accepts the group — it declines quantized and non-BF16 ones). The
+    // executor used to re-derive this per layer as
+    // `gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty()`; the
+    // second term is dead (workspace.cpp allocates that buffer
+    // unconditionally, by its own comment), so the binding alone decides
+    // and it is known here. Layer 0 speaks for the deployment because
+    // the contract accepts or declines a GROUP uniformly — and the
+    // executor's per-launch cross-check refuses if a later layer ever
+    // disagrees, rather than trusting this line.
+    cuda.gate_up_fused =
+        (!w.layers.empty() && w.layers[0].gate_up_proj_fused != nullptr) ? 1 : 0;
 
     out.decode = pie_forward::ForwardPlan::trace_llama_like_cuda(
         facts, cuda, pie_forward::PieForwardFireClass::Decode);
@@ -387,6 +581,141 @@ LlamaLikeDeclaredPlan build_llama_like_declared_plan(
         "/pad" + std::to_string(cuda.head_dim_padded);
     return out;
 }
+
+// `PIE_DECLARED_FLAT_TRACE=1`: print what each fire's list served. A
+// diagnostic, never a switch — there is nothing left to switch between.
+//
+// It replaces `PIE_DECLARED_SHADOW`, which armed the walk-vs-lowering
+// comparison that carried this migration (47% agreement on its first
+// run, 100% for the two increments before the drive was written, and
+// three real defects found on the way). With the walk gone the shadow
+// has nothing to compare against; what survives it is this line and the
+// `devwin` count, which the capture-split probe needs to show it took
+// the path at all.
+bool flat_trace_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("PIE_DECLARED_FLAT_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    return on;
+}
+
+// The rest of the executor's diagnostics, read ONCE.
+//
+// These were `std::getenv` calls in the fire path — four of them, on
+// every fire, for lines that print on none of them. An environment
+// lookup is not free and, more to the point, it is not what this file
+// does anywhere else: `declared_forward_enabled`, `flat_trace_enabled`
+// and `generated_forward_enabled` all latch. A diagnostic that costs
+// something when disarmed is a diagnostic people turn off for the wrong
+// reason.
+bool forward_trace_enabled() {
+    static const bool on = std::getenv("PIE_DECLARED_FORWARD_TRACE") != nullptr;
+    return on;
+}
+
+bool spatial_mask_trace_enabled() {
+    static const bool on = std::getenv("PIE_SPATIAL_MASK_TRACE") != nullptr;
+    return on;
+}
+
+bool lora_fire_trace_enabled() {
+    static const bool on = std::getenv("PIE_LORA_FIRE_TRACE") != nullptr;
+    return on;
+}
+
+// ONE FIRE'S ROWS — the executor's input, and now its only one.
+//
+// This is where a fire stops being a bundle of driver words and becomes
+// what the lowering takes: a row per token, each carrying the axes it
+// sits on. Everything downstream is a function of this array and the
+// declaration.
+//
+// Row-level truth where the driver has it and fire-level where it does
+// not, which is honest rather than lossy: the axes that are fire-wide
+// TODAY (mask, lora, write descriptors) are fire-wide in the trace's
+// guards too, so a fire-wide fill selects exactly the arms a per-row one
+// would. The genuinely per-row axes are the hook peel (`fast_rows` ends
+// the hook-free prefix), the spatial mask split, and depth.
+//
+// It was born as `shadow_rows`, feeding the comparison that proved the
+// lowering agreed with the walk. The walk is gone and the name went
+// with it; the function did not have to change at all, which is the
+// clearest statement of what that comparison was for.
+std::vector<pie_forward::PieForwardRow> fire_rows(
+    int n_fire,
+    int fast_rows,
+    int depth_k,
+    int depth_split,
+    bool depth_union,
+    const std::uint32_t* band_k,
+    const std::uint32_t* band_rows,
+    std::size_t band_count,
+    int mask_split,
+    bool has_mask,
+    bool has_lora,
+    bool has_write_desc,
+    bool wants_scores,
+    const std::int32_t* logit_row_indices_d,
+    int num_logit_rows)
+{
+    std::vector<pie_forward::PieForwardRow> rows(static_cast<std::size_t>(std::max(n_fire, 0)));
+    const bool compact =
+        logit_row_indices_d != nullptr && num_logit_rows > 0 &&
+        num_logit_rows < n_fire;
+    for (std::size_t r = 0; r < rows.size(); ++r) {
+        pie_forward::PieForwardRow& row = rows[r];
+        // The spatial split's UNMASKED PREFIX is a row axis, not a
+        // fire flag: `[0, mask_split)` attends causally and the suffix
+        // takes the custom dispatch. Filling the mask fire-wide made
+        // the lowering see an empty prefix and skip statements the walk
+        // ran — the shadow's own first finding, about the shadow.
+        row.custom_mask =
+            (has_mask && (mask_split < 0 || static_cast<int>(r) >= mask_split))
+                ? 1
+                : 0;
+        row.lora = has_lora ? 1 : 0;
+        row.write_desc = has_write_desc ? 1 : 0;
+        row.wants_scores = wants_scores ? 1 : 0;
+        row.hooked = static_cast<int>(r) >= fast_rows ? 1 : 0;
+        // THREE truncation shapes, and each states itself differently.
+        //
+        // BANDED (>= 2 distinct k): `band_rows[j]` is how many rows are
+        // still live at depths >= `band_k[j]`, deepest-first. Inverting
+        // that per row: rows below `band_rows[0]` are full depth, and a
+        // row at or past `band_rows[j]` dies at `band_k[j]` for the
+        // LAST j it reaches. Not filling this at all was the shadow's
+        // largest remaining drift — a banded fire read as untruncated,
+        // so the lowering covered every layer the bands had retired.
+        //
+        // UNION: full-depth rows first, truncated after `depth_split`.
+        // UNIFORM: every row at `k`, and no split exists to read.
+        if (band_count >= 2) {
+            int k = -1;
+            for (std::size_t j = 0; j < band_count; ++j) {
+                if (static_cast<std::uint32_t>(r) >= band_rows[j]) {
+                    k = static_cast<int>(band_k[j]);
+                }
+            }
+            row.depth_k = k;
+        } else {
+            const bool truncated =
+                depth_k >= 0 &&
+                (!depth_union || static_cast<int>(r) >= depth_split);
+            row.depth_k = truncated ? depth_k : -1;
+        }
+        // Compact fires sample the LAST row of each request; the walk
+        // does not carry the index list on the host, so the shadow says
+        // "the last `num_logit_rows` rows", which is that set whenever
+        // the requests are equal-length and a reported row-range drift
+        // otherwise. Stated so a reader does not mistake it for truth.
+        row.samples = compact
+            ? (static_cast<int>(rows.size() - r) <= num_logit_rows ? 1 : 0)
+            : 1;
+    }
+    return rows;
+}
+
 
 void llama_like_forward_declared(
     const LlamaLikeDeclaredPlan& declared,
@@ -427,6 +756,9 @@ void llama_like_forward_declared(
     std::uint32_t declared_max_layers,
     std::uint32_t declared_full_depth_rows)
 {
+    // Every weight an arm reads goes through the binder (see its header):
+    // the arms name what the TRACE names, never a struct field.
+    const declared::WeightBinder wb{&bind_llama_like_weight, &w};
     // Rung 3: the static form, when opted in and emitted for exactly this
     // deployment. Byte-for-byte the same launches as the interpreter walk
     // below — the parity gate's third leg proves it — with every choice
@@ -437,7 +769,7 @@ void llama_like_forward_declared(
         declared.facts_digest != kGeneratedDigest_qwen2_5_1_5b &&
         declared.facts_digest != kGeneratedDigest_mistral_7b_v03 &&
         declared.facts_digest != kGeneratedDigest_phi3_mini &&
-        std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
+        forward_trace_enabled()) {
         // Silent non-engagement is this path's failure mode; say why.
         std::fprintf(stderr,
                      "[declared-forward-generated] digest mismatch:\n"
@@ -506,14 +838,11 @@ void llama_like_forward_declared(
     // arms, nothing below derives a path (north-star-dsl.md).
     const pie_forward::ForwardPlan& plan =
         is_pure_decode ? declared.decode : declared.prefill;
-    // STRUCTURAL S-4: N/R are MUTABLE walk state — the depth window
-    // rebinds them per op (layer-tagged ops at layer >= k run over the
-    // full-depth prefix on a union fire, and are SKIPPED on a uniform
-    // truncated fire). Fire-level values stay in N_fire/R_fire.
+    // The fire's extents. They used to have MUTABLE peers (`N`, `R`)
+    // that a depth window rebound per op; a rectangle's row count is
+    // that number now, so the only extents left are the fire's own.
     const int N_fire = total_tokens;
     const int R_fire = num_requests;
-    int N = total_tokens;
-    int R = num_requests;
     const bool depth_stated = plan.view().depth_window != 0;
     const int depth_k =
         depth_stated && declared_max_layers != 0xffffffffu &&
@@ -532,24 +861,60 @@ void llama_like_forward_declared(
             "depth union (declared): planned split without a usable "
             "prefix plan (gate drift)");
     }
-    bool depth_tail_active = false;
+    // ④ Act 1 (banded depth): >= 2 distinct-k bands stamped by the
+    // prepare. Deepest-first arrays; at layer L the live rows are
+    // N_fire below the shallowest k, else the matched band's start row
+    // (0 = the op is skipped — nothing lives at that depth). Banded
+    // fires derive max_layers FULL, so the union/uniform logic above
+    // stays idle.
+    const int band_count = static_cast<int>(plan_state.depth_band_count);
+    // NOT `band_count >= 2 && depth_stated` computed here: the model's
+    // eligibility gate has to make the same decision, and when the two
+    // were separate copies the gate's went stale one commit after it was
+    // written. One function, both callers.
+    const bool depth_banded =
+        llama_like_bands_apply(declared, plan_state, is_pure_decode);
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (plan_state.depth_band_rows[static_cast<std::size_t>(j)] >
+                    0 &&
+                !plan_state.depth_band_plans[static_cast<std::size_t>(j)]) {
+                throw std::runtime_error(
+                    "depth bands (declared): stamped band without a "
+                    "usable prefix plan (the model gate should have "
+                    "kept this fire hand-written)");
+            }
+        }
+        if (spatial_mask_trace_enabled()) {
+            std::fprintf(stderr, "[depth-bands-declared] R=%d m=%d\n",
+                         R_fire, band_count);
+        }
+    }
+    // The SSA value arena (`model/declared/value_arena.hpp`): values an arm
+    // asks for by id, over a workspace block. Reset once per fire; the ask
+    // order is the op order, so a value keeps its address across fires of
+    // the same plan — what a captured graph replays against.
+    declared::ValueArena values;
+    values.reset(ws.declared_values.data(), ws.declared_values.nbytes(),
+                 plan, N_fire, R_fire);
     // The Peel split (A3): the hook-free prefix row count — the
     // hand-written `fast_rows` derivation verbatim. A runtime INPUT of
     // the stated Peel op, not a choice: with no hooks every row is the
     // prefix; the dispatch proved rows [0, fast_rows) belong to no
     // attention-stage program.
     const int fast_rows = stage_hooks == nullptr
-        ? R
-        : std::min(static_cast<int>(stage_hooks->hook_free_prefix_rows), R);
+        ? R_fire
+        : std::min(static_cast<int>(stage_hooks->hook_free_prefix_rows),
+                   R_fire);
     // Parity-harness visibility (PIE_HOOK_PREFIX_TRACE's pattern): without
     // it a silent fallback to the hand-written path would be
     // indistinguishable from a passing A/B run; fast_rows is what proves
     // a MIXED fire walked the declared Peel.
-    if (std::getenv("PIE_DECLARED_FORWARD_TRACE")) {
+    if (forward_trace_enabled()) {
         std::fprintf(stderr,
                      "[declared-forward] N=%d R=%d decode=%d fast_rows=%d "
                      "mask=%d hooked=%d lora=%d ops=%zu\n",
-                     N, R, is_pure_decode ? 1 : 0, fast_rows,
+                     N_fire, R_fire, is_pure_decode ? 1 : 0, fast_rows,
                      custom_mask_d != nullptr ? 1 : 0,
                      stage_hooks != nullptr ? 1 : 0,
                      (lora != nullptr && lora->usable()) ? 1 : 0,
@@ -571,6 +936,8 @@ void llama_like_forward_declared(
     // reads/writes and how the block norms route — the same buffer walk as
     // the hand-written `post_norm` branches, stated once here.
     const bool post_norm = fwd_cfg.norm_placement == NormPlacement::Post;
+    // This family's conventions, stated once over the plan (see the pass).
+    pin_llama_like_values(plan, ws, post_norm, values);
     // Inherit cublas's stream so every launch lands on the captured graph,
     // for the reason llama_like_forward_paged states at its stream setup.
     cudaStream_t stream = cublas.stream();
@@ -586,17 +953,17 @@ void llama_like_forward_declared(
             : nullptr;
     std::optional<LoraFireStateHandle> lora_state;
     if (has_lora && lora_staged == nullptr) {
-        lora_state.emplace(*lora, cfg, N, H, Hq, Hk, I, /*tp=*/1, stream,
+        lora_state.emplace(*lora, cfg, N_fire, H, Hq, Hk, I, /*tp=*/1, stream,
                            ws,
                            post_norm ? static_cast<const void*>(ws.y.data())
                                      : static_cast<const void*>(
                                            ws.norm_x.data()),
                            ws.q.data(), ws.v.data(), ws.gate.data());
     }
-    if (has_lora && std::getenv("PIE_LORA_FIRE_TRACE") != nullptr) {
+    if (has_lora && lora_fire_trace_enabled()) {
         std::fprintf(stderr,
                      "[lora-fire] declared R=%d lanes=%u grouping=%s%s\n",
-                     R, lora->count,
+                     R_fire, lora->count,
                      lora_staged != nullptr
                          ? lora_staged->grouping_desc().c_str()
                          : lora_state->grouping_desc().c_str(),
@@ -653,7 +1020,7 @@ void llama_like_forward_declared(
                 "launch_attention_xqa_decode_bf16_prepared") {
             ops::prepare_attention_xqa_decode_bf16(
                 kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                R, cache.page_size(), plan_state.xqa_max_pages_per_seq,
+                R_fire, cache.page_size(), plan_state.xqa_max_pages_per_seq,
                 attn_ws, stream);
             break;
         }
@@ -663,148 +1030,208 @@ void llama_like_forward_declared(
     // swiglu kernel the following Swiglu op launches (the hand-written
     // `use_fused_gu` pairing).
     bool gate_up_used_fused = false;
-    // Guard skip STACK (A1): when a taken region ends, everything to the
-    // chain's end is dead and the walk jumps it. Guards NEST since the
-    // class-collapse amendment (the mask arm carries the write-mechanism
-    // guard), so pending skips stack — inner skips (pushed later) always
-    // end at or before their enclosing region's skip point, so popping
-    // in LIFO order at each index is exact.
-    std::vector<std::pair<std::size_t, std::size_t>> guard_skips;
-    // The Peel row window (A3): `{win_start, win_len}` over token rows,
-    // `{0, N}` outside peel regions. Region transitions are index
-    // events, the guard skips' peer; the windowed call forms below bind
-    // it (offset zero + full length is the identity).
-    int win_start = 0;
-    int win_len = N;
-    // Device-window mode (peel_window_d != nullptr, hook captures only):
-    // the walk emits BOTH Peel regions at full-N grids and the windowed
-    // call forms read the split from the device word — so the captured
-    // launches are split-independent and the hook fingerprint can drop
-    // the row split. The region marker tells each windowed site which
-    // face of the word it consumes (prefix = [0, w0), tail = {w0, w1}).
+    // WHICH FACE of a row split a launch serves. Two axes, never nested
+    // (the engine plans the mask split UNPLANNED for hooked fires), and
+    // both are now RECTANGLE properties rather than walk state — they
+    // arrive as `execute_op` parameters that these names shadow.
+    //
+    // `WinRegion` is the hook peel's, and only under device-window
+    // capture (`peel_window_d != nullptr`): both regions launch at
+    // full-N grids and the windowed call forms read the split from the
+    // device word, so the captured exec is split-independent and the
+    // hook fingerprint can drop the split. The marker says which face
+    // of the word a site consumes (prefix = [0, w0), tail = {w0, w1}).
+    //
+    // `MaskRegion` is the spatial split's (NS-4 in the IR): the
+    // attention call forms key their addressing on it. `None` outside
+    // such peels, and inside one at its UNPLANNED endpoint — the
+    // prepare kept the fire-level arm and the tail runs full-N.
     enum class WinRegion { Full, Prefix, Tail };
-    WinRegion win_region = WinRegion::Full;
-    struct WinEvent {
-        std::size_t at;
-        int start;
-        int len;
-        WinRegion region = WinRegion::Full;
-    };
-    std::vector<WinEvent> win_events;
-    // The UnmaskedPrefix peel's region marker (NS-4 in the IR): which
-    // face of the spatial mask split the current launch serves — the
-    // attention call forms below key their addressing on it. `None`
-    // outside such peels, and inside one at its UNPLANNED endpoint
-    // (prepare kept the fire-level arm; the tail runs full-N). A
-    // separate axis from win_region: the hook window and the mask
-    // split never nest (the engine plans UNPLANNED for hooked fires).
     enum class MaskRegion { None, Prefix, Tail };
-    MaskRegion mask_region = MaskRegion::None;
-    struct MaskEvent {
-        std::size_t at;
-        MaskRegion region;
+    const bool flat_trace = flat_trace_enabled();
+
+    // An observation SITE, as a function of one statement and its rows.
+    //
+    // It launches no table kernel, which is why it has no rectangle —
+    // and it still runs the guest programs, stages the score capture
+    // and opens the page-mask bracket, which is why a form driven by
+    // the list has to run it. `Lowered::structural` names the live
+    // ones; this is what running one means.
+    //
+    // `N` is a PARAMETER for the same reason the arms' is. A site hands
+    // its programs `N` rows of the query buffer, and on a truncated
+    // fire the rows past the live count at this layer are frozen at
+    // whatever the last layer that owned them left behind. The list
+    // carries the window (`PieForwardSite::row_lo/row_hi`); reading a
+    // fire-wide count instead would show a banded fire's programs rows
+    // that stopped being theirs.
+    const auto execute_site = [&](const PieForwardOp& op, int N) {
+        // A3: the sites live in the ONE body every unmasked fire
+        // walks — a fire with no attached programs passes through
+        // by argument, zero launches, zero sideband setup.
+        if (stage_hooks == nullptr) return;
+        const int L = static_cast<int>(op.param1);
+        if (op.param0 == 0) {
+            // OnAttnProj: reset the layer's page view, re-seed the
+            // mask ("keep everything" unless this layer's program
+            // narrows it), stage the score capture the attention
+            // will publish through, and run the programs.
+            attn_page_indices = kv_page_indices;
+            attn_page_indptr = kv_page_indptr;
+            attn_last_page_lens = kv_last_page_lens;
+            page_mask.begin_layer(stream);
+            if (is_pure_decode) {
+                score_capture.emplace(
+                    stage_hooks, static_cast<std::uint32_t>(L),
+                    static_cast<std::uint32_t>(num_q_heads),
+                    /*capturable=*/true, stream);
+            } else {
+                prefill_score_capture.emplace(
+                    stage_hooks, static_cast<std::uint32_t>(L),
+                    static_cast<std::uint32_t>(num_q_heads),
+                    plan_state.prefill_score_window,
+                    /*capturable=*/true, stream);
+            }
+            invoke_stage_hook(
+                stage_hooks, StageHookPoint::OnAttnProj,
+                ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                static_cast<std::uint32_t>(L),
+                stream, /*query_is_f32=*/false,
+                {.mask_sink = page_mask.sink()});
+        } else {
+            // OnAttn: the programs read what the attention published.
+            invoke_stage_hook(
+                stage_hooks, StageHookPoint::OnAttn,
+                ws.q.data(),
+                static_cast<std::uint32_t>(N),
+                static_cast<std::uint32_t>(Hq),
+                static_cast<std::uint32_t>(L),
+                stream, /*query_is_f32=*/false,
+                {.scores = score_capture && score_capture->scores()
+                               ? score_capture->scores()
+                               : (prefill_score_capture
+                                      ? prefill_score_capture->scores()
+                                      : nullptr)});
+        }
     };
-    std::vector<MaskEvent> mask_events;
-    for (std::size_t i = 0; i < op_count; ++i) {
-        for (;;) {
-            if (!guard_skips.empty() && i == guard_skips.back().first) {
-                i += guard_skips.back().second;
-                guard_skips.pop_back();
-                continue;
-            }
-            if (!win_events.empty() && i == win_events.back().at) {
-                win_start = win_events.back().start;
-                win_len = win_events.back().len;
-                win_region = win_events.back().region;
-                win_events.pop_back();
-                continue;
-            }
-            if (!mask_events.empty() && i == mask_events.back().at) {
-                mask_region = mask_events.back().region;
-                mask_events.pop_back();
-                continue;
-            }
-            break;
-        }
-        if (i >= op_count) break;
-        const PieForwardOp& op = plan.op(i);
-        // STRUCTURAL S-4: the depth window, per op, keyed on the op's
-        // OWN layer tag (the declaration's stated axis — the trace is
-        // layer-unrolled while k is a runtime input, so the window is a
-        // per-op rebind, not a region op). Uniform truncated fire:
-        // tail-layer ops are SKIPPED (the unchanged epilogue, layer -1,
-        // is the logit-lens head). Union fire: tail-layer ops run over
-        // the full-depth prefix rows.
-        if (depth_k >= 0) {
-            const bool tail_op = op.layer >= 0 && op.layer >= depth_k;
-            if (tail_op && !depth_union) continue;
-            depth_tail_active = depth_union && tail_op;
-            N = depth_tail_active ? depth_split : N_fire;
-            R = depth_tail_active ? depth_split : R_fire;
-        }
+
+    // ── THE ARMS, as a function of one RECTANGLE ───────────────────
+    //
+    // `.wiki/tart/dsl.md` "The cutover, sized", step 1. Everything that
+    // LAUNCHES lives here; everything that TRAVERSES — the guard chain,
+    // the row peels, the observation sites — stays in the walk below.
+    // That is the same line `lower::Semantic::Structural` draws, and
+    // drawing it in both places is what lets the second form drive
+    // these arms without them noticing.
+    //
+    // The parameters are exactly what an arm reads about WHERE it is,
+    // counted off the body before the split: a row count (N, R), a row
+    // window (win_start, win_len), which face of the hook split
+    // (win_region) and of the mask split (mask_region), and which
+    // prepared plan (the band words). They SHADOW the walk's locals of
+    // the same names, so no arm body changed — which is the argument
+    // that this refactor cannot alter a launch.
+    //
+    // `win_region` joined the list late, and how it was missed is worth
+    // recording: the count of what the arms read (the table in the wiki)
+    // was taken over the words that appear in the arms' ARGUMENTS, and
+    // this one appears only in their kernel-CHOICE conditions
+    // (`peel_window_d != nullptr && win_region == Tail` picks the
+    // `_devwin` variant). A parameter that selects a kernel is as much
+    // "where am I" as one that sizes a grid.
+    //
+    // A `Launch{rows, layers, peel}` rectangle carries every one of
+    // them, which is what step 2 will pass instead of the walk's state.
+    const auto execute_op = [&](const PieForwardOp& op,
+                                int N,
+                                int R,
+                                int win_start,
+                                int win_len,
+                                WinRegion win_region,
+                                MaskRegion mask_region,
+                                int depth_band_index,
+                                bool depth_tail_active) {
         switch (op.kind) {
         case PieForwardOpKind::Embed: {
             const std::string_view name = plan.weight_name(op);
             if (name != "embed") throw_unknown_weight(name);
             kernels::launch_embed_bf16(
-                token_ids, require(w.embed, name)->data(), ws.y.data(),
+                token_ids, wb.require(name).data(), ws.y.data(),
                 N, H, V, stream);
             break;
         }
         case PieForwardOpKind::Rmsnorm: {
-            if (op.param0 !=
-                static_cast<std::uint32_t>(PieForwardNormVariant::Plain)) {
-                throw std::runtime_error(
-                    "declared forward: only the Plain rmsnorm variant is "
-                    "emitted (Gemma folding is a different arithmetic)");
-            }
+            // Gemma folds `(1 + w)` instead of `w`. Different arithmetic,
+            // so a different kernel — but the same signature and the same
+            // row space, and the variant rides on the wire, so the choice
+            // is one symbol and every arm below fans onto it. This used
+            // to throw; the lowering now names the fold's kernel, and a
+            // refusal here would be the executor disagreeing with the
+            // declaration it was handed.
+            const bool gemma_fold =
+                op.param0 !=
+                static_cast<std::uint32_t>(PieForwardNormVariant::Plain);
+            const auto norm = [&](const void* x, const void* weight,
+                                  void* y, int rows, int width) {
+                if (gemma_fold) {
+                    kernels::launch_rmsnorm_gemma_bf16(
+                        x, weight, y, rows, width, eps, stream);
+                } else {
+                    kernels::launch_rmsnorm_bf16(
+                        x, weight, y, rows, width, eps, stream);
+                }
+            };
             const std::string_view name = plan.weight_name(op);
             const ParsedWeightName nm = parse_weight_name(name);
             if (nm.field == "attn_norm") {
                 const auto& layer = layer_of(w, nm, name);
-                if (post_norm) {
-                    // Post-norm: the o_proj OUTPUT (in norm_x, the
-                    // hand-written scratch) is normed into norm_y; the
-                    // following ResidualAdd lands it on the stream.
-                    kernels::launch_rmsnorm_bf16(
-                        ws.norm_x.data(), require(layer.attn_norm, name)->data(),
-                        ws.norm_y.data(), N, H, eps, stream);
-                } else {
-                    kernels::launch_rmsnorm_bf16(
-                        ws.y.data(), require(layer.attn_norm, name)->data(),
-                        ws.norm_x.data(), N, H, eps, stream);
-                }
+                // ISLAND (pinned value): the normed activation is a traced
+                // VALUE whose buffer the pin pass states, because LoRA
+                // reaches it by name outside the walk.
+                void* const attn_norm_out =
+                    values.slot(plan.outputs(op)[0],
+                                plan.value(plan.outputs(op)[0]));
+                // Post-norm norms the o_proj OUTPUT (the pinned
+                // scratch), pre-norm the residual stream.
+                norm(post_norm ? ws.norm_x.data() : ws.y.data(),
+                     wb.require(name).data(), attn_norm_out, N, H);
             } else if (nm.field == "mlp_norm") {
                 const auto& layer = layer_of(w, nm, name);
                 if (post_norm) {
                     // Post-norm: the down_proj OUTPUT (in norm_x) → norm_y.
-                    kernels::launch_rmsnorm_bf16(
-                        ws.norm_x.data(), require(layer.mlp_norm, name)->data(),
-                        ws.norm_y.data(), N, H, eps, stream);
+                    norm(ws.norm_x.data(), wb.require(name).data(),
+                         ws.norm_y.data(), N, H);
                 } else {
-                    kernels::launch_rmsnorm_bf16(
-                        ws.y.data(), require(layer.mlp_norm, name)->data(),
-                        ws.norm_y.data(), N, H, eps, stream);
+                    // ISLAND (value arena): the normed activation is a
+                    // TRACED VALUE, not "ws.norm_y" — that name is this
+                    // family's convention, and qwen3_5 spells the same
+                    // role `ws.norm_x`. Producer and consumer move
+                    // together; the post-norm arm above keeps its
+                    // convention until its own island moves.
+                    norm(ws.y.data(), wb.require(name).data(),
+                         values.slot(plan.outputs(op)[0],
+                                     plan.value(plan.outputs(op)[0])),
+                         N, H);
                 }
             } else if (nm.field == "q_norm") {
                 // Global qk-norm (olmo2): ONE row RMSNorm over the
                 // flattened [N, heads * head_dim] projection, in place —
                 // the hand-written `rmsnorm_qk` global branch, verbatim.
                 const auto& layer = layer_of(w, nm, name);
-                kernels::launch_rmsnorm_bf16(
-                    ws.q.data(), require(layer.q_norm, name)->data(),
-                    ws.q.data(), N, Hq, eps, stream);
+                norm(ws.q.data(), wb.require(name).data(),
+                     ws.q.data(), N, Hq);
             } else if (nm.field == "k_norm") {
                 const auto& layer = layer_of(w, nm, name);
-                kernels::launch_rmsnorm_bf16(
-                    ws.k.data(), require(layer.k_norm, name)->data(),
-                    ws.k.data(), N, Hk, eps, stream);
+                norm(ws.k.data(), wb.require(name).data(),
+                     ws.k.data(), N, Hk);
             } else if (nm.layer < 0 && nm.field == "final_norm") {
                 // Deferred to LmHead: the hand-written epilogue interleaves
                 // the final norm with the logit-row gather (norm is row-wise,
                 // so gather-then-norm equals norm-then-gather), and copying
                 // that block whole is what keeps the two paths bit-identical.
-                require(w.final_norm, name);
+                &wb.require(name);
             } else {
                 throw_unknown_weight(name);
             }
@@ -821,15 +1248,15 @@ void llama_like_forward_declared(
             const auto& layer = layer_of(w, nm, name);
             if (nm.field == "q_bias") {
                 kernels::launch_add_bias_bf16(
-                    ws.q.data(), require(layer.q_bias, name)->data(),
+                    ws.q.data(), wb.require(name).data(),
                     N, Hq, stream);
             } else if (nm.field == "k_bias") {
                 kernels::launch_add_bias_bf16(
-                    ws.k.data(), require(layer.k_bias, name)->data(),
+                    ws.k.data(), wb.require(name).data(),
                     N, Hk, stream);
             } else if (nm.field == "v_bias") {
                 kernels::launch_add_bias_bf16(
-                    ws.v.data(), require(layer.v_bias, name)->data(),
+                    ws.v.data(), wb.require(name).data(),
                     N, Hk, stream);
             } else {
                 throw_unknown_weight(name);
@@ -845,8 +1272,21 @@ void llama_like_forward_declared(
             // normed copies (norm_x for QKV, norm_y for gate/up), post-norm
             // reads the residual stream raw — the hand-written `qkv_in` /
             // `mlp_in` indirections.
+            // Every projection writes its VALUE (all of them pinned by
+            // the pass, so this is the same memory the conventions named).
+            const auto out_slot = [&](std::size_t i) {
+                return values.slot(plan.outputs(op)[i],
+                                   plan.value(plan.outputs(op)[i]));
+            };
+            // The island's consumers: the projection reads the value the
+            // attn_norm arm produced (pinned, so LoRA's captured pointer
+            // and this slot are the same bytes).
             const void* const qkv_in =
-                post_norm ? ws.y.data() : ws.norm_x.data();
+                plan.inputs(op).size > 0
+                    ? static_cast<const void*>(
+                          values.slot(plan.inputs(op)[0],
+                                      plan.value(plan.inputs(op)[0])))
+                    : (post_norm ? ws.y.data() : ws.norm_x.data());
             const void* const mlp_in =
                 post_norm ? ws.y.data() : ws.norm_y.data();
             if (nm.field == "qkv") {
@@ -857,26 +1297,26 @@ void llama_like_forward_declared(
                 // it here is deleted (rung 2, north-star-dsl.md).
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    ops::WeightView(*require(layer.qkv_proj_fused, name)),
-                    ws.qkv_fused.data(), N, Hq + 2 * Hk, H);
+                    ops::WeightView(wb.require(name)),
+                    out_slot(0), N, Hq + 2 * Hk, H);
             } else if (nm.field == "q_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    make_weight_view(require(layer.q_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.q_proj_quant),
-                    ws.q.data(), N, Hq, H);
+                    out_slot(0), N, Hq, H);
             } else if (nm.field == "k_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    make_weight_view(require(layer.k_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.k_proj_quant),
-                    ws.k.data(), N, Hk, H);
+                    out_slot(0), N, Hk, H);
             } else if (nm.field == "v_proj") {
                 ops::gemm_act_x_w(cublas.handle(),
                     qkv_in,
-                    make_weight_view(require(layer.v_proj, name),
+                    make_weight_view(&wb.require(name),
                                      layer.v_proj_quant),
-                    ws.v.data(), N, Hk, H);
+                    out_slot(0), N, Hk, H);
             } else if (nm.field == "o_proj") {
                 if (post_norm) {
                     // Post-norm: o_proj lands in the norm_x scratch (the
@@ -884,21 +1324,37 @@ void llama_like_forward_declared(
                     // ResidualAdd land it on the stream — the hand-written
                     // post-norm block, same buffers, same order.
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.attn_out.data(),
-                        make_weight_view(require(layer.o_proj, name),
+                        // The trace's operand order, from the builder:
+                        // `matmul_inner(x, ...)` records the activation
+                        // FIRST and `matmul_add` appends the residual, so
+                        // inputs[0] is the activation on both forms.
+                        values.slot(plan.inputs(op)[0],
+                                    plan.value(plan.inputs(op)[0])),
+                        make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
-                        ws.norm_x.data(), N, H, Hq, beta);
+                        out_slot(0), N, H, Hq, beta);
                 } else {
                     // Residual accumulate folded into the GEMM (beta from
                     // the trace's beta_one), exactly the hand-written T==1
                     // branch.
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.attn_out.data(),
-                        make_weight_view(require(layer.o_proj, name),
+                        // The trace's operand order, from the builder:
+                        // `matmul_inner(x, ...)` records the activation
+                        // FIRST and `matmul_add` appends the residual, so
+                        // inputs[0] is the activation on both forms.
+                        values.slot(plan.inputs(op)[0],
+                                    plan.value(plan.inputs(op)[0])),
+                        make_weight_view(&wb.require(name),
                                          layer.o_proj_quant),
-                        ws.y.data(), N, H, Hq, beta);
+                        out_slot(0), N, H, Hq, beta);
                 }
             } else if (nm.field == "gate_up") {
+                // The island's consumer: the same traced value the
+                // mlp_norm arm produced (pre-norm only — see there).
+                const void* const gate_up_in =
+                    post_norm ? mlp_in
+                              : values.slot(plan.inputs(op)[0],
+                                            plan.value(plan.inputs(op)[0]));
                 // The trace declares one packed matmul either way; whether
                 // the binding materialised it fused is this emitter's call,
                 // the same dispatch the hand-written `use_fused_gu` makes.
@@ -907,34 +1363,40 @@ void llama_like_forward_declared(
                     !ws.gate_up_fused.empty();
                 if (gate_up_used_fused) {
                     ops::gemm_act_x_w(cublas.handle(),
-                        mlp_in,
+                        gate_up_in,
                         ops::WeightView(*layer.gate_up_proj_fused),
                         ws.gate_up_fused.data(), N, 2 * I, H);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
-                        mlp_in,
-                        make_weight_view(require(layer.gate_proj, name),
-                                         layer.gate_proj_quant),
+                        gate_up_in,
+                        make_weight_view(
+                            &wb.require_field(nm.layer, "gate_proj", name),
+                            layer.gate_proj_quant),
                         ws.gate.data(), N, I, H);
                     ops::gemm_act_x_w(cublas.handle(),
-                        mlp_in,
-                        make_weight_view(require(layer.up_proj, name),
-                                         layer.up_proj_quant),
+                        gate_up_in,
+                        make_weight_view(
+                            &wb.require_field(nm.layer, "up_proj", name),
+                            layer.up_proj_quant),
                         ws.up.data(), N, I, H);
                 }
             } else if (nm.field == "down") {
+                // The island's consumer.
+                const void* const down_in =
+                    values.slot(plan.inputs(op)[0],
+                                plan.value(plan.inputs(op)[0]));
                 if (post_norm) {
                     // Post-norm: down_proj → norm_x scratch (beta 0), then
                     // Rmsnorm(mlp_norm) + ResidualAdd — as o_proj above.
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.gate.data(),
-                        make_weight_view(require(layer.down_proj, name),
+                        down_in,
+                        make_weight_view(&wb.require(name),
                                          layer.down_proj_quant),
                         ws.norm_x.data(), N, H, I, beta);
                 } else {
                     ops::gemm_act_x_w(cublas.handle(),
-                        ws.gate.data(),
-                        make_weight_view(require(layer.down_proj, name),
+                        down_in,
+                        make_weight_view(&wb.require(name),
                                          layer.down_proj_quant),
                         ws.y.data(), N, H, I, beta);
                 }
@@ -976,11 +1438,11 @@ void llama_like_forward_declared(
             const auto& layer = layer_of(w, nm, name);
             if (nm.field == "q_norm") {
                 kernels::launch_rmsnorm_bf16(
-                    ws.q.data(), require(layer.q_norm, name)->data(),
+                    ws.q.data(), wb.require(name).data(),
                     ws.q.data(), N * num_q_heads, d, eps, stream);
             } else if (nm.field == "k_norm") {
                 kernels::launch_rmsnorm_bf16(
-                    ws.k.data(), require(layer.k_norm, name)->data(),
+                    ws.k.data(), wb.require(name).data(),
                     ws.k.data(), N * num_kv_heads, d, eps, stream);
             } else {
                 throw_unknown_weight(name);
@@ -1000,10 +1462,22 @@ void llama_like_forward_declared(
                     "declared forward: only standard rope is emitted "
                     "(build gate admits nothing else)");
             }
-            kernels::launch_rope_bf16(
-                ws.q.data(), ws.k.data(), positions,
-                N, num_q_heads, num_kv_heads, d,
-                cfg.rope_theta, stream);
+            // The rotary width crosses as param1, zero for the full
+            // rotation (no real partial width is 0 — the driver clamps to
+            // >= 2 — so the resting value cannot be mistaken). A partial
+            // trace therefore states its own width, and the executor does
+            // not re-derive it from the config.
+            if (op.param1 != 0) {
+                kernels::launch_rope_partial_bf16(
+                    ws.q.data(), ws.k.data(), positions,
+                    N, num_q_heads, num_kv_heads, d,
+                    static_cast<int>(op.param1), cfg.rope_theta, stream);
+            } else {
+                kernels::launch_rope_bf16(
+                    ws.q.data(), ws.k.data(), positions,
+                    N, num_q_heads, num_kv_heads, d,
+                    cfg.rope_theta, stream);
+            }
             break;
         }
         case PieForwardOpKind::KvAppend: {
@@ -1047,14 +1521,57 @@ void llama_like_forward_declared(
                         "attn_page_mask requires a page-count-independent "
                         "decode plan; this fire planned split-KV");
                 }
+                // R_fire, NOT the walk's depth-windowed `R`. The mask
+                // sink is carved ONCE for the fire (`sink_.num_requests`
+                // is the fire's request count), so the compaction that
+                // consumes it is a fire-wide operation; handing it a
+                // tail layer's live-row count made the two disagree and
+                // `FirePageMask::compact` refused — which is the right
+                // refusal against the wrong argument.
+                //
+                // Reading a prefix of the compacted CSR is exactly what a
+                // narrowed layer wants: the seriation keeps live rows
+                // first, and `indptr` is prefix-summed from row 0, so the
+                // first `R` entries describe precisely those rows.
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(R_fire), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             };
             switch (resolve_launch_kernel(plan.weight_name(op))) {
+            // The MLP activation. The declaration states WHICH swiglu,
+            // from the gate_up binding fact it was traced with, so this
+            // arm no longer asks the workspace — it CHECKS, because a
+            // trace built against a different binding than the one this
+            // model bound would otherwise read the wrong buffer and
+            // produce plausible garbage. Refuse on drift, the same rule
+            // the region table's plan cross-check follows.
+            case LaunchKernel::ChunkedSwiglu:
+            case LaunchKernel::Swiglu: {
+                const bool stated_fused =
+                    resolve_launch_kernel(plan.weight_name(op)) ==
+                    LaunchKernel::ChunkedSwiglu;
+                if (stated_fused != gate_up_used_fused) {
+                    throw std::runtime_error(
+                        "declared forward: the trace states the "
+                        + std::string(stated_fused ? "packed" : "unfused")
+                        + " swiglu but this deployment bound the other "
+                          "gate_up form (facts drift)");
+                }
+                void* const dst =
+                    values.slot(plan.outputs(op)[0],
+                                plan.value(plan.outputs(op)[0]));
+                if (stated_fused) {
+                    kernels::launch_chunked_swiglu_bf16(
+                        ws.gate_up_fused.data(), dst, N, I, stream);
+                } else {
+                    kernels::launch_swiglu_bf16(
+                        ws.gate.data(), ws.up.data(), dst, N * I, stream);
+                }
+                break;
+            }
             case LaunchKernel::RopeStandardTable: {
                 if (ws.rope_table.empty()) {
                     throw std::runtime_error(
@@ -1181,7 +1698,28 @@ void llama_like_forward_declared(
                 // STRUCTURAL S-4: tail-layer attention on a union fire
                 // pairs with the PREFIX plan and its dedicated
                 // workspace (the plan/workspace pairing rule).
-                if (depth_tail_active) {
+                // ④ Act 1: a banded tail dispatch pairs the band's
+                // prefix plan with the band's OWN workspace.
+                if (depth_band_index >= 0 && op.depth_role == 2) {
+                    const int layer_window_left_b =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    auto kv_view_b = cache.layer_view(L);
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan_state.depth_band_plans
+                             [static_cast<std::size_t>(depth_band_index)],
+                        attn_q, kv_view_b, attn_out_buf,
+                        kv_page_indices, kv_page_indptr,
+                        kv_last_page_lens,
+                        depth_band_attn_ws_public(depth_band_index),
+                        stream, layer_window_left_b,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                    break;
+                }
+                if (depth_tail_active && op.depth_role == 2) {
                     const int layer_window_left_d =
                         (!fwd_cfg.per_layer_window_left.empty() &&
                          L < static_cast<int>(
@@ -1373,7 +1911,10 @@ void llama_like_forward_declared(
                         kv_page_indptr + split,
                         kv_last_page_lens + split,
                         custom_mask_d, custom_mask_indptr_d + split,
-                        is_pure_decode ? attn_ws : spatial_suffix_attn_ws(),
+                        // Both classes now PLAN the suffix into the
+                        // dedicated workspace (the pure-decode split
+                        // overlaps on the side stream too).
+                        spatial_suffix_attn_ws(),
                         stream);
                     break;
                 }
@@ -1551,6 +2092,33 @@ void llama_like_forward_declared(
                     kv_last_page_lens,
                     attn_ws, stream, /*logits_soft_cap=*/0.f,
                     sm_scale_override);
+                // NO-DEMOTION (3-way, interpreter leg): when prepare
+                // armed the middle decode plan, the causal above was
+                // RE-PLANNED to the prefill lanes [0, P) — the
+                // plain-decode middle [P, split_req) takes the decode
+                // kernel here, exactly the hand-written pairing.
+                if (mask_region == MaskRegion::Prefix &&
+                    plan_state.mixed_mid_decode_plan &&
+                    plan_state.mixed_mid_start >= 0) {
+                    const int P = plan_state.mixed_mid_start;
+                    const int mid_row =
+                        static_cast<int>(qo_indptr_h[P]);
+                    const int layer_window_left_m =
+                        (!fwd_cfg.per_layer_window_left.empty() &&
+                         L < static_cast<int>(
+                                 fwd_cfg.per_layer_window_left.size()))
+                            ? fwd_cfg.per_layer_window_left[L]
+                            : fwd_cfg.sliding_window;
+                    ops::dispatch_attention_flashinfer_decode(
+                        *plan_state.mixed_mid_decode_plan,
+                        bf16_row(attn_q, mid_row, Hq), kv_view,
+                        bf16_row(attn_out_buf, mid_row, Hq),
+                        kv_page_indices,
+                        kv_page_indptr + P,
+                        kv_last_page_lens + P,
+                        attn_ws, stream, layer_window_left_m,
+                        /*logits_soft_cap=*/0.f, sm_scale_override);
+                }
                 break;
             }
             }
@@ -1576,235 +2144,15 @@ void llama_like_forward_declared(
             }
             break;
         }
-        case PieForwardOpKind::Peel: {
-            // A3: both regions run, over complementary row ranges —
-            // prefix `[0, fast_rows)`, tail `[fast_rows, N)`. An empty
-            // range skips its region's launches, exactly the
-            // hand-written `fast_rows > 0` / `unfused_tail_rows > 0`
-            // gates: fast_rows == N is the classic all-fused fire,
-            // 0 the all-hooked one, anything between the mixed fire.
-            const std::size_t prefix_len = op.param0;
-            const std::size_t tail_len = op.param1;
-            const std::size_t tail_start = i + 1 + prefix_len;
-            const std::size_t end = tail_start + tail_len;
-            {
-                // The peel's AXIS rides the aux run (PeelWindow):
-                // empty = the hook-free prefix (fast_rows, below),
-                // [1] = the unmasked prefix — the spatial mask split,
-                // NS-4 stated in the IR. The mask axis never touches
-                // the win_start/len machinery (that word is the hook
-                // axis's): it only marks regions, and the attention
-                // call forms key their addressing on the marker.
-                const auto aux = plan.aux_names(op);
-                if (aux.size >= 1 && aux[0] == 1) {
-                    const bool planned =
-                        plan_state.spatial_mask_split >= 0 &&
-                        unmasked_prefix_rows != 0xffffffffu;
-                    if (!planned) {
-                        // The UNPLANNED endpoint: the tail region IS
-                        // the fire-level custom dispatch, full-N.
-                        mask_region = MaskRegion::None;
-                        i = tail_start - 1;  // skip the prefix region
-                        break;
-                    }
-                    if (plan_state.spatial_mask_split !=
-                        static_cast<int>(unmasked_prefix_rows)) {
-                        throw std::runtime_error(
-                            "spatial mask: the planned split and the "
-                            "prepared split drifted");
-                    }
-                    if (plan_state.use_xqa_decode) {
-                        throw std::runtime_error(
-                            "spatial mask: the XQA prefix is not wired "
-                            "(its fire-wide prepare is R-shaped)");
-                    }
-                    if (mask_suffix_qo_indptr_d == nullptr) {
-                        throw std::runtime_error(
-                            "spatial mask: suffix qo identity missing");
-                    }
-                    mask_events.push_back({end, MaskRegion::None});
-                    if (plan_state.spatial_mask_split > 0) {
-                        mask_events.push_back(
-                            {tail_start, MaskRegion::Tail});
-                        mask_region = MaskRegion::Prefix;
-                    } else {
-                        // The all-masked composed fire: no prefix.
-                        mask_region = MaskRegion::Tail;
-                        i = tail_start - 1;
-                    }
-                    break;
-                }
-            }
-            if (peel_window_d != nullptr) {
-                // Device-window capture: BOTH regions are emitted — an
-                // empty region's kernels launch and early-out on the
-                // device word, so the captured exec replays across
-                // splits. No host skips, no host windows.
-                win_events.push_back({end, 0, N, WinRegion::Full});
-                win_events.push_back({tail_start, 0, N, WinRegion::Tail});
-                win_region = WinRegion::Prefix;
-                break;
-            }
-            const int tail_rows = N - fast_rows;
-            win_events.push_back({end, 0, N, WinRegion::Full});
-            if (fast_rows > 0) {
-                win_start = 0;
-                win_len = fast_rows;
-                if (tail_rows > 0) {
-                    win_events.push_back(
-                        {tail_start, fast_rows, tail_rows, WinRegion::Full});
-                } else {
-                    guard_skips.emplace_back(tail_start, tail_len);
-                }
-                // the loop's ++i lands on the prefix region
-            } else {
-                win_start = 0;
-                win_len = N;
-                i = tail_start - 1;  // skip the empty prefix region
-            }
-            break;
-        }
-        case PieForwardOpKind::HookSite: {
-            // A3: the sites live in the ONE body every unmasked fire
-            // walks — a fire with no attached programs passes through
-            // by argument, zero launches, zero sideband setup.
-            if (stage_hooks == nullptr) break;
-            const int L = static_cast<int>(op.param1);
-            if (op.param0 == 0) {
-                // OnAttnProj: reset the layer's page view, re-seed the
-                // mask ("keep everything" unless this layer's program
-                // narrows it), stage the score capture the attention
-                // will publish through, and run the programs.
-                attn_page_indices = kv_page_indices;
-                attn_page_indptr = kv_page_indptr;
-                attn_last_page_lens = kv_last_page_lens;
-                page_mask.begin_layer(stream);
-                if (is_pure_decode) {
-                    score_capture.emplace(
-                        stage_hooks, static_cast<std::uint32_t>(L),
-                        static_cast<std::uint32_t>(num_q_heads),
-                        /*capturable=*/true, stream);
-                } else {
-                    prefill_score_capture.emplace(
-                        stage_hooks, static_cast<std::uint32_t>(L),
-                        static_cast<std::uint32_t>(num_q_heads),
-                        plan_state.prefill_score_window,
-                        /*capturable=*/true, stream);
-                }
-                invoke_stage_hook(
-                    stage_hooks, StageHookPoint::OnAttnProj,
-                    ws.q.data(),
-                    static_cast<std::uint32_t>(N),
-                    static_cast<std::uint32_t>(Hq),
-                    static_cast<std::uint32_t>(L),
-                    stream, /*query_is_f32=*/false,
-                    {.mask_sink = page_mask.sink()});
-            } else {
-                // OnAttn: the programs read what the attention published.
-                invoke_stage_hook(
-                    stage_hooks, StageHookPoint::OnAttn,
-                    ws.q.data(),
-                    static_cast<std::uint32_t>(N),
-                    static_cast<std::uint32_t>(Hq),
-                    static_cast<std::uint32_t>(L),
-                    stream, /*query_is_f32=*/false,
-                    {.scores = score_capture && score_capture->scores()
-                                   ? score_capture->scores()
-                                   : (prefill_score_capture
-                                          ? prefill_score_capture->scores()
-                                          : nullptr)});
-            }
-            break;
-        }
-        case PieForwardOpKind::Guard: {
-            // The one branch a class trace carries — a CHAIN of arms over
-            // runtime inputs (closed predicate vocabulary,
-            // `PieForwardGuardPred`): param0 = arm count, aux run =
-            // [pred kind, payload, region len] per arm + trailing
-            // else-region len. Evaluate arms in order, run the first that
-            // holds (or the else), jump everything dead.
-            const auto aux = plan.aux_names(op);
-            const std::uint32_t n_arms = op.param0;
-            if (aux.size != static_cast<std::size_t>(n_arms) * 3 + 1) {
-                throw std::runtime_error(
-                    "declared forward: Guard aux run has " +
-                    std::to_string(aux.size) + " entries for " +
-                    std::to_string(n_arms) + " arms");
-            }
-            const auto pred_holds = [&](std::uint32_t kind,
-                                        std::uint32_t payload) -> bool {
-                switch (kind) {
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::HasWriteDesc):
-                    return has_write_desc;
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::TokensLE):
-                    return N <= static_cast<int>(payload);
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::TokensGT):
-                    return N > static_cast<int>(payload);
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::WantsAttnScore):
-                    return stage_hooks != nullptr &&
-                           stage_hooks->wants_attn_score;
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::HasCustomMask):
-                    // A1 (the class-collapse amendment): the mask arm
-                    // of the decode/prefill traces.
-                    return custom_mask_d != nullptr;
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::HasStageHooks):
-                    // A2: the hooked arm (retired vocabulary since A3;
-                    // kept for any trace that still states it).
-                    return stage_hooks != nullptr;
-                case static_cast<std::uint32_t>(
-                    pie_forward::PieForwardGuardPred::HasLora):
-                    // The §5.1 correction arm: usable lora lanes take the
-                    // general sequence + the correction pseudo-symbol.
-                    return has_lora;
-                default:
-                    throw std::runtime_error(
-                        "declared forward: guard predicate kind " +
-                        std::to_string(kind) +
-                        " is not in this executor's vocabulary");
-                }
-            };
-            // Region layout: arm regions in order, then the else region.
-            std::size_t chosen_start = SIZE_MAX;
-            std::uint32_t chosen_len = 0;
-            std::size_t cursor = i + 1;
-            for (std::uint32_t a = 0; a < n_arms; ++a) {
-                const std::uint32_t len = aux[a * 3 + 2];
-                if (chosen_start == SIZE_MAX &&
-                    pred_holds(aux[a * 3], aux[a * 3 + 1])) {
-                    chosen_start = cursor;
-                    chosen_len = len;
-                }
-                cursor += len;
-            }
-            const std::uint32_t else_len = aux[n_arms * 3];
-            if (chosen_start == SIZE_MAX) {
-                chosen_start = cursor;
-                chosen_len = else_len;
-            }
-            const std::size_t total_end = cursor + else_len;
-            // Jump to the chosen region; when it ends, jump to total_end
-            // (stacked, so a nested guard inside the region composes).
-            guard_skips.emplace_back(chosen_start + chosen_len,
-                                     total_end - (chosen_start + chosen_len));
-            i = chosen_start - 1;  // the loop's ++i lands on the region
-            break;
-        }
         case PieForwardOpKind::Swiglu: {
-            if (gate_up_used_fused) {
-                kernels::launch_chunked_swiglu_bf16(
-                    ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-            } else {
-                kernels::launch_swiglu_bf16(
-                    ws.gate.data(), ws.up.data(), ws.gate.data(),
-                    N * I, stream);
-            }
-            break;
+            // RUNG 5, again: the choice-deriving code is deleted. Every
+            // lowered trace states its activation kernel (the gate_up
+            // binding is a load-time fact), so the semantic kind reaching
+            // this walk means the trace and the executor drifted — the
+            // same refusal `Attention` and `KvAppend` make.
+            throw std::runtime_error(
+                "declared forward: semantic Swiglu in a class trace "
+                "(the declaration states the activation kernel)");
         }
         case PieForwardOpKind::ResidualAdd: {
             // The post-norm landing: `y += norm_y` — the sub-layer's
@@ -1823,8 +2171,8 @@ void llama_like_forward_declared(
             // Tied embeddings trace the lm head as "embed"; either way the
             // binding already aliased `w.lm_head` accordingly.
             const DeviceTensor* lm_head =
-                name == "embed" ? require(w.embed, name)
-                : name == "lm_head" ? require(w.lm_head, name)
+                name == "embed" ? &wb.require(name)
+                : name == "lm_head" ? &wb.require(name)
                 : nullptr;
             if (lm_head == nullptr) throw_unknown_weight(name);
             // The hand-written epilogue, copied whole (T==1, no fused-AR
@@ -1832,11 +2180,21 @@ void llama_like_forward_declared(
             // sampled rows first, then final-norm just those; full emits
             // recompute the final norm from `ws.y` for the reason
             // llama_like.cpp's comment gives (§6.2 staleness).
+            //
+            // This arm reads `N_fire`, not the `N` parameter, and that
+            // is the whole of the epilogue's row-space wrinkle. Every
+            // other op's rectangle is in `Dim::Tokens`; the epilogue's
+            // is in `Dim::Requests` (`lower()` emits it over the
+            // SAMPLED rows). The number this arm wants is the height of
+            // `ws.y` — the fire's tokens — and the epilogue is untagged
+            // by depth, so no window ever narrowed it. Saying `N_fire`
+            // makes that provable at the point of use instead of
+            // leaving the drive to special-case one op kind.
             const bool compact_logits =
                 logit_row_indices_d != nullptr && num_logit_rows > 0 &&
-                num_logit_rows < N;
+                num_logit_rows < N_fire;
             const void* lm_head_input = nullptr;
-            int lm_head_rows = N;
+            int lm_head_rows = N_fire;
             if (compact_logits) {
                 kernels::launch_gather_bf16_rows(
                     static_cast<const std::uint16_t*>(ws.y.data()),
@@ -1851,7 +2209,7 @@ void llama_like_forward_declared(
             } else {
                 kernels::launch_rmsnorm_bf16(
                     ws.y.data(), w.final_norm->data(), ws.norm_y.data(),
-                    N, H, eps, stream);
+                    N_fire, H, eps, stream);
                 lm_head_input = ws.norm_y.data();
             }
             ops::gemm_act_x_w(cublas.handle(),
@@ -1865,8 +2223,181 @@ void llama_like_forward_declared(
                 std::to_string(static_cast<std::uint32_t>(op.kind)) +
                 " has no emission rule");
         }
+    };
+
+    // ── WHAT A DECLARED FIRE RUNS ──────────────────────────────────
+    //
+    // Build the fire's rows, lower them, execute the list. That is the
+    // whole of it, and it is the shape `.wiki/tart/dsl.md` asked for: a
+    // loop with no vocabulary in it.
+    //
+    // Until `.wiki/tart/dsl.md` cutover step 3 there was a second form
+    // below this one — a WALK that decided the same thing by traversing
+    // the region IR, with a guard-skip stack, peel and mask index
+    // events, and a depth window rebound per op. It is deleted. What
+    // stood in for it while it existed was the shadow comparison, which
+    // agreed on every fire for two increments before this drive was
+    // written and found three real defects doing so.
+    //
+    // Nothing about the ARMS changed across any of it. Step 1 gave them
+    // the words they read about where they are; step 2a gave the list
+    // the observation sites it was missing; this maps one onto the
+    // other:
+    //
+    //   win_start/win_len  the rectangle, directly
+    //   win_region         which face of the hook split — and ONLY
+    //                      under device-window capture, where the
+    //                      rectangle is a full-window grid and the
+    //                      split is a device word
+    //   N                  the rectangle's row count, with NO
+    //                      exception: the epilogue's rows are
+    //                      Dim::Requests and its arm names `N_fire`
+    //                      itself for the one thing it wants from token
+    //                      space
+    //   R                  rows == N_fire ? R_fire : rows — narrowing
+    //                      makes tokens and requests the same live
+    //                      count, so only the un-narrowed case
+    //                      distinguishes them
+    //   mask_region        which face of the spatial split
+    //   band index         the band whose row count this IS. A prepared
+    //                      plan is found by ROW COUNT, which is why
+    //                      nothing here indexes bands and why the
+    //                      three-band ceiling has nothing left to sit
+    //                      on in this file (it survives in the PREPARE,
+    //                      which holds at most three plans).
+    {
+        const std::vector<pie_forward::PieForwardRow> rows = fire_rows(
+            N_fire, fast_rows, depth_k, depth_split, depth_union,
+            plan_state.depth_band_k.data(), plan_state.depth_band_rows.data(),
+            depth_banded ? static_cast<std::size_t>(band_count) : 0,
+            (custom_mask_d != nullptr && unmasked_prefix_rows != 0xffffffffu &&
+             plan_state.spatial_mask_split >= 0)
+                ? plan_state.spatial_mask_split
+                : -1,
+            custom_mask_d != nullptr, lora != nullptr && lora->usable(),
+            has_write_desc,
+            stage_hooks != nullptr && stage_hooks->wants_attn_score,
+            logit_row_indices_d, num_logit_rows);
+        const pie_forward::PieForwardLowered flat =
+            plan.lower(rows.data(), rows.size(), peel_window_d != nullptr);
+        if (flat.uncovered != pie_forward::PieForwardUncovered::None) {
+            throw std::runtime_error(
+                "declared forward (flat): the lowering refuses this fire, "
+                "reason " +
+                std::to_string(static_cast<std::uint32_t>(flat.uncovered)) +
+                " — an admission answer arriving too late");
+        }
+        // The band a row count names. `-1` for "the whole fire", which
+        // is the walk's own degenerate rule.
+        const auto band_of = [&](int live) {
+            if (!depth_banded || live == N_fire) return -1;
+            for (int j = 0; j < band_count; ++j) {
+                if (plan_state.depth_band_rows[static_cast<std::size_t>(j)] ==
+                    static_cast<std::uint32_t>(live)) {
+                    return j;
+                }
+            }
+            return -1;
+        };
+        std::size_t next_site = 0;
+        std::size_t at = 0;
+        while (at < flat.launches_len || next_site < flat.structural_len) {
+            // Statements run in op order, and the two lists are each in
+            // that order, so this is a merge.
+            const bool site_first =
+                at >= flat.launches_len ||
+                (next_site < flat.structural_len &&
+                 flat.structural[next_site].at_op < flat.launches[at].at_op);
+            if (site_first) {
+                const pie_forward::PieForwardSite& S =
+                    flat.structural[next_site];
+                // The arena advances with the STATEMENT, whichever form
+                // is driving: slots whose value was last read before
+                // this op return to the free list, and skipping that is
+                // how a bump arena runs out of block on the first fire.
+                values.begin_op(S.at_op);
+                execute_site(plan.op(S.at_op),
+                             static_cast<int>(S.row_hi - S.row_lo));
+                ++next_site;
+                continue;
+            }
+            const pie_forward::PieForwardLaunch& L = flat.launches[at];
+            // One CALL per rectangle, not per launch: an arm that runs
+            // several kernels for one statement (the epilogue's gather,
+            // norm and projection) runs all of them itself, so the
+            // rectangles sharing a statement and a window collapse.
+            std::size_t run = at + 1;
+            while (run < flat.launches_len &&
+                   flat.launches[run].at_op == L.at_op &&
+                   flat.launches[run].row_lo == L.row_lo &&
+                   flat.launches[run].row_hi == L.row_hi &&
+                   flat.launches[run].peel_axis == L.peel_axis &&
+                   flat.launches[run].peel_tail == L.peel_tail) {
+                ++run;
+            }
+            at = run;
+            values.begin_op(L.at_op);
+            const PieForwardOp& op = plan.op(L.at_op);
+            const int live = static_cast<int>(L.row_hi - L.row_lo);
+            // The mask peel has an UNPLANNED endpoint: when the driver
+            // declined the split, its tail IS the fire-level custom
+            // dispatch, full-N, and the walk marks that region `None`
+            // rather than `Tail`. Reading the axis alone gave the tail
+            // its windowed addressing on a fire that has no suffix
+            // plan — which the executor caught ("peel tail without a
+            // suffix mask plan") and then a stray launch turned into an
+            // illegal access. The split's existence is the word that
+            // separates the two, so the drive reads it.
+            const bool mask_split_planned =
+                plan_state.spatial_mask_split >= 0 &&
+                unmasked_prefix_rows != 0xffffffffu;
+            const MaskRegion region =
+                (L.peel_axis != 2 || !mask_split_planned)
+                    ? MaskRegion::None
+                    : L.peel_tail ? MaskRegion::Tail
+                                  : MaskRegion::Prefix;
+            // DEVICE-WINDOW capture (`rows_device`): the rectangle is a
+            // full-window GRID and the split is a device word the
+            // windowed call forms read, so the marker — not the row
+            // range — is what tells a launch which face it serves. This
+            // is the one thing the first drive got wrong: it read the
+            // row range for every peel, which is right for a host split
+            // and silently freezes THIS fire's split into a graph that
+            // is supposed to replay across all of them. Byte parity
+            // cannot see it (the fire it was measured on is correct);
+            // only the REPLAY is wrong.
+            const WinRegion window = !L.rows_device ? WinRegion::Full
+                                     : L.peel_tail ? WinRegion::Tail
+                                                   : WinRegion::Prefix;
+            execute_op(op,
+                       /*N=*/live,
+                       /*R=*/live == N_fire ? R_fire : live,
+                       /*win_start=*/static_cast<int>(L.row_lo),
+                       /*win_len=*/live,
+                       window,
+                       region,
+                       band_of(live),
+                       /*depth_tail_active=*/depth_union && live == depth_split);
+        }
+        if (flat_trace) {
+            // `devwin` counts the rectangles whose rows are a GRID and
+            // whose split is a device word. It is here because the
+            // capture defect (step 2e) was invisible without it: a probe
+            // that never takes the path passes either way, so proving a
+            // fix needs the count as much as the text.
+            std::size_t devwin = 0;
+            for (std::size_t j = 0; j < flat.launches_len; ++j) {
+                if (flat.launches[j].rows_device != 0) ++devwin;
+            }
+            std::fprintf(stderr,
+                         "[flat] served rows=%zu launches=%zu sites=%zu devwin=%zu\n",
+                         rows.size(), flat.launches_len, flat.structural_len,
+                         devwin);
+        }
     }
 }
+
+
 
 
 bool llama_like_supergraph_supported(const LlamaLikeDeclaredPlan& declared) {

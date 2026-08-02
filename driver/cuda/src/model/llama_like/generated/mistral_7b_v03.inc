@@ -74,6 +74,23 @@ std::uint32_t declared_full_depth_rows)
             "depth union (generated): planned split without "
             "a usable prefix plan (gate drift)");
     }
+    // ④ Act 1 (banded depth): >= 2 distinct-k bands from the
+    // prepare's stamp; per-layer scopes below resolve the
+    // band containing their static layer. Banded fires
+    // derive max_layers FULL, so the union logic stays idle.
+    const int band_count =
+        static_cast<int>(plan_state.depth_band_count);
+    const bool depth_banded = band_count >= 2;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (plan_state.depth_band_rows[j] > 0 &&
+                !plan_state.depth_band_plans[j]) {
+                throw std::runtime_error(
+                    "depth bands (generated): stamped band "
+                    "without a usable prefix plan");
+            }
+        }
+    }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
@@ -121,9 +138,22 @@ std::uint32_t declared_full_depth_rows)
         N, H, V, stream);
     {
     const bool depth_tail = depth_k <= 0;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].attn_norm, "layer.0.attn_norm")->data(),
@@ -153,9 +183,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 0;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -186,9 +229,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 0;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -223,44 +279,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(0u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(0);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[0]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(0u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(0);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(0u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(0);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[0]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -278,7 +380,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -344,7 +446,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -379,12 +481,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -404,7 +508,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -426,31 +531,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].mlp_norm, "layer.0.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_0 =
-        w.layers[0].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_0) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[0].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].gate_proj, "layer.0.gate_up"), w.layers[0].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[0].gate_up_proj_fused, "layer.0.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -459,9 +545,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 1;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].attn_norm, "layer.1.attn_norm")->data(),
@@ -491,9 +590,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 1;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -524,9 +636,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 1;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -561,44 +686,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(1u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(1);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[1]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(1u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(1);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(1u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(1);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[1]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -616,7 +787,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -682,7 +853,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -717,12 +888,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -742,7 +915,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -764,31 +938,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].mlp_norm, "layer.1.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_1 =
-        w.layers[1].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[1].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].gate_proj, "layer.1.gate_up"), w.layers[1].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[1].gate_up_proj_fused, "layer.1.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -797,9 +952,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 2;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].attn_norm, "layer.2.attn_norm")->data(),
@@ -829,9 +997,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 2;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -862,9 +1043,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 2;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -899,44 +1093,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(2u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(2);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[2]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(2u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(2);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(2u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(2);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[2]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -954,7 +1194,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -1020,7 +1260,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1055,12 +1295,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -1080,7 +1322,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -1102,31 +1345,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].mlp_norm, "layer.2.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_2 =
-        w.layers[2].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_2) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[2].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].gate_proj, "layer.2.gate_up"), w.layers[2].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[2].gate_up_proj_fused, "layer.2.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -1135,9 +1359,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 3;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].attn_norm, "layer.3.attn_norm")->data(),
@@ -1167,9 +1404,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 3;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -1200,9 +1450,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 3;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -1237,44 +1500,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(3u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(3);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[3]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(3u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(3);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(3u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(3);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[3]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -1292,7 +1601,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -1358,7 +1667,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1393,12 +1702,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -1418,7 +1729,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -1440,31 +1752,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].mlp_norm, "layer.3.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_3 =
-        w.layers[3].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_3) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[3].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].gate_proj, "layer.3.gate_up"), w.layers[3].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[3].gate_up_proj_fused, "layer.3.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -1473,9 +1766,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 4;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].attn_norm, "layer.4.attn_norm")->data(),
@@ -1505,9 +1811,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 4;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -1538,9 +1857,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 4;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -1575,44 +1907,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(4u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(4);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[4]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(4u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(4);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(4u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(4);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[4]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -1630,7 +2008,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -1696,7 +2074,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -1731,12 +2109,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -1756,7 +2136,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -1778,31 +2159,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].mlp_norm, "layer.4.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_4 =
-        w.layers[4].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_4) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[4].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].gate_proj, "layer.4.gate_up"), w.layers[4].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[4].gate_up_proj_fused, "layer.4.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -1811,9 +2173,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 5;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].attn_norm, "layer.5.attn_norm")->data(),
@@ -1843,9 +2218,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 5;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -1876,9 +2264,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 5;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -1913,44 +2314,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(5u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(5);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[5]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(5u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(5);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(5u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(5);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[5]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -1968,7 +2415,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -2034,7 +2481,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2069,12 +2516,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -2094,7 +2543,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -2116,31 +2566,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].mlp_norm, "layer.5.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_5 =
-        w.layers[5].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_5) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[5].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].gate_proj, "layer.5.gate_up"), w.layers[5].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[5].gate_up_proj_fused, "layer.5.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -2149,9 +2580,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 6;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].attn_norm, "layer.6.attn_norm")->data(),
@@ -2181,9 +2625,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 6;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -2214,9 +2671,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 6;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -2251,44 +2721,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(6u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(6);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[6]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(6u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(6);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(6u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(6);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[6]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -2306,7 +2822,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -2372,7 +2888,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2407,12 +2923,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -2432,7 +2950,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -2454,31 +2973,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].mlp_norm, "layer.6.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_6 =
-        w.layers[6].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_6) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[6].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].gate_proj, "layer.6.gate_up"), w.layers[6].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[6].gate_up_proj_fused, "layer.6.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -2487,9 +2987,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 7;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].attn_norm, "layer.7.attn_norm")->data(),
@@ -2519,9 +3032,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 7;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -2552,9 +3078,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 7;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -2589,44 +3128,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(7u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(7);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[7]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(7u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(7);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(7u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(7);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[7]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -2644,7 +3229,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -2710,7 +3295,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -2745,12 +3330,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -2770,7 +3357,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -2792,31 +3380,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].mlp_norm, "layer.7.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_7 =
-        w.layers[7].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_7) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[7].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].gate_proj, "layer.7.gate_up"), w.layers[7].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[7].gate_up_proj_fused, "layer.7.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -2825,9 +3394,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 8;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].attn_norm, "layer.8.attn_norm")->data(),
@@ -2857,9 +3439,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 8;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -2890,9 +3485,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 8;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -2927,44 +3535,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(8u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(8);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[8]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(8u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(8);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(8u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(8);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[8]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -2982,7 +3636,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -3048,7 +3702,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3083,12 +3737,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -3108,7 +3764,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -3130,31 +3787,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].mlp_norm, "layer.8.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_8 =
-        w.layers[8].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_8) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[8].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].gate_proj, "layer.8.gate_up"), w.layers[8].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[8].gate_up_proj_fused, "layer.8.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -3163,9 +3801,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 9;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].attn_norm, "layer.9.attn_norm")->data(),
@@ -3195,9 +3846,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 9;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -3228,9 +3892,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 9;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -3265,44 +3942,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(9u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(9);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[9]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(9u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(9);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(9u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(9);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[9]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -3320,7 +4043,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -3386,7 +4109,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3421,12 +4144,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -3446,7 +4171,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -3468,31 +4194,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].mlp_norm, "layer.9.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_9 =
-        w.layers[9].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_9) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[9].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].gate_proj, "layer.9.gate_up"), w.layers[9].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[9].gate_up_proj_fused, "layer.9.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -3501,9 +4208,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 10;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].attn_norm, "layer.10.attn_norm")->data(),
@@ -3533,9 +4253,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 10;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -3566,9 +4299,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 10;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -3603,44 +4349,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(10u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(10);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[10]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(10u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(10);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(10u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(10);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[10]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -3658,7 +4450,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -3724,7 +4516,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -3759,12 +4551,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -3784,7 +4578,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -3806,31 +4601,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].mlp_norm, "layer.10.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_10 =
-        w.layers[10].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_10) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[10].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].gate_proj, "layer.10.gate_up"), w.layers[10].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[10].gate_up_proj_fused, "layer.10.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -3839,9 +4615,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 11;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].attn_norm, "layer.11.attn_norm")->data(),
@@ -3871,9 +4660,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 11;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -3904,9 +4706,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 11;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -3941,44 +4756,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(11u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(11);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[11]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(11u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(11);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(11u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(11);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[11]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -3996,7 +4857,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -4062,7 +4923,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4097,12 +4958,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -4122,7 +4985,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -4144,31 +5008,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].mlp_norm, "layer.11.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_11 =
-        w.layers[11].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_11) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[11].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].gate_proj, "layer.11.gate_up"), w.layers[11].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[11].gate_up_proj_fused, "layer.11.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -4177,9 +5022,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 12;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].attn_norm, "layer.12.attn_norm")->data(),
@@ -4209,9 +5067,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 12;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -4242,9 +5113,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 12;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -4279,44 +5163,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(12u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(12);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[12]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(12u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(12);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(12u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(12);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[12]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -4334,7 +5264,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -4400,7 +5330,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4435,12 +5365,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -4460,7 +5392,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -4482,31 +5415,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].mlp_norm, "layer.12.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_12 =
-        w.layers[12].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_12) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[12].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].gate_proj, "layer.12.gate_up"), w.layers[12].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[12].gate_up_proj_fused, "layer.12.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -4515,9 +5429,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 13;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].attn_norm, "layer.13.attn_norm")->data(),
@@ -4547,9 +5474,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 13;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -4580,9 +5520,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 13;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -4617,44 +5570,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(13u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(13);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[13]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(13u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(13);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(13u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(13);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[13]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -4672,7 +5671,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -4738,7 +5737,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -4773,12 +5772,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -4798,7 +5799,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -4820,31 +5822,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].mlp_norm, "layer.13.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_13 =
-        w.layers[13].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_13) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[13].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].gate_proj, "layer.13.gate_up"), w.layers[13].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[13].gate_up_proj_fused, "layer.13.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -4853,9 +5836,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 14;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].attn_norm, "layer.14.attn_norm")->data(),
@@ -4885,9 +5881,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 14;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -4918,9 +5927,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 14;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -4955,44 +5977,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(14u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(14);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[14]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(14u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(14);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(14u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(14);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[14]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -5010,7 +6078,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -5076,7 +6144,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5111,12 +6179,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -5136,7 +6206,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -5158,31 +6229,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].mlp_norm, "layer.14.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_14 =
-        w.layers[14].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_14) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[14].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].gate_proj, "layer.14.gate_up"), w.layers[14].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[14].gate_up_proj_fused, "layer.14.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -5191,9 +6243,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 15;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].attn_norm, "layer.15.attn_norm")->data(),
@@ -5223,9 +6288,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 15;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -5256,9 +6334,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 15;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -5293,44 +6384,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(15u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(15);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[15]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(15u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(15);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(15u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(15);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[15]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -5348,7 +6485,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -5414,7 +6551,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5449,12 +6586,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -5474,7 +6613,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -5496,31 +6636,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].mlp_norm, "layer.15.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_15 =
-        w.layers[15].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_15) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[15].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].gate_proj, "layer.15.gate_up"), w.layers[15].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[15].gate_up_proj_fused, "layer.15.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -5529,9 +6650,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 16;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].attn_norm, "layer.16.attn_norm")->data(),
@@ -5561,9 +6695,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 16;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -5594,9 +6741,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 16;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -5631,44 +6791,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(16u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(16);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         16 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[16]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(16u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(16);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(16u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(16);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             16 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[16]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -5686,7 +6892,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -5752,7 +6958,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -5787,12 +6993,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -5812,7 +7020,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -5834,31 +7043,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].mlp_norm, "layer.16.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_16 =
-        w.layers[16].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_16) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[16].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].gate_proj, "layer.16.gate_up"), w.layers[16].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[16].gate_up_proj_fused, "layer.16.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -5867,9 +7057,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 17;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].attn_norm, "layer.17.attn_norm")->data(),
@@ -5899,9 +7102,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 17;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -5932,9 +7148,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 17;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -5969,44 +7198,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(17u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(17);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         17 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[17]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(17u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(17);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(17u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(17);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             17 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[17]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -6024,7 +7299,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -6090,7 +7365,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6125,12 +7400,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -6150,7 +7427,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -6172,31 +7450,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].mlp_norm, "layer.17.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_17 =
-        w.layers[17].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_17) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[17].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].gate_proj, "layer.17.gate_up"), w.layers[17].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[17].gate_up_proj_fused, "layer.17.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -6205,9 +7464,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 18;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].attn_norm, "layer.18.attn_norm")->data(),
@@ -6237,9 +7509,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 18;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -6270,9 +7555,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 18;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -6307,44 +7605,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(18u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(18);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         18 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[18]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(18u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(18);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(18u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(18);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             18 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[18]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -6362,7 +7706,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -6428,7 +7772,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6463,12 +7807,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -6488,7 +7834,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -6510,31 +7857,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].mlp_norm, "layer.18.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_18 =
-        w.layers[18].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_18) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[18].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].gate_proj, "layer.18.gate_up"), w.layers[18].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[18].gate_up_proj_fused, "layer.18.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -6543,9 +7871,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 19;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].attn_norm, "layer.19.attn_norm")->data(),
@@ -6575,9 +7916,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 19;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -6608,9 +7962,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 19;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -6645,44 +8012,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(19u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(19);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         19 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[19]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(19u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(19);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(19u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(19);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             19 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[19]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -6700,7 +8113,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -6766,7 +8179,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -6801,12 +8214,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -6826,7 +8241,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -6848,31 +8264,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].mlp_norm, "layer.19.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_19 =
-        w.layers[19].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_19) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[19].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].gate_proj, "layer.19.gate_up"), w.layers[19].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[19].gate_up_proj_fused, "layer.19.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -6881,9 +8278,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 20;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].attn_norm, "layer.20.attn_norm")->data(),
@@ -6913,9 +8323,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 20;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -6946,9 +8369,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 20;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -6983,44 +8419,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(20u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(20);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         20 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[20]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(20u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(20);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(20u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(20);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             20 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[20]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -7038,7 +8520,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -7104,7 +8586,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -7139,12 +8621,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -7164,7 +8648,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -7186,31 +8671,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].mlp_norm, "layer.20.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_20 =
-        w.layers[20].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_20) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[20].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].gate_proj, "layer.20.gate_up"), w.layers[20].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[20].gate_up_proj_fused, "layer.20.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -7219,9 +8685,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 21;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].attn_norm, "layer.21.attn_norm")->data(),
@@ -7251,9 +8730,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 21;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -7284,9 +8776,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 21;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -7321,44 +8826,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(21u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(21);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         21 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[21]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(21u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(21);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(21u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(21);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             21 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[21]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -7376,7 +8927,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -7442,7 +8993,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -7477,12 +9028,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -7502,7 +9055,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -7524,31 +9078,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].mlp_norm, "layer.21.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_21 =
-        w.layers[21].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_21) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[21].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].gate_proj, "layer.21.gate_up"), w.layers[21].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[21].gate_up_proj_fused, "layer.21.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -7557,9 +9092,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 22;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].attn_norm, "layer.22.attn_norm")->data(),
@@ -7589,9 +9137,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 22;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -7622,9 +9183,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 22;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -7659,44 +9233,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(22u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(22);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         22 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[22]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(22u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(22);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(22u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(22);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             22 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[22]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -7714,7 +9334,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -7780,7 +9400,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -7815,12 +9435,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -7840,7 +9462,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -7862,31 +9485,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].mlp_norm, "layer.22.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_22 =
-        w.layers[22].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_22) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[22].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].gate_proj, "layer.22.gate_up"), w.layers[22].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[22].gate_up_proj_fused, "layer.22.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -7895,9 +9499,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 23;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].attn_norm, "layer.23.attn_norm")->data(),
@@ -7927,9 +9544,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 23;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -7960,9 +9590,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 23;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -7997,44 +9640,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(23u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(23);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         23 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[23]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(23u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(23);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(23u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(23);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             23 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[23]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -8052,7 +9741,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -8118,7 +9807,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -8153,12 +9842,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -8178,7 +9869,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -8200,31 +9892,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].mlp_norm, "layer.23.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_23 =
-        w.layers[23].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_23) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[23].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].gate_proj, "layer.23.gate_up"), w.layers[23].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[23].gate_up_proj_fused, "layer.23.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -8233,9 +9906,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 24;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].attn_norm, "layer.24.attn_norm")->data(),
@@ -8265,9 +9951,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 24;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -8298,9 +9997,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 24;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -8335,44 +10047,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(24u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(24);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         24 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[24]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(24u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(24);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(24u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(24);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             24 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[24]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -8390,7 +10148,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -8456,7 +10214,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -8491,12 +10249,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -8516,7 +10276,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -8538,31 +10299,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].mlp_norm, "layer.24.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_24 =
-        w.layers[24].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_24) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[24].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].gate_proj, "layer.24.gate_up"), w.layers[24].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].up_proj, "layer.24.gate_up"), w.layers[24].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_24) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[24].gate_up_proj_fused, "layer.24.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
@@ -8571,9 +10313,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 25;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].attn_norm, "layer.25.attn_norm")->data(),
@@ -8603,9 +10358,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 25;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -8636,9 +10404,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 25;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -8673,44 +10454,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(25u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(25);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         25 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[25]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(25u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(25);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(25u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(25);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             25 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[25]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -8728,7 +10555,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -8794,7 +10621,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -8829,12 +10656,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -8854,7 +10683,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -8876,31 +10706,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].mlp_norm, "layer.25.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_25 =
-        w.layers[25].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_25) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[25].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].gate_proj, "layer.25.gate_up"), w.layers[25].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].up_proj, "layer.25.gate_up"), w.layers[25].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_25) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[25].gate_up_proj_fused, "layer.25.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
@@ -8909,9 +10720,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 26;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].attn_norm, "layer.26.attn_norm")->data(),
@@ -8941,9 +10765,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 26;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -8974,9 +10811,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 26;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -9011,44 +10861,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(26u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(26);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         26 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[26]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(26u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(26);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(26u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(26);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             26 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[26]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -9066,7 +10962,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -9132,7 +11028,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -9167,12 +11063,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -9192,7 +11090,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -9214,31 +11113,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].mlp_norm, "layer.26.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_26 =
-        w.layers[26].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_26) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[26].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].gate_proj, "layer.26.gate_up"), w.layers[26].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].up_proj, "layer.26.gate_up"), w.layers[26].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_26) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[26].gate_up_proj_fused, "layer.26.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
@@ -9247,9 +11127,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 27;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].attn_norm, "layer.27.attn_norm")->data(),
@@ -9279,9 +11172,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 27;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -9312,9 +11218,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 27;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -9349,44 +11268,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(27u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(27);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         27 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[27]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(27u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(27);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(27u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(27);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             27 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[27]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -9404,7 +11369,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -9470,7 +11435,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -9505,12 +11470,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -9530,7 +11497,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -9552,31 +11520,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].mlp_norm, "layer.27.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_27 =
-        w.layers[27].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_27) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[27].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].gate_proj, "layer.27.gate_up"), w.layers[27].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].up_proj, "layer.27.gate_up"), w.layers[27].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_27) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[27].gate_up_proj_fused, "layer.27.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
@@ -9585,9 +11534,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 28;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[28].attn_norm, "layer.28.attn_norm")->data(),
@@ -9617,9 +11579,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 28;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -9650,9 +11625,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 28;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -9687,44 +11675,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(28u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(28);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         28 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[28]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(28u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(28);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(28u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(28);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             28 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[28]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -9742,7 +11776,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -9808,7 +11842,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -9843,12 +11877,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -9868,7 +11904,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -9890,31 +11927,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[28].mlp_norm, "layer.28.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_28 =
-        w.layers[28].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_28) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[28].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[28].gate_proj, "layer.28.gate_up"), w.layers[28].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[28].up_proj, "layer.28.gate_up"), w.layers[28].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_28) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[28].gate_up_proj_fused, "layer.28.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[28].down_proj, "layer.28.down"), w.layers[28].down_proj_quant),
@@ -9923,9 +11941,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 29;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[29].attn_norm, "layer.29.attn_norm")->data(),
@@ -9955,9 +11986,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 29;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -9988,9 +12032,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 29;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -10025,44 +12082,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(29u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(29);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         29 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[29]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(29u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(29);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(29u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(29);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             29 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[29]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -10080,7 +12183,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -10146,7 +12249,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -10181,12 +12284,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -10206,7 +12311,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -10228,31 +12334,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[29].mlp_norm, "layer.29.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_29 =
-        w.layers[29].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_29) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[29].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[29].gate_proj, "layer.29.gate_up"), w.layers[29].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[29].up_proj, "layer.29.gate_up"), w.layers[29].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_29) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[29].gate_up_proj_fused, "layer.29.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[29].down_proj, "layer.29.down"), w.layers[29].down_proj_quant),
@@ -10261,9 +12348,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 30;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[30].attn_norm, "layer.30.attn_norm")->data(),
@@ -10293,9 +12393,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 30;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -10326,9 +12439,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 30;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -10363,44 +12489,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(30u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(30);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         30 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[30]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(30u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(30);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(30u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(30);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             30 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[30]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -10418,7 +12590,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -10484,7 +12656,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -10519,12 +12691,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -10544,7 +12718,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -10566,31 +12741,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[30].mlp_norm, "layer.30.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_30 =
-        w.layers[30].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_30) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[30].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[30].gate_proj, "layer.30.gate_up"), w.layers[30].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[30].up_proj, "layer.30.gate_up"), w.layers[30].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_30) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[30].gate_up_proj_fused, "layer.30.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[30].down_proj, "layer.30.down"), w.layers[30].down_proj_quant),
@@ -10599,9 +12755,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 31;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[31].attn_norm, "layer.31.attn_norm")->data(),
@@ -10631,9 +12800,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 31;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
@@ -10664,9 +12846,22 @@ std::uint32_t declared_full_depth_rows)
     }
     {
     const bool depth_tail = depth_k <= 31;
-    if (!depth_tail || depth_union) {
-    const int N = depth_tail ? depth_split : total_tokens;
-    const int R = depth_tail ? depth_split : num_requests;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
     (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
@@ -10701,44 +12896,90 @@ std::uint32_t declared_full_depth_rows)
                     "spatial mask: suffix qo identity missing");
             }
             if (split > 0) {
-                if (page_mask.written_for(31u)) {
+                if (hooks != nullptr && hooks->wants_attn_score) {
                     if (!plan_state.decode_plan) {
                         throw std::runtime_error(
-                            "attn_page_mask was written but this layer does "
-                            "not take the paged decode path");
+                            "generated forward: prepare built no decode plan");
                     }
-                    if (!ops::decode_plan_is_page_count_independent(
-                            *plan_state.decode_plan)) {
+                    if (!score_capture || !score_capture->active()) {
                         throw std::runtime_error(
-                            "attn_page_mask requires a page-count-independent "
-                            "decode plan; this fire planned split-KV");
+                            "generated forward: capture decode stated but no "
+                            "active score capture (guard/pred drift)");
                     }
-                    page_mask.compact(
-                        kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                        static_cast<std::uint32_t>(R), stream);
-                    attn_page_indices = page_mask.page_indices();
-                    attn_page_indptr = page_mask.page_indptr();
-                    attn_last_page_lens = page_mask.last_page_lens();
-                }
-                if (!plan_state.decode_plan) {
-                    throw std::runtime_error(
-                        "spatial mask: split active but prepare built "
-                        "no prefix decode plan");
-                }
-                {
-                    auto kv_view = cache.layer_view(31);
-                    const int layer_window_left =
-                        (!fwd_cfg.per_layer_window_left.empty() &&
-                         31 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
-                            ? fwd_cfg.per_layer_window_left[31]
-                            : fwd_cfg.sliding_window;
-                    ops::dispatch_attention_flashinfer_decode(
-                        *plan_state.decode_plan,
-                        ws.q.data(), kv_view, ws.attn_out.data(),
-                        attn_page_indices, attn_page_indptr,
-                        attn_last_page_lens,
-                        attn_ws, stream, layer_window_left,
-                        /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    if (page_mask.written_for(31u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    {
+                        auto kv_view = cache.layer_view(31);
+                        ops::dispatch_attention_flashinfer_decode_capture(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream,
+                            score_capture->raw(), score_capture->indptr_d(),
+                            /*window_left=*/-1,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                        score_capture->publish(
+                            attn_page_indptr, attn_last_page_lens,
+                            cache.page_size());
+                    }
+                } else {
+                    if (page_mask.written_for(31u)) {
+                        if (!plan_state.decode_plan) {
+                            throw std::runtime_error(
+                                "attn_page_mask was written but this layer does "
+                                "not take the paged decode path");
+                        }
+                        if (!ops::decode_plan_is_page_count_independent(
+                                *plan_state.decode_plan)) {
+                            throw std::runtime_error(
+                                "attn_page_mask requires a page-count-independent "
+                                "decode plan; this fire planned split-KV");
+                        }
+                        page_mask.compact(
+                            kv_page_indices, kv_page_indptr, kv_last_page_lens,
+                            static_cast<std::uint32_t>(num_requests), stream);
+                        attn_page_indices = page_mask.page_indices();
+                        attn_page_indptr = page_mask.page_indptr();
+                        attn_last_page_lens = page_mask.last_page_lens();
+                    }
+                    if (!plan_state.decode_plan) {
+                        throw std::runtime_error(
+                            "spatial mask: split active but prepare built "
+                            "no prefix decode plan");
+                    }
+                    {
+                        auto kv_view = cache.layer_view(31);
+                        const int layer_window_left =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             31 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[31]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.decode_plan,
+                            ws.q.data(), kv_view, ws.attn_out.data(),
+                            attn_page_indices, attn_page_indptr,
+                            attn_last_page_lens,
+                            attn_ws, stream, layer_window_left,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -10756,7 +12997,7 @@ std::uint32_t declared_full_depth_rows)
                     kv_page_indptr + split,
                     kv_last_page_lens + split,
                     custom_mask_d, custom_mask_indptr_d + split,
-                    attn_ws, stream);
+                    spatial_suffix_attn_ws(), stream);
             }
         } else {
             if (!plan_state.mask_decode_plan) {
@@ -10822,7 +13063,7 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
@@ -10857,12 +13098,14 @@ std::uint32_t declared_full_depth_rows)
                 }
                 page_mask.compact(
                     kv_page_indices, kv_page_indptr, kv_last_page_lens,
-                    static_cast<std::uint32_t>(R), stream);
+                    static_cast<std::uint32_t>(num_requests), stream);
                 attn_page_indices = page_mask.page_indices();
                 attn_page_indptr = page_mask.page_indptr();
                 attn_last_page_lens = page_mask.last_page_lens();
             }
-            const ops::DecodePlanCache* depth_dp = depth_tail
+            const ops::DecodePlanCache* depth_dp = band_j >= 0
+                ? plan_state.depth_band_plans[band_j].get()
+                : depth_tail
                 ? plan_state.depth_prefix_decode_plan.get()
                 : plan_state.decode_plan.get();
             if (depth_dp == nullptr) {
@@ -10882,7 +13125,8 @@ std::uint32_t declared_full_depth_rows)
                     ws.q.data(), kv_view, ws.attn_out.data(),
                     attn_page_indices, attn_page_indptr,
                     attn_last_page_lens,
-                    depth_tail ? spatial_suffix_attn_ws() : attn_ws,
+                    band_j >= 0 ? depth_band_attn_ws_public(band_j)
+                    : depth_tail ? spatial_suffix_attn_ws() : attn_ws,
                     stream, layer_window_left,
                     /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
             }
@@ -10904,31 +13148,12 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[31].mlp_norm, "layer.31.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_31 =
-        w.layers[31].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_31) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[31].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[31].gate_proj, "layer.31.gate_up"), w.layers[31].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[31].up_proj, "layer.31.gate_up"), w.layers[31].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_31) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[31].gate_up_proj_fused, "layer.31.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[31].down_proj, "layer.31.down"), w.layers[31].down_proj_quant),
@@ -11006,6 +13231,46 @@ std::uint32_t declared_full_depth_rows)
     // the staging aliases are the plain buffers).
     const int N = total_tokens;
     const int R = num_requests;
+    // STRUCTURAL S-4: the depth axis, stated by the trace
+    // (ForwardPlan::depth_window) — per-layer scopes below
+    // shadow N/R on tail layers; uniform truncation skips
+    // them and the unchanged epilogue is the logit-lens head.
+    const int depth_k =
+        declared_max_layers != 0xffffffffu &&
+        declared_max_layers <
+            static_cast<std::uint32_t>(cfg.num_hidden_layers)
+            ? static_cast<int>(declared_max_layers)
+            : cfg.num_hidden_layers;
+    const bool depth_union =
+        depth_k < cfg.num_hidden_layers &&
+        declared_full_depth_rows != 0xffffffffu;
+    const int depth_split = depth_union
+        ? static_cast<int>(declared_full_depth_rows)
+        : N;
+    if (depth_union &&
+        (depth_split <= 0 || depth_split >= R ||
+         !plan_state.depth_prefix_decode_plan)) {
+        throw std::runtime_error(
+            "depth union (generated): planned split without "
+            "a usable prefix plan (gate drift)");
+    }
+    // ④ Act 1 (banded depth): >= 2 distinct-k bands from the
+    // prepare's stamp; per-layer scopes below resolve the
+    // band containing their static layer. Banded fires
+    // derive max_layers FULL, so the union logic stays idle.
+    const int band_count =
+        static_cast<int>(plan_state.depth_band_count);
+    const bool depth_banded = band_count >= 2;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (plan_state.depth_band_rows[j] > 0 &&
+                !plan_state.depth_band_plans[j]) {
+                throw std::runtime_error(
+                    "depth bands (generated): stamped band "
+                    "without a usable prefix plan");
+            }
+        }
+    }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
     const int Hk = cfg.num_key_value_heads * cfg.head_dim;
@@ -11051,6 +13316,25 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_embed_bf16(
         token_ids, require(w.embed, "embed")->data(), ws.y.data(),
         N, H, V, stream);
+    {
+    const bool depth_tail = depth_k <= 0;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].attn_norm, "layer.0.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11062,6 +13346,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -11075,10 +13361,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 0;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(0);
@@ -11100,6 +13407,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 0;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (0 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -11153,6 +13479,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             0 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[0]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -11285,35 +13631,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].mlp_norm, "layer.0.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_0 =
-        w.layers[0].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_0) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[0].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].gate_proj, "layer.0.gate_up"), w.layers[0].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[0].gate_up_proj_fused, "layer.0.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 1;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].attn_norm, "layer.1.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11325,6 +13673,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -11338,10 +13688,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 1;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(1);
@@ -11363,6 +13734,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 1;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (1 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -11416,6 +13806,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             1 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[1]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -11548,35 +13958,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].mlp_norm, "layer.1.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_1 =
-        w.layers[1].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[1].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].gate_proj, "layer.1.gate_up"), w.layers[1].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[1].gate_up_proj_fused, "layer.1.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 2;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].attn_norm, "layer.2.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11588,6 +14000,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -11601,10 +14015,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 2;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(2);
@@ -11626,6 +14061,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 2;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (2 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -11679,6 +14133,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             2 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[2]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -11811,35 +14285,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].mlp_norm, "layer.2.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_2 =
-        w.layers[2].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_2) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[2].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].gate_proj, "layer.2.gate_up"), w.layers[2].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[2].gate_up_proj_fused, "layer.2.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 3;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].attn_norm, "layer.3.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -11851,6 +14327,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -11864,10 +14342,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 3;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(3);
@@ -11889,6 +14388,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 3;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (3 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -11942,6 +14460,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             3 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[3]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -12074,35 +14612,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].mlp_norm, "layer.3.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_3 =
-        w.layers[3].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_3) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[3].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].gate_proj, "layer.3.gate_up"), w.layers[3].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[3].gate_up_proj_fused, "layer.3.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 4;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].attn_norm, "layer.4.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12114,6 +14654,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -12127,10 +14669,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 4;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(4);
@@ -12152,6 +14715,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 4;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (4 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -12205,6 +14787,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             4 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[4]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -12337,35 +14939,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].mlp_norm, "layer.4.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_4 =
-        w.layers[4].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_4) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[4].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].gate_proj, "layer.4.gate_up"), w.layers[4].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[4].gate_up_proj_fused, "layer.4.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 5;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].attn_norm, "layer.5.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12377,6 +14981,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -12390,10 +14996,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 5;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(5);
@@ -12415,6 +15042,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 5;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (5 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -12468,6 +15114,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             5 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[5]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -12600,35 +15266,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].mlp_norm, "layer.5.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_5 =
-        w.layers[5].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_5) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[5].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].gate_proj, "layer.5.gate_up"), w.layers[5].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[5].gate_up_proj_fused, "layer.5.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 6;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].attn_norm, "layer.6.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12640,6 +15308,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -12653,10 +15323,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 6;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(6);
@@ -12678,6 +15369,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 6;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (6 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -12731,6 +15441,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             6 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[6]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -12863,35 +15593,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].mlp_norm, "layer.6.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_6 =
-        w.layers[6].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_6) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[6].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].gate_proj, "layer.6.gate_up"), w.layers[6].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[6].gate_up_proj_fused, "layer.6.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 7;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].attn_norm, "layer.7.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -12903,6 +15635,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -12916,10 +15650,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 7;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(7);
@@ -12941,6 +15696,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 7;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (7 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -12994,6 +15768,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             7 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[7]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -13126,35 +15920,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].mlp_norm, "layer.7.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_7 =
-        w.layers[7].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_7) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[7].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].gate_proj, "layer.7.gate_up"), w.layers[7].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[7].gate_up_proj_fused, "layer.7.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 8;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].attn_norm, "layer.8.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13166,6 +15962,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -13179,10 +15977,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 8;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(8);
@@ -13204,6 +16023,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 8;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (8 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -13257,6 +16095,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             8 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[8]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -13389,35 +16247,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].mlp_norm, "layer.8.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_8 =
-        w.layers[8].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_8) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[8].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].gate_proj, "layer.8.gate_up"), w.layers[8].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[8].gate_up_proj_fused, "layer.8.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 9;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].attn_norm, "layer.9.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13429,6 +16289,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -13442,10 +16304,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 9;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(9);
@@ -13467,6 +16350,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 9;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (9 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -13520,6 +16422,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             9 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[9]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -13652,35 +16574,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].mlp_norm, "layer.9.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_9 =
-        w.layers[9].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_9) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[9].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].gate_proj, "layer.9.gate_up"), w.layers[9].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[9].gate_up_proj_fused, "layer.9.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 10;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].attn_norm, "layer.10.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13692,6 +16616,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -13705,10 +16631,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 10;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(10);
@@ -13730,6 +16677,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 10;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (10 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -13783,6 +16749,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             10 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[10]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -13915,35 +16901,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].mlp_norm, "layer.10.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_10 =
-        w.layers[10].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_10) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[10].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].gate_proj, "layer.10.gate_up"), w.layers[10].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[10].gate_up_proj_fused, "layer.10.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 11;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].attn_norm, "layer.11.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -13955,6 +16943,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -13968,10 +16958,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 11;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(11);
@@ -13993,6 +17004,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 11;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (11 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -14046,6 +17076,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             11 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[11]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -14178,35 +17228,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].mlp_norm, "layer.11.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_11 =
-        w.layers[11].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_11) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[11].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].gate_proj, "layer.11.gate_up"), w.layers[11].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[11].gate_up_proj_fused, "layer.11.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 12;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].attn_norm, "layer.12.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -14218,6 +17270,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -14231,10 +17285,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 12;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(12);
@@ -14256,6 +17331,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 12;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (12 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -14309,6 +17403,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             12 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[12]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -14441,35 +17555,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].mlp_norm, "layer.12.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_12 =
-        w.layers[12].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_12) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[12].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].gate_proj, "layer.12.gate_up"), w.layers[12].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[12].gate_up_proj_fused, "layer.12.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 13;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].attn_norm, "layer.13.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -14481,6 +17597,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -14494,10 +17612,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 13;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(13);
@@ -14519,6 +17658,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 13;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (13 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -14572,6 +17730,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             13 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[13]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -14704,35 +17882,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].mlp_norm, "layer.13.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_13 =
-        w.layers[13].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_13) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[13].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].gate_proj, "layer.13.gate_up"), w.layers[13].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[13].gate_up_proj_fused, "layer.13.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 14;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].attn_norm, "layer.14.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -14744,6 +17924,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -14757,10 +17939,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 14;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(14);
@@ -14782,6 +17985,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 14;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (14 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -14835,6 +18057,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             14 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[14]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -14967,35 +18209,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].mlp_norm, "layer.14.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_14 =
-        w.layers[14].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_14) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[14].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].gate_proj, "layer.14.gate_up"), w.layers[14].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[14].gate_up_proj_fused, "layer.14.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 15;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].attn_norm, "layer.15.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -15007,6 +18251,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -15020,10 +18266,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 15;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(15);
@@ -15045,6 +18312,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 15;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (15 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -15098,6 +18384,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             15 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[15]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -15230,35 +18536,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].mlp_norm, "layer.15.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_15 =
-        w.layers[15].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_15) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[15].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].gate_proj, "layer.15.gate_up"), w.layers[15].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[15].gate_up_proj_fused, "layer.15.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 16;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].attn_norm, "layer.16.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -15270,6 +18578,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -15283,10 +18593,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 16;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(16);
@@ -15308,6 +18639,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 16;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (16 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -15361,6 +18711,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             16 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[16]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -15493,35 +18863,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].mlp_norm, "layer.16.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_16 =
-        w.layers[16].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_16) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[16].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].gate_proj, "layer.16.gate_up"), w.layers[16].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[16].gate_up_proj_fused, "layer.16.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 17;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].attn_norm, "layer.17.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -15533,6 +18905,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -15546,10 +18920,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 17;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(17);
@@ -15571,6 +18966,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 17;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (17 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -15624,6 +19038,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             17 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[17]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -15756,35 +19190,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].mlp_norm, "layer.17.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_17 =
-        w.layers[17].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_17) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[17].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].gate_proj, "layer.17.gate_up"), w.layers[17].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[17].gate_up_proj_fused, "layer.17.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 18;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].attn_norm, "layer.18.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -15796,6 +19232,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -15809,10 +19247,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 18;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(18);
@@ -15834,6 +19293,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 18;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (18 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -15887,6 +19365,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             18 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[18]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -16019,35 +19517,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].mlp_norm, "layer.18.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_18 =
-        w.layers[18].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_18) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[18].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].gate_proj, "layer.18.gate_up"), w.layers[18].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[18].gate_up_proj_fused, "layer.18.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 19;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].attn_norm, "layer.19.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -16059,6 +19559,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -16072,10 +19574,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 19;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(19);
@@ -16097,6 +19620,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 19;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (19 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -16150,6 +19692,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             19 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[19]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -16282,35 +19844,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].mlp_norm, "layer.19.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_19 =
-        w.layers[19].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_19) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[19].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].gate_proj, "layer.19.gate_up"), w.layers[19].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[19].gate_up_proj_fused, "layer.19.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 20;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].attn_norm, "layer.20.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -16322,6 +19886,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -16335,10 +19901,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 20;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(20);
@@ -16360,6 +19947,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 20;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (20 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -16413,6 +20019,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             20 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[20]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -16545,35 +20171,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].mlp_norm, "layer.20.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_20 =
-        w.layers[20].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_20) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[20].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].gate_proj, "layer.20.gate_up"), w.layers[20].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[20].gate_up_proj_fused, "layer.20.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 21;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].attn_norm, "layer.21.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -16585,6 +20213,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -16598,10 +20228,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 21;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(21);
@@ -16623,6 +20274,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 21;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (21 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -16676,6 +20346,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             21 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[21]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -16808,35 +20498,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].mlp_norm, "layer.21.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_21 =
-        w.layers[21].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_21) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[21].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].gate_proj, "layer.21.gate_up"), w.layers[21].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[21].gate_up_proj_fused, "layer.21.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 22;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].attn_norm, "layer.22.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -16848,6 +20540,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -16861,10 +20555,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 22;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(22);
@@ -16886,6 +20601,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 22;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (22 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -16939,6 +20673,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             22 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[22]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -17071,35 +20825,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].mlp_norm, "layer.22.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_22 =
-        w.layers[22].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_22) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[22].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].gate_proj, "layer.22.gate_up"), w.layers[22].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[22].gate_up_proj_fused, "layer.22.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 23;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].attn_norm, "layer.23.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -17111,6 +20867,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -17124,10 +20882,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 23;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(23);
@@ -17149,6 +20928,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 23;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (23 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -17202,6 +21000,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             23 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[23]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -17334,35 +21152,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].mlp_norm, "layer.23.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_23 =
-        w.layers[23].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_23) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[23].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].gate_proj, "layer.23.gate_up"), w.layers[23].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[23].gate_up_proj_fused, "layer.23.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 24;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].attn_norm, "layer.24.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -17374,6 +21194,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -17387,10 +21209,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 24;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(24);
@@ -17412,6 +21255,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 24;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (24 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -17465,6 +21327,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             24 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[24]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -17597,35 +21479,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].mlp_norm, "layer.24.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_24 =
-        w.layers[24].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_24) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[24].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].gate_proj, "layer.24.gate_up"), w.layers[24].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].up_proj, "layer.24.gate_up"), w.layers[24].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_24) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[24].gate_up_proj_fused, "layer.24.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 25;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].attn_norm, "layer.25.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -17637,6 +21521,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -17650,10 +21536,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 25;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(25);
@@ -17675,6 +21582,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 25;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (25 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -17728,6 +21654,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             25 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[25]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -17860,35 +21806,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].mlp_norm, "layer.25.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_25 =
-        w.layers[25].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_25) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[25].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].gate_proj, "layer.25.gate_up"), w.layers[25].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].up_proj, "layer.25.gate_up"), w.layers[25].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_25) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[25].gate_up_proj_fused, "layer.25.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 26;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].attn_norm, "layer.26.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -17900,6 +21848,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -17913,10 +21863,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 26;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(26);
@@ -17938,6 +21909,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 26;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (26 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -17991,6 +21981,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             26 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[26]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -18123,35 +22133,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].mlp_norm, "layer.26.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_26 =
-        w.layers[26].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_26) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[26].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].gate_proj, "layer.26.gate_up"), w.layers[26].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].up_proj, "layer.26.gate_up"), w.layers[26].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_26) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[26].gate_up_proj_fused, "layer.26.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 27;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].attn_norm, "layer.27.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -18163,6 +22175,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -18176,10 +22190,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 27;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(27);
@@ -18201,6 +22236,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 27;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (27 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -18254,6 +22308,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             27 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[27]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -18386,35 +22460,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].mlp_norm, "layer.27.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_27 =
-        w.layers[27].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_27) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[27].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].gate_proj, "layer.27.gate_up"), w.layers[27].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].up_proj, "layer.27.gate_up"), w.layers[27].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_27) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[27].gate_up_proj_fused, "layer.27.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 28;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[28].attn_norm, "layer.28.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -18426,6 +22502,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -18439,10 +22517,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 28;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(28);
@@ -18464,6 +22563,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 28;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (28 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -18517,6 +22635,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             28 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[28]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -18649,35 +22787,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[28].mlp_norm, "layer.28.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_28 =
-        w.layers[28].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_28) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[28].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[28].gate_proj, "layer.28.gate_up"), w.layers[28].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[28].up_proj, "layer.28.gate_up"), w.layers[28].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_28) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[28].gate_up_proj_fused, "layer.28.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[28].down_proj, "layer.28.down"), w.layers[28].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 29;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[29].attn_norm, "layer.29.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -18689,6 +22829,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -18702,10 +22844,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 29;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(29);
@@ -18727,6 +22890,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 29;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (29 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -18780,6 +22962,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             29 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[29]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -18912,35 +23114,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[29].mlp_norm, "layer.29.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_29 =
-        w.layers[29].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_29) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[29].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[29].gate_proj, "layer.29.gate_up"), w.layers[29].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[29].up_proj, "layer.29.gate_up"), w.layers[29].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_29) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[29].gate_up_proj_fused, "layer.29.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[29].down_proj, "layer.29.down"), w.layers[29].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 30;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[30].attn_norm, "layer.30.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -18952,6 +23156,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -18965,10 +23171,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 30;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(30);
@@ -18990,6 +23217,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 30;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (30 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -19043,6 +23289,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             30 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[30]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -19175,35 +23441,37 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[30].mlp_norm, "layer.30.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_30 =
-        w.layers[30].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_30) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[30].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[30].gate_proj, "layer.30.gate_up"), w.layers[30].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[30].up_proj, "layer.30.gate_up"), w.layers[30].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_30) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[30].gate_up_proj_fused, "layer.30.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[30].down_proj, "layer.30.down"), w.layers[30].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
+    {
+    const bool depth_tail = depth_k <= 31;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[31].attn_norm, "layer.31.attn_norm")->data(),
         ws.norm_x.data(), N, H, eps, stream);
@@ -19215,6 +23483,8 @@ std::uint32_t declared_full_depth_rows)
         ws.qkv_fused.data(),
         ws.q.data(), ws.k.data(), ws.v.data(),
         N, Hq, Hk, stream);
+    }
+    }
     if (lora != nullptr && lora->usable()) {
         if (lora_staged == nullptr && !lora_state) {
             throw std::runtime_error(
@@ -19228,10 +23498,31 @@ std::uint32_t declared_full_depth_rows)
             ws.q.data(), ws.v.data(), ws.gate.data());
     } else {
     }
+    {
+    const bool depth_tail = depth_k <= 31;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     kernels::launch_rope_bf16(
         ws.q.data(), ws.k.data(), positions,
         N, num_q_heads, num_kv_heads, d,
         cfg.rope_theta, stream);
+    }
+    }
     if (has_write_desc) {
         {
             auto kv_view = cache.layer_view(31);
@@ -19253,6 +23544,25 @@ std::uint32_t declared_full_depth_rows)
                 N, R, stream, row_valid_d, /*first_token=*/0);
         }
     }
+    {
+    const bool depth_tail = depth_k <= 31;
+    int band_j = -1; int band_live = total_tokens;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (31 >= static_cast<int>(plan_state.depth_band_k[j])) {
+                band_live = static_cast<int>(
+                    plan_state.depth_band_rows[j]);
+                band_j = j;
+                break;
+            }
+        }
+        if (band_live == total_tokens) band_j = -1;
+    }
+    (void)band_j;
+    if (depth_banded ? band_live > 0 : (!depth_tail || depth_union)) {
+    const int N = depth_banded ? band_live : (depth_tail ? depth_split : total_tokens);
+    const int R = depth_banded ? band_live : (depth_tail ? depth_split : num_requests);
+    (void)N; (void)R;
     if (custom_mask_d != nullptr) {
         if (hooks != nullptr) {
             attn_page_indices = kv_page_indices;
@@ -19306,6 +23616,26 @@ std::uint32_t declared_full_depth_rows)
                         kv_last_page_lens,
                         attn_ws, stream, /*logits_soft_cap=*/0.f,
                         /*sm_scale_override=*/-1.f);
+                    if (plan_state.mixed_mid_decode_plan &&
+                        plan_state.mixed_mid_start >= 0) {
+                        const int mid_P = plan_state.mixed_mid_start;
+                        const int mid_row =
+                            static_cast<int>(qo_indptr_h[mid_P]);
+                        const int mid_wl =
+                            (!fwd_cfg.per_layer_window_left.empty() &&
+                             31 < static_cast<int>(fwd_cfg.per_layer_window_left.size()))
+                                ? fwd_cfg.per_layer_window_left[31]
+                                : fwd_cfg.sliding_window;
+                        ops::dispatch_attention_flashinfer_decode(
+                            *plan_state.mixed_mid_decode_plan,
+                            bf16_row(ws.q.data(), mid_row, Hq), kv_view,
+                            bf16_row(ws.attn_out.data(), mid_row, Hq),
+                            kv_page_indices,
+                            kv_page_indptr + mid_P,
+                            kv_last_page_lens + mid_P,
+                            attn_ws, stream, mid_wl,
+                            /*logits_soft_cap=*/0.f, /*sm_scale_override=*/-1.f);
+                    }
                 }
             }
             if (!plan_state.mask_decode_plan) {
@@ -19438,35 +23768,18 @@ std::uint32_t declared_full_depth_rows)
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[31].mlp_norm, "layer.31.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_31 =
-        w.layers[31].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_31) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[31].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[31].gate_proj, "layer.31.gate_up"), w.layers[31].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[31].up_proj, "layer.31.gate_up"), w.layers[31].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_31) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[31].gate_up_proj_fused, "layer.31.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[31].down_proj, "layer.31.down"), w.layers[31].down_proj_quant),
         ws.y.data(), N, H, I, 1.f);
+    }
+    }
     // final_norm: deferred into the LmHead epilogue below.
     if (fwd_cfg.emit_logits) {
         // The hand-written epilogue, the interpreter's arm verbatim
@@ -19561,6 +23874,23 @@ std::uint32_t declared_full_depth_rows,
         throw std::runtime_error(
             "depth union (generated): planned split without "
             "a usable prefix plan (gate drift)");
+    }
+    // ④ Act 1 (banded depth): >= 2 distinct-k bands from the
+    // prepare's stamp; per-layer scopes below resolve the
+    // band containing their static layer. Banded fires
+    // derive max_layers FULL, so the union logic stays idle.
+    const int band_count =
+        static_cast<int>(plan_state.depth_band_count);
+    const bool depth_banded = band_count >= 2;
+    if (depth_banded) {
+        for (int j = 0; j < band_count; ++j) {
+            if (plan_state.depth_band_rows[j] > 0 &&
+                !plan_state.depth_band_plans[j]) {
+                throw std::runtime_error(
+                    "depth bands (generated): stamped band "
+                    "without a usable prefix plan");
+            }
+        }
     }
     const int H = cfg.hidden_size;
     const int Hq = cfg.num_attention_heads * cfg.head_dim;
@@ -19683,31 +24013,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].mlp_norm, "layer.0.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_0 =
-        w.layers[0].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_0) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[0].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].gate_proj, "layer.0.gate_up"), w.layers[0].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[0].gate_up_proj_fused, "layer.0.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -19781,31 +24092,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].mlp_norm, "layer.1.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_1 =
-        w.layers[1].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[1].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].gate_proj, "layer.1.gate_up"), w.layers[1].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[1].gate_up_proj_fused, "layer.1.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -19879,31 +24171,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].mlp_norm, "layer.2.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_2 =
-        w.layers[2].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_2) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[2].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].gate_proj, "layer.2.gate_up"), w.layers[2].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[2].gate_up_proj_fused, "layer.2.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -19977,31 +24250,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].mlp_norm, "layer.3.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_3 =
-        w.layers[3].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_3) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[3].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].gate_proj, "layer.3.gate_up"), w.layers[3].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[3].gate_up_proj_fused, "layer.3.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -20075,31 +24329,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].mlp_norm, "layer.4.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_4 =
-        w.layers[4].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_4) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[4].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].gate_proj, "layer.4.gate_up"), w.layers[4].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[4].gate_up_proj_fused, "layer.4.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -20173,31 +24408,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].mlp_norm, "layer.5.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_5 =
-        w.layers[5].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_5) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[5].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].gate_proj, "layer.5.gate_up"), w.layers[5].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[5].gate_up_proj_fused, "layer.5.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -20271,31 +24487,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].mlp_norm, "layer.6.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_6 =
-        w.layers[6].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_6) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[6].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].gate_proj, "layer.6.gate_up"), w.layers[6].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[6].gate_up_proj_fused, "layer.6.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -20369,31 +24566,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].mlp_norm, "layer.7.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_7 =
-        w.layers[7].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_7) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[7].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].gate_proj, "layer.7.gate_up"), w.layers[7].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[7].gate_up_proj_fused, "layer.7.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -20467,31 +24645,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].mlp_norm, "layer.8.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_8 =
-        w.layers[8].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_8) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[8].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].gate_proj, "layer.8.gate_up"), w.layers[8].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[8].gate_up_proj_fused, "layer.8.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -20565,31 +24724,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].mlp_norm, "layer.9.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_9 =
-        w.layers[9].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_9) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[9].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].gate_proj, "layer.9.gate_up"), w.layers[9].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[9].gate_up_proj_fused, "layer.9.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -20663,31 +24803,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].mlp_norm, "layer.10.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_10 =
-        w.layers[10].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_10) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[10].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].gate_proj, "layer.10.gate_up"), w.layers[10].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[10].gate_up_proj_fused, "layer.10.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -20761,31 +24882,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].mlp_norm, "layer.11.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_11 =
-        w.layers[11].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_11) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[11].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].gate_proj, "layer.11.gate_up"), w.layers[11].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[11].gate_up_proj_fused, "layer.11.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -20859,31 +24961,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].mlp_norm, "layer.12.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_12 =
-        w.layers[12].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_12) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[12].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].gate_proj, "layer.12.gate_up"), w.layers[12].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[12].gate_up_proj_fused, "layer.12.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -20957,31 +25040,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].mlp_norm, "layer.13.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_13 =
-        w.layers[13].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_13) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[13].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].gate_proj, "layer.13.gate_up"), w.layers[13].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[13].gate_up_proj_fused, "layer.13.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -21055,31 +25119,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].mlp_norm, "layer.14.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_14 =
-        w.layers[14].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_14) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[14].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].gate_proj, "layer.14.gate_up"), w.layers[14].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[14].gate_up_proj_fused, "layer.14.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -21153,31 +25198,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].mlp_norm, "layer.15.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_15 =
-        w.layers[15].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_15) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[15].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].gate_proj, "layer.15.gate_up"), w.layers[15].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[15].gate_up_proj_fused, "layer.15.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -21251,31 +25277,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].mlp_norm, "layer.16.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_16 =
-        w.layers[16].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_16) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[16].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].gate_proj, "layer.16.gate_up"), w.layers[16].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[16].gate_up_proj_fused, "layer.16.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -21349,31 +25356,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].mlp_norm, "layer.17.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_17 =
-        w.layers[17].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_17) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[17].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].gate_proj, "layer.17.gate_up"), w.layers[17].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[17].gate_up_proj_fused, "layer.17.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -21447,31 +25435,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].mlp_norm, "layer.18.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_18 =
-        w.layers[18].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_18) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[18].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].gate_proj, "layer.18.gate_up"), w.layers[18].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[18].gate_up_proj_fused, "layer.18.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -21545,31 +25514,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].mlp_norm, "layer.19.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_19 =
-        w.layers[19].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_19) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[19].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].gate_proj, "layer.19.gate_up"), w.layers[19].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[19].gate_up_proj_fused, "layer.19.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -21643,31 +25593,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].mlp_norm, "layer.20.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_20 =
-        w.layers[20].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_20) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[20].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].gate_proj, "layer.20.gate_up"), w.layers[20].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[20].gate_up_proj_fused, "layer.20.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -21741,31 +25672,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].mlp_norm, "layer.21.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_21 =
-        w.layers[21].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_21) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[21].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].gate_proj, "layer.21.gate_up"), w.layers[21].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[21].gate_up_proj_fused, "layer.21.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -21839,31 +25751,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].mlp_norm, "layer.22.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_22 =
-        w.layers[22].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_22) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[22].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].gate_proj, "layer.22.gate_up"), w.layers[22].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[22].gate_up_proj_fused, "layer.22.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -21937,31 +25830,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].mlp_norm, "layer.23.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_23 =
-        w.layers[23].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_23) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[23].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].gate_proj, "layer.23.gate_up"), w.layers[23].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[23].gate_up_proj_fused, "layer.23.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -22035,31 +25909,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].mlp_norm, "layer.24.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_24 =
-        w.layers[24].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_24) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[24].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].gate_proj, "layer.24.gate_up"), w.layers[24].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].up_proj, "layer.24.gate_up"), w.layers[24].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_24) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[24].gate_up_proj_fused, "layer.24.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
@@ -22133,31 +25988,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].mlp_norm, "layer.25.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_25 =
-        w.layers[25].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_25) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[25].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].gate_proj, "layer.25.gate_up"), w.layers[25].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].up_proj, "layer.25.gate_up"), w.layers[25].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_25) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[25].gate_up_proj_fused, "layer.25.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
@@ -22231,31 +26067,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].mlp_norm, "layer.26.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_26 =
-        w.layers[26].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_26) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[26].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].gate_proj, "layer.26.gate_up"), w.layers[26].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].up_proj, "layer.26.gate_up"), w.layers[26].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_26) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[26].gate_up_proj_fused, "layer.26.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
@@ -22329,31 +26146,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].mlp_norm, "layer.27.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_27 =
-        w.layers[27].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_27) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[27].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].gate_proj, "layer.27.gate_up"), w.layers[27].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].up_proj, "layer.27.gate_up"), w.layers[27].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_27) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[27].gate_up_proj_fused, "layer.27.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
@@ -22427,31 +26225,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[28].mlp_norm, "layer.28.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_28 =
-        w.layers[28].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_28) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[28].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[28].gate_proj, "layer.28.gate_up"), w.layers[28].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[28].up_proj, "layer.28.gate_up"), w.layers[28].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_28) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[28].gate_up_proj_fused, "layer.28.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[28].down_proj, "layer.28.down"), w.layers[28].down_proj_quant),
@@ -22525,31 +26304,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[29].mlp_norm, "layer.29.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_29 =
-        w.layers[29].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_29) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[29].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[29].gate_proj, "layer.29.gate_up"), w.layers[29].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[29].up_proj, "layer.29.gate_up"), w.layers[29].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_29) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[29].gate_up_proj_fused, "layer.29.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[29].down_proj, "layer.29.down"), w.layers[29].down_proj_quant),
@@ -22623,31 +26383,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[30].mlp_norm, "layer.30.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_30 =
-        w.layers[30].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_30) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[30].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[30].gate_proj, "layer.30.gate_up"), w.layers[30].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[30].up_proj, "layer.30.gate_up"), w.layers[30].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_30) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[30].gate_up_proj_fused, "layer.30.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[30].down_proj, "layer.30.down"), w.layers[30].down_proj_quant),
@@ -22721,31 +26462,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[31].mlp_norm, "layer.31.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_31 =
-        w.layers[31].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_31) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[31].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[31].gate_proj, "layer.31.gate_up"), w.layers[31].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[31].up_proj, "layer.31.gate_up"), w.layers[31].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_31) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[31].gate_up_proj_fused, "layer.31.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[31].down_proj, "layer.31.down"), w.layers[31].down_proj_quant),
@@ -22843,7 +26565,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -22883,31 +26605,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[0].mlp_norm, "layer.0.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_0 =
-        w.layers[0].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_0) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[0].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].gate_proj, "layer.0.gate_up"), w.layers[0].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[0].up_proj, "layer.0.gate_up"), w.layers[0].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_0) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[0].gate_up_proj_fused, "layer.0.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[0].down_proj, "layer.0.down"), w.layers[0].down_proj_quant),
@@ -22966,7 +26669,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -23006,31 +26709,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[1].mlp_norm, "layer.1.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_1 =
-        w.layers[1].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_1) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[1].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].gate_proj, "layer.1.gate_up"), w.layers[1].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[1].up_proj, "layer.1.gate_up"), w.layers[1].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_1) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[1].gate_up_proj_fused, "layer.1.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[1].down_proj, "layer.1.down"), w.layers[1].down_proj_quant),
@@ -23089,7 +26773,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -23129,31 +26813,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[2].mlp_norm, "layer.2.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_2 =
-        w.layers[2].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_2) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[2].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].gate_proj, "layer.2.gate_up"), w.layers[2].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[2].up_proj, "layer.2.gate_up"), w.layers[2].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_2) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[2].gate_up_proj_fused, "layer.2.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[2].down_proj, "layer.2.down"), w.layers[2].down_proj_quant),
@@ -23212,7 +26877,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -23252,31 +26917,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[3].mlp_norm, "layer.3.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_3 =
-        w.layers[3].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_3) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[3].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].gate_proj, "layer.3.gate_up"), w.layers[3].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[3].up_proj, "layer.3.gate_up"), w.layers[3].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_3) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[3].gate_up_proj_fused, "layer.3.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[3].down_proj, "layer.3.down"), w.layers[3].down_proj_quant),
@@ -23335,7 +26981,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -23375,31 +27021,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[4].mlp_norm, "layer.4.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_4 =
-        w.layers[4].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_4) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[4].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].gate_proj, "layer.4.gate_up"), w.layers[4].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[4].up_proj, "layer.4.gate_up"), w.layers[4].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_4) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[4].gate_up_proj_fused, "layer.4.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[4].down_proj, "layer.4.down"), w.layers[4].down_proj_quant),
@@ -23458,7 +27085,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -23498,31 +27125,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[5].mlp_norm, "layer.5.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_5 =
-        w.layers[5].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_5) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[5].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].gate_proj, "layer.5.gate_up"), w.layers[5].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[5].up_proj, "layer.5.gate_up"), w.layers[5].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_5) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[5].gate_up_proj_fused, "layer.5.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[5].down_proj, "layer.5.down"), w.layers[5].down_proj_quant),
@@ -23581,7 +27189,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -23621,31 +27229,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[6].mlp_norm, "layer.6.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_6 =
-        w.layers[6].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_6) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[6].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].gate_proj, "layer.6.gate_up"), w.layers[6].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[6].up_proj, "layer.6.gate_up"), w.layers[6].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_6) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[6].gate_up_proj_fused, "layer.6.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[6].down_proj, "layer.6.down"), w.layers[6].down_proj_quant),
@@ -23704,7 +27293,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -23744,31 +27333,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[7].mlp_norm, "layer.7.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_7 =
-        w.layers[7].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_7) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[7].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].gate_proj, "layer.7.gate_up"), w.layers[7].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[7].up_proj, "layer.7.gate_up"), w.layers[7].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_7) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[7].gate_up_proj_fused, "layer.7.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[7].down_proj, "layer.7.down"), w.layers[7].down_proj_quant),
@@ -23827,7 +27397,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -23867,31 +27437,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[8].mlp_norm, "layer.8.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_8 =
-        w.layers[8].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_8) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[8].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].gate_proj, "layer.8.gate_up"), w.layers[8].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[8].up_proj, "layer.8.gate_up"), w.layers[8].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_8) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[8].gate_up_proj_fused, "layer.8.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[8].down_proj, "layer.8.down"), w.layers[8].down_proj_quant),
@@ -23950,7 +27501,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -23990,31 +27541,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[9].mlp_norm, "layer.9.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_9 =
-        w.layers[9].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_9) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[9].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].gate_proj, "layer.9.gate_up"), w.layers[9].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[9].up_proj, "layer.9.gate_up"), w.layers[9].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_9) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[9].gate_up_proj_fused, "layer.9.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[9].down_proj, "layer.9.down"), w.layers[9].down_proj_quant),
@@ -24073,7 +27605,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -24113,31 +27645,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[10].mlp_norm, "layer.10.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_10 =
-        w.layers[10].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_10) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[10].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].gate_proj, "layer.10.gate_up"), w.layers[10].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[10].up_proj, "layer.10.gate_up"), w.layers[10].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_10) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[10].gate_up_proj_fused, "layer.10.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[10].down_proj, "layer.10.down"), w.layers[10].down_proj_quant),
@@ -24196,7 +27709,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -24236,31 +27749,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[11].mlp_norm, "layer.11.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_11 =
-        w.layers[11].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_11) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[11].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].gate_proj, "layer.11.gate_up"), w.layers[11].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[11].up_proj, "layer.11.gate_up"), w.layers[11].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_11) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[11].gate_up_proj_fused, "layer.11.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[11].down_proj, "layer.11.down"), w.layers[11].down_proj_quant),
@@ -24319,7 +27813,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -24359,31 +27853,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[12].mlp_norm, "layer.12.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_12 =
-        w.layers[12].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_12) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[12].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].gate_proj, "layer.12.gate_up"), w.layers[12].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[12].up_proj, "layer.12.gate_up"), w.layers[12].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_12) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[12].gate_up_proj_fused, "layer.12.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[12].down_proj, "layer.12.down"), w.layers[12].down_proj_quant),
@@ -24442,7 +27917,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -24482,31 +27957,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[13].mlp_norm, "layer.13.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_13 =
-        w.layers[13].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_13) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[13].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].gate_proj, "layer.13.gate_up"), w.layers[13].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[13].up_proj, "layer.13.gate_up"), w.layers[13].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_13) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[13].gate_up_proj_fused, "layer.13.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[13].down_proj, "layer.13.down"), w.layers[13].down_proj_quant),
@@ -24565,7 +28021,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -24605,31 +28061,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[14].mlp_norm, "layer.14.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_14 =
-        w.layers[14].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_14) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[14].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].gate_proj, "layer.14.gate_up"), w.layers[14].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[14].up_proj, "layer.14.gate_up"), w.layers[14].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_14) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[14].gate_up_proj_fused, "layer.14.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[14].down_proj, "layer.14.down"), w.layers[14].down_proj_quant),
@@ -24688,7 +28125,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -24728,31 +28165,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[15].mlp_norm, "layer.15.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_15 =
-        w.layers[15].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_15) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[15].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].gate_proj, "layer.15.gate_up"), w.layers[15].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[15].up_proj, "layer.15.gate_up"), w.layers[15].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_15) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[15].gate_up_proj_fused, "layer.15.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[15].down_proj, "layer.15.down"), w.layers[15].down_proj_quant),
@@ -24811,7 +28229,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -24851,31 +28269,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[16].mlp_norm, "layer.16.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_16 =
-        w.layers[16].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_16) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[16].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].gate_proj, "layer.16.gate_up"), w.layers[16].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[16].up_proj, "layer.16.gate_up"), w.layers[16].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_16) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[16].gate_up_proj_fused, "layer.16.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[16].down_proj, "layer.16.down"), w.layers[16].down_proj_quant),
@@ -24934,7 +28333,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -24974,31 +28373,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[17].mlp_norm, "layer.17.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_17 =
-        w.layers[17].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_17) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[17].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].gate_proj, "layer.17.gate_up"), w.layers[17].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[17].up_proj, "layer.17.gate_up"), w.layers[17].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_17) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[17].gate_up_proj_fused, "layer.17.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[17].down_proj, "layer.17.down"), w.layers[17].down_proj_quant),
@@ -25057,7 +28437,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -25097,31 +28477,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[18].mlp_norm, "layer.18.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_18 =
-        w.layers[18].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_18) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[18].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].gate_proj, "layer.18.gate_up"), w.layers[18].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[18].up_proj, "layer.18.gate_up"), w.layers[18].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_18) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[18].gate_up_proj_fused, "layer.18.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[18].down_proj, "layer.18.down"), w.layers[18].down_proj_quant),
@@ -25180,7 +28541,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -25220,31 +28581,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[19].mlp_norm, "layer.19.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_19 =
-        w.layers[19].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_19) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[19].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].gate_proj, "layer.19.gate_up"), w.layers[19].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[19].up_proj, "layer.19.gate_up"), w.layers[19].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_19) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[19].gate_up_proj_fused, "layer.19.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[19].down_proj, "layer.19.down"), w.layers[19].down_proj_quant),
@@ -25303,7 +28645,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -25343,31 +28685,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[20].mlp_norm, "layer.20.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_20 =
-        w.layers[20].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_20) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[20].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].gate_proj, "layer.20.gate_up"), w.layers[20].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[20].up_proj, "layer.20.gate_up"), w.layers[20].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_20) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[20].gate_up_proj_fused, "layer.20.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[20].down_proj, "layer.20.down"), w.layers[20].down_proj_quant),
@@ -25426,7 +28749,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -25466,31 +28789,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[21].mlp_norm, "layer.21.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_21 =
-        w.layers[21].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_21) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[21].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].gate_proj, "layer.21.gate_up"), w.layers[21].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[21].up_proj, "layer.21.gate_up"), w.layers[21].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_21) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[21].gate_up_proj_fused, "layer.21.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[21].down_proj, "layer.21.down"), w.layers[21].down_proj_quant),
@@ -25549,7 +28853,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -25589,31 +28893,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[22].mlp_norm, "layer.22.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_22 =
-        w.layers[22].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_22) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[22].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].gate_proj, "layer.22.gate_up"), w.layers[22].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[22].up_proj, "layer.22.gate_up"), w.layers[22].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_22) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[22].gate_up_proj_fused, "layer.22.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[22].down_proj, "layer.22.down"), w.layers[22].down_proj_quant),
@@ -25672,7 +28957,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -25712,31 +28997,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[23].mlp_norm, "layer.23.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_23 =
-        w.layers[23].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_23) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[23].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].gate_proj, "layer.23.gate_up"), w.layers[23].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[23].up_proj, "layer.23.gate_up"), w.layers[23].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_23) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[23].gate_up_proj_fused, "layer.23.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[23].down_proj, "layer.23.down"), w.layers[23].down_proj_quant),
@@ -25795,7 +29061,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -25835,31 +29101,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[24].mlp_norm, "layer.24.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_24 =
-        w.layers[24].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_24) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[24].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].gate_proj, "layer.24.gate_up"), w.layers[24].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[24].up_proj, "layer.24.gate_up"), w.layers[24].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_24) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[24].gate_up_proj_fused, "layer.24.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[24].down_proj, "layer.24.down"), w.layers[24].down_proj_quant),
@@ -25918,7 +29165,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -25958,31 +29205,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[25].mlp_norm, "layer.25.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_25 =
-        w.layers[25].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_25) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[25].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].gate_proj, "layer.25.gate_up"), w.layers[25].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[25].up_proj, "layer.25.gate_up"), w.layers[25].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_25) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[25].gate_up_proj_fused, "layer.25.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[25].down_proj, "layer.25.down"), w.layers[25].down_proj_quant),
@@ -26041,7 +29269,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -26081,31 +29309,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[26].mlp_norm, "layer.26.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_26 =
-        w.layers[26].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_26) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[26].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].gate_proj, "layer.26.gate_up"), w.layers[26].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[26].up_proj, "layer.26.gate_up"), w.layers[26].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_26) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[26].gate_up_proj_fused, "layer.26.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[26].down_proj, "layer.26.down"), w.layers[26].down_proj_quant),
@@ -26164,7 +29373,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -26204,31 +29413,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[27].mlp_norm, "layer.27.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_27 =
-        w.layers[27].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_27) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[27].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].gate_proj, "layer.27.gate_up"), w.layers[27].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[27].up_proj, "layer.27.gate_up"), w.layers[27].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_27) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[27].gate_up_proj_fused, "layer.27.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[27].down_proj, "layer.27.down"), w.layers[27].down_proj_quant),
@@ -26287,7 +29477,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -26327,31 +29517,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[28].mlp_norm, "layer.28.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_28 =
-        w.layers[28].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_28) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[28].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[28].gate_proj, "layer.28.gate_up"), w.layers[28].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[28].up_proj, "layer.28.gate_up"), w.layers[28].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_28) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[28].gate_up_proj_fused, "layer.28.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[28].down_proj, "layer.28.down"), w.layers[28].down_proj_quant),
@@ -26410,7 +29581,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -26450,31 +29621,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[29].mlp_norm, "layer.29.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_29 =
-        w.layers[29].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_29) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[29].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[29].gate_proj, "layer.29.gate_up"), w.layers[29].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[29].up_proj, "layer.29.gate_up"), w.layers[29].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_29) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[29].gate_up_proj_fused, "layer.29.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[29].down_proj, "layer.29.down"), w.layers[29].down_proj_quant),
@@ -26533,7 +29685,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -26573,31 +29725,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[30].mlp_norm, "layer.30.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_30 =
-        w.layers[30].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_30) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[30].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[30].gate_proj, "layer.30.gate_up"), w.layers[30].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[30].up_proj, "layer.30.gate_up"), w.layers[30].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_30) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[30].gate_up_proj_fused, "layer.30.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[30].down_proj, "layer.30.down"), w.layers[30].down_proj_quant),
@@ -26656,7 +29789,7 @@ std::uint32_t declared_full_depth_rows,
         }
         page_mask.compact(
             kv_page_indices, kv_page_indptr, kv_last_page_lens,
-            static_cast<std::uint32_t>(R), stream);
+            static_cast<std::uint32_t>(num_requests), stream);
         attn_page_indices = page_mask.page_indices();
         attn_page_indptr = page_mask.page_indptr();
         attn_last_page_lens = page_mask.last_page_lens();
@@ -26696,31 +29829,12 @@ std::uint32_t declared_full_depth_rows,
     kernels::launch_rmsnorm_bf16(
         ws.y.data(), require(w.layers[31].mlp_norm, "layer.31.mlp_norm")->data(),
         ws.norm_y.data(), N, H, eps, stream);
-    const bool gate_up_fused_31 =
-        w.layers[31].gate_up_proj_fused != nullptr && !ws.gate_up_fused.empty();
-    if (gate_up_fused_31) {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            ops::WeightView(*w.layers[31].gate_up_proj_fused),
-            ws.gate_up_fused.data(), N, 2 * I, H);
-    } else {
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[31].gate_proj, "layer.31.gate_up"), w.layers[31].gate_proj_quant),
-            ws.gate.data(), N, I, H);
-        ops::gemm_act_x_w(cublas.handle(),
-            ws.norm_y.data(),
-            make_weight_view(require(w.layers[31].up_proj, "layer.31.gate_up"), w.layers[31].up_proj_quant),
-            ws.up.data(), N, I, H);
-    }
-    if (gate_up_fused_31) {
-        kernels::launch_chunked_swiglu_bf16(
-            ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
-    } else {
-        kernels::launch_swiglu_bf16(
-            ws.gate.data(), ws.up.data(), ws.gate.data(),
-            N * I, stream);
-    }
+    ops::gemm_act_x_w(cublas.handle(),
+        ws.norm_y.data(),
+        ops::WeightView(*require(w.layers[31].gate_up_proj_fused, "layer.31.gate_up")),
+        ws.gate_up_fused.data(), N, 2 * I, H);
+    kernels::launch_chunked_swiglu_bf16(
+        ws.gate_up_fused.data(), ws.gate.data(), N, I, stream);
     ops::gemm_act_x_w(cublas.handle(),
         ws.gate.data(),
         make_weight_view(require(w.layers[31].down_proj, "layer.31.down"), w.layers[31].down_proj_quant),

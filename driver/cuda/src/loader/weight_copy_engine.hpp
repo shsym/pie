@@ -42,6 +42,24 @@ public:
     WeightCopyEngine(const WeightCopyEngine&) = delete;
     WeightCopyEngine& operator=(const WeightCopyEngine&) = delete;
 
+    /// Tune for many small transfers rather than one large load.
+    ///
+    /// Everything this engine does by default trades setup for throughput --
+    /// a pool of copy streams, host reader lanes staging through pinned
+    /// buffers -- and every one of those is amortised over a whole model. A
+    /// page-in moves a few hundred kilobytes, inside a forward pass that is
+    /// blocked on it, so there is nothing to overlap and the setup is the
+    /// cost: a lane per stream to synchronise at each flush, and a thread
+    /// pool dispatch and join to copy from pages that are already mapped.
+    ///
+    /// One stream, straight from the mapping. Must be set before the first
+    /// copy, which is what creates the pool.
+    void prefer_small_transfers() noexcept
+    {
+        stream_limit_ = 1;
+        reader_lanes_ = false;
+    }
+
     // Counter sink for the current load (set to nullptr between loads).
     void set_stats(LoadExecutionStats* stats) noexcept { stats_ = stats; }
 
@@ -76,13 +94,7 @@ public:
 #if PIE_CUDA_WEIGHT_COPY_ENGINE_HAS_CUDA
         if (copy_streams_enabled()) {
             ensure_copy_streams();
-            if (pinned_staging_enabled()) {
-                if (enqueue_pinned_staged_copy(shard_id, file_offset, span_bytes, dst)) {
-                    return;
-                }
-            }
-            cudaStream_t stream = copy_streams_[next_copy_stream_];
-            next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
+            cudaStream_t stream = next_stream();
             if (batched_copies_enabled()) {
                 enqueue_batched_copy(shard_id, file_offset, span_bytes, dst, stream);
             } else {
@@ -135,9 +147,7 @@ public:
     cudaStream_t acquire_stream()
     {
         ensure_copy_streams();
-        cudaStream_t stream = copy_streams_[next_copy_stream_];
-        next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
-        return stream;
+        return next_stream();
     }
 #endif
 
@@ -151,10 +161,17 @@ public:
         PhaseTimer _pt(stats_ != nullptr ? &stats_->phase_transfer_ms
                                          : &transfer_ms_sink_);
         flush_batched_copies();
-        for (auto stream : copy_streams_) {
-            CUDA_CHECK(cudaStreamSynchronize(stream));
+        // Only the streams this flush's copies actually landed on. Syncing an
+        // idle stream is not free -- it is a driver round trip of the same
+        // order as a small copy -- and a plan flushes several times, so a
+        // whole-pool sweep costs stream-count times flush-count round trips
+        // whatever the plan moved. Immaterial when a plan moves a model;
+        // most of a page-in when it moves one expert.
+        for (std::size_t i = 0; i < copy_streams_.size(); ++i) {
+            if (!stream_used_[i]) continue;
+            CUDA_CHECK(cudaStreamSynchronize(copy_streams_[i]));
+            stream_used_[i] = false;
         }
-        release_inflight_pinned_slots();
         if (stats_ != nullptr) {
             ++stats_->copy_stream_flushes;
         }
@@ -165,35 +182,13 @@ public:
 private:
     bool copy_streams_enabled() const
     {
-        return !loader_config::env_truthy("PIE_CUDA_DISABLE_PARALLEL_WEIGHT_COPIES");
-    }
-
-    bool pinned_staging_enabled() const
-    {
-        // Opt-in (default OFF). Measured no-op-to-negative on the real load path:
-        // the bulk of bytes go through BulkExtentWrite -> the staged reader lanes,
-        // which bypass this pinned ring, so it only covers the minority single-
-        // ExtentWrite copies and its slot-busy flushes shrink pipelining depth.
-        // Kept as a knob; see WEIGHT_LOADER_TODO.md A1.1 for the measurement.
-        return loader_config::env_truthy("PIE_CUDA_ENABLE_PINNED_WEIGHT_STAGING");
-    }
-
-    std::uint64_t pinned_staging_min_bytes() const
-    {
-        return loader_config::env_u64("PIE_CUDA_PINNED_WEIGHT_MIN_BYTES",
-                                      loader_config::kPinnedMinBytesDefault);
-    }
-
-    std::uint64_t pinned_staging_pool_bytes() const
-    {
-        const std::uint64_t mb = loader_config::env_u64("PIE_CUDA_PINNED_WEIGHT_POOL_MB", 0);
-        return mb != 0 ? mb * loader_config::kMiB : loader_config::kPinnedPoolBytesDefault;
+        return true;
     }
 
     bool batched_copies_enabled() const
     {
 #if CUDART_VERSION >= 12080
-        return !loader_config::env_truthy("PIE_CUDA_DISABLE_BATCHED_WEIGHT_COPIES");
+        return true;
 #else
         return false;
 #endif
@@ -208,46 +203,31 @@ private:
         cudaStream_t stream = nullptr;
     };
 
-    struct PinnedSlot {
-        void* ptr = nullptr;
-        std::uint64_t capacity = 0;
-        cudaStream_t stream = nullptr;
-        bool busy = false;
-    };
-
-    std::size_t pinned_staging_slot_count() const
-    {
-        std::size_t count = std::max<std::size_t>(copy_streams_.size(), 1);
-        const std::uint64_t slots = loader_config::env_u64("PIE_CUDA_PINNED_WEIGHT_SLOTS", 0);
-        if (slots != 0) {
-            count = std::min<std::size_t>(slots, loader_config::kPinnedSlotsMax);
-        }
-        return count;
-    }
-
     void ensure_copy_streams()
     {
         if (!copy_streams_.empty()) {
             return;
         }
         std::size_t count = loader_config::kCopyStreamsDefault;
-        const std::uint64_t streams = loader_config::env_u64("PIE_CUDA_WEIGHT_COPY_STREAMS", 0);
-        if (streams != 0) {
-            count = std::min<std::size_t>(streams, loader_config::kCopyStreamsMax);
+        if (stream_limit_ != 0) {
+            count = std::min(count, stream_limit_);
         }
         copy_streams_.resize(count);
+        stream_used_.assign(count, false);
         for (auto& stream : copy_streams_) {
             CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
         }
     }
 
-    void ensure_pinned_slots()
+    /// The next stream in the rotation, marked as owing a sync at flush.
+    cudaStream_t next_stream()
     {
-        if (!pinned_slots_.empty()) {
-            return;
-        }
-        pinned_slots_.resize(pinned_staging_slot_count());
+        const std::size_t i = next_copy_stream_;
+        next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
+        stream_used_[i] = true;
+        return copy_streams_[i];
     }
+
 
     void enqueue_batched_copy(std::uint32_t shard_id, std::uint64_t file_offset,
                               std::uint64_t span_bytes, void* dst, cudaStream_t stream)
@@ -261,61 +241,6 @@ private:
         });
     }
 
-    bool enqueue_pinned_staged_copy(std::uint32_t shard_id, std::uint64_t file_offset,
-                                    std::uint64_t span_bytes, void* dst)
-    {
-        const std::uint64_t min_bytes = pinned_staging_min_bytes();
-        if (span_bytes < min_bytes) {
-            return false;
-        }
-        ensure_pinned_slots();
-        const std::uint64_t pool_bytes = pinned_staging_pool_bytes();
-        const std::uint64_t max_slot_bytes =
-            pool_bytes / std::max<std::uint64_t>(pinned_slots_.size(), 1);
-        if (span_bytes > max_slot_bytes) {
-            return false;
-        }
-
-        PinnedSlot& slot = pinned_slots_[next_pinned_slot_];
-        next_pinned_slot_ = (next_pinned_slot_ + 1) % pinned_slots_.size();
-        if (slot.busy) {
-            flush();
-        }
-        if (slot.capacity < span_bytes) {
-            const std::uint64_t next_capacity = next_power_of_two(span_bytes);
-            if (pinned_pool_capacity_bytes_ - slot.capacity + next_capacity > pool_bytes) {
-                return false;
-            }
-            if (slot.ptr != nullptr) {
-                CUDA_CHECK(cudaFreeHost(slot.ptr));
-                pinned_pool_capacity_bytes_ -= slot.capacity;
-                slot.ptr = nullptr;
-                slot.capacity = 0;
-            }
-            CUDA_CHECK(cudaMallocHost(&slot.ptr, static_cast<std::size_t>(next_capacity)));
-            slot.capacity = next_capacity;
-            pinned_pool_capacity_bytes_ += next_capacity;
-        }
-
-        cudaStream_t stream = copy_streams_[next_copy_stream_];
-        next_copy_stream_ = (next_copy_stream_ + 1) % copy_streams_.size();
-        loader_.read_storage_bytes_to_host(shard_id, file_offset, span_bytes, slot.ptr);
-        CUDA_CHECK(cudaMemcpyAsync(
-            dst, slot.ptr, span_bytes, cudaMemcpyHostToDevice, stream));
-        slot.stream = stream;
-        slot.busy = true;
-        ++pending_copy_count_;
-        if (stats_ != nullptr) {
-            ++stats_->h2d_pinned_copy_count;
-            stats_->h2d_pinned_copy_bytes += span_bytes;
-            stats_->max_pending_copies_seen =
-                std::max(stats_->max_pending_copies_seen, pending_copy_count_);
-        }
-        if (pending_copy_count_ >= max_pending_copies_) {
-            flush();
-        }
-        return true;
-    }
 
     // Stage all pending copies (mmap host src -> device) through the shared
     // pinned-pipelined engine, round-robin across reader lanes.
@@ -355,7 +280,7 @@ private:
         if (pending_copies_.empty()) {
             return;
         }
-        if (loader_config::reader_lane_count() > 0) {
+        if (reader_lanes_ && loader_config::reader_lane_count() > 0) {
             parallel_staged_flush();
             pending_copies_.clear();
             return;
@@ -425,38 +350,13 @@ private:
 #endif
     }
 
-    void release_inflight_pinned_slots() noexcept
-    {
-        for (auto& slot : pinned_slots_) {
-            if (slot.busy) {
-                slot.busy = false;
-                slot.stream = nullptr;
-            }
-        }
-    }
 
-    void free_pinned_slots_noexcept() noexcept
-    {
-        for (auto& slot : pinned_slots_) {
-            if (slot.ptr != nullptr) {
-                (void)cudaFreeHost(slot.ptr);
-                slot.ptr = nullptr;
-            }
-            slot.capacity = 0;
-            slot.busy = false;
-            slot.stream = nullptr;
-        }
-        pinned_slots_.clear();
-        pinned_pool_capacity_bytes_ = 0;
-        next_pinned_slot_ = 0;
-    }
 #endif  // PIE_CUDA_WEIGHT_COPY_ENGINE_HAS_CUDA
 
     void destroy_noexcept() noexcept
     {
 #if PIE_CUDA_WEIGHT_COPY_ENGINE_HAS_CUDA
         if (copy_streams_.empty()) {
-            free_pinned_slots_noexcept();
             reader_pool_.reset();
             return;
         }
@@ -468,7 +368,6 @@ private:
                 (void)cudaStreamDestroy(stream);
             }
         }
-        free_pinned_slots_noexcept();
         reader_pool_.reset();
         copy_streams_.clear();
         pending_copy_count_ = 0;
@@ -484,10 +383,12 @@ private:
 #if PIE_CUDA_WEIGHT_COPY_ENGINE_HAS_CUDA
     std::vector<cudaStream_t> copy_streams_;
     std::size_t next_copy_stream_ = 0;
+    /// Which streams have had work queued since the last flush.
+    std::vector<bool> stream_used_;
+    /// 0 means the default pool.
+    std::size_t stream_limit_ = 0;
+    bool reader_lanes_ = true;
     std::vector<PendingCopy> pending_copies_;
-    std::vector<PinnedSlot> pinned_slots_;
-    std::size_t next_pinned_slot_ = 0;
-    std::uint64_t pinned_pool_capacity_bytes_ = 0;
     std::unique_ptr<PinnedLanePool> reader_pool_;
     std::vector<void*> batched_dsts_;
     std::vector<void*> batched_srcs_;

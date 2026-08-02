@@ -28,6 +28,7 @@
 #include <cuda_runtime.h>
 
 #include "ops/attention_workspace.hpp"
+#include "kernels/argmax.hpp"
 #include "kernels/custom_all_reduce.hpp"
 #include "cuda_check.hpp"
 #include "device_buffer.hpp"
@@ -53,12 +54,23 @@ void ForwardFn::attach_model(model::IModel* m) {
             "graph-safe model must gate every KV write on row_valid");
     }
     graph_safe                   = caps.graph_safe;
+    // Diagnostic escape hatch. A capturing stream forbids the event syncs the
+    // in-engine stage profilers need, so the decode path -- the one that
+    // decides throughput -- is the one path that cannot be measured while it
+    // is captured. Dropping capability, rather than replay, keeps the plan
+    // and the executor consistent with each other. Costs throughput; it is
+    // for measurement, not for serving.
+    if (graph_safe && std::getenv("PIE_CUDA_DISABLE_GRAPH_CAPTURE") != nullptr) {
+        graph_safe = false;
+    }
     graph_padding_kv_write_safe  = caps.graph_padding_kv_write_safe;
     supports_compact_logits      = caps.supports_compact_logits;
     supports_small_prefill_graph = caps.supports_small_prefill_graph;
     supports_runtime_window       = caps.supports_runtime_window;
     supports_hook_graph_capture   = caps.supports_hook_graph_capture;
     supports_supergraph           = caps.supports_supergraph;
+    supports_fused_lm_head_argmax = caps.supports_fused_lm_head_argmax;
+    upfront_capture_safe          = caps.upfront_capture_safe;
 }
 
 void ForwardFn::invoke_prepare(AttentionWorkspace& aws,
@@ -123,6 +135,22 @@ std::uint32_t ForwardFn::invoke_graph_layout() {
 
 std::uint32_t ForwardFn::invoke_supergraph_graph_layout() {
     return model ? model->supergraph_graph_layout() : 0u;
+}
+
+bool ForwardFn::invoke_prefill_graph_capturable() const {
+    return model != nullptr && model->prefill_graph_capturable();
+}
+
+// `PIE_PREFILL_GRAPH=1` lets a wave carrying a prefill reach the graph cache
+// instead of falling to the eager path along with all of its decode lanes.
+// Default OFF: this changes which fires are captured, and the campaign's own
+// rule is that a single interleaved series is a hypothesis, not a result.
+bool prefill_graph_enabled() {
+    static const bool value = [] {
+        const char* const env = std::getenv("PIE_PREFILL_GRAPH");
+        return env != nullptr && *env != '\0' && env[0] != '0';
+    }();
+    return value;
 }
 
 namespace {
@@ -209,22 +237,10 @@ class CudaStreamOwner {
         bool active_ = true;
 };
 
-bool step_profile_enabled() {
-    static const bool enabled = [] {
-        const char* v = std::getenv("PIE_STEP_PROFILE");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    }();
-    return enabled;
-}
+constexpr bool step_profile_enabled() { return false; }
 
-std::uint64_t step_profile_limit() {
-    static const std::uint64_t limit = [] {
-        const char* v = std::getenv("PIE_STEP_PROFILE_LIMIT");
-        if (v == nullptr || v[0] == '\0') return std::uint64_t{32};
-        const long parsed = std::strtol(v, nullptr, 10);
-        return parsed > 0 ? static_cast<std::uint64_t>(parsed) : std::uint64_t{0};
-    }();
-    return limit;
+constexpr std::uint64_t step_profile_limit() {
+    return std::uint64_t{32};
 }
 
 std::vector<int> forward_graph_request_lattice(int max_requests) {
@@ -273,6 +289,30 @@ bool step_profile_take() {
     return seq.fetch_add(1, std::memory_order_relaxed) < step_profile_limit();
 }
 
+int logits_argmax_chunk_tokens() {
+    static const int tokens = [] {
+        const char* v = std::getenv("PIE_LOGITS_CHUNK_TOKENS");
+        if (v == nullptr || v[0] == '\0') return 0;
+        const long parsed = std::strtol(v, nullptr, 10);
+        if (parsed <= 0) return 0;
+        // Validated, not clamped. The width itself is a tuning question this
+        // layer refuses to answer, but a value the mechanism cannot express is
+        // a config error, and failing at startup beats capturing a graph with
+        // tens of thousands of slab nodes and appearing to hang.
+        if (parsed > std::numeric_limits<int>::max() ||
+            parsed < static_cast<long>(kernels::kArgmaxAccumSlots)) {
+            throw std::runtime_error(
+                "PIE_LOGITS_CHUNK_TOKENS must be at least " +
+                std::to_string(kernels::kArgmaxAccumSlots) +
+                " (the per-row accumulator width) and fit in an int; a slab "
+                "narrower than that carries more running state than it "
+                "summarises");
+        }
+        return static_cast<int>(parsed);
+    }();
+    return tokens;
+}
+
 cudaGraphExec_t capture_forward_graph_exec(
     BatchEngine& engine,
     const std::uint32_t* qo_indptr_h,
@@ -298,7 +338,8 @@ cudaGraphExec_t capture_forward_graph_exec(
     // NS-3: the spatial split (UINT32_MAX = not a spatial fire). The
     // captured body splits its attention and reads the identity qo from
     // pi.mask_suffix_qo_indptr.
-    std::uint32_t unmasked_prefix_rows)
+    std::uint32_t unmasked_prefix_rows,
+    int logits_argmax_chunk)
 {
     auto& pi = engine.inputs;
 
@@ -365,6 +406,7 @@ cudaGraphExec_t capture_forward_graph_exec(
         fwd_in.is_fresh_d          = pi.is_fresh.data();
         fwd_in.logit_row_indices_d = logit_row_indices_d;
         fwd_in.num_logit_rows      = num_logit_rows;
+        fwd_in.logits_argmax_chunk_tokens = logits_argmax_chunk;
         fwd_in.w_page_d = w_page_d;
         fwd_in.w_off_d = w_off_d;
         fwd_in.row_valid_d = pi.row_valid.data();
@@ -466,6 +508,51 @@ cudaGraphExec_t capture_forward_graph_exec(
             ", node_types:" + histogram + ", pending_before=" +
             cudaGetErrorName(pending) + ")");
     }
+    // PIE_GRAPH_NODE_TRACE: per-capture node census — the discriminating
+    // probe for "does a slow bucket's graph CONTAIN more work or just
+    // slower kernels".
+    static const bool node_trace = [] {
+        const char* v = std::getenv("PIE_GRAPH_NODE_TRACE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    // PIE_GRAPH_DOT_DIR: dump every captured graph's full topology (node
+    // kinds, event edges, kernel names) as DOT — the tool that names which
+    // subsystem's event-record/wait pairs ended up inside a bucket graph.
+    static const char* dot_dir = std::getenv("PIE_GRAPH_DOT_DIR");
+    if (dot_dir != nullptr && dot_dir[0] != '\0') {
+        static std::atomic<int> dot_seq{0};
+        const int seq = dot_seq.fetch_add(1);
+        const std::string path = std::string(dot_dir) + "/graph_R" +
+            std::to_string(R) + "_N" + std::to_string(N) + "_" +
+            std::to_string(seq) + ".dot";
+        cudaGraphDebugDotPrint(graph.get(), path.c_str(),
+                               cudaGraphDebugDotFlagsVerbose);
+        cudaGetLastError();
+    }
+    if (node_trace) {
+        std::size_t nodes = 0;
+        cudaGraphGetNodes(graph.get(), nullptr, &nodes);
+        std::string histogram;
+        std::vector<cudaGraphNode_t> node_list(nodes);
+        if (nodes > 0 &&
+            cudaGraphGetNodes(graph.get(), node_list.data(), &nodes) ==
+                cudaSuccess) {
+            std::map<int, int> by_type;
+            for (cudaGraphNode_t node : node_list) {
+                cudaGraphNodeType type{};
+                if (cudaGraphNodeGetType(node, &type) == cudaSuccess) {
+                    ++by_type[static_cast<int>(type)];
+                }
+            }
+            for (const auto& [type, count] : by_type) {
+                histogram += " t" + std::to_string(type) + "=" +
+                             std::to_string(count);
+            }
+        }
+        std::fprintf(stderr,
+                     "[graph-nodes] N=%d R=%d nodes=%zu%s\n",
+                     N, R, nodes, histogram.c_str());
+    }
     CUDA_CHECK(cudaGraphUpload(exec.get(), nullptr));
     return exec.release();
 }
@@ -499,10 +586,11 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
         return skip_upfront_capture(
             "nemotron_h recurrent state requires first-use capture");
     }
-    const char* disable_upfront = std::getenv("PIE_CUDA_DISABLE_UPFRONT_GRAPHS");
-    if (disable_upfront != nullptr && disable_upfront[0] != '\0' &&
-        disable_upfront[0] != '0') {
-        return skip_upfront_capture("PIE_CUDA_DISABLE_UPFRONT_GRAPHS is set");
+    if (!engine.forward_fn.upfront_capture_safe) {
+        return skip_upfront_capture(
+            "model declares synthetic upfront capture unsafe (plan-free "
+            "force_prefill attention bakes capture-shape launch config); "
+            "buckets capture on first use with real geometry");
     }
     const int max_requests =
         std::min(engine.max_forward_requests, engine.max_workspace_tokens);
@@ -582,9 +670,19 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             });
         const std::uint32_t graph_layout =
             engine.forward_fn.invoke_graph_layout();
+        // The lattice pre-captures the shape the hot path will ask for. Setting
+        // the width is an explicit opt-in, so betting on the fused shape is the
+        // right bet -- but it IS a bet: a deployment that sets the width and
+        // then runs guests whose epilogues are not bare argmaxes gets no useful
+        // lattice at all and pays lazy capture per bucket on the ramp.
+        const int lattice_chunk =
+            engine.tp_comm == nullptr && engine.forward_fn.supports_fused_lm_head_argmax
+                ? logits_argmax_chunk_tokens()
+                : 0;
         const std::uint32_t graph_variant =
             make_graph_variant(/*small_spec=*/false, /*rs_verify=*/false,
                                /*custom_mask=*/false,
+                               /*fused_argmax=*/lattice_chunk > 0,
                                graph_layout);
         const ForwardGraphKey key{R, N, graph_variant};
         if (engine.graph_cache->get(key) != nullptr) continue;
@@ -600,7 +698,12 @@ std::size_t capture_forward_graph_lattice(BatchEngine& engine) {
             /*num_logit_rows=*/0,
             pi.w_page.data(), pi.w_off.data(),
             /*has_write_desc=*/true,
-            /*runtime_window_left=*/-2);
+            /*runtime_window_left=*/-2,
+            /*stage_hooks=*/nullptr,
+            /*use_supergraph=*/false,
+            /*lora=*/nullptr,
+            /*unmasked_prefix_rows=*/0xffffffffu,
+            lattice_chunk);
         engine.graph_cache->put(key, exec);
         ++captured;
         tp_graph_capture_barrier(engine);
@@ -721,9 +824,21 @@ bool forward_graph_replay_eligible(
         !have_custom_mask ||
         (engine.inputs.custom_mask.data() != nullptr &&
          engine.inputs.custom_mask_indptr.data() != nullptr);
+    // A wave is replayable if its geometry is content-independent. Pure decode
+    // always is. A wave carrying a prefill is when the PLANNER says so --
+    // `PrefillPlanCache::graph_capturable`, which is exactly the "FA2 causal
+    // path planned in graph mode" condition and already computed per fire.
+    //
+    // Without the second clause one arriving request costs every decode lane in
+    // the wave its replay: measured 7,290 us of host enqueue on a prefill-
+    // carrying wave against 10 us on a pure-decode wave of the SAME width.
+    const bool geometry_replayable =
+        is_pure_decode ||
+        (prefill_graph_enabled() &&
+         engine.forward_fn.invoke_prefill_graph_capturable());
     return engine.graph_cache != nullptr &&
         engine.forward_fn.graph_safe &&
-        is_pure_decode &&
+        geometry_replayable &&
         mask_pointers_stable &&
         !rs_buffer_write &&
         !rs_buffer_fold &&
@@ -813,7 +928,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         // STRUCTURAL v0 (S-1): truncated fires are eager — the graph
         // exec family is full-depth (the depth peel is the recorded
         // union rung).
-        in.planned_max_layers == 0xffffffffu;
+        in.planned_max_layers == 0xffffffffu &&
+        // ④ Act 1: banded fires are eager (per-band plans + boundary
+        // walk are not in any captured layout).
+        in.depth_band_count == 0;
     const bool use_spatial_mask = spatial_mask_enabled() &&
         in.is_pure_decode && in.have_custom_mask &&
         // AC-2/AC-4: neither lora nor hooks disarm the split — the
@@ -950,6 +1068,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 /*small_spec=*/false,
                 /*rs_verify=*/false,
                 use_supergraph ? false : in.have_custom_mask,
+                /*fused_argmax=*/in.logits_argmax_chunk_tokens > 0,
                 graph_layout,
                 /*has_hooks=*/has_hooks) |
             (use_supergraph ? kGvSupergraph : 0u) |
@@ -1113,7 +1232,8 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
                 in.lora,
                 (use_spatial_mask || use_spatial_mask_mixed)
                     ? in.unmasked_prefix_rows
-                    : 0xffffffffu);
+                    : 0xffffffffu,
+                in.logits_argmax_chunk_tokens);
             if (has_hooks) {
                 // The capture is the one moment the model's per-layer hook
                 // coverage is observable; a body that skipped hooks would
@@ -1310,6 +1430,10 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
         : nullptr;
     fwd_in.rs_buffer_slot_ids_h    = in.rs_buffer_slot_ids_h;
     fwd_in.rs_buffer_slot_indptr_h = in.rs_buffer_slot_indptr_h;
+    fwd_in.rs_buffer_read_slot_ids_h = in.rs_buffer_read_slot_ids_h;
+    fwd_in.rs_buffer_read_indptr_h   = in.rs_buffer_read_indptr_h;
+    fwd_in.rs_buffer_read_lens_h     = in.rs_buffer_read_lens_h;
+    fwd_in.rs_buffer_heads_h         = in.rs_buffer_heads_h;
     fwd_in.rs_fold_lens_h           = in.rs_fold_lens_h;
     fwd_in.rs_fold_lens_d           = in.rs_fold_lens_d;
     fwd_in.rs_buffer_write         = in.rs_buffer_write;
@@ -1319,6 +1443,7 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.num_logit_rows =
         in.compact_logits ? in.num_sampling : 0;
     fwd_in.emit_logits         = in.num_sampling > 0;
+    fwd_in.logits_argmax_chunk_tokens = in.logits_argmax_chunk_tokens;
     // Multimodal: image data for the encode+scatter (no-op if none).
     fwd_in.image_pixels_h            = in.image_pixels_h;
     fwd_in.image_pixel_byte_indptr_h = in.image_pixel_byte_indptr_h;
@@ -1338,6 +1463,9 @@ void run_forward_dispatch(BatchEngine& engine, const ForwardDispatchInputs& in) 
     fwd_in.lora                         = in.lora;
     fwd_in.max_layers                   = in.planned_max_layers;
     fwd_in.full_depth_rows              = in.planned_full_depth_rows;
+    fwd_in.depth_band_k                 = in.depth_band_k;
+    fwd_in.depth_band_rows              = in.depth_band_rows;
+    fwd_in.depth_band_count             = in.depth_band_count;
     if (use_spatial_mask || use_spatial_mask_mixed) {
         // The masked suffix's rebased device CSRs (pure decode: qo is the
         // identity, kv_page_indptr rebases by its page base; every other

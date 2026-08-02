@@ -266,6 +266,18 @@ pub(crate) struct MemberFacts {
     /// row-window precondition, exactly as mask-last was the spatial
     /// fire's.
     pub(crate) truncated: bool,
+    /// V2 rung ④ (banded depth): the truncation's k. Inside the
+    /// truncated block the key orders DEEPEST-FIRST, so at layer l the
+    /// live rows are always a PREFIX of the block — the multi-boundary
+    /// walkers' row-window precondition, exactly as full-depth-first
+    /// was the single-boundary union's. None on untruncated members
+    /// (constant term, no effect on their order).
+    pub(crate) max_layers: Option<u32>,
+    /// NO-DEMOTION: multi-token (prefill-shaped) members sort before
+    /// single-token ones within each block, so a mixed fire's prefix is
+    /// [prefill | plain-decode] and the plain-decode run can take the
+    /// DECODE kernel instead of demoting to the general causal prefill.
+    pub(crate) multi_token: bool,
     /// Device-resolved (chained-decode envelope) geometry: composes as the
     /// ordered suffix sub-batch, never interleaved with wire members.
     pub(crate) device_resolved_geometry: bool,
@@ -340,19 +352,67 @@ pub(crate) fn plan_fire_with_model(members: &[MemberFacts], model_sites: &[Site]
     member_order.sort_by_key(|&index| {
         let member = &members[index];
         (
-            // AC-4 order [plain | truncated | hooked | masked]: the mask
-            // window stays the outermost SUFFIX (its machinery is
-            // end-anchored), hooked lanes sit before it (the unfused
-            // QKV tail is the GENERAL path — masked rows riding it is
-            // correctness-neutral), the truncated middle before that.
+            // ACT 2 step (i) — order [full(plain|hooked) | truncated
+            // deepest-first | masked]: the mask window stays the outermost
+            // SUFFIX (its machinery is end-anchored); DEPTH becomes the
+            // ordered operand ABOVE the hook bit, so every full-depth row
+            // (plain, lora, hooked) precedes every truncated one — the
+            // banded walk's live-prefix invariant now holds fire-wide, not
+            // by accident of lane class. Hooks move EARLY among the
+            // full-depth rows: the peel is position-parametric
+            // (hook_free_prefix_rows re-stamps below) and the fused-QKV
+            // fast_rows shrinkage this costs was priced NIL (playbook,
+            // 2026-08-05: hook delta 0.58ms/step hooks-early vs 1.06
+            // hooks-late, controls subtracted). The old
+            // [plain|trunc|hook|mask] contract lives on only in the
+            // stash server, whose family-2 prefix-marker rule already
+            // tolerates hook blocks at or before t_start.
             member.device_resolved_geometry,
             member.custom_mask,
-            member.hook_program,
             member.truncated,
+            // ④: deepest-first inside the truncated block (banded
+            // depth's prefix invariant); constant for everyone else.
+            std::cmp::Reverse(member.max_layers.unwrap_or(u32::MAX)),
+            member.hook_program,
+            !member.multi_token,
             member.arrival,
         )
     });
 
+    // ACT 2 step (i): the cutover sentinel PROMOTED. Detection served its
+    // purpose (the event fired; the reorder above is its consequence) — the
+    // production check is now the guarantee itself: every window axis's
+    // members must form ONE contiguous run in the final order, because the
+    // window consumers (mask split, hook peel, depth bands/stash) each take
+    // one (start, len). A fragmented axis is the signal that an admitted
+    // combination needs the gather fallback — the trio's last leg — so it
+    // logs loudly (latched) instead of silently fragmenting a window.
+    {
+        let contiguous = |bit: fn(&MemberFacts) -> bool| -> bool {
+            let mut runs = 0;
+            let mut inside = false;
+            for &index in &member_order {
+                let hit = bit(&members[index]);
+                if hit && !inside {
+                    runs += 1;
+                }
+                inside = hit;
+            }
+            runs <= 1
+        };
+        let mask_ok = contiguous(|m| m.custom_mask);
+        let hook_ok = contiguous(|m| m.hook_program);
+        let trunc_ok = contiguous(|m| m.truncated);
+        if !(mask_ok && hook_ok && trunc_ok) {
+            static FIRED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FIRED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[seriation] window axis fragmented under the Act-2 order                      (mask_ok={mask_ok} hook_ok={hook_ok} trunc_ok={trunc_ok},                      order={member_order:?}) — this combination wants the                      gather fallback"
+                );
+            }
+        }
+    }
     let hook_members = members.iter().filter(|m| m.hook_program).count();
     let qkv_postprocess = if hook_members == 0 {
         Site {
@@ -449,6 +509,8 @@ mod tests {
             lora,
             custom_mask: false,
             truncated: false,
+            max_layers: None,
+            multi_token: false,
             device_resolved_geometry,
             arrival,
         }
@@ -460,9 +522,75 @@ mod tests {
             lora: false,
             custom_mask: true,
             truncated: false,
+            max_layers: None,
+            multi_token: false,
             device_resolved_geometry: false,
             arrival,
         }
+    }
+
+    /// V2 rung ④ (banded depth): truncated members order DEEPEST-FIRST
+    /// inside their block, so at any layer l the live rows (k > l) are
+    /// a PREFIX of the block — the multi-boundary walkers' invariant.
+    #[test]
+    fn truncated_members_seriate_deepest_first() {
+        let band = |k: u32, arrival: usize| {
+            let mut m = member(false, false, false, arrival);
+            m.truncated = true;
+            m.max_layers = Some(k);
+            m
+        };
+        let members = [
+            band(8, 0),
+            band(24, 1),
+            band(16, 2),
+            member(false, false, false, 3),
+        ];
+        let plan = plan_fire_with_model(&members, &[]);
+        assert_eq!(
+            plan.member_order,
+            vec![3, 1, 2, 0],
+            "full depth first, then bands deepest-first"
+        );
+    }
+
+    /// ACT 2 step (i): depth outranks the hook bit — a full-depth hooked
+    /// member sorts INTO the full prefix, before every truncated member,
+    /// so the banded walk's live prefix contains the hook rows at every
+    /// layer (tier-1 hook banding's ordering precondition). Within the
+    /// full prefix, hook members still sit after the plain ones (the
+    /// fused-QKV prefix), and the mask suffix is untouched.
+    #[test]
+    fn full_depth_hook_sorts_before_truncated_members() {
+        let band = |k: u32, arrival: usize| {
+            let mut m = member(false, false, false, arrival);
+            m.truncated = true;
+            m.max_layers = Some(k);
+            m
+        };
+        let members = [
+            band(8, 0),
+            member(true, false, false, 1),  // hooked, full depth
+            band(12, 2),
+            member(false, false, false, 3), // plain, full depth
+        ];
+        let plan = plan_fire_with_model(&members, &[]);
+        assert_eq!(
+            plan.member_order,
+            vec![3, 1, 2, 0],
+            "[plain-full, hook-full, k12, k8]"
+        );
+        let masked = [
+            band(8, 0),
+            member(true, false, false, 1),
+            masked_member(2),
+        ];
+        let plan = plan_fire_with_model(&masked, &[]);
+        assert_eq!(
+            plan.member_order,
+            vec![1, 0, 2],
+            "[hook-full, k8, masked] — mask stays the outermost suffix"
+        );
     }
 
     /// NS-1: masked members seriate to the tail of their (geometry, hook)
