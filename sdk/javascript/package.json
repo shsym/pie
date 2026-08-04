@@ -1,0 +1,26 @@
+{
+  "name": "@pie-project/inferlet",
+  "version": "0.4.0",
+  "description": "JavaScript library for writing Pie inferlets",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run src/__tests__",
+    "test:watch": "vitest",
+    "generate-bindings": "jco types ../../runtime/wit -o src/bindings --world-name inferlet"
+  },
+  "devDependencies": {
+    "@bytecodealliance/jco": "^1.15.4",
+    "esbuild": "^0.28.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.0.16"
+  }
+}
