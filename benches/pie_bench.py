@@ -4,10 +4,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 import tomllib
@@ -17,32 +19,41 @@ from typing import Any
 
 from common import (
     ROOT,
+    ArrivalPacer,
     RequestResult,
     add_mode_subcommands,
+    arrival_schedule,
+    hash_output_tokens,
     cuda_profiler_start,
     cuda_profiler_stop,
     finish,
+    gpu_clock_state,
     hf_chat_token_ids_and_counts,
     make_prompts,
     maybe_set_cpu_affinity,
+    request_max_tokens,
+    resolve_local_model,
+    run_timed_warmup,
     summarize,
     visible_cuda_devices,
 )
 
-SERVER_SDK = ROOT / "sdk" / "python-server" / "python"
+SERVER_SDK = ROOT / "sdk" / "server" / "python" / "python"
 if str(SERVER_SDK) not in sys.path:
     sys.path.insert(0, str(SERVER_SDK))
 
 
-BENCH_INFERLET = "text-completion-bench"
 EMBEDDED_CLI_DRIVERS: set[str] = {
-    "cuda_native",
-    "portable",
     "dummy",
+    # Apple Silicon: the Metal driver is linked into the `pie` binary, and
+    # there is no maturin `pie._engine` built for it, so drive the CLI.
+    "metal",
     "vllm",
     "sglang",
     "tensorrt_llm",
 }
+
+
 KV_CACHE_DTYPES = [
     "auto",
     "bf16",
@@ -56,19 +67,71 @@ KV_CACHE_DTYPES = [
 ]
 
 
-def bench_inferlet_paths() -> tuple[Path, Path, str]:
-    inferlet_dir = ROOT / "inferlets" / BENCH_INFERLET
-    wasm = (
-        inferlet_dir / "target" / "wasm32-wasip2" / "release"
-        / "text_completion_bench.wasm"
-    )
+def reconstruct_token_arrivals(
+    first_arrival_s: float,
+    intertoken_us: list[int],
+    output_tokens: int,
+) -> list[float]:
+    arrivals = [first_arrival_s]
+    for gap_us in intertoken_us:
+        arrivals.append(arrivals[-1] + gap_us / 1_000_000.0)
+    if len(arrivals) != output_tokens:
+        raise ValueError(
+            f"token timing count is {len(arrivals)}, expected {output_tokens}"
+        )
+    return arrivals
+
+
+PIE_BENCH_DEFAULT_DEVICE = "cuda:0"
+
+# Metal's driver takes these two unconditionally: its planner has no lattice
+# to collapse, so a value is always wanted. The CUDA driver documents the
+# opposite -- "Omit to let the memory planner choose ... A guess here is worse
+# than absence" (`crates/worker/src/config.rs`) -- so cuda_native forwards them only
+# when the caller moved them off these defaults.
+PIE_MAX_FORWARD_TOKENS_DEFAULT = 10240
+PIE_MAX_FORWARD_REQUESTS_DEFAULT = 512
+
+
+def bench_inferlet_paths(inferlet_dir: str | None) -> tuple[Path, Path, str]:
+    if not inferlet_dir:
+        raise FileNotFoundError(
+            "text-completion-bench is not part of the curated inferlets; pass "
+            "--inferlet-dir or set PIE_BENCH_INFERLET_DIR"
+        )
+    inferlet_dir = Path(inferlet_dir).expanduser().resolve()
     manifest = inferlet_dir / "Pie.toml"
+    pkg = tomllib.loads(manifest.read_text())["package"]
+    # Derive the artifact from the manifest rather than hard-coding
+    # text-completion-bench's (cargo folds dashes to underscores). Without this
+    # the harness can bench exactly ONE inferlet, which is why the
+    # `ptir::run_ahead` change had no way to be measured.
+    rel = Path("target") / "wasm32-wasip2" / "release" / f"{pkg['name'].replace('-', '_')}.wasm"
+    candidates = [inferlet_dir / rel]
+    for parent in inferlet_dir.parents:
+        candidates.append(parent / rel)
+        if (parent / "Cargo.toml").exists() and "[workspace]" in (
+            parent / "Cargo.toml"
+        ).read_text():
+            break
+    wasm = next((c for c in candidates if c.exists()), candidates[0])
     if not wasm.exists():
         raise FileNotFoundError(
             f"missing {wasm}; build with: cd {inferlet_dir} && "
             "cargo build --target wasm32-wasip2 --release"
         )
-    pkg = tomllib.loads(manifest.read_text())["package"]
+    # The wasm is a build OUTPUT with no staleness guard of its own (the engine
+    # guard below covers only driver/interface/runtime/worker/sdk sources), so
+    # an edited inferlet silently benches the previous build. Refuse instead.
+    newest_src = max(
+        (p.stat().st_mtime_ns for p in (inferlet_dir / "src").rglob("*.rs")),
+        default=0,
+    )
+    if newest_src and wasm.stat().st_mtime_ns < newest_src:
+        raise RuntimeError(
+            f"{wasm} is older than {inferlet_dir}/src; rebuild with: "
+            f"cd {inferlet_dir} && cargo build --target wasm32-wasip2 --release"
+        )
     return wasm, manifest, f"{pkg['name']}@{pkg['version']}"
 
 
@@ -78,9 +141,103 @@ def find_free_port() -> int:
         return int(s.getsockname()[1])
 
 
+def embedded_engine_identity() -> dict[str, str]:
+    from pie import _engine
+
+    engine_path = Path(_engine.__file__).resolve()
+    source_suffixes = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".rs"}
+    source_roots = [
+        ROOT / "driver",
+        ROOT / "interface",
+        ROOT / "runtime",
+        ROOT / "worker",
+        ROOT / "sdk" / "server" / "python" / "src",
+    ]
+    # `driver-metal` is only in the dependency list on Apple-Silicon builds
+    # (sdk/server/python/Cargo.toml), so on Linux its sources cannot have gone
+    # into this .so. Counting them makes an origin/dev pull that touched only
+    # the Metal driver look like a stale CUDA engine.
+    skip_roots = () if sys.platform == "darwin" else (ROOT / "driver" / "metal",)
+    # `driver/*/bench` holds standalone microbenchmarks built directly with
+    # nvcc; the engine's CMakeLists builds `tests/`, never `bench/`. Editing
+    # one cannot change the .so, so counting them here only blocks the bench
+    # from running until an unrelated 12-minute rebuild is done.
+    newest_source = max(
+        (
+            path
+            for root in source_roots
+            for path in root.rglob("*")
+            if path.is_file()
+            and path.suffix in source_suffixes
+            # target/ holds generated build artifacts (serde build-script output
+            # under runtime/engine/tests/inferlets/target/, regenerated by
+            # `cargo test`). They are outputs, not inputs: including them makes
+            # the guard fire on a tree that is not stale.
+            and "target" not in path.parts
+            and "bench" not in path.relative_to(root).parts
+            and not any(path.is_relative_to(s) for s in skip_roots)
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+    )
+    if engine_path.stat().st_mtime_ns < newest_source.stat().st_mtime_ns:
+        raise RuntimeError(
+            f"embedded engine {engine_path} is older than {newest_source}; "
+            "rebuild with PIE_COMPILER_LAUNCHER=env CARGO_BUILD_JOBS=2 "
+            "CMAKE_BUILD_PARALLEL_LEVEL=2 uv --project sdk/server/python sync "
+            "--reinstall-package pie-server"
+        )
+    digest = hashlib.sha256()
+    with engine_path.open("rb") as engine:
+        for chunk in iter(lambda: engine.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return {
+        "embedded engine": str(engine_path),
+        "embedded engine sha256": digest.hexdigest(),
+    }
+
+
+def is_cumulative_status_key(key: str) -> bool:
+    suffix = key.rsplit(".", 1)[-1]
+    return (
+        suffix.endswith("_sum")
+        or suffix
+        in {
+            "batch_size_hist",
+            "bypass_hits",
+            "chain_drops",
+            "chain_submits",
+            "cumulative_batch_latency_us",
+            "escape_fires",
+            "readiness_miss",
+            "spec_attempted",
+            "spec_budget_skipped",
+            "spec_dropped_orphan",
+            "spec_hits",
+            "spec_misses",
+            "spec_need_pages",
+            "spec_rule_skipped",
+            "submit_ahead_fires",
+            "total_batches",
+            "total_requests_processed",
+            "total_tokens_processed",
+            "wave_fires",
+        }
+    )
+
+
+def measured_average(
+    status: dict[str, Any],
+    numerator_key: str,
+    denominator: int | float,
+    output_key: str,
+) -> None:
+    numerator = status.get(numerator_key)
+    if isinstance(numerator, (int, float)) and denominator > 0:
+        status[output_key] = numerator / denominator
+
+
 def build_config(args: argparse.Namespace):
     from pie.config import (
-        AuthConfig,
         Config,
         DriverConfig,
         ModelConfig,
@@ -90,12 +247,18 @@ def build_config(args: argparse.Namespace):
         TelemetryConfig,
     )
 
+    # One device per TP rank. Data parallelism is NOT an engine shape — a
+    # worker serves one replica — so `--dp-size` spawns workers (see
+    # `run_data_parallel`) and never widens this list. An explicit
+    # `--device` still wins.
+    if args.device == PIE_BENCH_DEFAULT_DEVICE and args.tp_size > 1:
+        args.device = ",".join(f"cuda:{i}" for i in range(args.tp_size))
     device = [d.strip() for d in args.device.split(",")] if "," in args.device else [args.device]
     driver_options: dict[str, Any]
     if args.driver == "cuda_native":
         driver_options = {
             "gpu_mem_utilization": args.gpu_mem_util,
-            "ready_timeout_s": float(args.server_startup_timeout),
+            "ready_timeout": f"{int(args.server_startup_timeout)}s",
         }
         if args.memory_profile != "auto":
             driver_options["memory_profile"] = args.memory_profile
@@ -105,6 +268,8 @@ def build_config(args: argparse.Namespace):
             driver_options["runtime_quant"] = args.runtime_quant
         if args.mxfp4_moe:
             driver_options["mxfp4_moe"] = args.mxfp4_moe
+        if getattr(args, "stream_routed_experts", False):
+            driver_options["stream_routed_experts"] = True
         if args.mtp_assistant_snapshot_dir:
             driver_options["mtp_assistant_snapshot_dir"] = (
                 args.mtp_assistant_snapshot_dir
@@ -113,13 +278,59 @@ def build_config(args: argparse.Namespace):
             driver_options["mtp_num_drafts"] = args.mtp_num_drafts
         if args.enable_system_speculation:
             driver_options["enable_system_speculation"] = True
-    elif args.driver == "portable":
-        driver_options = {
-            "max_forward_tokens": args.max_forward_tokens,
-            "max_forward_requests": args.max_forward_requests,
-            "total_pages": args.kv_pages,
-            "kv_cache_dtype": args.kv_cache_dtype,
-        }
+        # `gpu_mem_utilization` sizes only the memory planner's *logical* KV
+        # budget; the runtime is free to exceed it, so it cannot create KV
+        # pressure. `max_total_pages` is the one binding cap, and
+        # `swap_pool_size` is what arms the suspend/restore rung (it defaults
+        # to 0, i.e. off). The knob is named `max_total_pages` here and
+        # `total_pages` on Metal because they are not the same quantity: there
+        # the value IS the pool, here it is a ceiling over a number derived
+        # from `gpu_mem_utilization` (crates/worker/src/config.rs).
+        if getattr(args, "total_pages", 0):
+            driver_options["max_total_pages"] = args.total_pages
+        # Pin the forward layout only on explicit request: an unasked-for pin
+        # collapses the planner's lattice to a guess. Needed when the planner
+        # reports "no viable crates/model-compiler/KV layout fits budget", which a large
+        # dense checkpoint can provoke by leaving too little room for the
+        # prefill width the planner would otherwise pick.
+        if args.max_forward_tokens != PIE_MAX_FORWARD_TOKENS_DEFAULT:
+            driver_options["max_forward_tokens"] = args.max_forward_tokens
+        if args.max_forward_requests != PIE_MAX_FORWARD_REQUESTS_DEFAULT:
+            driver_options["max_forward_requests"] = args.max_forward_requests
+        if getattr(args, "swap_pool_size", 0):
+            driver_options["swap_pool_size"] = args.swap_pool_size
+    elif args.driver == "metal":
+        # Apple Silicon. The Metal driver sizes its own heap from the
+        # checkpoint and exposes no memory-fraction knob, so the CUDA-shaped
+        # `gpu_mem_utilization` has nowhere to go; the batching caps are the
+        # only tunables it reads.
+        driver_options = {}
+        # Same key, same name, both backends -- the switch is a residency trade
+        # an operator makes about a model, not a backend detail.
+        if getattr(args, "stream_routed_experts", False):
+            driver_options["stream_routed_experts"] = True
+        # The bounded form of the same trade, and the only one that can admit a
+        # checkpoint bigger than the machine: streaming maps the bank and every
+        # mapped page is wired, so it moves bytes off the heap without capping
+        # them, while a slab caps them and pays a submit-and-wait per layer.
+        if getattr(args, "expert_slab_mb", 0):
+            driver_options["expert_slab_bytes"] = int(args.expert_slab_mb) * 1024 * 1024
+        if getattr(args, "max_forward_tokens", 0):
+            driver_options["max_forward_tokens"] = args.max_forward_tokens
+        if getattr(args, "max_forward_requests", 0):
+            driver_options["max_forward_requests"] = args.max_forward_requests
+        if getattr(args, "total_pages", 0):
+            driver_options["total_pages"] = args.total_pages
+        # `--max-model-len` is the cross-engine context knob (llama.cpp takes
+        # it as `--ctx-size`, vLLM as `max_model_len`), and on every other
+        # engine it means ONE REQUEST's context. The Metal driver's knob is
+        # the whole fleet's ring -- it is one shared linear ring, not a
+        # per-request allocation -- so the fair translation multiplies by the
+        # fleet the client will actually offer. Sending the per-request number
+        # straight through would hand a 16-way run 128 tokens per request and
+        # measure a starved engine against unstarved ones.
+        fleet = max(1, args.concurrency) if args.mode != "latency" else 1
+        driver_options["max_model_len"] = args.max_model_len * fleet
     elif args.driver == "vllm":
         driver_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
@@ -189,27 +400,51 @@ def build_config(args: argparse.Namespace):
     else:
         driver_options = {}
 
-    # Concurrency 0 means "no admission cap" (all submitted inferlets run wasm
-    # immediately; the inference scheduler still caps via max_forward_requests).
+    # Concurrency 0 means "no explicit cap": the engine then defaults its
+    # admission cap to the driver's max_forward_requests (R). Admitting more
+    # than R processes cannot widen a batch (one fire per process per forward),
+    # it only makes batches ragged -- see bootstrap.rs.
     if args.mode == "latency":
         max_concurrent_processes: int | None = 1
     elif args.concurrency == 0:
-        max_concurrent_processes = None  # serializer drops field → unlimited
+        max_concurrent_processes = None  # serializer drops field → engine default
     else:
         max_concurrent_processes = args.concurrency
-    scheduler = args.batch_policy or ("greedy" if args.mode == "latency" else "adaptive")
-    scheduler_kwargs = {
-        "batch_policy": scheduler,
+    # Decouple the engine's admission cap from the client's offered
+    # concurrency. Setting them equal (the default above) means every request
+    # the client holds open is also admitted, so under KV oversubscription the
+    # whole fleet stays resident and thrashes. Overriding lets an experiment
+    # ask what the pool can actually sustain while the OFFERED load is
+    # unchanged -- the client still holds `--concurrency` requests open, they
+    # just queue for a seat.
+    _cap_override = os.environ.get("PIE_BENCH_ADMISSION_CAP")
+    if _cap_override:
+        max_concurrent_processes = int(_cap_override)
+    requested_scheduler_kwargs = {
         "default_token_limit": args.default_token_limit,
         "default_endowment_pages": args.default_endowment_pages,
         "admission_oversubscription_factor": args.admission_oversubscription_factor,
+        # Frame geometry, absent unless asked for. `None` is dropped by the
+        # config serializer, so not passing these is exactly the engine's own
+        # default rather than a second spelling of it.
+        "frame_size": args.frame_size,
+        "frame_submit_depth": args.frame_submit_depth,
+        "frame_dispatch_depth": args.frame_dispatch_depth,
+        "submit_deadline": args.submit_deadline,
     }
-    if (
-        args.speculation_depth is not None
-        and "speculation_depth" in inspect.signature(SchedulerConfig).parameters
-    ):
+    requested_scheduler_kwargs = {
+        k: v for k, v in requested_scheduler_kwargs.items() if v is not None
+    }
+    scheduler_parameters = inspect.signature(SchedulerConfig).parameters
+    scheduler_kwargs = {
+        key: value
+        for key, value in requested_scheduler_kwargs.items()
+        if key in scheduler_parameters
+    }
+    if args.speculation_depth is not None and "speculation_depth" in scheduler_parameters:
         scheduler_kwargs["speculation_depth"] = args.speculation_depth
 
+    resolved_model = resolve_local_model(args.model)
     cfg = Config(
         server=ServerConfig(
             host="127.0.0.1",
@@ -217,43 +452,65 @@ def build_config(args: argparse.Namespace):
             verbose=True,
             max_concurrent_processes=max_concurrent_processes,
         ),
-        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
-            wasm_max_instances=max(4096, (args.num_requests + args.warmup) * 4),
+            # A pooling slot costs ~4 GiB of VIRTUAL address space (wasmtime
+            # reserves a full wasm32 range per memory so it can elide bounds
+            # checks), and Linux gives the process 128 TiB total. So this cap
+            # is bounded at ~32k slots no matter how much RAM the box has.
+            # Sizing it off num_requests blew through that: 12288 requests
+            # asked for 49156 slots = 212 TB and the engine panicked inside
+            # mmap before serving anything.
+            #
+            # The live instance count is bounded by ADMISSION, not by the
+            # total request count -- a process releases its slot when it
+            # exits. pie's spawn pipeline can hold prewarm + bind (2x the
+            # execution limit, double-buffered) + executing at once, so 4x
+            # the admission cap is the true ceiling. `None` means the engine
+            # falls back to max_forward_requests (R), which the 4096 floor
+            # already covers for any R <= 1024.
+            wasm_max_instances=max(4096, (max_concurrent_processes or 0) * 4),
+            # Prepared-but-idle guest slots. The engine's default is 100, which
+            # is below the fleet width every contended cell here runs at, so a
+            # run with request turnover instantiates from cold for most of its
+            # arrivals. Exposed to measure that, not because a default is known
+            # to be wrong.
+            **({"wasm_warm_slots": args.wasm_warm_slots}
+               if getattr(args, "wasm_warm_slots", None) else {}),
+            # Bytes of a guest's linear memory that survive its exit instead of
+            # being decommitted. The engine's default is 0, so every arriving
+            # guest re-faults its whole heap -- and the madvise that frees it
+            # is an address-space operation, i.e. it interrupts every other
+            # thread in this process, scheduler threads included. Exposed to
+            # measure that cost under turnover.
+            **({"wasm_warm_memory_mb": args.wasm_warm_memory_mb}
+               if getattr(args, "wasm_warm_memory_mb", None) is not None else {}),
             **({"worker_threads": args.worker_threads} if args.worker_threads else {}),
         ),
-        models=[
-            ModelConfig(
-                name="default",
-                hf_repo=args.model,
-                scheduler=SchedulerConfig(**scheduler_kwargs),
-                driver=DriverConfig(
-                    type=args.driver,
-                    device=device,
-                    tensor_parallel_size=args.tp_size,
-                    ipc_profile=args.ipc_profile,
-                    spin_budget_us=args.spin_budget_us,
-                    options=driver_options,
-                ),
+        model=ModelConfig(
+            name="default",
+            hf_repo=resolved_model,
+            scheduler=SchedulerConfig(**scheduler_kwargs),
+            driver=DriverConfig(
+                type=args.driver,
+                device=device,
+                tensor_parallel_size=args.tp_size,
+                options=driver_options,
             )
-        ],
+        ),
     )
     config_blob = {
         "driver": args.driver,
-        "scheduler": scheduler,
+        "resolved model": resolved_model,
         **driver_options,
     }
-    if args.token_budget is not None:
-        config_blob["token budget"] = args.token_budget
-    elif args.auto_token_budget:
-        config_blob["token budget"] = args.max_tokens + args.token_budget_prompt_margin
     if args.speculation_depth is not None:
         # Surface for the summary's "spec chain yield" derived stat —
         # yield = hits / (attempted × depth).
         config_blob["speculation depth"] = args.speculation_depth
     if args.warmup_max_tokens is not None:
         config_blob["warmup max tokens"] = args.warmup_max_tokens
+    config_blob["warmup seconds"] = args.warmup_seconds
     return cfg, config_blob
 
 
@@ -262,8 +519,29 @@ async def python_pie_client(args: argparse.Namespace):
     from pie.server import Server
 
     cfg, engine_config = build_config(args)
+    engine_identity = embedded_engine_identity()
+    if url := os.environ.get("PIE_BENCH_SERVER_URL"):
+        # Connect to an externally hosted server (see PIE_BENCH_SERVE_ONLY):
+        # same embedded engine, its own process. vLLM is always benched with
+        # its server in a separate process; this gives pie the same topology
+        # so client-interpreter interference can be isolated and measured.
+        from pie_client import PieClient
+
+        client = PieClient(url)
+        await client.connect()
+        try:
+            yield client, {**engine_config, **engine_identity}
+        finally:
+            await client.close()
+        return
     async with Server(cfg) as server:
-        yield await server.connect(), engine_config
+        if os.environ.get("PIE_BENCH_SERVE_ONLY") == "1":
+            # Host-only mode: boot the server with this invocation's exact
+            # config, announce the URL, and park until killed. A second
+            # invocation with PIE_BENCH_SERVER_URL runs the workload.
+            print(f"PIE_BENCH_SERVER_URL={server.url}", flush=True)
+            await asyncio.Event().wait()
+        yield await server.connect(), {**engine_config, **engine_identity}
 
 
 @asynccontextmanager
@@ -278,23 +556,24 @@ async def cli_pie_client(args: argparse.Namespace):
 
     pie_bin = Path(args.pie_bin)
     if not pie_bin.exists():
+        feature = "driver-metal" if args.driver == "metal" else "driver-cuda"
         raise FileNotFoundError(
-            f"missing {pie_bin}; build with: cargo build -p pie-server --release "
-            "--no-default-features --features driver-cuda"
+            f"missing {pie_bin}; build with: cargo build --release -p pie "
+            f"--no-default-features --features {feature}"
         )
 
     proc = await asyncio.create_subprocess_exec(
         str(pie_bin),
-        "serve",
         "--config",
         str(cfg_path),
+        "serve",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
     startup_lines: list[str] = []
     server_lines: list[str] = startup_lines
     drain_task: asyncio.Task[None] | None = None
-    token: str | None = None
+    server_ready = False
     server_log_file = None
     if server_log_path := os.environ.get("PIE_BENCH_SERVER_LOG"):
         path = Path(server_log_path)
@@ -304,6 +583,7 @@ async def cli_pie_client(args: argparse.Namespace):
     def should_surface_server_line(txt: str) -> bool:
         return (
             txt.startswith("[fire ")
+            or txt.startswith("[pie-fire-timing] ")
             or txt.startswith("[sched-fire ")
             or txt.startswith("[outer-fire ")
             or txt.startswith("[sched-batch ")
@@ -369,16 +649,17 @@ async def cli_pie_client(args: argparse.Namespace):
             if should_surface_server_line(text):
                 sys.stderr.write(text)
                 sys.stderr.flush()
-            marker = "internal token: "
-            if marker in text:
-                token = text.split(marker, 1)[1].strip()
+            # The banner's scheme moved from `ws://` to `gateway://` when the
+            # gateway edge landed; match the phrase, not the scheme.
+            if "Server ready at " in text:
+                server_ready = True
                 break
             if proc.returncode is not None:
                 raise RuntimeError(
                     f"pie serve exited with {proc.returncode}:\n"
                     + "".join(startup_lines[-80:])
                 )
-        if token is None:
+        if not server_ready:
             raise TimeoutError(
                 "timed out waiting for pie serve startup:\n" + "".join(startup_lines[-80:])
             )
@@ -386,7 +667,6 @@ async def cli_pie_client(args: argparse.Namespace):
         drain_task = asyncio.create_task(drain_stdout())
         client = PieClient(f"ws://127.0.0.1:{cfg.server.port}")
         await client.connect()
-        await client.auth_by_token(token)
         try:
             yield client, {**engine_config, "pie_bin": str(pie_bin)}
         finally:
@@ -418,7 +698,8 @@ async def run(args: argparse.Namespace):
 
     # Pin to GPU-local CPUs before the server spawns so the pie serve
     # subprocess inherits the affinity mask (mirrors vllm/sglang benches).
-    cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
+    cpu_affinity = maybe_set_cpu_affinity(
+        args, visible_cuda_devices(args.tp_size, args.dp_size))
 
     n = args.requests if args.mode == "latency" else args.num_requests
     prompts = make_prompts(args, n + args.warmup)
@@ -427,12 +708,16 @@ async def run(args: argparse.Namespace):
         prompt_token_ids, _ = hf_chat_token_ids_and_counts(
             args.model, args.system, prompts
         )
-    wasm, manifest, pkg = bench_inferlet_paths()
+    wasm, manifest, pkg = bench_inferlet_paths(args.inferlet_dir)
 
     async with pie_client(args) as (client, engine_config):
         await client.install_program(wasm, manifest, force_overwrite=True)
 
         first_output_text: list[str | None] = [None]
+        output_token_ids_by_process: dict[str, list[int]] = {}
+        measured_epoch: float | None = None
+        measured_epoch_unix_s: float | None = None
+        measured_epoch_monotonic_ns: int | None = None
 
         def common_input(max_tokens: int | None = None) -> dict[str, Any]:
             return {
@@ -442,7 +727,14 @@ async def run(args: argparse.Namespace):
                 "top_p": args.top_p,
                 "ignore_eos": args.ignore_eos,
                 "wasm_delay_us": args.wasm_delay_us,
-                "return_text": args.dump_first_text,
+                **(
+                    {"run_ahead_frames": args.run_ahead_frames}
+                    if getattr(args, "run_ahead_frames", None)
+                    else {}
+                ),
+                "return_text": args.dump_first_text or args.dump_all_texts,
+                "report_timing": args.report_timing,
+                "report_arrivals": args.report_arrivals,
                 "wait_for_start": args.defer_start,
                 **(
                     {"system_speculation": args.system_speculation}
@@ -452,6 +744,8 @@ async def run(args: argparse.Namespace):
             }
 
         async def launch_one(i: int, *, max_tokens: int | None = None):
+            if max_tokens is None:
+                max_tokens = request_max_tokens(args, i)
             inp = {
                 **common_input(max_tokens),
                 "prompt": prompts[i],
@@ -459,34 +753,130 @@ async def run(args: argparse.Namespace):
             if prompt_token_ids is not None:
                 inp["prompt_tokens"] = prompt_token_ids[i]
             start = time.perf_counter()
+            send_monotonic_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+            client_send_s = (
+                (send_monotonic_ns - measured_epoch_monotonic_ns)
+                / 1_000_000_000.0
+                if measured_epoch_monotonic_ns is not None
+                and (args.report_timing or args.report_arrivals)
+                else None
+            )
             try:
-                token_budget = args.token_budget
-                if token_budget is None and args.auto_token_budget:
-                    budget_tokens = args.max_tokens if max_tokens is None else max_tokens
-                    token_budget = budget_tokens + args.token_budget_prompt_margin
-                proc = await client.launch_process(pkg, input=inp, token_budget=token_budget)
-                return i, start, proc
+                proc = await client.launch_process(pkg, input=inp)
+                return i, start, proc, client_send_s
             except Exception as e:
                 return RequestResult(False, time.perf_counter() - start, 0, error=f"{type(e).__name__}: {e}")
 
         async def wait_one(launched) -> RequestResult:
             if isinstance(launched, RequestResult):
                 return launched
-            i, start, proc = launched
+            i, start, proc, client_send_s = launched
+            ttft_s: float | None = None
+            first_arrival_s: float | None = None
             try:
                 while True:
                     ev, msg = await asyncio.wait_for(
                         proc.recv(), timeout=args.request_timeout
                     )
+                    if ev == Event.Message and str(msg) == "t0":
+                        # Launch-inclusive first-token stamp (see inferlet's
+                        # report_timing contract).
+                        now = time.perf_counter()
+                        now_monotonic_ns = time.clock_gettime_ns(
+                            time.CLOCK_MONOTONIC
+                        )
+                        ttft_s = now - start
+                        first_arrival_s = (
+                            (
+                                now_monotonic_ns
+                                - measured_epoch_monotonic_ns
+                            )
+                            / 1_000_000_000.0
+                            if measured_epoch_monotonic_ns is not None
+                            and (args.report_timing or args.report_arrivals)
+                            else None
+                        )
+                        continue
                     if ev == Event.Return:
+                        returned = time.perf_counter()
+                        returned_monotonic_ns = time.clock_gettime_ns(
+                            time.CLOCK_MONOTONIC
+                        )
                         obj = json.loads(msg)
-                        if i == 0 and first_output_text[0] is None:
+                        if i == args.warmup and first_output_text[0] is None:
                             first_output_text[0] = obj.get("text", "")
+                        output_tokens = int(obj["num_output_tokens"])
+                        token_ids = [int(token) for token in obj.get("token_ids") or []]
+                        if len(token_ids) != output_tokens:
+                            raise ValueError(
+                                f"output token count {len(token_ids)}, expected {output_tokens}"
+                            )
+                        output_token_ids_by_process[str(proc.process_id)] = token_ids
+                        gaps = obj.get("intertoken_us") or []
+                        arrivals = None
+                        arrival_monotonic_ns = [
+                            int(value)
+                            for value in (obj.get("token_monotonic_ns") or [])
+                        ]
+                        if (
+                            measured_epoch_monotonic_ns is not None
+                            and arrival_monotonic_ns
+                            and arrival_monotonic_ns[-1]
+                            < measured_epoch_monotonic_ns
+                        ):
+                            # The guest clock may return measured-epoch-relative
+                            # marks; normalize the persisted field to absolute
+                            # CLOCK_MONOTONIC like the client stamps.
+                            arrival_monotonic_ns = [
+                                measured_epoch_monotonic_ns + value
+                                for value in arrival_monotonic_ns
+                            ]
+                        if measured_epoch_monotonic_ns is not None:
+                            if first_arrival_s is not None:
+                                arrivals = reconstruct_token_arrivals(
+                                    first_arrival_s, gaps, output_tokens
+                                )
+                            elif args.report_arrivals:
+                                if len(arrival_monotonic_ns) != output_tokens:
+                                    raise ValueError(
+                                        "shared-clock token timing count is "
+                                        f"{len(arrival_monotonic_ns)}, "
+                                        f"expected {output_tokens}"
+                                    )
+                                arrivals = [
+                                    (
+                                        int(value)
+                                        - measured_epoch_monotonic_ns
+                                    )
+                                    / 1_000_000_000.0
+                                    for value in arrival_monotonic_ns
+                                ]
                         return RequestResult(
                             True,
-                            time.perf_counter() - start,
-                            int(obj["num_output_tokens"]),
+                            returned - start,
+                            output_tokens,
                             int(obj["num_prompt_tokens"]),
+                            ttft_s=ttft_s,
+                            intertoken_us=gaps or None,
+                            client_send_s=client_send_s,
+                            token_arrival_s=arrivals,
+                            token_arrival_monotonic_ns=(
+                                arrival_monotonic_ns or None
+                            ),
+                            client_return_s=(
+                                (
+                                    returned_monotonic_ns
+                                    - measured_epoch_monotonic_ns
+                                )
+                                / 1_000_000_000.0
+                                if measured_epoch_monotonic_ns is not None
+                                else None
+                            ),
+                            process_id=str(proc.process_id),
+                            prologue_us=obj.get("prologue_us") or None,
+                            output_text=(
+                                obj.get("text", "") if args.dump_all_texts else None
+                            ),
                         )
                     if ev == Event.Error:
                         return RequestResult(False, time.perf_counter() - start, 0, error=str(msg))
@@ -506,13 +896,7 @@ async def run(args: argparse.Namespace):
                 inp["prompt_tokens_batch"] = [prompt_token_ids[i] for i in indices]
             start = time.perf_counter()
             try:
-                token_budget = args.token_budget
-                if token_budget is None and args.auto_token_budget:
-                    budget_tokens = args.max_tokens if max_tokens is None else max_tokens
-                    token_budget = (
-                        budget_tokens + args.token_budget_prompt_margin
-                    ) * max(1, len(indices))
-                proc = await client.launch_process(pkg, input=inp, token_budget=token_budget)
+                proc = await client.launch_process(pkg, input=inp)
                 if args.defer_start:
                     while True:
                         ev, msg = await asyncio.wait_for(
@@ -574,6 +958,12 @@ async def run(args: argparse.Namespace):
                     for _ in indices
                 ]
 
+        pacer = ArrivalPacer(
+            arrival_schedule(
+                n, args.arrival_rate, args.arrival_process, args.arrival_seed
+            )
+        )
+
         async def one(i: int, *, max_tokens: int | None = None) -> RequestResult:
             return await wait_one(await launch_one(i, max_tokens=max_tokens))
 
@@ -590,7 +980,7 @@ async def run(args: argparse.Namespace):
                     if isinstance(item, RequestResult):
                         failed.append(item)
                         continue
-                    i, _start, proc = item
+                    i, _start, proc, _client_send_s = item
                     try:
                         while True:
                             ev, msg = await asyncio.wait_for(
@@ -613,19 +1003,56 @@ async def run(args: argparse.Namespace):
                         )
                 start = time.perf_counter()
                 await asyncio.gather(*(proc.signal("start") for _i, proc in ready))
-                deferred = [(i, start, proc) for i, proc in ready]
+                deferred = [
+                    (
+                        i,
+                        start,
+                        proc,
+                        (
+                            time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+                            - measured_epoch_monotonic_ns
+                        )
+                        / 1_000_000_000.0
+                        if measured_epoch_monotonic_ns is not None
+                        else None,
+                    )
+                    for i, proc in ready
+                ]
                 return failed + await asyncio.gather(
                     *(wait_one(item) for item in deferred)
                 )
             return await asyncio.gather(*(wait_one(item) for item in launched))
 
+        async def many_paced(indices) -> list[RequestResult]:
+            # Open loop: each request is launched at its scheduled offset and
+            # awaited from there, so a request that arrives while the engine
+            # is full pays the queueing delay in its own latency instead of
+            # having its arrival silently deferred.
+            pacer.start()
+
+            async def offer(k: int, i: int) -> RequestResult:
+                await pacer.wait(k)
+                return await one(i)
+
+            return await asyncio.gather(
+                *(offer(k, i) for k, i in enumerate(indices))
+            )
+
         if args.warmup:
             warmup_max_tokens = args.warmup_max_tokens or args.max_tokens
-            if args.mode == "tput":
-                await many(range(args.warmup), max_tokens=warmup_max_tokens)
-            else:
-                for i in range(args.warmup):
-                    await one(i, max_tokens=warmup_max_tokens)
+
+            async def warmup_pass() -> None:
+                if args.mode == "tput":
+                    await many(range(args.warmup), max_tokens=warmup_max_tokens)
+                else:
+                    for i in range(args.warmup):
+                        await one(i, max_tokens=warmup_max_tokens)
+
+            await warmup_pass()
+            # Optional duration-based extension of the warmup (off by
+            # default); see --warmup-seconds.
+            await run_timed_warmup(
+                warmup_pass, args.warmup_seconds, label="pie")
 
         start_idx = args.warmup
         # Snapshot cumulative stats after warmup so the final diff
@@ -637,16 +1064,61 @@ async def run(args: argparse.Namespace):
                 pre_stats = json.loads(body)
         except Exception:
             pass
-        cuda_profiler_start(args.cuda_profiler_capture)
-        start = time.perf_counter()
+        clocks_at_start = gpu_clock_state()
+        print("[pie-bench] measured-start", flush=True)
+        profiler_task = None
+        if (
+            args.cuda_profiler_capture
+            and args.cuda_profiler_duration_s > 0
+        ):
+            async def capture_profiler_window() -> None:
+                await asyncio.sleep(args.cuda_profiler_delay_s)
+                cuda_profiler_start(True)
+                try:
+                    await asyncio.sleep(args.cuda_profiler_duration_s)
+                finally:
+                    cuda_profiler_stop(True)
+
+            profiler_task = asyncio.create_task(capture_profiler_window())
+        else:
+            cuda_profiler_start(args.cuda_profiler_capture)
+        if (
+            args.report_timing
+            or args.report_arrivals
+            or args.report_wall_clock
+        ):
+            measured_epoch_unix_s = time.time()
+            measured_epoch_monotonic_ns = time.clock_gettime_ns(
+                time.CLOCK_MONOTONIC
+            )
+            measured_epoch = time.perf_counter()
+            start = measured_epoch
+        else:
+            start = time.perf_counter()
         try:
             if args.mode == "latency":
                 results = [await one(start_idx + i) for i in range(n)]
+            elif pacer.enabled:
+                results = await many_paced(range(start_idx, start_idx + n))
             else:
                 results = await many(range(start_idx, start_idx + n))
         finally:
             wall = time.perf_counter() - start
-            cuda_profiler_stop(args.cuda_profiler_capture)
+            if profiler_task is None:
+                cuda_profiler_stop(args.cuda_profiler_capture)
+            else:
+                if not profiler_task.done():
+                    profiler_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await profiler_task
+            clocks_at_end = gpu_clock_state()
+            print("[pie-bench] measured-end", flush=True)
+        for result in results:
+            if result.process_id is not None:
+                token_ids = output_token_ids_by_process[result.process_id]
+                result.output_token_sha256 = hash_output_tokens(token_ids)
+                if args.dump_all_token_ids:
+                    result.output_token_ids = token_ids
         if args.mode == "tput" and args.defer_start:
             measured = [r.latency_s for r in results if r.ok]
             if measured:
@@ -665,12 +1137,89 @@ async def run(args: argparse.Namespace):
                 model_status: dict[str, Any] = {}
                 for k, v in model_status_raw.items():
                     pre = pre_stats.get(k)
-                    if isinstance(v, (int, float)) and isinstance(pre, (int, float)):
+                    if (
+                        is_cumulative_status_key(k)
+                        and isinstance(v, (int, float))
+                        and isinstance(pre, (int, float))
+                    ):
                         model_status[k] = v - pre
-                    elif isinstance(v, list) and isinstance(pre, list) and len(v) == len(pre):
+                    elif (
+                        is_cumulative_status_key(k)
+                        and isinstance(v, list)
+                        and isinstance(pre, list)
+                        and len(v) == len(pre)
+                    ):
                         model_status[k] = [a - b for a, b in zip(v, pre)]
                     else:
                         model_status[k] = v
+                measured_batches = model_status.get("default.total_batches", 0)
+                if isinstance(measured_batches, (int, float)):
+                    measured_average(
+                        model_status,
+                        "default.cumulative_batch_latency_us",
+                        measured_batches,
+                        "default.avg_batch_latency_us",
+                    )
+                    for sum_key, average_key in (
+                        ("default.fire.accumulate.accum_loop_us_sum",
+                         "default.fire.accumulate.accum_loop_us"),
+                        ("default.fire.pre_dispatch.fire_prepare_us_sum",
+                         "default.fire.pre_dispatch.fire_prepare_us"),
+                        ("default.fire.execute.total_us_sum",
+                         "default.fire.execute.total_us"),
+                        ("default.fire.execute.batch_build_us_sum",
+                         "default.fire.execute.batch_build_us"),
+                        ("default.fire.execute.driver_fire_us_sum",
+                         "default.fire.execute.driver_fire_us"),
+                        ("default.fire.post_dispatch.context_tick_us_sum",
+                         "default.fire.post_dispatch.context_tick_us"),
+                        ("default.fire.post_dispatch.stats_update_us_sum",
+                         "default.fire.post_dispatch.stats_update_us"),
+                        ("default.fire.quorum.inter_batch_bubble_us_sum",
+                         "default.fire.quorum.inter_batch_bubble_us"),
+                        ("default.fire.quorum.quorum_latency_us_sum",
+                         "default.fire.quorum.quorum_latency_us"),
+                    ):
+                        measured_average(
+                            model_status,
+                            sum_key,
+                            measured_batches,
+                            average_key,
+                        )
+                    pre_batches = pre_stats.get("default.total_batches", 0)
+                    inter_fire_samples = (
+                        measured_batches
+                        if isinstance(pre_batches, (int, float)) and pre_batches > 0
+                        else max(measured_batches - 1, 0)
+                    )
+                    for sum_key, average_key in (
+                        ("default.fire.inter_fire_us_sum",
+                         "default.fire.inter_fire_us"),
+                        ("default.fire.post_dispatch_to_fire_us_sum",
+                         "default.fire.post_dispatch_to_fire_us"),
+                        ("default.fire.recv_block_wait_us_sum",
+                         "default.fire.recv_block_wait_us"),
+                    ):
+                        measured_average(
+                            model_status,
+                            sum_key,
+                            inter_fire_samples,
+                            average_key,
+                        )
+                wave_fires = model_status.get("default.fire.quorum.wave_fires", 0)
+                if isinstance(wave_fires, (int, float)):
+                    measured_average(
+                        model_status,
+                        "default.fire.quorum.wave_active_sum",
+                        wave_fires,
+                        "default.fire.quorum.avg_active_pipelines_at_fire",
+                    )
+                    measured_average(
+                        model_status,
+                        "default.fire.quorum.wave_missing_sum",
+                        wave_fires,
+                        "default.fire.quorum.avg_missing_at_fire",
+                    )
                 for key, label in (
                     ("default.spec_attempted", "spec attempted"),
                     ("default.spec_hits", "spec hits"),
@@ -694,40 +1243,59 @@ async def run(args: argparse.Namespace):
                     ("default.fire.execute.total_us", "fire.execute.total_us"),
                     ("default.fire.execute.batch_build_us", "fire.execute.batch_build_us"),
                     ("default.fire.execute.driver_fire_us", "fire.execute.driver_fire_us"),
-                    ("default.fire.execute.response_dispatch.total_us", "fire.execute.response_dispatch.total_us"),
-                    ("default.fire.execute.response_dispatch.direct_count", "fire.execute.response_dispatch.direct_count"),
-                    ("default.fire.execute.response_dispatch.chain_count", "fire.execute.response_dispatch.chain_count"),
-                    ("default.fire.execute.response_dispatch.chunk_count", "fire.execute.response_dispatch.chunk_count"),
-                    ("default.fire.execute.driver_cuda.ipc_submit_us", "fire.execute.driver_cuda.ipc_submit_us"),
-                    ("default.fire.execute.driver_cuda.gpu_wait_us", "fire.execute.driver_cuda.gpu_wait_us"),
-                    ("default.fire.execute.driver_cuda.ipc_recv_us", "fire.execute.driver_cuda.ipc_recv_us"),
-                    ("default.fire.execute.driver_cuda.wire_parse_us", "fire.execute.driver_cuda.wire_parse_us"),
-                    ("default.fire.execute.driver_cuda.plan_us", "fire.execute.driver_cuda.plan_us"),
-                    ("default.fire.execute.driver_cuda.h2d_us", "fire.execute.driver_cuda.h2d_us"),
-                    ("default.fire.execute.driver_cuda.kernel_launch_us", "fire.execute.driver_cuda.kernel_launch_us"),
-                    ("default.fire.execute.driver_cuda.sync_us", "fire.execute.driver_cuda.sync_us"),
-                    ("default.fire.execute.driver_cuda.response_build_us", "fire.execute.driver_cuda.response_build_us"),
-                    ("default.fire.execute.driver_cuda.sum_sync_us", "fire.execute.driver_cuda.sum_sync_us"),
-                    ("default.fire.execute.driver_cuda.sum_kernel_launch_us", "fire.execute.driver_cuda.sum_kernel_launch_us"),
+                    (
+                        "default.fire.quorum.avg_active_pipelines_at_fire",
+                        "wave avg active pipelines",
+                    ),
+                    (
+                        "default.fire.quorum.avg_missing_at_fire",
+                        "wave avg missing pipelines",
+                    ),
+                    ("default.fire.quorum.wave_fires", "wave fires"),
+                    # Chain engagement: what fraction of boundaries were
+                    # assembled while the device was still working. Present in
+                    # every build, not just profile-fire.
+                    ("default.fire.quorum.seal_events", "seal events"),
+                    ("default.fire.quorum.seal_while_executing",
+                     "seals while executing"),
+                    ("default.fire.quorum.dispatch_blocked_holds",
+                     "sealed-queue blocked holds"),
+                    # Device starvation: idle summed at frame post, when the
+                    # post found nothing executing.
+                    ("default.fire.quorum.device_idle_us", "device idle us"),
+                    ("default.fire.quorum.device_idle_gaps", "device idle gaps"),
+                    ("default.fire.quorum.idle_break_control",
+                     "idle breaks (control holds launches)"),
+                    ("default.fire.quorum.idle_break_depth",
+                     "idle breaks (depth cap)"),
+                    ("default.fire.quorum.idle_park_control_us",
+                     "idle park us (control holds launches)"),
+                    ("default.fire.quorum.idle_park_other_us",
+                     "idle park us (other)"),
+                    ("default.fire.quorum.accept_us", "accept us total"),
+                    ("default.fire.quorum.turnaround_sum_us", "turnaround sum us"),
+                    ("default.fire.quorum.turnaround_max_us", "turnaround max us"),
+                    ("default.fire.quorum.turnaround_n", "turnaround n"),
+                    ("default.fire.quorum.lane_launch_us", "lane launch us"),
+                    ("default.fire.quorum.lane_launch_n", "lane launch n"),
+                    ("default.fire.quorum.lane_prefill_us", "lane prefill us"),
+                    ("default.fire.quorum.lane_prefill_n", "lane prefill n"),
+                    ("default.fire.quorum.lane_control_us", "lane control us"),
+                    ("default.fire.quorum.lane_control_n", "lane control n"),
+                    ("default.fire.quorum.lane_control_max_us", "lane control max us"),
+                    ("default.fire.quorum.accept_calls", "accept calls"),
+                    # Guest bring-up: what a fresh lane costs before it can
+                    # submit anything.
+                    ("default.process.completed", "processes completed"),
+                    ("default.process.avg_admission_wait_us",
+                     "process avg admission wait us"),
+                    ("default.process.avg_instantiate_us",
+                     "process avg instantiate us"),
+                    ("default.process.avg_wasm_run_us",
+                     "process avg wasm run us"),
                     ("default.cumulative_batch_latency_us", "cumulative_batch_latency_us"),
                     ("default.fire.post_dispatch.context_tick_us", "fire.post_dispatch.context_tick_us"),
                     ("default.fire.post_dispatch.stats_update_us", "fire.post_dispatch.stats_update_us"),
-                    (
-                        "default.system_spec_draft_tokens_proposed",
-                        "system spec draft tokens proposed",
-                    ),
-                    (
-                        "default.system_spec_draft_tokens_accepted",
-                        "system spec draft tokens accepted",
-                    ),
-                    (
-                        "default.system_spec_draft_tokens_proposed_per_pos",
-                        "system spec draft tokens proposed per pos",
-                    ),
-                    (
-                        "default.system_spec_draft_tokens_accepted_per_pos",
-                        "system spec draft tokens accepted per pos",
-                    ),
                     ("default.last_batch_latency_us", "last batch latency us"),
                     ("default.bypass_hits", "bypass hits"),
                     ("default.chain_submits", "chain submits"),
@@ -740,6 +1308,14 @@ async def run(args: argparse.Namespace):
                 ):
                     if key in model_status:
                         engine_config[label] = model_status[key]
+                for key, value in model_status.items():
+                    if (
+                        "wave" in key
+                        or "active_pipelines" in key
+                        or "missing_at_fire" in key
+                        or "straggler" in key
+                    ):
+                        engine_config[key] = value
         except Exception:  # noqa: BLE001
             # Stats are advisory — never break a bench on a failed query.
             pass
@@ -766,7 +1342,29 @@ async def run(args: argparse.Namespace):
             "ignore_eos": args.ignore_eos,
             "unique_prompts": args.unique_prompts,
             "cuda profiler capture": args.cuda_profiler_capture,
+            "arrival_rate": args.arrival_rate,
+            "arrival_process": args.arrival_process,
+            **pacer.stats(),
+            **(
+                {
+                    "client timing epoch unix s": measured_epoch_unix_s,
+                    "client timing epoch monotonic ns": (
+                        measured_epoch_monotonic_ns
+                    ),
+                }
+                if (
+                    args.report_timing
+                    or args.report_arrivals
+                    or args.report_wall_clock
+                )
+                else {}
+            ),
             "cpu affinity": cpu_affinity,
+            # Clock state on both edges of the measured window. A run that
+            # started mid-ramp reads far below steady state, so record it
+            # rather than let it silently skew the numbers.
+            "gpu clocks at start": clocks_at_start,
+            "gpu clocks at end": clocks_at_end,
             **engine_config,
         },
     )
@@ -777,9 +1375,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Pie canonical latency/throughput benchmark")
     add_mode_subcommands(p)
     for sp in p._subparsers._group_actions[0].choices.values():
-        sp.add_argument("--device", default="cuda:0")
+        sp.add_argument(
+            "--inferlet-dir",
+            default=os.environ.get("PIE_BENCH_INFERLET_DIR"),
+            help="Path to a built text-completion-bench inferlet project "
+                 "(or set PIE_BENCH_INFERLET_DIR).",
+        )
+        sp.add_argument("--device", default=PIE_BENCH_DEFAULT_DEVICE)
         sp.add_argument("--driver", default="cuda_native",
-                        choices=["cuda_native", "portable", "vllm", "sglang", "tensorrt_llm", "dummy"])
+                        choices=["cuda_native", "metal", "vllm", "sglang", "tensorrt_llm", "dummy"])
         sp.add_argument("--default-token-limit", type=int, default=200_000)
         sp.add_argument("--default-endowment-pages", type=int, default=64)
         sp.add_argument("--admission-oversubscription-factor", type=float, default=4.0)
@@ -787,23 +1391,84 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument(
             "--memory-profile",
             default="auto",
-            choices=["auto", "latency", "balanced", "throughput", "capacity"],
+            choices=["auto", "latency", "throughput"],
         )
-        sp.add_argument("--kv-pages", type=int, default=2048)
+        sp.add_argument(
+            "--kv-pages", type=int, default=2048,
+            help="DEAD for cuda_native: never reaches driver_options, so it "
+                 "silently does nothing. Use --total-pages to cap KV.",
+        )
+        sp.add_argument(
+            "--total-pages",
+            type=int,
+            default=0,
+            help="HARD cap on resident KV pages (cuda_native driver option). "
+                 "0 leaves the driver to derive its own budget. This is the "
+                 "only knob that actually bounds KV residency — --gpu-mem-util "
+                 "sizes the planner's logical budget only.",
+        )
+        sp.add_argument(
+            "--swap-pool-size",
+            type=int,
+            default=0,
+            help="Host-side swap pages (cuda_native driver option). Must be "
+                 ">0 to arm the suspend/restore rung; 0 leaves the residency "
+                 "planner with pool-only reclaim.",
+        )
+        sp.add_argument(
+            "--frame-size", type=int, default=None,
+            help="Waves per frame (pie scheduler `frame_size`). Omit for the "
+                 "engine default (2).",
+        )
+        sp.add_argument(
+            "--frame-submit-depth", type=int, default=None,
+            help="Frames a guest keeps queued in the engine. Omit for the "
+                 "engine default (3). This is the guest running ahead of the "
+                 "engine; too few collapses the pipeline to lockstep.",
+        )
+        sp.add_argument(
+            "--frame-dispatch-depth", type=int, default=None,
+            help="Frames the engine keeps posted to the driver. Omit for the "
+                 "engine default (2). The worker's config notes this is a "
+                 "two-sided trade-off that a fully batched fleet can lose.",
+        )
+        sp.add_argument(
+            "--submit-deadline", default=None,
+            help="How long a wave waits on a straggler lane before sealing "
+                 "without it, with unit (e.g. '50ms'). Omit for the engine "
+                 "default.",
+        )
         sp.add_argument("--kv-cache-dtype", choices=KV_CACHE_DTYPES, default="auto")
-        sp.add_argument("--max-forward-tokens", type=int, default=10240)
-        sp.add_argument("--max-forward-requests", type=int, default=512)
+        sp.add_argument(
+            "--stream-routed-experts",
+            action="store_true",
+            help="Bind a MoE checkpoint's routed experts over the file instead "
+                 "of copying them into the device heap. Both backends take the "
+                 "same `[model].stream_routed_experts` key; what they do with "
+                 "it differs (cuda stages through a cache, Metal demand-faults "
+                 "a page-aligned pack).",
+        )
+        sp.add_argument(
+            "--expert-slab-mb",
+            type=int,
+            default=0,
+            help="Metal only. Cap the routed experts at this many MiB of device "
+                 "memory and page them through a slab, instead of keeping the "
+                 "whole bank resident. 0 leaves the bank resident. This is what "
+                 "runs a checkpoint that does not fit; it is not a faster "
+                 "--stream-routed-experts.",
+        )
+        sp.add_argument("--max-forward-tokens", type=int,
+                        default=PIE_MAX_FORWARD_TOKENS_DEFAULT)
+        sp.add_argument("--max-forward-requests", type=int,
+                        default=PIE_MAX_FORWARD_REQUESTS_DEFAULT)
         sp.add_argument("--runtime-quant", choices=["fp8", "int8"], default=None)
         sp.add_argument(
             "--mxfp4-moe",
             choices=["auto", "routed_dequant", "packed", "bf16", "dequant", "eager_bf16", "native"],
             default=None,
         )
-        sp.add_argument("--portable-n-gpu-layers", type=int, default=-1)
         sp.add_argument("--worker-threads", type=int, default=None)
-        sp.add_argument("--token-budget", type=int, default=None)
-        sp.add_argument("--auto-token-budget", action=argparse.BooleanOptionalAction, default=False)
-        sp.add_argument("--token-budget-prompt-margin", type=int, default=64)
         sp.add_argument(
             "--speculation-depth",
             type=int,
@@ -812,11 +1477,77 @@ def build_parser() -> argparse.ArgumentParser:
                  "0 disables speculation; 1 is piggyback (default). Forwards "
                  "to scheduler.speculation_depth in the generated toml.",
         )
+        # `choices.values()` can yield the same parser under an alias, and
+        # `common.py` registers some of these already; a duplicate
+        # add_argument raises. Guard EACH flag by its own option string --
+        # guarding a block by one member silently drops the rest, which is how
+        # the frame-geometry flags were added and then never appeared.
+        for flag, dest, helptext in (
+            ("--wasm-warm-slots", "wasm_warm_slots",
+             "Prepared-but-idle guest slots kept for fast respawn. "
+             "Default: the engine's (100)."),
+            ("--wasm-warm-memory-mb", "wasm_warm_memory_mb",
+             "MiB of a guest's linear memory kept resident across its exit "
+             "instead of decommitted. Default: the engine's (0)."),
+            ("--frame-size", "frame_size",
+             "Waves per frame (k). Default: the engine's."),
+            ("--frame-submit-depth", "frame_submit_depth",
+             "Frames a guest keeps submitted. Default: the engine's."),
+            ("--frame-dispatch-depth", "frame_dispatch_depth",
+             "Frames the engine keeps posted to the driver. "
+             "Default: the engine's."),
+        ):
+            if not any(flag in a.option_strings for a in sp._actions):
+                sp.add_argument(flag, dest=dest, type=int, default=None,
+                                help=helptext)
+        if not any(
+            "--run-ahead-frames" in a.option_strings for a in sp._actions
+        ):
+            sp.add_argument(
+                "--run-ahead-frames",
+                dest="run_ahead_frames",
+                type=int,
+                default=None,
+                help="Override the inferlet's run-ahead window depth, in "
+                     "frames (forwarded as the bench input's "
+                     "run_ahead_frames; the ring grows to match). "
+                     "Default: the inferlet's own sizing.",
+            )
         sp.add_argument(
             "--dump-first-text",
             action="store_true",
             help="Print the first request's full output text + its sha256 prefix. "
                  "Use to A/B-compare spec vs no-spec runs at temperature=0.",
+        )
+        sp.add_argument(
+            "--dump-all-token-ids",
+            action="store_true",
+            help="Include every measured request's emitted token IDs in JSON output.",
+        )
+        sp.add_argument(
+            "--dump-all-texts",
+            action="store_true",
+            help="Include every measured request's decoded output in JSON output.",
+        )
+        sp.add_argument(
+            "--report-timing",
+            action="store_true",
+            help="Collect per-request TTFT (launch-inclusive, client-stamped on "
+                 "the inferlet's t0 message) and inter-token gap distributions; "
+                 "adds ttft/intertoken summaries to the output.",
+        )
+        sp.add_argument(
+            "--report-arrivals",
+            action="store_true",
+            help="Collect per-token guest-drain timestamps from the shared "
+            "host monotonic clock without sending a live first-token client "
+            "message. Intended for non-perturbing occupancy reconstruction.",
+        )
+        sp.add_argument(
+            "--report-wall-clock",
+            action="store_true",
+            help="Record only the measured wall's shared monotonic epoch; "
+            "adds no per-request or per-token client timing.",
         )
         sp.add_argument(
             "--pretokenized-prompts",
@@ -867,13 +1598,6 @@ def build_parser() -> argparse.ArgumentParser:
                  "runtime drives the auto-drafter only when this is on. Default "
                  "off (latency-regime feature).",
         )
-        sp.add_argument(
-            "--batch-policy",
-            default=None,
-            choices=["adaptive", "eager", "greedy"],
-            help="Override scheduler.batch_policy. Default: greedy (latency) "
-                 "or adaptive (tput).",
-        )
         sp.add_argument("--vllm-attention-backend", default=None)
         sp.add_argument("--vllm-max-num-seqs", type=int, default=None)
         sp.add_argument("--vllm-max-num-batched-tokens", type=int, default=None)
@@ -914,19 +1638,139 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--venv", default=None,
                         help="Path to a Python venv for subprocess drivers (vllm/sglang/tensorrt_llm/dev)")
-        sp.add_argument(
-            "--ipc-profile",
-            default=None,
-            choices=["latency", "balanced", "power"],
-            help="Driver IPC wait profile. latency uses the polling in-process channel.",
-        )
-        sp.add_argument("--spin-budget-us", type=int, default=None)
     return p
+
+
+def run_data_parallel(args):
+    """Fan the request set out over `dp_size` single-replica workers.
+
+    A replica is a worker, not a driver inside one engine, so measuring DP
+    means running that many engines. Each child gets its own slice of the
+    devices through CUDA_VISIBLE_DEVICES and its own server port. Wall
+    clock is the slowest child's own measured window — they run
+    concurrently, so that is the wall the merged request set saw, and it
+    excludes the minutes each spends loading weights.
+
+    This mirrors `vllm_bench.run_data_parallel` exactly, so both engines
+    are measured the same way.
+    """
+    import subprocess
+    import tempfile
+
+    total = args.requests if args.mode == "latency" else args.num_requests
+    per = [total // args.dp_size] * args.dp_size
+    for i in range(total % args.dp_size):
+        per[i] += 1
+
+    rewritten = {"--dp-size", "--json-out", "--requests", "--num-requests",
+                 "--device"}
+    forwarded, skip_next = [], False
+    for token in sys.argv[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in rewritten:
+            skip_next = True
+            continue
+        if any(token.startswith(f"{flag}=") for flag in rewritten):
+            continue
+        forwarded.append(token)
+
+    procs, outs = [], []
+    tmpdir = tempfile.mkdtemp(prefix="pie-dp-")
+    for replica, count in enumerate(per):
+        if count == 0:
+            continue
+        devices = ",".join(
+            str(replica * args.tp_size + i) for i in range(args.tp_size))
+        out = os.path.join(tmpdir, f"replica{replica}.json")
+        outs.append(out)
+        # `forwarded` already carries the mode: it is argv[1].
+        argv = [sys.executable, os.path.abspath(__file__),
+                *forwarded, "--json-out", out]
+        argv += (["--requests", str(count)] if args.mode == "latency"
+                 else ["--num-requests", str(count)])
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": devices}
+        procs.append(subprocess.Popen(argv, env=env))
+    failures = [p.wait() for p in procs]
+    if any(rc != 0 for rc in failures):
+        raise RuntimeError(f"pie data-parallel replica failed: {failures}")
+
+    merged: list = []
+    wall = 0.0
+    for path in outs:
+        with open(path) as fh:
+            payload = json.load(fh)
+        wall = max(wall, float(payload["summary"]["wall_s"]))
+        for record in payload["requests"]:
+            merged.append(RequestResult(**record))
+    summary = summarize(
+        mode=args.mode,
+        engine="pie",
+        model=args.model,
+        results=merged,
+        wall_s=wall,
+        config={
+            "data_parallel_size": args.dp_size,
+            "tensor_parallel_size": args.tp_size,
+            "dp_replica_requests": per,
+            "max_tokens": args.max_tokens,
+        },
+    )
+    return summary, merged
+
+
+def refuse_if_a_wedged_pie_is_still_dying() -> None:
+    """Abort rather than launch alongside a `pie` the kernel cannot reap.
+
+    When the Metal driver gives up waiting on an event it abandons the
+    context, because the command buffers may still be executing and
+    releasing their heaps would be unsafe. The process then blocks in the
+    kernel on GPU work forever: it shows up in state `?E`, RSS 0,
+    reparented to launchd, and `kill -9` will not touch it. Its memory is
+    never returned.
+
+    That makes a retry actively harmful. The dead run still holds its
+    share of a unified-memory machine, so the next run starts with less
+    than the last one, wedges sooner, and leaves a second corpse. Three
+    attempts can take a 48 GB box down to single-digit gigabytes. Free
+    memory reads healthy right up until it doesn't, because the pages a
+    wedged context holds are not accounted to any live process.
+
+    So we do not wait, and we do not retry — neither can work. We say
+    what is wrong and that only a reboot fixes it.
+    """
+    if sys.platform != "darwin":
+        return
+    if os.environ.get("PIE_BENCH_ALLOW_WEDGED") == "1":
+        # The driver now refuses on host memory too, so a run on a wedged box
+        # ends in a sentence rather than a hang. This exists to exercise that
+        # refusal, which is otherwise only reachable on a machine already in
+        # the state we are trying to prevent.
+        return
+    try:
+        out = subprocess.run(["ps", "-eo", "pid,stat,comm"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return
+    wedged = [line.split()[0] for line in out.splitlines()[1:]
+              if "(pie)" in line and "E" in line.split()[1]]
+    if wedged:
+        raise SystemExit(
+            f"pie_bench: refusing to start — {len(wedged)} wedged pie "
+            f"process(es) still hold GPU memory: {', '.join(wedged)}.\n"
+            "They are blocked in the kernel awaiting GPU work and cannot be "
+            "killed; their memory is unreclaimable. Retrying will only add "
+            "another. Reboot the machine.")
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    summary, results = asyncio.run(run(args))
+    refuse_if_a_wedged_pie_is_still_dying()
+    if args.dp_size > 1:
+        summary, results = run_data_parallel(args)
+    else:
+        summary, results = asyncio.run(run(args))
     finish(summary, results, args.json_out)
 
 

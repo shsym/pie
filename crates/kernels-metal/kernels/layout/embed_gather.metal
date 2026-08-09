@@ -1,0 +1,168 @@
+// Raw-Metal port of the tied-quantized embedding gather for Phase-0 decode.
+//
+// Source semantics: weights.hpp apply_embedding (quantized path) ==
+//   take(weight, id, axis0) + take(scales/biases) + dequantize(gs, bits).
+// qwen3.6 uses a TIED 4-bit lm_head as the embed table (dense embed dropped for
+// true-4-bit parity): gather + affine-dequant ONE row [hidden] for the token.
+// Port notes (M=1 decode, group_size=64, bits=4, hidden=1024):
+//   * token_id IS the per-token IO scalar -> read from a *buffer* (id[0]) per
+//     decode_abi I1, never setBytes.
+//   * Same affine packing as qmv: 32/bits codes per uint32, per-group scale+bias.
+//   * One thread per output channel k -> out[k] = scale[g]*nibble_k + bias[g].
+//   * Output goes to the resident hidden slot (logits path is the separate qmv).
+// Launch: dispatchThreads grid=(hidden, 1, 1). bfloat native on Metal 4.
+
+#include <metal_stdlib>
+using namespace metal;
+
+// One row of a quantized table, at either width mlx_lm ships. The `bits`
+// template parameter used to be decorative -- the body divided by 8 and masked
+// a nibble -- so an 8-bit table would have been gathered as if it were 4-bit,
+// which is exactly the class of error that produces a fluent wrong answer.
+template <int bits>
+inline uint dequant_code(const device uint32_t* row, int k) {
+  constexpr int per_word = 32 / bits;
+  constexpr uint mask = (1u << bits) - 1u;
+  return (row[k / per_word] >> ((k % per_word) * bits)) & mask;
+}
+
+template <typename T, int group_size, int bits, bool SCALED>
+METAL_FUNC void embed_gather_body(
+    const device uint32_t* w, const device T* scales, const device T* biases,
+    device T* out, int hidden, int row, int k, size_t out_at,
+    float embed_scale) {
+  if (k >= hidden) return;
+  const int packs_per_row = hidden / (32 / bits);
+  const int groups_per_row = hidden / group_size;
+  const int g = k / group_size;
+  const uint code = dequant_code<bits>(w + row * packs_per_row, k);
+  const float s = float(scales[row * groups_per_row + g]);
+  const float b = float(biases[row * groups_per_row + g]);
+  const float value = s * float(code) + b;
+  out[out_at] = static_cast<T>(SCALED ? value * embed_scale : value);
+}
+
+template <typename T, int group_size, int bits>
+[[kernel]] void embed_gather_4bit(
+    const device uint32_t* w   [[buffer(0)]],  // [vocab, hidden/8] packed
+    const device T* scales     [[buffer(1)]],  // [vocab, hidden/group_size]
+    const device T* biases     [[buffer(2)]],  // [vocab, hidden/group_size]
+    const device int* id       [[buffer(3)]],  // IO scalar (I1): id[0] = token
+    device T* out              [[buffer(4)]],  // [hidden]
+    const constant int& hidden [[buffer(5)]],
+    uint k [[thread_position_in_grid]]) {
+  embed_gather_body<T, group_size, bits, false>(
+      w, scales, biases, out, hidden, id[0], int(k), size_t(k), 1.0f);
+}
+
+#define instantiate_embed(name, itype, gs, b)                        \
+  template [[host_name("embed_gather_4bit_" #name "_gs_" #gs "_b_" #b)]] \
+  [[kernel]] void embed_gather_4bit<itype, gs, b>(                   \
+      const device uint32_t*, const device itype*, const device itype*, \
+      const device int*, device itype*, const constant int&, uint);
+
+instantiate_embed(bfloat16, bfloat, 64, 4)
+instantiate_embed(bfloat16, bfloat, 32, 4)
+instantiate_embed(bfloat16, bfloat, 128, 4)
+instantiate_embed(bfloat16, bfloat, 64, 8)
+instantiate_embed(bfloat16, bfloat, 32, 8)
+instantiate_embed(bfloat16, bfloat, 128, 8)
+
+// ── Scaled variant (gemma4): out[k] = embed_scale * dequant(row, k). ─────────────
+// gemma4 multiplies the gathered embedding by a constant (embed_tokens: sqrt(hidden);
+// embed_tokens_per_layer: sqrt(per_layer_emb_dim)). Same tied 4-bit table as the
+// unscaled gather + lm_head — the scale must NOT be folded into the shared weights
+// (lm_head reuses them), so it is applied here on the embed path only. Extra buffer 6
+// = const float scale; qwen's `embed_gather_4bit` (no buffer 6) is untouched.
+template <typename T, int group_size, int bits>
+[[kernel]] void embed_gather_scaled_4bit(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device int* id       [[buffer(3)]],
+    device T* out              [[buffer(4)]],
+    const constant int& hidden [[buffer(5)]],
+    const constant float& embed_scale [[buffer(6)]],
+    uint k [[thread_position_in_grid]]) {
+  embed_gather_body<T, group_size, bits, true>(
+      w, scales, biases, out, hidden, id[0], int(k), size_t(k), embed_scale);
+}
+
+#define instantiate_embed_scaled(name, itype, gs, b)                            \
+  template [[host_name("embed_gather_scaled_4bit_" #name "_gs_" #gs "_b_" #b)]] \
+  [[kernel]] void embed_gather_scaled_4bit<itype, gs, b>(                       \
+      const device uint32_t*, const device itype*, const device itype*,         \
+      const device int*, device itype*, const constant int&,                    \
+      const constant float&, uint);
+
+instantiate_embed_scaled(bfloat16, bfloat, 64, 4)
+instantiate_embed_scaled(bfloat16, bfloat, 32, 4)
+instantiate_embed_scaled(bfloat16, bfloat, 128, 4)
+instantiate_embed_scaled(bfloat16, bfloat, 64, 8)
+instantiate_embed_scaled(bfloat16, bfloat, 32, 8)
+instantiate_embed_scaled(bfloat16, bfloat, 128, 8)
+
+// ── M>1 batched gather (multi-batch lane). ───────────────────────────────────
+// One thread per (channel k, token row m); token m gathers row id[m] (per-row IO
+// read — the M>1 relaxation of the sealed id[0]). out is token-major [N, hidden].
+// Reduces to embed_gather_4bit at N=1 (m=0, id[0]). Launch grid=(hidden, N, 1).
+template <typename T, int group_size, int bits>
+[[kernel]] void embed_gather_mb_4bit(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device int* id       [[buffer(3)]],  // [N] per-token ids
+    device T* out              [[buffer(4)]],  // [N, hidden]
+    const constant int& hidden [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const int k = int(gid.x);
+  const int m = int(gid.y);
+  embed_gather_body<T, group_size, bits, false>(
+      w, scales, biases, out, hidden, id[m], k,
+      size_t(m) * size_t(hidden) + size_t(k), 1.0f);
+}
+
+#define instantiate_embed_mb(name, itype, gs, b)                            \
+  template [[host_name("embed_gather_mb_4bit_" #name "_gs_" #gs "_b_" #b)]]  \
+  [[kernel]] void embed_gather_mb_4bit<itype, gs, b>(                       \
+      const device uint32_t*, const device itype*, const device itype*,     \
+      const device int*, device itype*, const constant int&, uint2);
+
+instantiate_embed_mb(bfloat16, bfloat, 64, 4)
+instantiate_embed_mb(bfloat16, bfloat, 32, 4)
+instantiate_embed_mb(bfloat16, bfloat, 128, 4)
+instantiate_embed_mb(bfloat16, bfloat, 64, 8)
+instantiate_embed_mb(bfloat16, bfloat, 32, 8)
+instantiate_embed_mb(bfloat16, bfloat, 128, 8)
+
+// gemma4 scaled batched variant.
+template <typename T, int group_size, int bits>
+[[kernel]] void embed_gather_scaled_mb_4bit(
+    const device uint32_t* w   [[buffer(0)]],
+    const device T* scales     [[buffer(1)]],
+    const device T* biases     [[buffer(2)]],
+    const device int* id       [[buffer(3)]],
+    device T* out              [[buffer(4)]],
+    const constant int& hidden [[buffer(5)]],
+    const constant float& embed_scale [[buffer(6)]],
+    uint2 gid [[thread_position_in_grid]]) {
+  const int k = int(gid.x);
+  const int m = int(gid.y);
+  embed_gather_body<T, group_size, bits, true>(
+      w, scales, biases, out, hidden, id[m], k,
+      size_t(m) * size_t(hidden) + size_t(k), embed_scale);
+}
+
+#define instantiate_embed_scaled_mb(name, itype, gs, b)                            \
+  template [[host_name("embed_gather_scaled_mb_4bit_" #name "_gs_" #gs "_b_" #b)]] \
+  [[kernel]] void embed_gather_scaled_mb_4bit<itype, gs, b>(                       \
+      const device uint32_t*, const device itype*, const device itype*,           \
+      const device int*, device itype*, const constant int&,                      \
+      const constant float&, uint2);
+
+instantiate_embed_scaled_mb(bfloat16, bfloat, 64, 4)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 32, 4)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 128, 4)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 64, 8)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 32, 8)
+instantiate_embed_scaled_mb(bfloat16, bfloat, 128, 8)
