@@ -45,9 +45,11 @@ fn mm_snapshot() -> String {
 /// Max-fit single-model cuda config for the 15G gemma-4-E4B vision model. The
 /// default 0.90 / bf16 / auto-KV layout leaves only ~857 MiB after weights +
 /// encoders; this squeezes the two axes the cuda planner accepts:
+///
 ///   * `gpu_mem_utilization = 0.97`   — +~1.7G headroom (→ ~2545 MiB budget).
 ///   * `kv_cache_dtype = "fp8"`       — halves the KV cache (negligible here —
 ///     KV is tiny at batch=1/short-seq; the wall is weights + encoder workspace).
+///
 /// Even so this does NOT fit a forward layout on a 24G 4090 (see module note):
 /// the weight-halving lever (`runtime_quant=fp8`) is unimplemented for gemma4, so
 /// the 15G weight side can't be freed. Runs on a >24G GPU.
@@ -79,8 +81,8 @@ fn mm_cuda_toml(snapshot_path: &str) -> String {
 /// Boot the embedded cuda engine with the multimodal model under the tight
 /// [`mm_cuda_toml`] fit config.
 async fn boot_mm_cuda(snapshot_path: &str) -> worker::WorkerHandle {
-    let cfg = worker::Config::parse(&mm_cuda_toml(snapshot_path))
-        .expect("parse mm cuda worker config");
+    let cfg =
+        worker::Config::parse(&mm_cuda_toml(snapshot_path)).expect("parse mm cuda worker config");
     worker::run(cfg)
         .await
         .expect("boot embedded cuda engine (gemma-4-E4B)")

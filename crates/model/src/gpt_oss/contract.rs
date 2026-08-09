@@ -10,9 +10,9 @@ use model_loader::contract::{Expr, GroupContract, Scales, TensorContract};
 use model_loader::error::Error;
 use model_loader::types::{DType, Encoding, QuantGranularity, RepackLayout, ScaleForm, TensorId};
 
-use crate::builder::{Builder, align_up, is_raw, mxfp4_encoding};
-use crate::mlx;
-use crate::policy::Mxfp4MoePolicy;
+use crate::shared::builder::{Builder, align_up, is_raw, mxfp4_encoding};
+use crate::shared::mlx;
+use crate::shared::policy::Mxfp4MoePolicy;
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))
@@ -256,11 +256,11 @@ fn native_down(
 /// path Marlin-repacks into a layout whose rows are permuted across the
 /// whole bank, so one expert's repacked bytes are not a contiguous band.
 fn streamed_expert_groups(b: &mut Builder<'_>) -> Result<(), Error> {
-    let experts = i64::from(b.facts().num_experts);
+    let experts = i64::from(b.shape().n_experts);
     if experts <= 0 {
         return Ok(());
     }
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let bound = format!("model.layers.{layer}.mlp.experts.");
         let prefix = b.source_name(&bound);
 
@@ -370,7 +370,8 @@ pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
             let biases = b.find(&format!("{base}.biases"));
             let Some(scales) = scales else {
                 return fail(format!(
-                    "Metal GptOss: '{}' is a packed weight with no scales, which no                      scheme here describes",
+                    "Metal GptOss: '{}' is a packed weight with no scales, which no \
+                     scheme here describes",
                     raw.name
                 ));
             };
@@ -390,14 +391,15 @@ pub fn author_gpt_oss_mlx(b: &mut Builder<'_>) -> Result<(), Error> {
             let groups = *scales.shape.last().unwrap_or(&0);
             if groups <= 0 || packed_cols % (2 * groups) != 0 {
                 return fail(format!(
-                    "Metal GptOss: '{}' is not quantized in groups of 64, which is                      what these kernels read",
+                    "Metal GptOss: '{}' is not quantized in groups of 64, which is \
+                     what these kernels read",
                     raw.name
                 ));
             }
             let bits = packed_cols / (2 * groups);
             if bits != 4 && bits != 8 {
                 return fail(format!(
-                    "Metal GptOss: '{}' is {bits}-bit, and only 4 and 8 are                      described here",
+                    "Metal GptOss: '{}' is {bits}-bit, and only 4 and 8 are described here",
                     raw.name
                 ));
             }
@@ -493,7 +495,8 @@ fn declare_mxfp4_experts_mlx(b: &mut Builder<'_>, declared: &mut usize) -> Resul
         let fused = base.ends_with("gate_up_proj");
         if !fused && !base.ends_with("down_proj") {
             return fail(format!(
-                "Metal GptOss: MXFP4 tensor '{}' is neither the fused gate/up                  projection nor the down projection",
+                "Metal GptOss: MXFP4 tensor '{}' is neither the fused gate/up \
+                 projection nor the down projection",
                 blocks.name
             ));
         }

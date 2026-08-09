@@ -20,8 +20,7 @@
 pub mod facts;
 
 use self::facts::{NemotronHFacts, NemotronLayerKind};
-use model_compiler::dsl::{
-    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct NhLayerW {
@@ -85,16 +84,9 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
     // panicked, on the first prefill a serving deployment sends. The
     // class-dependent sites in this text number exactly one, the
     // attention op, which `dsl::cuda::attention_for` now holds.
-    let family = format!(
-        "nemotron_h.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            FireClass::Prefill => "prefill",
-            other => panic!("nemotron_h states no {other:?} class yet"),
-        }
-    );
-    let mb = facts.mamba.clone();
-    let _at = facts.attn.clone();
+    let family = format!("nemotron_h.cuda.{}", class.suffix());
+    let mb = facts.mamba;
+    let _at = facts.attn;
     dsl::trace_named(&family, |t| {
         let mut y = dsl::embedded_prologue(t, facts.hidden);
 
@@ -102,8 +94,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
             // executors used to re-derive it per launch.
-            let window_left =
-                model_compiler::facts::window_left_at(&facts.window_left, l);
+            let window_left = model_compiler::facts::window_left_at(facts.window_left, l);
             let w = NhLayerW::new(l, facts);
             let x = dsl::cuda::rmsnorm(&y, &w.norm);
 
@@ -141,8 +132,7 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
                     let _ = dt_bias;
                     let (dt, _da) =
                         dsl::cuda::nemotron_prepare_mamba_dt_da(&dt_raw, &a_par, mb.num_heads);
-                    let core =
-                        dsl::cuda::nemotron_mamba_ssm(&conv_out, &dt, l, mb.intermediate());
+                    let core = dsl::cuda::nemotron_mamba_ssm(&conv_out, &dt, l, mb.intermediate());
                     dsl::seam(core.trace(), &dsl::seam::ATTN_OUT, &[&core], Some(l));
                     // A GATED norm, not a plain one: `z` is the gate the
                     // split produced and the norm applies it.
@@ -178,6 +168,17 @@ pub fn nemotron_h_cuda(facts: &NemotronHFacts, class: FireClass) -> ForwardPlan 
             }
 
             // ── MoE, on the mixer layers ─────────────────────────────
+            // A DENSE stack stops here. Every published Nemotron-H is
+            // dense (`num_experts` is null in all three configs), and
+            // this block ran unconditionally: a dense row would trace a
+            // router of width 0, a top-k of 0 and an expert GEMV over a
+            // bank of no experts, which is not a shape error anywhere —
+            // it is a fire that reads a zero-length weight and returns
+            // zeros. The mixer layers of a dense stack are their mixer
+            // and their residual, and nothing else.
+            if facts.moe.num_experts == 0 {
+                continue;
+            }
             let m = dsl::cuda::rmsnorm(&y, &w.norm);
             // FP32 logits — `nemotron_h_forward.cpp` fires
             // `act_x_wt_bf16_out_fp32` for the router because

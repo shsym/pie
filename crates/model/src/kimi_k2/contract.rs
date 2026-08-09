@@ -10,7 +10,7 @@ use model_loader::contract::Expr;
 use model_loader::error::Error;
 use model_loader::types::{DType, Encoding};
 
-use crate::builder::{Builder, int4b8_encoding, is_raw};
+use crate::shared::builder::{Builder, int4b8_encoding, is_raw};
 
 fn fail<T>(what: impl Into<String>) -> Result<T, Error> {
     Err(Error::Contract(what.into()))
@@ -41,7 +41,7 @@ pub fn author_kimi(b: &mut Builder<'_>) -> Result<(), Error> {
 /// Fuse the two MLA projection pairs that share an input.
 fn mla_fused_projection_joins(b: &mut Builder<'_>) -> Result<(), Error> {
     let mut candidates = Vec::new();
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let p = format!("model.layers.{layer}.");
         let s = b.source_name(&p);
         // q_a_proj + kv_a_proj_with_mqa share an input (norm_x, unsharded).
@@ -99,7 +99,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
     // this same constant, and the two have to agree.
     const GATE_SECOND: bool = false;
 
-    for layer in 0..b.facts().num_hidden_layers {
+    for layer in 0..b.shape().layers {
         let mlp = format!("model.layers.{layer}.mlp.");
         // Kimi's leading layers are dense, and a dense layer simply has no
         // expert names — which is why the loop probes rather than reading
@@ -263,7 +263,7 @@ fn bf16_expert_stacks(b: &mut Builder<'_>, budget: u64) -> Result<(), Error> {
             * (local_inter as u64)
             * (hidden as u64)
             * 2
-            * u64::from(b.facts().num_hidden_layers);
+            * u64::from(b.shape().layers);
         if slab_bytes > budget {
             return Ok(());
         }

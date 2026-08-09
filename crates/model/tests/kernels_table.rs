@@ -11,13 +11,13 @@
 //! Being an integration test costs nothing here: `check_plan`, `Backend` and
 //! `sig_in` are all public, because a driver-side consumer reads them too.
 
-use model_compiler::kernels::*;
-use model_compiler::trace::ForwardPlan;
-use model::families::llama_like::forward::facts::LlamaLikeCudaFacts;
-use model::families::llama_like::forward::facts::LlamaLikeFacts;
 use model::qwen_3_5::forward::facts::Qwen35CudaFacts;
 use model::qwen_3_5::forward::facts::Qwen35HybridFacts;
+use model::shared::llama_like::forward::facts::LlamaLikeCudaFacts;
+use model::shared::llama_like::forward::facts::LlamaLikeFacts;
+use model_compiler::kernels::*;
 use model_compiler::trace::FireClass;
+use model_compiler::trace::ForwardPlan;
 
 use model_compiler::trace::{Op, OpKind};
 
@@ -84,12 +84,18 @@ fn the_check_is_not_vacuous() {
 /// A family name says whose kernels a text states.
 #[test]
 fn the_backend_is_read_off_the_family() {
-    assert_eq!(Backend::of_family("llama_like.cuda.decode"), Some(Backend::Cuda));
+    assert_eq!(
+        Backend::of_family("llama_like.cuda.decode"),
+        Some(Backend::Cuda)
+    );
     assert_eq!(
         Backend::of_family("qwen3_5_hybrid.cuda.commit_advance"),
         Some(Backend::Cuda)
     );
-    assert_eq!(Backend::of_family("llama_like.metal.decode"), Some(Backend::Metal));
+    assert_eq!(
+        Backend::of_family("llama_like.metal.decode"),
+        Some(Backend::Metal)
+    );
     // Semantic traces state no kernels, so no table applies.
     assert_eq!(Backend::of_family("llama_like"), None);
     assert_eq!(Backend::of_family("qwen3_5_moe_mlp_block"), None);
@@ -134,7 +140,7 @@ fn the_metal_table_admits_its_rows_and_refuses_the_rest() {
 ///
 /// This list is the seam between the table's TWO jobs, which stopped being
 /// one job when the ABI pilot landed. The compiler's job is to plan against
-/// symbols a declaration can record; `driver-cuda-new`'s
+/// symbols a declaration can record; `driver-cuda`'s
 /// `every_launcher_the_header_declares_has_a_row` gives the table a second
 /// one — being the operand contract for every launcher a HEADER declares,
 /// whether a declaration reaches it or not. A row can now be real and
@@ -163,6 +169,12 @@ const UNSTATED_ROWS: &[&str] = &[
     // A statement the LOWERING makes is real without a text stating it,
     // which is precisely what this list is for.
     "layout::gather_bf16_rows",
+    // The LOADER's two quantizers, called from `loader/arena.rs` rather
+    // than recorded by any forward text: a weight transform runs once at
+    // load and never appears in a fire's op list. Real without a text
+    // stating it, which is what this list is for.
+    "quant::quantize_bf16_to_fp8_e4m3_per_channel",
+    "quant::quantize_bf16_to_mxfp4_e2m1_per_block",
     "rope::rope_partial_bf16_position_delta",
 ];
 
@@ -247,8 +259,8 @@ fn the_table_covers_the_dsl_surface() {
                 "dist::",
                 "comm::",
             ]
-                .iter()
-                .any(|p| s.starts_with(p))
+            .iter()
+            .any(|p| s.starts_with(p))
         })
         .collect();
     stated.sort_unstable();
@@ -292,7 +304,7 @@ fn the_table_covers_the_dsl_surface() {
 #[test]
 fn the_depth_axis_derives_from_the_layer_tag() {
     let facts = LlamaLikeFacts::qwen3_0_6b();
-    let plan = model::families::llama_like::forward::llama_like_cuda(
+    let plan = model::shared::llama_like::forward::llama_like_cuda(
         &facts,
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Decode,
@@ -312,14 +324,21 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // Three planned-decode dispatches per layer take the swap: the
     // mask arm's unmasked-prefix rows, and the plain body's
     // score-capturing and plain arms.
-    let swaps = plan.ops.iter().filter(|op| plan.depth_prefix_plan(op)).count();
+    let swaps = plan
+        .ops
+        .iter()
+        .filter(|op| plan.depth_prefix_plan(op))
+        .count();
     assert_eq!(swaps, 3 * facts.layers as usize);
     assert!(
-        plan.ops.iter().filter(|op| plan.depth_prefix_plan(op)).all(|op| matches!(
-            &op.kind,
-            OpKind::Launch { kernel, .. }
-                if kernel == "attn::dispatch_attention_flashinfer_decode"
-        )),
+        plan.ops
+            .iter()
+            .filter(|op| plan.depth_prefix_plan(op))
+            .all(|op| matches!(
+                &op.kind,
+                OpKind::Launch { kernel, .. }
+                    if kernel == "attn::dispatch_attention_flashinfer_decode"
+            )),
         "only the planned decode dispatch swaps"
     );
 
@@ -331,16 +350,13 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // between the two halves of the axis: stopping after layer `k`
     // costs a prefill nothing, and narrowing rows under it would
     // cost it a plan it has no way to build.
-    let prefill = model::families::llama_like::forward::llama_like_cuda(
+    let prefill = model::shared::llama_like::forward::llama_like_cuda(
         &facts,
         &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
         FireClass::Prefill,
     );
     assert!(prefill.depth_window);
-    assert!(prefill
-        .ops
-        .iter()
-        .any(|op| prefill.depth_windowed(op)));
+    assert!(prefill.ops.iter().any(|op| prefill.depth_windowed(op)));
     // Asked of the LOWERED form, not the traced one, and that is the
     // window-class merge (`.wiki/driver/graph.md` §4.1): the trace now
     // carries BOTH window classes as arms of a `GuardPred::WindowOne`
@@ -348,7 +364,10 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // dispatch — it is the arm this fire will not take. Which arm runs
     // is a lowering answer, and `Resolve` is where it is given.
     let prefill_rows = vec![
-        model_compiler::lower::Row { multi_token: true, ..Default::default() };
+        model_compiler::lower::Row {
+            multi_token: true,
+            ..Default::default()
+        };
         7
     ];
     let lowered = model_compiler::lower::lower_with(
@@ -376,7 +395,7 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // not have. So the trace states the axis and the DRIVER refuses
     // the shapes that narrow (`PaddedHeadNarrowing`), which is the
     // same division of labour the Prefill class settled.
-    let padded = model::families::llama_like::forward::llama_like_cuda(
+    let padded = model::shared::llama_like::forward::llama_like_cuda(
         &facts,
         &LlamaLikeCudaFacts {
             head_dim_padded: true,
@@ -394,7 +413,7 @@ fn the_depth_axis_derives_from_the_layer_tag() {
     // The XQA decode deployment is the one that still withholds it:
     // its prepare is fire-wide and R-shaped, so even the free half
     // has nothing to stand on.
-    let xqa = model::families::llama_like::forward::llama_like_cuda(
+    let xqa = model::shared::llama_like::forward::llama_like_cuda(
         &facts,
         &LlamaLikeCudaFacts {
             xqa_decode: true,
@@ -424,21 +443,18 @@ fn table_is_unambiguous() {
 fn live_traces_satisfy_the_table() {
     let mut plans = Vec::new();
     for class in [FireClass::Decode, FireClass::Prefill] {
-        plans.push(model::families::llama_like::forward::llama_like_cuda(
+        plans.push(model::shared::llama_like::forward::llama_like_cuda(
             &LlamaLikeFacts::qwen3_0_6b(),
             &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
             class,
         ));
-        plans.push(model::families::llama_like::forward::llama_like_cuda(
+        plans.push(model::shared::llama_like::forward::llama_like_cuda(
             &LlamaLikeFacts::mistral_7b_v03(),
             &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
             class,
         ));
     }
-    for class in [
-        FireClass::Decode,
-        FireClass::Prefill,
-    ] {
+    for class in [FireClass::Decode, FireClass::Prefill] {
         plans.push(model::qwen_3_5::forward::qwen3_5_hybrid_cuda(
             &Qwen35HybridFacts::qwen3_5_0_8b(),
             &Qwen35CudaFacts::qwen3_5_0_8b_synthetic(),
@@ -507,7 +523,7 @@ fn a_weight_representation_states_its_kernel() {
         (WeightRepr::Mxfp4Marlin, "gemm::act_x_wt_mxfp4_marlin", 1),
     ];
     for (repr, symbol, extra) in cases {
-        let w = dense.clone().with_repr(repr.clone());
+        let w = dense.clone().with_repr(repr);
         assert_eq!(
             w.gemm_symbol(),
             Some(symbol),
@@ -549,7 +565,10 @@ fn a_weight_representation_states_its_kernel() {
 fn the_kernels_a_semantic_kind_fans_to_are_declared() {
     // (kind, the symbols its driver arms pick between)
     const FANS: &[(&str, &[&str])] = &[
-        ("Rmsnorm", &["norm::rmsnorm_bf16", "norm::rmsnorm_gemma_bf16"]),
+        (
+            "Rmsnorm",
+            &["norm::rmsnorm_bf16", "norm::rmsnorm_gemma_bf16"],
+        ),
         (
             "RmsnormPerHead",
             &["norm::rmsnorm_bf16", "norm::rmsnorm_gemma_bf16"],

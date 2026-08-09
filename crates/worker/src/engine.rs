@@ -164,10 +164,10 @@ impl EngineHandle {
         // report.
         tracing::info!(worker = ?self.control_plane.worker_id(), "leaving control plane");
         drop(self.control_plane);
-        if let Some(runtime) = self.runtime.take() {
-            if let Err(err) = runtime.shutdown().await {
-                tracing::error!(?err, "runtime shutdown failed");
-            }
+        if let Some(runtime) = self.runtime.take()
+            && let Err(err) = runtime.shutdown().await
+        {
+            tracing::error!(?err, "runtime shutdown failed");
         }
     }
 }
@@ -364,7 +364,7 @@ struct LoadedModelDrivers {
     kv_handle: Option<driver_api::KvHandle>,
     drivers: ModelDrivers,
     /// The model's compiled metadata, read once while resolving it. Present
-    /// for either input form: an artifact carries the descriptor, a snapshot's
+    /// for either input form: an artifact carries the config, a snapshot's
     /// `config.json` is normalized into one.
     metadata: model::ModelMetadata,
 }
@@ -428,7 +428,7 @@ fn manifest_digest(path: &Path) -> Result<Option<[u8; 32]>> {
 fn model_artifact_digest(snapshot_dir: &Path) -> Result<[u8; 32]> {
     // A `.zt` artifact already has an identity, and it is a better one than
     // anything derivable here: the manifest digest covers every tensor, the
-    // compiled tokenizer and the model descriptor together, and for a sharded
+    // compiled tokenizer and the checkpoint config together, and for a sharded
     // artifact it reaches the shards through their entries in the shard table.
     // It also survives the file being moved, which the path-derived answer
     // below does not.
@@ -526,14 +526,15 @@ fn load_model_drivers(
         // load. Sharing a directory left `.weights` files sitting in a store
         // that scans for `.zt` and silently ignored them, while `pie cache`
         // reported their size under the store's name.
-        crate::state::weight_cache_dir().to_string_lossy().into_owned()
+        crate::state::weight_cache_dir()
+            .to_string_lossy()
+            .into_owned()
     } else {
         user_cfg.model.weight_cache_dir.clone()
     };
     crate::embedded_driver::set_weight_cache_dir(weight_cache_dir);
 
-    let mut metadata: Option<model::ModelMetadata> = None;
-    let (driver_groups, snapshot_dir) = {
+    let (driver_groups, snapshot_dir, metadata) = {
         let m = &user_cfg.model;
         let resolved = preflight::resolve_flavor(m.driver.kind, &m.name)?;
 
@@ -562,10 +563,7 @@ fn load_model_drivers(
         let ResolvedFlavor::Embedded(flavor) = resolved;
         let mut embedded_base_opts = preflight::build_embedded_options(m, flavor)?;
         apply_embedded_verbose(&mut embedded_base_opts, user_cfg.server.verbose);
-        apply_embedded_calibration(
-            &mut embedded_base_opts,
-            user_cfg.server.calibrate_planner,
-        );
+        apply_embedded_calibration(&mut embedded_base_opts, user_cfg.server.calibrate_planner);
         let resolved_model = weights::resolve(&m.model)
             .with_context(|| format!("resolving the model for {:?}", m.name))?;
         // Lifted once, here, in one open. The drivers get the compiled model
@@ -576,8 +574,7 @@ fn load_model_drivers(
         let lifted = resolved_model
             .metadata()
             .with_context(|| format!("reading the model metadata for {:?}", m.name))?;
-        let descriptor = lifted.descriptor.clone();
-        metadata = Some(lifted);
+        let config = lifted.config.clone();
         let snapshot_dir = resolved_model.path().to_path_buf();
         let mut group_drivers: Vec<GroupDriver> = Vec::with_capacity(topology.len());
         for (group_idx, group) in topology.iter().enumerate() {
@@ -588,7 +585,7 @@ fn load_model_drivers(
                 flavor,
                 &embedded_base_opts,
                 &snapshot_dir,
-                &descriptor,
+                &config,
                 tp_degree,
                 component,
             )?);
@@ -598,6 +595,7 @@ fn load_model_drivers(
                 groups: group_drivers,
             },
             snapshot_dir,
+            lifted,
         )
     };
 
@@ -616,9 +614,7 @@ fn load_model_drivers(
         *blake3::hash(user_cfg.model.model.as_bytes()).as_bytes()
     };
     Ok(LoadedModelDrivers {
-        // Set in the block above, which is the only path that reaches here:
-        // a model that could not be resolved never got as far as a driver.
-        metadata: metadata.expect("the model was resolved before its drivers were created"),
+        metadata,
         model: user_cfg.model.name.clone(),
         full_identity: model_identity(
             user_cfg,
@@ -1002,6 +998,11 @@ async fn assemble_distributed<C: ControlLink>(
     ))
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "nine independent inputs to one driver launch; a struct here \
+              would be a parameter list with a name"
+)]
 fn create_driver_group(
     m: &config::ModelConfig,
     group_idx: usize,
@@ -1009,7 +1010,7 @@ fn create_driver_group(
     flavor: Flavor,
     base_opts: &DriverOptions,
     snapshot_dir: &Path,
-    descriptor: &[u8],
+    config: &[u8],
     tp_degree: usize,
     component: driver_api::ModelComponent,
 ) -> Result<GroupDriver> {
@@ -1021,7 +1022,7 @@ fn create_driver_group(
             return crate::embedded_driver::create_driver_backend_group(
                 &rank_opts,
                 snapshot_dir,
-                descriptor,
+                config,
                 group_idx,
                 &tp_launches,
                 component,
@@ -1050,7 +1051,7 @@ fn create_driver_group(
     crate::embedded_driver::create_driver_backend(
         &opts,
         snapshot_dir,
-        descriptor,
+        config,
         group_idx,
         None,
         component,
@@ -1285,9 +1286,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        let driver = ::engine::driver::DummyDriver::new(
-            driver_dummy::DummyDriverOptions::default(),
-        );
+        let driver =
+            ::engine::driver::DummyDriver::new(driver_dummy::DummyDriverOptions::default());
         let full_caps = driver.capabilities().clone();
         let mut encode_caps = full_caps.clone();
         encode_caps.total_pages = 0;

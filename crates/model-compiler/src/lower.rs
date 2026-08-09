@@ -89,7 +89,7 @@ pub struct Row {
 /// The region-signature bits, as the wire states them.
 ///
 /// Restated here rather than imported from the C ABI, for the reason
-/// `driver-metal-new` gives for its own copy: `Row` must not depend on
+/// `driver-metal` gives for its own copy: `Row` must not depend on
 /// the descriptor surface, and the VALUES are the contract. Stated beside
 /// `Row` so the mapping below can be one function instead of one per
 /// driver — the two shells were reading the same six bits into the same
@@ -122,9 +122,17 @@ pub mod region_sig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegionDrift {
     /// The three region arrays disagree on how many regions there are.
-    Ragged { segments: usize, sigs: usize, ks: usize },
+    Ragged {
+        segments: usize,
+        sigs: usize,
+        ks: usize,
+    },
     /// A region names rows the step does not have.
-    OutOfRange { region: usize, end: u32, rows: usize },
+    OutOfRange {
+        region: usize,
+        end: u32,
+        rows: usize,
+    },
     /// Two regions claim one row, or no region claims it.
     DoNotTile { at: u32 },
 }
@@ -165,7 +173,7 @@ impl Row {
 ///
 /// It is the only thing that turns the wire's axis bitset into the
 /// lowering's guard predicates, and a shell that does not call it gets
-/// `Row::default()` — every guard false, silently. `driver-cuda-new` did
+/// `Row::default()` — every guard false, silently. `driver-cuda` did
 /// exactly that: `vec![Row { samples: true, ..default() }; rows]`, so
 /// `HasLora`, `HasCustomMask`, `HasStageHooks` and the depth truncation
 /// could never hold no matter what the engine sent, and LoRA looked like
@@ -236,7 +244,9 @@ pub fn rows_from_regions(
     out.into_iter()
         .enumerate()
         .map(|(i, row)| {
-            row.ok_or(RegionDrift::DoNotTile { at: u32::try_from(i).unwrap_or(u32::MAX) })
+            row.ok_or(RegionDrift::DoNotTile {
+                at: u32::try_from(i).unwrap_or(u32::MAX),
+            })
         })
         .collect()
 }
@@ -920,21 +930,22 @@ impl Lowerer<'_> {
                     let outer_region = self.peel_region;
                     let axis = *axis;
                     let grid = window.clone();
-                    let run = |me: &mut Self, span: Range<usize>, w: Range<u32>, tail_side: bool| {
-                        if !device && w.is_empty() {
-                            return Ok(());
-                        }
-                        let w = if device { grid.clone() } else { w };
-                        me.peel_region = Some(PeelRegion {
-                            axis,
-                            tail: tail_side,
-                            rows_device: device,
-                        });
-                        let outer = std::mem::replace(&mut me.peel_tail, tail_side);
-                        let r = me.region(span, w);
-                        me.peel_tail = outer;
-                        r
-                    };
+                    let run =
+                        |me: &mut Self, span: Range<usize>, w: Range<u32>, tail_side: bool| {
+                            if !device && w.is_empty() {
+                                return Ok(());
+                            }
+                            let w = if device { grid.clone() } else { w };
+                            me.peel_region = Some(PeelRegion {
+                                axis,
+                                tail: tail_side,
+                                rows_device: device,
+                            });
+                            let outer = std::mem::replace(&mut me.peel_tail, tail_side);
+                            let r = me.region(span, w);
+                            me.peel_tail = outer;
+                            r
+                        };
                     let next = t.end;
                     run(self, p, prefix, false)?;
                     run(self, t, tail, true)?;
@@ -998,6 +1009,47 @@ impl Lowerer<'_> {
         op: &Op,
         window: &Range<u32>,
     ) -> Result<(), Uncovered> {
+        self.emit_bound(at, kernel, op, window, None, None)
+    }
+
+    /// [`Self::emit`], with the statement's OUTPUT replaced.
+    ///
+    /// The epilogue's row gather is the only caller: one `LmHead` lowers
+    /// to two launches that pass a value between them, and the trace has
+    /// no name for it. See [`Self::epilogue`].
+    fn emit_with_out(
+        &mut self,
+        at: usize,
+        kernel: &str,
+        op: &Op,
+        window: &Range<u32>,
+        out: Option<Arg>,
+    ) -> Result<(), Uncovered> {
+        self.emit_bound(at, kernel, op, window, None, out)
+    }
+
+    /// [`Self::emit`], with the statement's INPUT replaced — the other
+    /// half of the gather's hand-off.
+    fn emit_with_in(
+        &mut self,
+        at: usize,
+        kernel: &str,
+        op: &Op,
+        window: &Range<u32>,
+        input: Option<Arg>,
+    ) -> Result<(), Uncovered> {
+        self.emit_bound(at, kernel, op, window, input, None)
+    }
+
+    fn emit_bound(
+        &mut self,
+        at: usize,
+        kernel: &str,
+        op: &Op,
+        window: &Range<u32>,
+        in_override: Option<Arg>,
+        out_override: Option<Arg>,
+    ) -> Result<(), Uncovered> {
         if window.is_empty() && !self.peel_region.is_some_and(|r| r.rows_device) {
             return Ok(());
         }
@@ -1009,14 +1061,15 @@ impl Lowerer<'_> {
         // fire. This is the same rule `kernels::check_plan` enforces
         // statically against Peel regions; here it also catches the
         // dynamic case, where an arm happens to select a subset.
-        if let Some(sig) = kernels::sig_in(backend, kernel) {
-            if sig.whole && (window.start != 0 || window.end != self.rows.len() as u32) {
-                return Err(Uncovered::WholeKernelSplit {
-                    at_op: at,
-                    kernel: kernel.to_string(),
-                    rows: window.clone(),
-                });
-            }
+        if let Some(sig) = kernels::sig_in(backend, kernel)
+            && sig.whole
+            && (window.start != 0 || window.end != self.rows.len() as u32)
+        {
+            return Err(Uncovered::WholeKernelSplit {
+                at_op: at,
+                kernel: kernel.to_string(),
+                rows: window.clone(),
+            });
         }
         let id = match self.kernel_ids.get(kernel) {
             Some(&id) => id,
@@ -1050,16 +1103,25 @@ impl Lowerer<'_> {
         // the attention's value-producing guard it was handed the guard's
         // output as a fourth operand, so its row's arity check refused
         // every fire that took the quantized path.
-        let outs: &[ValueId] =
-            if op.outputs.is_empty()
-                && op.kind.state_ref().is_none()
-                && !self.region_outs.is_empty() {
-                &self.region_outs
-            } else {
-                &op.outputs
-            };
-        for &v in op.inputs.iter().chain(outs.iter()) {
-            self.args.push(self.slot(v));
+        let outs: &[ValueId] = if op.outputs.is_empty()
+            && op.kind.state_ref().is_none()
+            && !self.region_outs.is_empty()
+        {
+            &self.region_outs
+        } else {
+            &op.outputs
+        };
+        for (i, &v) in op.inputs.iter().enumerate() {
+            match (i, in_override.clone()) {
+                (0, Some(a)) => self.args.push(a),
+                _ => self.args.push(self.slot(v)),
+            }
+        }
+        for (i, &v) in outs.iter().enumerate() {
+            match (i, out_override.clone()) {
+                (0, Some(a)) => self.args.push(a),
+                _ => self.args.push(self.slot(v)),
+            }
         }
         let first_param = self.params.len() as u32;
         if let OpKind::Launch {
@@ -1092,8 +1154,20 @@ impl Lowerer<'_> {
     fn push_cond_pair(&mut self, parent: u32, slot: u32, param: u32) -> (u32, u32) {
         let t = self.conds.len() as u32;
         let f = t + 1;
-        self.conds.push(CondRegion { parent, slot, param, on_true: true, sibling: f });
-        self.conds.push(CondRegion { parent, slot, param, on_true: false, sibling: t });
+        self.conds.push(CondRegion {
+            parent,
+            slot,
+            param,
+            on_true: true,
+            sibling: f,
+        });
+        self.conds.push(CondRegion {
+            parent,
+            slot,
+            param,
+            on_true: false,
+            sibling: t,
+        });
         (t, f)
     }
 
@@ -1173,7 +1247,42 @@ impl Lowerer<'_> {
         }
         let out = 0..sampled;
         if sampled < window.len() as u32 {
-            self.emit(at, "layout::gather_bf16_rows", op, &out)?;
+            // THE GATHER NOW HAS SOMEWHERE TO WRITE.
+            //
+            // It used to be emitted through the plain `emit`, which binds
+            // the OP's operands -- and `OpKind::LmHead` states
+            // `inputs=[hidden] outputs=[logits]`. So the gather, whose job
+            // is to compact `[sampled, hidden]` for the head to read, was
+            // handed the LOGITS buffer as its destination: the wrong
+            // width, and the head then read what it had overwritten. It
+            // produced all-zero logits on gemma-4 and the hybrid, which is
+            // why the shell forces `samples: true` on every row and pays a
+            // prefill's head over every token rather than one per request.
+            //
+            // The scratch has existed all along -- `Buffers::epilogue_gather`
+            // is sized from this very statement and carried on `Lowered`.
+            // Nothing ever bound it. So the gather is emitted with its
+            // output REPLACED by that block, and the head's input with it,
+            // which is the whole of what "the epilogue names its temp"
+            // means.
+            //
+            // A fire whose planner refused the block (`NAMED`) keeps the
+            // old binding rather than inventing an address: that is a
+            // fire the caller must not ask a gather of, and `samples` is
+            // the shell's to over-claim.
+            let temp = (self.buffers.epilogue_gather != Buffers::NAMED).then(|| Arg::Arena {
+                at: self.buffers.epilogue_gather,
+                width: self.row_width(op.inputs.first().copied().unwrap_or(0)),
+                bytes: op
+                    .inputs
+                    .first()
+                    .and_then(|&v| self.plan.values.get(v as usize))
+                    .map_or(2, |i| dtype_bytes(i.dtype)),
+            });
+            self.emit_with_out(at, "layout::gather_bf16_rows", op, &out, temp.clone())?;
+            // The head reads the compacted rows, not the raw stream.
+            self.emit_with_in(at, "gemm::act_x_w", op, &out, temp)?;
+            return Ok(());
         }
         // NO FINAL NORM HERE, and its absence is the correction rather
         // than an omission.
@@ -1292,12 +1401,7 @@ impl Lowerer<'_> {
     /// Where a peel's axis splits `window` — the prefix is the rows that
     /// do NOT carry the axis's mark (hook-free, unmasked), which is the
     /// order the seriation produces.
-    fn split_at(
-        &self,
-        window: &Range<u32>,
-        axis: PeelWindow,
-        at: usize,
-    ) -> Result<u32, Uncovered> {
+    fn split_at(&self, window: &Range<u32>, axis: PeelWindow, at: usize) -> Result<u32, Uncovered> {
         let (name, marked): (&'static str, fn(&Row) -> bool) = match axis {
             PeelWindow::HookFreePrefix => ("hook", |r| r.hooked),
             PeelWindow::UnmaskedPrefix => ("mask", |r| r.custom_mask),
@@ -1306,9 +1410,16 @@ impl Lowerer<'_> {
         // The marked rows are the SUFFIX; anything else means this order
         // and this trace disagree.
         if !tail.is_empty() && tail.end != window.end {
-            return Err(Uncovered::Discontiguous { at_op: at, axis: name });
+            return Err(Uncovered::Discontiguous {
+                at_op: at,
+                axis: name,
+            });
         }
-        Ok(if tail.is_empty() { window.end } else { tail.start })
+        Ok(if tail.is_empty() {
+            window.end
+        } else {
+            tail.start
+        })
     }
 }
 
@@ -1428,9 +1539,7 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         // with them — a lowered trace states its KV write and its
         // attention as stated-kernel launches. So they cannot appear, and
         // if they do the honest answer is the same refusal.
-        KvAppend { .. } => {
-            Semantic::Unlowered("a lowered trace states the KV write as a launch")
-        }
+        KvAppend { .. } => Semantic::Unlowered("a lowered trace states the KV write as a launch"),
         Attention { .. } => {
             Semantic::Unlowered("a lowered trace states its attention kernel as a launch")
         }
@@ -1440,9 +1549,7 @@ fn semantic(kind: &OpKind, peel_tail: bool) -> Semantic {
         // facts and erases at trace time — but no fact carries it today,
         // so the executor reads the workspace and picks. The trace has to
         // state it before this statement can be a rectangle.
-        Swiglu { .. } => {
-            Semantic::Unlowered("the fused-gate_up binding fact is not in the facts")
-        }
+        Swiglu { .. } => Semantic::Unlowered("the fused-gate_up binding fact is not in the facts"),
 
         // The MoE branch's three statements, each refused BY NAME until
         // `moe_mlp_body_cuda` states its kernel. They are grouped here
@@ -1677,11 +1784,11 @@ impl Buffers {
             }
             let Some(at) = stmt.op else { continue };
             for probe in [at as usize, at as usize + 1] {
-                if let Some(op) = plan.ops.get(probe) {
-                    if matches!(op.kind, OpKind::HookSite { .. } | OpKind::Launch { .. }) {
-                        pinned.extend(op.inputs.iter().copied());
-                        break;
-                    }
+                if let Some(op) = plan.ops.get(probe)
+                    && matches!(op.kind, OpKind::HookSite { .. } | OpKind::Launch { .. })
+                {
+                    pinned.extend(op.inputs.iter().copied());
+                    break;
                 }
             }
         }
@@ -1695,8 +1802,10 @@ impl Buffers {
             let owner = alias_owners(plan);
             let roots: std::collections::BTreeSet<ValueId> =
                 pinned.iter().map(|&v| owner[v as usize]).collect();
-            for v in 0..plan.values.len() {
-                if roots.contains(&owner[v]) {
+            // `alias_owners` returns one entry per value, so walking it
+            // walks every value.
+            for (v, root) in owner.iter().enumerate() {
+                if roots.contains(root) {
                     pinned.push(v as ValueId);
                 }
             }
@@ -1776,8 +1885,7 @@ impl Buffers {
                     // to bind; the arena has no address to offset from.
                     offset[out as usize] = Self::NAMED;
                 } else {
-                    offset[out as usize] =
-                        offset[src as usize] + index as usize * want;
+                    offset[out as usize] = offset[src as usize] + index as usize * want;
                 }
                 size[out as usize] = want;
                 continue;
@@ -1800,9 +1908,7 @@ impl Buffers {
             // was written to an address nothing read.
             {
                 let pairs = match &op.kind {
-                    OpKind::Launch { kernel, .. } => {
-                        crate::kernels::in_place_pairs(plan, kernel)
-                    }
+                    OpKind::Launch { kernel, .. } => crate::kernels::in_place_pairs(plan, kernel),
                     other => crate::kernels::semantic_in_place(other),
                 };
                 let mut aliased = false;
@@ -1814,8 +1920,7 @@ impl Buffers {
                         (op.inputs.get(i as usize), op.outputs.get(o as usize))
                     {
                         offset[out as usize] = offset[src as usize];
-                        size[out as usize] =
-                            value_bytes(plan, out, n_tokens, n_requests);
+                        size[out as usize] = value_bytes(plan, out, n_tokens, n_requests);
                         aliased = true;
                     }
                 }
@@ -1864,7 +1969,9 @@ impl Buffers {
             if !matches!(op.kind, OpKind::LmHead { .. }) {
                 continue;
             }
-            let Some(&input) = op.inputs.first() else { continue };
+            let Some(&input) = op.inputs.first() else {
+                continue;
+            };
             let width = value_bytes(plan, input, 1, 1);
             let sampled = rows.iter().filter(|r| r.samples).count().max(1);
             let want = width * sampled;
@@ -2069,12 +2176,39 @@ mod region_tests {
     /// transposition rather than merely a missing read.
     #[test]
     fn each_axis_bit_lands_on_its_own_field() {
-        let base = Row { samples: true, ..Row::default() };
+        let base = Row {
+            samples: true,
+            ..Row::default()
+        };
         for (bit, expected) in [
-            (region_sig::MULTI_TOKEN, Row { multi_token: true, ..base }),
-            (region_sig::MASK, Row { custom_mask: true, ..base }),
-            (region_sig::HOOK, Row { hooked: true, ..base }),
-            (region_sig::HOOK_PAGE_MASK, Row { hooked: true, ..base }),
+            (
+                region_sig::MULTI_TOKEN,
+                Row {
+                    multi_token: true,
+                    ..base
+                },
+            ),
+            (
+                region_sig::MASK,
+                Row {
+                    custom_mask: true,
+                    ..base
+                },
+            ),
+            (
+                region_sig::HOOK,
+                Row {
+                    hooked: true,
+                    ..base
+                },
+            ),
+            (
+                region_sig::HOOK_PAGE_MASK,
+                Row {
+                    hooked: true,
+                    ..base
+                },
+            ),
             (region_sig::LORA, Row { lora: true, ..base }),
         ] {
             assert_eq!(
@@ -2093,13 +2227,20 @@ mod region_tests {
     /// "all of it".
     #[test]
     fn a_truncation_needs_both_the_bit_and_the_depth() {
-        assert_eq!(Row::from_region(region_sig::TRUNCATED, 7, true).depth_k, Some(7));
+        assert_eq!(
+            Row::from_region(region_sig::TRUNCATED, 7, true).depth_k,
+            Some(7)
+        );
         assert_eq!(
             Row::from_region(region_sig::TRUNCATED, region_sig::MAX_LAYERS_FULL, true).depth_k,
             None,
             "the bit plus the sentinel is FULL depth, not a truncation at u32::MAX"
         );
-        assert_eq!(Row::from_region(0, 7, true).depth_k, None, "no bit, no truncation");
+        assert_eq!(
+            Row::from_region(0, 7, true).depth_k,
+            None,
+            "no bit, no truncation"
+        );
     }
 
     /// An empty readout list means the LAST row is read, not none.
@@ -2112,7 +2253,10 @@ mod region_tests {
             "a decode fire exists to produce its last token"
         );
         let named = rows_from_regions(3, &[0, 2], &[], &[], &[]).expect("named readout");
-        assert_eq!(named.iter().map(|r| r.samples).collect::<Vec<_>>(), [true, false, true]);
+        assert_eq!(
+            named.iter().map(|r| r.samples).collect::<Vec<_>>(),
+            [true, false, true]
+        );
     }
 
     /// Regions tile the rows, and a table that does not is drift.
@@ -2150,6 +2294,9 @@ mod region_tests {
             [false, false, true, true],
             "the adapter is the second region's, not the fire's"
         );
-        assert_eq!(rows.iter().map(|r| r.samples).collect::<Vec<_>>(), [false, false, false, true]);
+        assert_eq!(
+            rows.iter().map(|r| r.samples).collect::<Vec<_>>(),
+            [false, false, false, true]
+        );
     }
 }

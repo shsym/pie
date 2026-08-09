@@ -1,15 +1,15 @@
 //! The plan: what the loader emits, and the passes that shape it.
 //!
-//! `build` turns a checked contract into instructions; `passes` rewrites them
-//! into the form the executor wants; `mod.rs` is only the vocabulary the two
-//! share.
+//! `plan/build.rs` turns a checked contract into instructions; `plan/passes/`
+//! rewrites them into the form the executor wants; this file is only the
+//! vocabulary the two share.
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::types::{
-    BackendKind, BufferId, CheckpointFormat, DType, FileId, InstrId, QuantGranularity, QuantScheme,
-    RepackSpec, ScaleForm, TensorDecl, TensorId,
+    BackendKind, BufferId, CheckpointFormat, DType, Encoding, FileId, InstrId, QuantGranularity,
+    QuantScheme, RepackSpec, ScaleForm, TensorDecl, TensorId,
 };
 
 pub mod build;
@@ -18,6 +18,7 @@ pub mod group;
 pub mod index;
 pub mod pass;
 pub mod passes;
+pub mod spans;
 
 pub use crate::extent::{Dim, Extent};
 pub use passes::tile::{
@@ -26,12 +27,12 @@ pub use passes::tile::{
 
 /// Which tile-map transforms a target's kernels implement.
 ///
-/// Defined here, not in `ffi/`: the plan is the thing that has transforms, and
-/// the ABI is a view of the plan. The arrow used to point the other way — the
-/// compiler imported `crate::ffi::types::PIE_LOADER_TILE_MAP_*` — which
-/// made the core depend on its own serialization format. `ffi/types.rs` now
-/// restates these under the C names and a `const` assertion pins the two
-/// together, because cbindgen emits literals and cannot follow a path.
+/// Defined here because the plan is the thing that has transforms. The arrow
+/// used to point the other way — the compiler imported
+/// `crate::ffi::types::PIE_LOADER_TILE_MAP_*`, which made the core depend on
+/// its own serialization format. The C ABI that justified that dependency has
+/// since gone, and these are now simply where they belong: beside the target
+/// that advertises them.
 pub const TILE_MAP_CAST: u32 = 1 << 0;
 pub const TILE_MAP_DECODE: u32 = 1 << 1;
 pub const TILE_MAP_ENCODE: u32 = 1 << 2;
@@ -115,6 +116,57 @@ pub struct StorageTarget {
     /// would be a second rule to keep in sync with the kernel — such a source is
     /// simply not tiled.
     pub block_scale_rows: u32,
+}
+
+impl StorageTarget {
+    /// The target a backend asks for, stated once.
+    ///
+    /// Four sites used to write this literal — both drivers, `pie model build`
+    /// and `pie model import` — and every one of them repeated `256`, `64 MiB`
+    /// and `BF16`. Repetition was not the worst of it: each also restated the
+    /// backend's `tile_map_mask`, so a driver and
+    /// [`passes::tile`](crate::plan::passes::tile) each held an opinion about
+    /// which transforms that device implements, and a test compared the two
+    /// instead of there being one.
+    ///
+    /// The mask comes from [`passes::tile::tile_map_mask`], which is the
+    /// loader's model of the backend and now the only statement of it. That
+    /// inverts the old rule — the driver was the authority and the loader
+    /// checked it — and the reason is that the loader is where the consequence
+    /// lands: it decides which plans compile, and it owns the host fallback
+    /// every claimed transform has to have.
+    ///
+    /// The fields NOT here are the ones a caller genuinely varies:
+    /// `native_mxfp4_moe` and `fusion_mask` are per-request capabilities, and
+    /// `block_scale_rows` belongs to an encode path. Each starts at the
+    /// conservative answer and is set by the caller that knows better.
+    #[must_use]
+    pub fn for_backend(backend: BackendKind, tp_rank: u32, tp_size: u32) -> Self {
+        Self {
+            backend,
+            tp_rank,
+            tp_size: tp_size.max(1),
+            // What cuBLAS wants for a matrix operand and what `cudaMalloc`
+            // itself guarantees, so a view into the arena is as aligned as its
+            // own allocation would have been. Metal's buffers want no less.
+            preferred_alignment: 256,
+            // How much host staging one load-time transform may take at once.
+            max_tile_bytes: 64 * 1024 * 1024,
+            tile_map_mask: passes::tile::compilable_tile_maps(backend),
+            // FALSE, and the name is the trap. `native_mxfp4_moe` does not mean
+            // "reads MXFP4"; it means "has a native MXFP4 *GEMM*", which in
+            // gpt-oss's contract selects a Marlin REPACK of the expert banks —
+            // work this tree did not port. A driver whose GEMM reads the stored
+            // banks directly wants the other branch, which is this one.
+            native_mxfp4_moe: false,
+            // No fused transcode kernels in this tree.
+            fusion_mask: 0,
+            // The dtype the encode kernels dequantize through, which decides
+            // how many rows of scratch fit in the tile budget.
+            encode_scratch_dtype: DType::BF16,
+            block_scale_rows: 0,
+        }
+    }
 }
 
 impl Default for StorageTarget {
@@ -331,6 +383,31 @@ pub struct TransformSpec {
     /// what they see.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scale_blocks: Vec<i64>,
+    /// The backend entry point this transform runs as, when the target has one
+    /// for these exact operands.
+    ///
+    /// Filled in by [`passes::tile::lower`](crate::plan::passes::tile::lower)
+    /// against the target's own kernel table, and `None` when no row covers
+    /// the operands — a dtype pair with no cast kernel, a uniform `Scale`
+    /// where the kernel wants a per-group operand, an MXFP4 `Encode` whose
+    /// width is not a multiple of its block. Those run on the host, and the
+    /// plan now SAYS which ones will.
+    ///
+    /// This is the field that lets a backing stop deciding. A capability bit
+    /// is per KIND and a kernel is per SHAPE, so a backing asked "can you do
+    /// `Cast`" could only answer for the kind and then decline the operands at
+    /// launch — which made "the loader transforms on the GPU" a claim you had
+    /// to instrument a load to check. Naming the row moves that answer to
+    /// compile time, where the tensor is still in hand to name in the refusal,
+    /// and leaves the backing a lookup.
+    ///
+    /// A `String` rather than a `&'static str` because a plan is serialized and
+    /// cached. The symbol is checked against the target's table when it is
+    /// chosen, so a plan cannot name a row that does not exist; a plan read
+    /// back from an older cache is refused by the compiler hash before it gets
+    /// here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,5 +537,247 @@ impl LoadPlan {
             attachments: Vec::new(),
             groups: Vec::new(),
         }
+    }
+
+    /// Does this plan publish ONE tensor for the embedding and the output
+    /// projection?
+    ///
+    /// Decided once, by the contract, and read back here rather than decided
+    /// a second time. The rule is that a shipped `lm_head` beats whatever the
+    /// config says, and the config can be wrong in both directions:
+    /// Qwen3.5-35B-A3B is a multimodal wrapper spelling `tie_word_embeddings`
+    /// at the TOP level, outside the `text_config` its family parses, so the
+    /// facts default to tied; Qwen3-0.6B says `tie_word_embeddings: true` and
+    /// then ships an `lm_head.weight` anyway. Either way the contract staged
+    /// `embed_tokens` and `lm_head` while the DAG asked for
+    /// `shared_embedding`, and the load stopped on "unstaged weight
+    /// shared_embedding.weight" — two opinions about one fact.
+    ///
+    /// The plan's own tensor list is the only opinion that cannot be wrong in
+    /// a way the binding survives, so it is the one every family follows. It
+    /// It is a method here rather than a helper in a driver because a driver
+    /// asking the question had to spell `shared_embedding.weight` to ask it
+    /// — a name four contract authors in `crates/model` produce and no
+    /// driver owns. See [`TIED_EMBEDDING_NAME`] for what this does and does
+    /// not close.
+    #[must_use]
+    pub fn ties_embeddings(&self) -> bool {
+        self.tensors
+            .iter()
+            .any(|tensor| tensor.name == TIED_EMBEDDING_NAME)
+    }
+
+    /// The names of every tensor this plan leaves in MXFP4.
+    ///
+    /// A plan's job is to get bytes onto a device unchanged; what they MEAN
+    /// is the binder's business, and this is how the plan tells it. A set of
+    /// names rather than a flag because **a checkpoint need not be uniform**:
+    /// `mlx-community/gpt-oss-20b-MXFP4-Q4` names 98 tensors as affine/64/4
+    /// in its `quantization` block and leaves the expert banks out, so those
+    /// take the top-level default — mxfp4, group 32.
+    ///
+    /// Reading a bank with the dense format is not a near miss. Every scale
+    /// comes from the wrong offset and bf16 garbage is NaN more often than
+    /// not: measured, a fire bound every name, ran all 484 statements, and
+    /// produced NaNs from the first routed projection of layer 0 onward while
+    /// every structural gate passed.
+    ///
+    /// A driver computing this itself has to match on `Encoding::Quant` and
+    /// on the `QuantScheme` variant — two of this crate's enums, read
+    /// structurally, in a crate that should be reading answers.
+    #[must_use]
+    pub fn mxfp4_tensor_names(&self) -> std::collections::HashSet<String> {
+        self.tensors
+            .iter()
+            .filter(|t| {
+                matches!(
+                    &t.encoding,
+                    Encoding::Quant(spec) if spec.scheme == QuantScheme::Mxfp4E2M1E8M0
+                )
+            })
+            .map(|t| t.name.clone())
+            .collect()
+    }
+
+    /// Every DISTINCT affine point this plan's tensors arrive at.
+    ///
+    /// `(group_size, bits_per_element)` for each tensor whose encoding is
+    /// affine — which is to say quantized and not MXFP4, since a bank in
+    /// MXFP4 takes its own kernel at its own group and is not read at an
+    /// affine point at all.
+    ///
+    /// # Why a SET, and why the plan is the one that knows
+    ///
+    /// For the same reason [`Self::mxfp4_tensor_names`] is a set of names:
+    /// **a checkpoint need not be uniform.** `mlx_lm` publishes a routed
+    /// stack at 4 bits and its ROUTER GATE at 8, because the gate is a
+    /// small tensor whose error the whole mixture inherits — every token
+    /// routed to almost the right experts. That is not a fault. It is a
+    /// fluent model answering wrongly, measured at cosine 0.84 against the
+    /// reference logits.
+    ///
+    /// A driver cannot see this. It is handed the checkpoint's
+    /// `config.json` point — ONE `(group, bits)` — and builds one kernel
+    /// set from it, so a second point in the tensors is read at the first
+    /// and nothing anywhere says so. The plan is where the per-tensor
+    /// `QuantSpec` lives, so the plan is what can be asked.
+    ///
+    /// Sorted, so a caller comparing two plans or printing a refusal gets
+    /// a stable answer rather than a hash order.
+    #[must_use]
+    pub fn affine_points(&self) -> Vec<(u32, u32)> {
+        let mut points: Vec<(u32, u32)> = self
+            .tensors
+            .iter()
+            .filter_map(|t| match &t.encoding {
+                Encoding::Quant(spec)
+                    if spec.scheme != QuantScheme::Mxfp4E2M1E8M0 && spec.group_size > 0 =>
+                {
+                    Some((spec.group_size, u32::from(spec.bits_per_element)))
+                }
+                _ => None,
+            })
+            .collect();
+        points.sort_unstable();
+        points.dedup();
+        points
+    }
+}
+
+/// The one name a contract publishes when the embedding and the output
+/// projection are the same tensor.
+///
+/// **This crate does not emit it.** Four contract authors in `crates/model`
+/// do — `llama_3`, `qwen_3_5` and `gemma_4` each `format!` it — and the
+/// dependency runs `model` → `model-loader`, so nothing links their spelling
+/// to this one. A constant here does not fix that; what it fixes is the
+/// smaller thing, that a **driver** asking whether a plan ties its
+/// embeddings no longer has to spell the name to find out.
+///
+/// The larger gap is real and stays open: rename the tied tensor in those
+/// authors and this constant goes quietly stale.
+pub const TIED_EMBEDDING_NAME: &str = "shared_embedding.weight";
+
+#[cfg(test)]
+mod plan_query_tests {
+    use super::*;
+    use crate::types::{QuantSpec, Visibility};
+
+    fn decl(name: &str, encoding: Encoding) -> TensorDecl {
+        TensorDecl {
+            id: TensorId(0),
+            name: name.to_string(),
+            shape: vec![32, 8],
+            encoding,
+            alignment: 256,
+            visibility: Visibility::Public,
+        }
+    }
+
+    #[test]
+    fn tied_embeddings_are_read_off_the_plan_not_the_config() {
+        let mut plan = LoadPlan::empty(StorageTarget::default());
+        assert!(!plan.ties_embeddings());
+        plan.tensors
+            .push(decl(TIED_EMBEDDING_NAME, Encoding::Raw(DType::BF16)));
+        assert!(plan.ties_embeddings());
+    }
+
+    fn affine(name: &str, group: u32, bits: u8) -> TensorDecl {
+        decl(
+            name,
+            Encoding::Quant(QuantSpec {
+                scheme: QuantScheme::MlxAffineU4,
+                logical_dtype: DType::BF16,
+                bits_per_element: bits,
+                group_size: group,
+                channel_axis: None,
+            }),
+        )
+    }
+
+    /// The router gate published at a width the rest of the stack is not.
+    ///
+    /// `mlx_lm` does this deliberately: the gate is a small tensor whose
+    /// error the WHOLE mixture inherits, so it is published at 8 bits
+    /// inside a 4-bit stack. A driver handed one `(group, bits)` off
+    /// `config.json` reads it at 4 and the mixture routes each token to
+    /// almost the right experts — cosine 0.84 against the reference
+    /// logits, and not one NaN to notice it by.
+    ///
+    /// The plan knew all along; nothing asked. This is the asking.
+    #[test]
+    fn a_stack_that_publishes_its_router_gate_wider_says_so() {
+        let mut plan = LoadPlan::empty(StorageTarget::default());
+        assert!(
+            plan.affine_points().is_empty(),
+            "an empty plan arrives at no affine point"
+        );
+
+        plan.tensors.push(affine("layer.0.q_proj.weight", 64, 4));
+        plan.tensors.push(affine("layer.0.k_proj.weight", 64, 4));
+        assert_eq!(
+            plan.affine_points(),
+            vec![(64, 4)],
+            "a uniform stack is ONE point, however many tensors carry it"
+        );
+
+        plan.tensors.push(affine("layer.0.router.gate", 64, 8));
+        assert_eq!(
+            plan.affine_points(),
+            vec![(64, 4), (64, 8)],
+            "the gate's width is a second point, and sorted so a refusal \
+             prints the same way twice"
+        );
+
+        // An MXFP4 bank is NOT a second affine point: it takes its own
+        // kernel at its own group and is never read at one. Without this
+        // exclusion every gpt-oss checkpoint would refuse.
+        plan.tensors.push(decl(
+            "layer.0.experts.gate_up",
+            Encoding::Quant(QuantSpec {
+                scheme: QuantScheme::Mxfp4E2M1E8M0,
+                logical_dtype: DType::BF16,
+                bits_per_element: 0,
+                group_size: 32,
+                channel_axis: None,
+            }),
+        ));
+        assert_eq!(
+            plan.affine_points(),
+            vec![(64, 4), (64, 8)],
+            "an mxfp4 bank is not read at an affine point"
+        );
+
+        // Nor is an unquantized tensor.
+        plan.tensors
+            .push(decl("layer.0.norm.weight", Encoding::Raw(DType::BF16)));
+        assert_eq!(plan.affine_points(), vec![(64, 4), (64, 8)]);
+    }
+
+    #[test]
+    fn a_mixed_checkpoint_names_only_the_banks_it_left_in_mxfp4() {
+        // The case this exists for: gpt-oss-20b-MXFP4-Q4 quantizes 98 dense
+        // tensors as affine/64/4 and leaves the expert banks at the top-level
+        // mxfp4 default. A flag would have to pick one answer for both.
+        let mut plan = LoadPlan::empty(StorageTarget::default());
+        plan.tensors
+            .push(decl("layer.0.mlp.weight", Encoding::Raw(DType::BF16)));
+        plan.tensors.push(decl(
+            "layer.0.experts.gate_up",
+            Encoding::Quant(
+                QuantSpec {
+                    scheme: QuantScheme::Mxfp4E2M1E8M0,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 0,
+                    group_size: 0,
+                    channel_axis: None,
+                }
+                .normalized(),
+            ),
+        ));
+        let names = plan.mxfp4_tensor_names();
+        assert_eq!(names.len(), 1, "only the bank is mxfp4: {names:?}");
+        assert!(names.contains("layer.0.experts.gate_up"));
     }
 }

@@ -1,7 +1,7 @@
 //! kimi's forward, declared.
 //!
 //! Transcribed from `driver-cuda/csrc/src/model/kimi/kimi_forward.cpp`.
-//! The second MLA family; what differs from [`crate::glm5`] is worth
+//! The second MLA family; what differs from [`crate::glm_5`] is worth
 //! naming, because the shapes are otherwise the same statement:
 //!
 //! * **No DSA.** kimi's attention reads the whole context; there is no
@@ -23,8 +23,7 @@
 pub mod facts;
 
 use self::facts::{KimiCudaFacts, KimiFacts};
-use model_compiler::dsl::{
-    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct KimiLayerW {
@@ -82,14 +81,19 @@ impl KimiLayerW {
 }
 
 /// kimi's CUDA text for one fire class.
+///
+/// **Both shaped classes, and the body is the same text for each.** MLA's
+/// attention is one planned dispatch — `attn::plan_attention_mla_bf16` takes
+/// a `qo_indptr` and a `causal` flag, so a decode is the special case where
+/// every request contributes one query row, not a different kernel. Nothing
+/// else here reads the class. So the class reaches only the trace's NAME,
+/// which is what a lowering keys its cache by.
+///
+/// It used to `panic!` on anything but Decode. That was not a statement about
+/// this text — it was the absence of one, and it made every prefill a failed
+/// request.
 pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> ForwardPlan {
-    let family = format!(
-        "kimi.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            other => panic!("kimi states no {other:?} class yet"),
-        }
-    );
+    let family = format!("kimi.cuda.{}", class.suffix());
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
         let mut y = dsl::embedded_prologue(t, facts.hidden);
@@ -163,13 +167,12 @@ pub fn kimi_cuda(facts: &KimiFacts, cuda: &KimiCudaFacts, class: FireClass) -> F
             let _ = up;
             let act = dsl::cuda::swiglu(&gate, facts.moe.moe_intermediate, false);
             let act_fp16 = dsl::cuda::bf16_to_fp16(&act);
-            let route_out =
-                dsl::cuda::wna16_down_decode(
-                    &act_fp16,
-                    &experts,
-                    facts.hidden,
-                    &format!("layer.{l}.experts"),
-                );
+            let route_out = dsl::cuda::wna16_down_decode(
+                &act_fp16,
+                &experts,
+                facts.hidden,
+                &format!("layer.{l}.experts"),
+            );
             let routed = dsl::cuda::weighted_sum(&weights, &route_out, facts.hidden, None);
 
             let moe_out = if facts.moe.shared_intermediate > 0 {

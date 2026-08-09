@@ -16,7 +16,7 @@
 //!   Still `#[repr(C)]` and still `{ptr, len}` where a slice would do, which
 //!   is the shape they took when they crossed a C boundary. Nothing crosses
 //!   one now; converting them to borrowed Rust is a mechanical sweep over
-//!   ~65 construction sites in `engine`, `driver-cuda-new` and
+//!   ~65 construction sites in `engine`, `driver-cuda` and
 //!   `driver-dummy`, and it is the next step rather than this one.
 //! - [`adopt`]: the [`local`] → [`plan`] direction, copying a borrowed launch
 //!   package into the owned one a driver keeps for the life of the program.
@@ -37,6 +37,7 @@ pub mod image;
 pub mod local;
 pub mod plan;
 pub mod remote;
+pub mod submission;
 pub mod transfer;
 
 pub use adopt::{adopt_emitted_kernels, adopt_package, adopt_region_analysis};
@@ -60,4 +61,5 @@ pub use plan::{
     RS_FLAG_FOLD, RS_FLAG_FOLD_LEN_DEVICE, RS_FLAG_RESET, StateCopyPlan,
 };
 pub use remote::*;
+pub use submission::{FrameSubmission, StepSubmission};
 pub use transfer::{KvDtype, KvExport, KvHandle, KvLayout, KvLayoutKind, KvRegion, MemoryDomain};

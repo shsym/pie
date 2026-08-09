@@ -28,10 +28,29 @@ pub mod layout;
 pub mod mlp;
 pub mod moe;
 pub mod norm;
+pub mod norm_device;
 pub mod quant;
 pub mod rope;
 pub mod sample;
 pub mod ssm;
+
+/// The `pie_k_*` entry points, for the rows any caller can state.
+///
+/// `native` builds `libpie_launch_shim.a`, which DEFINES these; this is the
+/// matching declaration, generated from the same rows in the same process, so
+/// a signature cannot drift from what the shim proves against the header.
+///
+/// Restricted to portable rows — see
+/// [`abi::emit_rust_bindings_portable`]. A row taking `KvCacheLayerView` or a
+/// FlashInfer plan is absent, because its declaration would name a
+/// `#[repr(C)]` mirror this crate does not hold. Those belong to the shell,
+/// which generates the full set against its own mirrors; nothing stops two
+/// crates from declaring one symbol, because a declaration is not a
+/// definition.
+#[cfg(feature = "native")]
+pub mod ffi {
+    include!(concat!(env!("OUT_DIR"), "/ffi.rs"));
+}
 
 /// Every kernel a lowered declaration may state.
 ///
@@ -87,6 +106,7 @@ const EMPTY: KernelSig = KernelSig {
     lacks: &[], sink: None, in_place: &[], depth_prefix_plan: false,
     operands: &[],
     returns: "", axes: &[], grid_param: None,
+    head_param: None, heads_param: None, lowered_as: None,
 };
 
 const fn copy_sig(k: &KernelSig) -> KernelSig {
@@ -97,5 +117,7 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         depth_prefix_plan: k.depth_prefix_plan,
         operands: k.operands, returns: k.returns, axes: k.axes,
         grid_param: k.grid_param,
+        head_param: k.head_param, heads_param: k.heads_param,
+        lowered_as: k.lowered_as,
     }
 }

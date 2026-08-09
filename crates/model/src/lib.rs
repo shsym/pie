@@ -1,19 +1,27 @@
-//! What a model IS: the two registries that turn a model's name into an
-//! implementation, and the implementations they dispatch to.
+//! What a model IS: the one registry that turns a model's name into an
+//! implementation, and the implementations it dispatches to.
 //!
 //! ## Three aspects, one crate
 //!
-//! * [`contract`] — `model_type` to the author that writes its load contract.
-//! * [`instruct`] — `arch_name` to the chat template that formats for it.
+//! * [`contract`] — a row to the author that writes its load contract.
+//! * [`instruct`] — a row to the chat template that formats for it.
 //! * `<generation>::forward` — the forward pass, written in
 //!   `model-compiler`'s tracing eDSL. Behind the non-default `forward`
 //!   feature, because `pie model convert` wants the first two and not a
 //!   tracer.
 //!
-//! The first two are REGISTRIES and the third is not: a forward pass is
+//! The first two are ASPECTS OF A ROW and the third is not: a forward pass is
 //! reached by a driver naming a family's text directly, not by a row. That
 //! asymmetry is real and is why `forward` sits on the generation module
-//! rather than in a table beside the other two.
+//! rather than beside the other two on [`catalog::Variant`].
+//!
+//! Neither of the first two is a registry any more, and saying so twice is
+//! how this file used to contradict itself. [`contract::author`] takes a
+//! `&dyn Variant` and calls `row.author`; [`instruct::create`] takes an id,
+//! asks [`catalog::find`] for the row, and calls `row.chat`. The lookup they
+//! used to each own — one keyed on `config.json`'s `model_type`, one on
+//! `architectures[0]` — is [`catalog`], once, for both. See "The registries"
+//! below for what those separate keys cost.
 //!
 //! There was a fourth thing here — `ffi`, a `#[repr(C)]` door and a committed
 //! `include/pie_forward.h`, 5,382 lines of it. It existed so the C++ drivers
@@ -24,10 +32,14 @@
 //! rather than kept warm: an ABI with no caller does not stay correct, it
 //! just stays compiling.
 //!
-//! They deliberately partition the model space differently: templates split by
-//! release, contracts by storage schema. So a generation is reached through a
-//! *row*, never as a module path, and every N:1 reuse is written out — a dozen
-//! `model_type`s share Llama 3's dense author, and ChatML serves four vendors.
+//! They used to partition the model space differently — templates split by
+//! release, contracts by storage schema — and the whole point of one row is
+//! that they no longer do. A generation is reached through a *row*, never as
+//! a module path, and every N:1 reuse is written out on that one partition: a
+//! dozen `model_type`s share Llama 3's dense author, and ChatML serves four
+//! vendors. Two rows may still answer the same author and different
+//! templates; what they can no longer do is disagree about which model they
+//! are talking about.
 //!
 //! A generation with no implementation of its own gets no module: `mixtral`,
 //! `deepseek_v2`, `deepseek_v3`, `ministral3`, `gemma3n`, `kimi_k25` and
@@ -51,7 +63,7 @@
 //!
 //! And the sharing that broke the old rule gets the home the rule implies:
 //! ChatML — which `qwen3`, `qwen3_5`, `nemotron_h`, `glm_moe_dsa` and `qwen2`
-//! all bind — is [`families::chatml`], not a file inside whichever generation
+//! all bind — is [`shared::chatml`], not a file inside whichever generation
 //! happened to write it down first.
 //!
 //! The module layout mirrors the old crate layout on purpose. A generation
@@ -81,35 +93,29 @@
 //! `engine/src/model.rs`; only [`ModelMetadata`] stayed, because the worker
 //! reads it without linking the runtime.
 
-// ── The shared root: the contract aspect ─────────────────────────────
-#[cfg(feature = "contract")]
-pub mod builder;
-#[cfg(feature = "contract")]
-pub mod mlx;
-#[cfg(feature = "contract")]
-pub mod moe;
-#[cfg(feature = "contract")]
-pub mod policy;
-#[cfg(feature = "contract")]
-pub mod probe;
+// ── The descriptor aspect is GONE ────────────────────────────────────
+//
+// `config` (1,563 lines), `descriptor` (443) and `facts` (153) are
+// deleted, and so is `deployment_cuda` (1,436): a `pie.model/1`
+// descriptor normalized from a 136-field schema, a reader that parsed it
+// back, a `ModelFacts` projection of the result, and eleven per-family
+// derivations over all of it. That is 3,595 lines whose entire job was
+// to turn strings a checkpoint says about itself into numbers, ONCE PER
+// REPRESENTATION, with nothing holding the representations to each
+// other.
+//
+// The numbers were always the same numbers. They are stated once now, in
+// `catalog`, and the only thing left that a file has to answer is the
+// declared encoding — see `encoding`.
 
-// ── The descriptor aspect ────────────────────────────────────────────
-// `pie.model/1`: HuggingFace `config.json` in, the descriptor out, and
-// nothing but serde behind it. Its own feature rather than `contract`'s
-// because `worker` writes a descriptor for a plain snapshot without
-// authoring anything, and because being reachable with no graph attached is
-// the whole point — see the module doc.
-#[cfg(feature = "config")]
-pub mod config;
-/// Trace names for the weights a checkpoint publishes.
-#[cfg(feature = "config")]
-pub mod weight_names;
-#[cfg(feature = "contract")]
-pub mod facts;
+/// What a driver needs to serve a checkpoint, with no family name in it.
+///
+/// The answer to "what is this model made of", shaped so that a driver
+/// CANNOT ask the question again. See the module doc for why this is a
+/// value rather than the `Box<dyn PlannedFamily>` the drivers built per
+/// fire.
+pub mod deployment;
 
-// ── The shared root: the chat aspect ─────────────────────────────────
-#[cfg(feature = "chat")]
-pub mod decoders;
 // The `Instruct` trait and its events, AND the `create` registry that picks an
 // implementation for an `arch_name`. Those were two files in two crates: a
 // generation could not depend on the registry that dispatches to it, so the
@@ -118,22 +124,48 @@ pub mod decoders;
 pub mod instruct;
 
 // ── Cross-generation sharing ─────────────────────────────────────────
-// The only thing a generation module may name besides the root. What lives
-// here is what more than one generation binds -- not what one generation
-// wrote first.
-// Gated on either aspect that has a family module in it: `chatml` is chat's,
-// `llama_like`'s forward pass is the forward aspect's. The directory is the
-// home for what more than one generation binds, whichever aspect binds it.
-#[cfg(any(feature = "chat", feature = "forward"))]
-pub mod families;
-
-/// The committed static-C++ emissions, as one list — `bin/emit-cuda.rs`
-/// writes it, `tests/generated_cuda.rs` checks it, and neither holds a
-/// copy of its own.
-#[cfg(feature = "forward")]
-pub mod emissions;
+// The ONLY thing a generation module may name. What lives there is what more
+// than one generation binds -- not what one generation wrote first -- plus
+// the general vocabulary (`builder`, `policy`, `probe`, `moe`, `mlx`,
+// `weight_names`, `decoders`) that used to be scattered across this root.
+//
+// Ungated as a whole because its contents are not: each module inside carries
+// its own aspect gate, and the two kinds of shared thing do not share one.
+// The root that is left is the catalog and its answers.
+pub mod shared;
 
 // ── The registries ───────────────────────────────────────────────────
+//
+// `catalog` is THE registry. There used to be three -- `contract::HF_ROWS`
+// keyed on a `config.json` `model_type`, `deployment_cuda::FACTS_ROWS` keyed
+// on the same string, and `instruct::create` keyed on `architectures[0]` --
+// and nothing held them to each other. `qwen3_moe` authored as a GDN mixture
+// and deployed as a dense llama in the same tree; the chat table's `_ =>`
+// arm answered ChatML for a generation that had never heard of `<|im_end|>`.
+//
+// One row now answers all three, so the answers cannot disagree.
+
+/// The tensor manifest: what a checkpoint of a row MUST contain.
+///
+/// Identity and validation are the same operation here, which is the
+/// whole reason a manifest is first-class. Ungated: every aspect that
+/// can name a row can ask what it is made of.
+pub mod manifest;
+
+/// The catalog: one row per model, one row per answer.
+pub mod catalog;
+
+/// What a checkpoint's FILES say about how its numbers are stored.
+///
+/// Beside the catalog rather than in it, because an encoding is a
+/// property of a file and a row is a property of a model. Qwen3-8B is
+/// one row and four downloads.
+pub mod encoding;
+
+/// The load path itself: a row in, a plan out, stated once for every
+/// driver. Sits with `contract` because it is that registry's caller.
+#[cfg(feature = "contract")]
+pub mod boot;
 #[cfg(feature = "contract")]
 pub mod contract;
 #[cfg(feature = "chat")]
@@ -145,17 +177,18 @@ pub mod multimodal;
 // its own aspects, so a generation that implements only one is an empty module
 // under the other.
 //
-// `qwen_3` is absent by the families rule: everything it held was ChatML,
-// which four other generations bind, so it is `families::chatml`.
+// `qwen_3` used to be absent by the families rule -- everything it held was
+// ChatML, which four other generations bind. It is back, because a
+// generation now holds something no family can: its ROWS. `shared::chatml`
+// still speaks for it.
 pub mod csm;
 pub mod deepseek_r1;
 pub mod deepseek_v4;
 pub mod gemma_2;
 pub mod gemma_3;
-pub mod gemma3n;
+pub mod gemma_3n;
 pub mod gemma_4;
 pub mod glm_5;
-pub mod glm5;
 pub mod gpt_oss;
 pub mod kimi_k2;
 pub mod kimi_k3;
@@ -167,7 +200,14 @@ pub mod olmo_2;
 pub mod olmo_3;
 pub mod phi_3;
 pub mod qwen_2;
+pub mod qwen_3;
 pub mod qwen_3_5;
+
+/// One row that describes no real checkpoint, so that a test can afford to
+/// write one. Absent unless asked for; see the module for why a closed set
+/// needs a door and why this is not one.
+#[cfg(feature = "test-rows")]
+pub mod test_rows;
 
 // ── Neither aspect ───────────────────────────────────────────────────
 //

@@ -65,38 +65,35 @@ fn production_lines(body: &str) -> impl Iterator<Item = (usize, &str)> {
 
 /// The compiler opens no files.
 ///
-/// Five places are allowed to, and each is allowed for a reason that is about
+/// Six places are allowed to, and each is allowed for a reason that is about
 /// *bytes* or about the *world*, never about a decision:
 ///
 /// * `checkpoint/` — the reader. Turning a directory into a
 ///   `CheckpointMetadata` is precisely the step this test exists to keep
 ///   separate, so it has to live somewhere, and it lives in one module.
-/// * `executor/host.rs` — it runs a finished plan, which means copying
+/// * `executor/walk.rs` — it runs a finished plan, which means copying
 ///   weight bytes; that is its whole job. (It lived under `testkit/` until
 ///   `pie model convert` made it a production path.)
 /// * `cache_key.rs` — the on-disk plan cache. It stats and writes files that are
 ///   outputs of compilation, never inputs to it.
-/// * `weight_store.rs` — the materialized-weight artifact, which is an output
-///   for the same reason: it is written *after* a plan has run, from device
-///   memory the driver already holds, and read back only to skip doing that
-///   again. Nothing the compiler decides depends on whether one exists.
 /// * `verify.rs` — staleness. `verify` is deliberately *not* `compile`: its
 ///   whole point is to compare a plan against the world it was compiled for, so
 ///   asking whether the files still have the recorded sizes is the check, not a
 ///   leak. A `compile` that could do this would be a different function.
-/// * `main.rs` — the CLI, which is a caller, not the library.
 /// * `testkit.rs` — feature-gated test support (the fixture writer). The
 ///   build this property protects — the worker's — compiles with `testkit`
 ///   off, so the gate enforces for production what this exemption relaxes
 ///   for tests.
+///
+/// An exemption that names no file is itself an offence — weight_store.rs was
+/// on this list for a module that had been deleted, and a list of exemptions
+/// is a list nothing else checks.
 #[test]
 fn nothing_below_the_reader_opens_a_file() {
     const ALLOWED: &[&str] = &[
-        "executor/host.rs",
+        "executor/walk.rs",
         "cache_key.rs",
         "verify.rs",
-        "weight_store.rs",
-        "main.rs",
         "testkit.rs",
     ];
     // `Path`/`PathBuf` are values and may be passed around freely; what must not
@@ -112,6 +109,7 @@ fn nothing_below_the_reader_opens_a_file() {
     ];
 
     let mut offences = Vec::new();
+    let mut unused: Vec<&str> = ALLOWED.to_vec();
     for (rel, body) in sources() {
         // Test-only files are exempt wholesale: a fixture has to be written
         // somewhere, and a golden has to be read back.
@@ -119,6 +117,7 @@ fn nothing_below_the_reader_opens_a_file() {
             || rel.starts_with("checkpoint/")
             || rel.ends_with("tests.rs")
         {
+            unused.retain(|allowed| *allowed != rel.as_str());
             continue;
         }
         for (line_no, line) in production_lines(&body) {
@@ -134,6 +133,12 @@ fn nothing_below_the_reader_opens_a_file() {
         "the compiler must not touch the filesystem; move the read into \
          `checkpoint/read.rs` and pass a value:\n{}",
         offences.join("\n")
+    );
+    assert!(
+        unused.is_empty(),
+        "these files are exempted from the no-filesystem rule and do not \
+         exist. An exemption for a deleted module is an exemption waiting to \
+         be inherited by whatever takes its name: {unused:?}"
     );
 }
 
@@ -200,8 +205,9 @@ fn a_plan_compiles_from_a_value_with_no_checkpoint_anywhere() {
 /// this GPU's block scales" and lives here, the loader has an opinion about
 /// hardware it cannot see.
 ///
-/// There is no exemption. `arch.rs`, `arch/` and `config.rs` used to be exempt
-/// *by name*, which is what made deleting them turn this test from a lint into
+/// There is no exemption. Three modules — arch.rs, arch/ and config.rs, all
+/// deleted — used to be exempt *by name*, which is what made deleting them
+/// turn this test from a lint into
 /// a proof: the moment the exemption had nothing left to cover, the property
 /// held over the whole crate rather than over the part of it nobody had
 /// finished migrating.
@@ -256,12 +262,22 @@ fn the_backend_lowering_reads_its_numbers_off_the_target() {
     let mut offences = Vec::new();
     for (line_no, line) in production_lines(tile) {
         let trimmed = line.trim();
-        // A `const` here is a number the driver never stated. The tile-map masks
-        // are the one exception and are not capability claims: they are the set
-        // of transforms the *loader* knows how to emit, which the driver
-        // intersects with its own.
+        // A `const` here is a number the driver never stated. Two kinds are
+        // not, and the difference is what the rule is about: a NUMBER
+        // describes the device, while a NAME is the loader's own vocabulary
+        // for expressing a transform.
+        //
+        // * the tile-map masks — the set of transforms the *loader* knows how
+        //   to emit, which the driver intersects with its own;
+        // * a kernel symbol (`: &str = "..."`) — which row a chosen transform
+        //   IS. The failure this test exists to catch is a fallback tile size,
+        //   a block-scale granularity, a scratch dtype: quantities that make
+        //   the plan depend on something no caller stated. A symbol cannot be
+        //   one of those, and it is checked from the other end —
+        //   `executor::cuda`'s tests resolve each against
+        //   `kernels_cuda::quant::KERNELS` when the feature is on.
         if trimmed.starts_with("const ") || trimmed.starts_with("pub const ") {
-            if trimmed.contains("TILE_MAP_MASK") {
+            if trimmed.contains("TILE_MAP_MASK") || trimmed.contains(": &str = \"") {
                 continue;
             }
             offences.push(format!("{TILE}:{line_no}: {trimmed}"));

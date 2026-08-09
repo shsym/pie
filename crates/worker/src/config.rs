@@ -237,9 +237,7 @@ fn parse_duration(text: &str) -> std::result::Result<Duration, String> {
     let t = text.trim();
     let split = t
         .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .ok_or_else(|| {
-            format!("duration {t:?} has no unit; write one of 120s, 50ms, 2m")
-        })?;
+        .ok_or_else(|| format!("duration {t:?} has no unit; write one of 120s, 50ms, 2m"))?;
     let (value, unit) = t.split_at(split);
     let value: f64 = value
         .parse()
@@ -273,9 +271,9 @@ impl<'de> Deserialize<'de> for Duration {
 impl Serialize for Duration {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         let us = self.as_micros();
-        if us % 1_000_000 == 0 {
+        if us.is_multiple_of(1_000_000) {
             s.serialize_str(&format!("{}s", us / 1_000_000))
-        } else if us % 1_000 == 0 {
+        } else if us.is_multiple_of(1_000) {
             s.serialize_str(&format!("{}ms", us / 1_000))
         } else {
             s.serialize_str(&format!("{us}us"))
@@ -310,9 +308,7 @@ fn parse_byte_size(text: &str) -> std::result::Result<ByteSize, String> {
     let t = text.trim();
     let split = t
         .find(|c: char| !c.is_ascii_digit() && c != '.')
-        .ok_or_else(|| {
-            format!("size {t:?} has no unit; write one of 512B, 256MiB, 4GiB")
-        })?;
+        .ok_or_else(|| format!("size {t:?} has no unit; write one of 512B, 256MiB, 4GiB"))?;
     let (value, unit) = t.split_at(split);
     let value: f64 = value
         .parse()
@@ -349,11 +345,11 @@ impl Serialize for ByteSize {
         const MIB: u64 = 1024 * 1024;
         const KIB: u64 = 1024;
         let b = self.0;
-        let text = if b % GIB == 0 && b != 0 {
+        let text = if b.is_multiple_of(GIB) && b != 0 {
             format!("{}GiB", b / GIB)
-        } else if b % MIB == 0 && b != 0 {
+        } else if b.is_multiple_of(MIB) && b != 0 {
             format!("{}MiB", b / MIB)
-        } else if b % KIB == 0 && b != 0 {
+        } else if b.is_multiple_of(KIB) && b != 0 {
             format!("{}KiB", b / KIB)
         } else {
             format!("{b}B")
@@ -593,10 +589,7 @@ impl Default for RuntimeConfig {
 
 impl RuntimeConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(
-            self.worker_threads > 0,
-            "server.worker_threads must be > 0"
-        );
+        ensure!(self.worker_threads > 0, "server.worker_threads must be > 0");
         ensure!(
             self.wasm_max_instances > 0,
             "sandbox.max_instances must be > 0"
@@ -704,8 +697,7 @@ impl ModelConfig {
         // operator did not choose and which differs between the worker and a
         // driver launched as its own process.
         ensure!(
-            self.weight_cache_dir.is_empty()
-                || Path::new(&self.weight_cache_dir).is_absolute(),
+            self.weight_cache_dir.is_empty() || Path::new(&self.weight_cache_dir).is_absolute(),
             "model.weight_cache_dir must be an absolute path (got {:?}); \
              leave it empty for $PIE_HOME/cache/weights",
             self.weight_cache_dir
@@ -969,10 +961,7 @@ pub struct DriverConfig {
 
 impl DriverConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(
-            !self.device.is_empty(),
-            "driver.device must be non-empty"
-        );
+        ensure!(!self.device.is_empty(), "driver.device must be non-empty");
         match self.kind {
             DriverKind::CudaNative => {
                 let opts: CudaNativeDriverOptions = toml::Value::Table(self.options.clone())
@@ -1109,6 +1098,19 @@ where
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct MetalDriverOptions {
+    /// `[model] id`: the operator's answer to "which model is this".
+    ///
+    /// Absent — the ordinary case — the driver identifies the checkpoint
+    /// from its TENSORS against the catalog every driver links. Present,
+    /// it names a row directly, for a checkpoint that is genuinely a
+    /// known model under an unknown name: a fine-tune, a re-upload, a
+    /// mirror that renamed the directory.
+    ///
+    /// It is an OVERRIDE and not a bypass. The named row's manifest is
+    /// still matched, so this cannot be used to load a checkpoint as
+    /// something it is not — which is the failure the whole arrangement
+    /// exists to prevent.
+    pub model_id: Option<String>,
     /// KV page size in tokens. Used as given -- unlike the CUDA driver, the
     /// Metal driver has no planner to derive one.
     pub kv_page_size: u32,
@@ -1188,6 +1190,7 @@ pub struct MetalDriverOptions {
 impl Default for MetalDriverOptions {
     fn default() -> Self {
         Self {
+            model_id: None,
             kv_page_size: 32,
             total_pages: 1024,
             max_forward_tokens: 10240,
@@ -1225,6 +1228,18 @@ pub struct DummyDriverOptions {
     /// `architectures[0]` with a `forcausallm` suffix stripped).
     #[serde(default)]
     pub arch_name: Option<String>,
+    /// The catalog id advertised in the caps handshake — `"qwen3-0.6b"`,
+    /// not `"qwen3"`. The engine looks this up to get the layer count, the
+    /// vocabulary and the chat template, so unlike the two above it is not
+    /// a label: it names a row.
+    ///
+    /// When `None` the standalone IDENTIFIES the checkpoint from its
+    /// tensors, which is what a real driver does. Stating it here is the
+    /// same escape hatch `pie model build --as` is, and it is held to the
+    /// same rule — an id that does not match the tensors is refused, not
+    /// believed.
+    #[serde(default)]
+    pub model_id: Option<String>,
 
     /// How long to wait for the caps handshake. Short, because the dummy
     /// driver fabricates its answer rather than loading anything.
@@ -1241,6 +1256,19 @@ fn default_dummy_ready_timeout() -> Duration {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CudaNativeDriverOptions {
+    /// `[model] id`: the operator's answer to "which model is this".
+    ///
+    /// Absent — the ordinary case — the driver identifies the checkpoint
+    /// from its TENSORS against the catalog every driver links. Present,
+    /// it names a row directly, for a checkpoint that is genuinely a
+    /// known model under an unknown name: a fine-tune, a re-upload, a
+    /// mirror that renamed the directory.
+    ///
+    /// It is an OVERRIDE and not a bypass. The named row's manifest is
+    /// still matched, so this cannot be used to load a checkpoint as
+    /// something it is not — which is the failure the whole arrangement
+    /// exists to prevent.
+    pub model_id: Option<String>,
     /// Fraction of each GPU's memory pie may use, weights included.
     ///
     /// What is left after the weights becomes the KV pool, so this is the
@@ -1425,6 +1453,7 @@ pub enum CudaMemoryProfile {
 impl Default for CudaNativeDriverOptions {
     fn default() -> Self {
         Self {
+            model_id: None,
             gpu_mem_utilization: 0.90,
             memory_profile: CudaMemoryProfile::Auto,
             kv_page_size: None,
@@ -1606,7 +1635,10 @@ device = ["cpu"]
         );
         let cfg: Config = toml::from_str(&toml).unwrap();
         let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("must not be shorter than submit_deadline"), "got: {err}");
+        assert!(
+            err.contains("must not be shorter than submit_deadline"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -1725,9 +1757,8 @@ device = ["cpu"]
     #[test]
     fn rejects_more_steps_in_flight_than_the_driver_stages() {
         let mut cfg: Config = toml::from_str(MINIMAL_METAL).unwrap();
-        let steps = |c: &Config| {
-            c.model.scheduler.frame_dispatch_depth * c.model.scheduler.frame_size
-        };
+        let steps =
+            |c: &Config| c.model.scheduler.frame_dispatch_depth * c.model.scheduler.frame_size;
 
         // The pool must strictly exceed steps in flight; equality is the case
         // that blocks in `cudaEventSynchronize` on every submit.
@@ -2049,7 +2080,10 @@ mtp_num_drafts = 6
         assert_eq!(opts.memory_profile, CudaMemoryProfile::Throughput);
         assert_eq!(opts.runtime_quant, "fp8");
         assert_eq!(opts.mxfp4_moe, "routed_dequant");
-        assert_eq!(opts.mtp_assistant_snapshot_dir.as_deref(), Some("/models/gemma4-mtp"));
+        assert_eq!(
+            opts.mtp_assistant_snapshot_dir.as_deref(),
+            Some("/models/gemma4-mtp")
+        );
         assert_eq!(opts.mtp_num_drafts, 6);
         assert_eq!(opts.weight_dtype, "bfloat16"); // default
         // Absent = derive: the planner scores candidates unless pinned.

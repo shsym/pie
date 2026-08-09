@@ -26,8 +26,7 @@
 pub mod facts;
 
 use self::facts::Gemma2Facts;
-use model_compiler::dsl::{
-    WeightRepr,self, matmul, MatW, NormW};
+use model_compiler::dsl::{self, MatW, NormW, WeightRepr, matmul};
 use model_compiler::trace::{FireClass, ForwardPlan, NormVariant};
 
 struct G2LayerW {
@@ -88,30 +87,21 @@ pub fn gemma2_cuda(facts: &Gemma2Facts, class: FireClass) -> ForwardPlan {
     //
     // The MTP passes stay unstated, because those genuinely are different
     // passes and not this one under another name.
-    let family = format!(
-        "gemma_2.cuda.{}",
-        match class {
-            FireClass::Decode => "decode",
-            FireClass::Prefill => "prefill",
-            other => panic!("gemma_2 states no {other:?} class yet"),
-        }
-    );
+    let family = format!("gemma_2.cuda.{}", class.suffix());
     let a = facts.attn.clone();
     dsl::trace_named(&family, |t| {
         let embedded = dsl::embedded_prologue(t, facts.hidden);
         // `sqrt(hidden)` on the embedding — a launch, not a fold.
-        let mut y = dsl::cuda::scalar_mul(
-            &embedded,
-            "embed_scale",
-            Some((facts.hidden as f32).sqrt()),
-        );
+        let mut y =
+            dsl::cuda::scalar_mul(&embedded, "embed_scale", Some((facts.hidden as f32).sqrt()));
 
         for l in 0..facts.layers {
             // THIS LAYER's sliding window, `-1` for none — a
             // load-time fact the dispatch statements carry, where four
-            // executors used to re-derive it per launch.
-            let window_left =
-                model_compiler::facts::window_left_at(&facts.window_left, l);
+            // executors used to re-derive it per launch. The shape
+            // answers from the alternation RULE now; it used to index a
+            // per-layer vector that spelled the same rule out.
+            let window_left = facts.window_left_at(l);
             let w = G2LayerW::new(l, facts);
             let x = dsl::cuda::rmsnorm(&y, &w.attn_norm);
 

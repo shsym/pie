@@ -36,11 +36,11 @@ use model_compiler::trace::{FireClass, ForwardPlan, OpKind};
 /// diff. The `Decode` class alone, because both ends are class-invariant
 /// — a prefill has the same prologue and the same readout.
 fn plans() -> Vec<(&'static str, ForwardPlan)> {
-    use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     vec![
         (
             "llama_like",
-            model::families::llama_like::forward::llama_like_cuda(
+            model::shared::llama_like::forward::llama_like_cuda(
                 &LlamaLikeFacts::qwen3_0_6b(),
                 &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
                 FireClass::Decode,
@@ -55,8 +55,8 @@ fn plans() -> Vec<(&'static str, ForwardPlan)> {
         ),
         (
             "glm5",
-            model::glm5::forward::glm5_cuda(
-                &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+            model::glm_5::forward::glm5_cuda(
+                &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
                 FireClass::Decode,
             ),
         ),
@@ -84,8 +84,14 @@ fn plans() -> Vec<(&'static str, ForwardPlan)> {
 /// statement they observe. So their POSITION is not representable and
 /// this does not pretend otherwise; what is representable, and is the
 /// stronger claim anyway, is WHICH VALUE the boundary exposes.
-fn seam_values<'a>(plan: &'a ForwardPlan, name: &str) -> Option<&'a [model_compiler::trace::ValueId]> {
-    plan.seams.iter().find(|s| s.seam == name).map(|s| s.values.as_slice())
+fn seam_values<'a>(
+    plan: &'a ForwardPlan,
+    name: &str,
+) -> Option<&'a [model_compiler::trace::ValueId]> {
+    plan.seams
+        .iter()
+        .find(|s| s.seam == name)
+        .map(|s| s.values.as_slice())
 }
 
 #[test]
@@ -104,12 +110,18 @@ fn every_plan_states_both_boundaries() {
              failure with no symptom until something tries to sample."
         );
         assert_eq!(
-            plan.ops.iter().filter(|o| matches!(o.kind, OpKind::Embed { .. })).count(),
+            plan.ops
+                .iter()
+                .filter(|o| matches!(o.kind, OpKind::Embed { .. }))
+                .count(),
             1,
             "{name}: a decode backbone embeds exactly once"
         );
         assert_eq!(
-            plan.ops.iter().filter(|o| matches!(o.kind, OpKind::LmHead { .. })).count(),
+            plan.ops
+                .iter()
+                .filter(|o| matches!(o.kind, OpKind::LmHead { .. }))
+                .count(),
             1,
             "{name}: a decode backbone reads out exactly once"
         );
@@ -189,9 +201,7 @@ fn the_attention_seam_sees_a_value_something_later_consumes() {
         );
         for (at, values) in sites {
             for v in values {
-                let consumed_later = plan.ops[at + 1..]
-                    .iter()
-                    .any(|o| o.inputs.contains(&v));
+                let consumed_later = plan.ops[at + 1..].iter().any(|o| o.inputs.contains(&v));
                 assert!(
                     consumed_later,
                     "{name}: the `attn.out` seam at op {at} names a value \

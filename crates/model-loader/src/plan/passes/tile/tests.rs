@@ -25,6 +25,13 @@ fn facts(source_dtype: DType, rows: u64, cols: u64, max_tile_bytes: u64) -> Tile
         compact_source: true,
         shape: Some((rows, cols)),
         max_tile_bytes,
+        // The kernel-selection facts. This fixture is an `Encode` from a
+        // checkpoint source, so the first two are what that means — a
+        // quantized destination has no plain dtype, and bytes on disk are
+        // never rewritten in place — and the third belongs to `Scale`.
+        dest_dtype: None,
+        in_place: false,
+        blocked_scale: false,
     }
 }
 
@@ -229,9 +236,15 @@ fn the_reference_backend_declines_every_optimization() {
 
 #[test]
 fn each_backend_resolves_to_its_own_rules() {
-    assert_eq!(tile_map_mask(BackendKind::Cuda), CUDA_TILE_MAP_MASK);
-    assert_eq!(tile_map_mask(BackendKind::Metal), METAL_TILE_MAP_MASK);
-    assert_eq!(tile_map_mask(BackendKind::Unknown), HOST_TILE_MAP_MASK);
+    assert_eq!(compilable_tile_maps(BackendKind::Cuda), CUDA_TILE_MAP_MASK);
+    assert_eq!(
+        compilable_tile_maps(BackendKind::Metal),
+        METAL_TILE_MAP_MASK
+    );
+    assert_eq!(
+        compilable_tile_maps(BackendKind::Unknown),
+        HOST_TILE_MAP_MASK
+    );
 }
 
 // ---------------------------------------------------------------------------

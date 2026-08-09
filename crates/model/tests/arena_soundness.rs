@@ -28,7 +28,7 @@
 //! Both are unions, so the trace stamps by the union's ROOT and the
 //! intended sharing passes while an accidental one still fails.
 
-use model_compiler::lower::{value_bytes, Buffers, Row};
+use model_compiler::lower::{Buffers, Row, value_bytes};
 use model_compiler::trace::{FireClass, ForwardPlan, OpKind, ValueId};
 
 /// A decode-shaped fire: every row samples, so the epilogue's row space
@@ -133,15 +133,19 @@ fn walk(plan: &ForwardPlan, rows: &[Row], buffers: &Buffers) -> Option<String> {
         for &v in &op.inputs {
             let Some((at, len)) = extent(v) else { continue };
             let want = alias.root(v);
-            for b in at..(at + len).min(owner.len()) {
-                if owner[b] != want {
+            // `take`/`skip` rather than `owner[at..hi]`: a value placed
+            // past the arena end is exactly the bug this hunts, and
+            // slicing it would panic instead of reporting it.
+            let hi = (at + len).min(owner.len());
+            for (b, &owns) in owner.iter().enumerate().take(hi).skip(at) {
+                if owns != want {
                     return Some(format!(
                         "op {i} ({:?}) reads value {v} at [{at}, {}), but byte \
                          {b} now belongs to value {} — the arena placed it \
                          over a buffer this op still reads",
                         op.kind,
                         at + len,
-                        owner[b]
+                        owns
                     ));
                 }
             }
@@ -164,9 +168,9 @@ fn families() -> Vec<(&'static str, FireClass, ForwardPlan)> {
         out.push((
             "llama_like",
             f,
-            families::llama_like::forward::llama_like_cuda(
-                &families::llama_like::forward::facts::LlamaLikeFacts::qwen3_0_6b(),
-                &families::llama_like::forward::facts::LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
+            shared::llama_like::forward::llama_like_cuda(
+                &shared::llama_like::forward::facts::LlamaLikeFacts::qwen3_0_6b(),
+                &shared::llama_like::forward::facts::LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
                 f,
             ),
         ));
@@ -208,7 +212,7 @@ fn families() -> Vec<(&'static str, FireClass, ForwardPlan)> {
     out.push((
         "glm5",
         d,
-        glm5::forward::glm5_cuda(&glm5::forward::facts::Glm5Facts::glm5_106b_a12b(), d),
+        glm_5::forward::glm5_cuda(&glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(), d),
     ));
     out.push((
         "kimi_k2",
@@ -222,12 +226,18 @@ fn families() -> Vec<(&'static str, FireClass, ForwardPlan)> {
     out.push((
         "kimi_k3",
         d,
-        kimi_k3::forward::kimi_k3_cuda(&kimi_k3::forward::facts::KimiK3Facts::kimi_k3_synthetic(), d),
+        kimi_k3::forward::kimi_k3_cuda(
+            &kimi_k3::forward::facts::KimiK3Facts::kimi_k3_synthetic(),
+            d,
+        ),
     ));
     out.push((
         "deepseek_v4",
         d,
-        deepseek_v4::forward::dsv4_cuda(&deepseek_v4::forward::facts::Dsv4Facts::dsv4_synthetic(), d),
+        deepseek_v4::forward::dsv4_cuda(
+            &deepseek_v4::forward::facts::Dsv4Facts::dsv4_synthetic(),
+            d,
+        ),
     ));
     out.push((
         "nemotron_h",
@@ -240,7 +250,10 @@ fn families() -> Vec<(&'static str, FireClass, ForwardPlan)> {
     out.push((
         "gemma3n",
         d,
-        gemma3n::forward::gemma3n_cuda(&gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(), d),
+        gemma_3n::forward::gemma3n_cuda(
+            &gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
+            d,
+        ),
     ));
     out.push((
         "gemma_2",
@@ -375,7 +388,7 @@ fn the_walk_catches_an_overlap_it_is_given() {
 /// still read something the value alone does not say.
 #[test]
 fn a_matmul_operand_has_a_row_width_a_driver_can_derive() {
-    use model_compiler::lower::{lower, Arg, Fire};
+    use model_compiler::lower::{Arg, Fire, lower};
     use std::collections::BTreeSet;
 
     let mut widthless: BTreeSet<String> = BTreeSet::new();
@@ -645,7 +658,7 @@ fn what_is_live_where_the_arena_peaks() {
         // Who is holding it, longest-lived first: a value defined far
         // before the peak and read far after is the one the text could
         // stop carrying.
-        let mut holders: Vec<(usize, usize, usize)> = (0..plan.values.len())
+        let holders: Vec<(usize, usize, usize)> = (0..plan.values.len())
             .filter(|&v| placed(v) && def[v] <= peak_at && peak_at <= last[v])
             .map(|v| (bytes(v), last[v] - def[v], v))
             .collect();
@@ -665,7 +678,10 @@ fn what_is_live_where_the_arena_peaks() {
         }
         let mut rows_out: Vec<_> = by_shape.into_iter().collect();
         rows_out.sort_by_key(|(_, (_, b, _))| std::cmp::Reverse(*b));
-        println!("  {:>5}  {:>11}  {:>8}  {}", "count", "bytes", "max span", "shape");
+        println!(
+            "  {:>5}  {:>11}  {:>8}  shape",
+            "count", "bytes", "max span"
+        );
         for (shape, (count, b, span)) in rows_out.into_iter().take(8) {
             println!("  {count:>5}  {b:>11}  {span:>8}  {shape}");
         }
@@ -710,31 +726,44 @@ fn what_a_widest_fire_actually_costs() {
             let mut def = vec![usize::MAX; plan.values.len()];
             for (i, op) in plan.ops.iter().enumerate() {
                 for &v in op.inputs.iter().chain(op.outputs.iter()) {
-                    if let Some(s) = last.get_mut(v as usize) { *s = (*s).max(i); }
+                    if let Some(s) = last.get_mut(v as usize) {
+                        *s = (*s).max(i);
+                    }
                 }
                 for &v in &op.outputs {
-                    if let Some(s) = def.get_mut(v as usize) { *s = (*s).min(i); }
+                    if let Some(s) = def.get_mut(v as usize) {
+                        *s = (*s).min(i);
+                    }
                 }
             }
             let sizes: Vec<usize> = (0..plan.values.len())
-                .map(|v| if b.offset[v] == Buffers::NAMED { 0 }
-                     else { value_bytes(&plan, v as ValueId, tokens, sampled.max(1)) })
+                .map(|v| {
+                    if b.offset[v] == Buffers::NAMED {
+                        0
+                    } else {
+                        value_bytes(&plan, v as ValueId, tokens, sampled.max(1))
+                    }
+                })
                 .collect();
             let mut floor = 0usize;
             let mut cur = 0usize;
             let mut ends: Vec<Vec<usize>> = vec![Vec::new(); plan.ops.len() + 1];
             for v in 0..plan.values.len() {
-                if sizes[v] == 0 || def[v] == usize::MAX { continue; }
+                if sizes[v] == 0 || def[v] == usize::MAX {
+                    continue;
+                }
                 ends[last[v].min(plan.ops.len())].push(v);
             }
-            for i in 0..plan.ops.len() {
-                for &v in &plan.ops[i].outputs {
+            for (i, op) in plan.ops.iter().enumerate() {
+                for &v in &op.outputs {
                     if (v as usize) < sizes.len() && def[v as usize] == i {
                         cur += sizes[v as usize];
                     }
                 }
                 floor = floor.max(cur);
-                for &v in &ends[i] { cur -= sizes[v]; }
+                for &v in &ends[i] {
+                    cur -= sizes[v];
+                }
             }
             println!(
                 "{name:12} {tokens}t/{sampled}s -> arena {:>13} ({:.2} GB)  floor {:>13} ({:.2} GB)  x{:.2}",
@@ -763,7 +792,7 @@ fn what_a_widest_fire_actually_costs() {
 /// exist at all before believing the hypothesis.
 #[test]
 fn which_values_are_read_wider_than_they_are_written() {
-    use model_compiler::lower::{lower, Fire};
+    use model_compiler::lower::{Fire, lower};
     use std::collections::BTreeMap;
 
     for (name, class, plan) in families() {
@@ -800,7 +829,10 @@ fn which_values_are_read_wider_than_they_are_written() {
             }
         }
         let mut gaps = 0usize;
-        let mut worst: Option<(ValueId, (u32, u32), (u32, u32))> = None;
+        // Which value was read wider than written, the span the fire
+        // wrote, and the span it read.
+        type WidestRead = (ValueId, (u32, u32), (u32, u32));
+        let mut worst: Option<WidestRead> = None;
         for (&v, &(rlo, rhi)) in &read {
             let Some(&(wlo, whi)) = wrote.get(&v) else {
                 continue; // an input nothing in this fire produced
@@ -854,7 +886,7 @@ fn which_values_are_read_wider_than_they_are_written() {
 /// here, at every fire width, for every family, without a GPU.
 #[test]
 fn an_alias_lands_inside_its_owner() {
-    use model_compiler::lower::{lower, Buffers, Fire};
+    use model_compiler::lower::{Buffers, Fire, lower};
 
     for (name, class, plan) in families() {
         for n in [1usize, 8] {
@@ -986,7 +1018,7 @@ fn short(k: &OpKind) -> String {
 /// epilogue's rectangles and the operands each was handed.
 #[test]
 fn what_the_epilogue_hands_each_of_its_rectangles() {
-    use model_compiler::lower::{lower, Arg, Fire};
+    use model_compiler::lower::{Arg, Fire, lower};
 
     for (name, class, plan) in families() {
         // A fire whose sampled rows are a strict SUBSET, which is what
@@ -1030,8 +1062,7 @@ fn what_the_epilogue_hands_each_of_its_rectangles() {
             let last = out
                 .launches
                 .iter()
-                .filter(|p| p.op == l.op)
-                .next_back()
+                .rfind(|p| p.op == l.op)
                 .expect("the epilogue emits at least the gemm");
             assert!(
                 out.kernels[last.kernel as usize].contains("gemm"),
@@ -1074,8 +1105,7 @@ fn which_op_kinds_each_family_states() {
             };
             *census.entry(key).or_default() += 1;
         }
-        let mut line: Vec<String> =
-            census.iter().map(|(k, n)| format!("{k}x{n}")).collect();
+        let mut line: Vec<String> = census.iter().map(|(k, n)| format!("{k}x{n}")).collect();
         line.sort();
         println!("{name:12} {class:?}: {}", line.join(" "));
     }
@@ -1129,8 +1159,7 @@ fn which_values_a_pin_pass_owes() {
         let summary: Vec<String> = by_kind
             .iter()
             .map(|(k, vs)| {
-                let head: Vec<String> =
-                    vs.iter().take(4).map(|v| format!("v{v}")).collect();
+                let head: Vec<String> = vs.iter().take(4).map(|v| format!("v{v}")).collect();
                 format!("{k}x{} [{}...]", vs.len(), head.join(","))
             })
             .collect();

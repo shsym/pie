@@ -5,8 +5,11 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
+use ::engine::driver::{
+    BoundInstance, ChannelValue, DriverBackend, FrameLaunchOutcome, FrameSubmission,
+    InstanceBindingPlan, StepSubmission,
+};
 use anyhow::{Context, Result};
-use futures::StreamExt;
 use driver_api::{
     ExecutorRequest, ExecutorResponse, ExecutorRpc, ExecutorRpcRequest, ExecutorRpcResponse,
     HelloRequest, HelloResponse, InlineKvPayload, MemoryDomain, ModelIdentity,
@@ -16,10 +19,7 @@ use driver_api::{
     RemoteMediaBlob, RemoteMediaKind, RemotePeerConn, RemoteRegisterChannel, RemoteTerminal,
     RemoteTransferKind, ScratchGrant, TerminalCellState,
 };
-use ::engine::driver::{
-    BoundInstance, ChannelValue, DriverBackend, FrameLaunchOutcome, FrameSubmission,
-    InstanceBindingPlan, StepSubmission,
-};
+use futures::StreamExt;
 use tarpc::serde_transport::tcp;
 use tarpc::server::{BaseChannel, Channel};
 use tarpc::tokio_serde::formats::Bincode;
@@ -867,6 +867,18 @@ impl ExecutorCoreHandle {
     }
 }
 
+/// Not boxed. The 1424 bytes are `Execute`'s, and `Execute` is 1384 of them
+/// because `RemoteLaunch` is -- which is `LaunchPlan` (~1160B) plus eight
+/// `Vec` headers. So the large variant is also the HOT one: `Launch` is sent
+/// once per forward step, while the small variants (`ReleaseBlob`, `Retired`,
+/// `Connect`) are rare. Boxing would buy a cheaper mpsc slot for the rare
+/// messages by adding an allocation to every forward. If this is worth
+/// changing, the place to change it is `LaunchPlan`'s own layout, with a
+/// benchmark -- not here, on a lint's say-so.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the large variant is the hot one"
+)]
 enum Command {
     Connect {
         client_id: ClientId,
@@ -1355,7 +1367,7 @@ impl ExecutorActor {
             client.client_nonce = request.client_nonce;
             client.lease_slot = Some(slot);
             client.transfer = Some(RemoteTransferKind::Inline);
-            return Ok(ExecutorResponse::Hello(HelloResponse {
+            return Ok(ExecutorResponse::Hello(Box::new(HelloResponse {
                 wire_version: REMOTE_WIRE_VERSION,
                 model: self.model.clone(),
                 kv_layout: request.kv_layout,
@@ -1369,7 +1381,7 @@ impl ExecutorActor {
                     handle: None,
                     metadata: Vec::new(),
                 },
-            }));
+            })));
         }
         let kv_handle = self
             .kv_handle
@@ -1429,7 +1441,7 @@ impl ExecutorActor {
         self.stats
             .leased_pages
             .fetch_add(grant.num_pages, Ordering::Relaxed);
-        Ok(ExecutorResponse::Hello(HelloResponse {
+        Ok(ExecutorResponse::Hello(Box::new(HelloResponse {
             wire_version: REMOTE_WIRE_VERSION,
             model: self.model.clone(),
             kv_layout: kv_handle.layout.clone(),
@@ -1456,7 +1468,7 @@ impl ExecutorActor {
                     }
                 },
             },
-        }))
+        })))
     }
 
     fn register_program(
@@ -3000,9 +3012,7 @@ fn append_plan(
         .rs_buffer_slot_ids
         .extend(source.rs_buffer_slot_ids);
     destination.masks.extend(source.masks);
-    destination
-        .sampling_indices
-        .extend(source.sampling_indices.into_iter());
+    destination.sampling_indices.extend(source.sampling_indices);
     destination.context_ids.extend(source.context_ids);
     destination.single_token_mode &= source.single_token_mode;
     destination.has_user_mask |= source.has_user_mask;
@@ -3285,9 +3295,12 @@ fn validate_raw_encode_plan(
             && plan.image_pixel_indptr.last().copied()
                 == u32::try_from(plan.image_pixels.len()).ok()
             && !plan.image_pixels.is_empty()
-            && plan.image_pixels.len() % std::mem::size_of::<f32>() == 0
+            && plan
+                .image_pixels
+                .len()
+                .is_multiple_of(std::mem::size_of::<f32>())
             && !plan.image_patch_positions.is_empty()
-            && plan.image_patch_positions.len() % 2 == 0
+            && plan.image_patch_positions.len().is_multiple_of(2)
             && plan.image_pixel_indptr.windows(2).all(|window| {
                 window[0] <= window[1]
                     && window[0] % std::mem::size_of::<f32>() as u32 == 0
@@ -3302,7 +3315,10 @@ fn validate_raw_encode_plan(
             && plan.audio_feature_indptr.last().copied()
                 == u32::try_from(plan.audio_features.len()).ok()
             && !plan.audio_features.is_empty()
-            && plan.audio_features.len() % std::mem::size_of::<f32>() == 0
+            && plan
+                .audio_features
+                .len()
+                .is_multiple_of(std::mem::size_of::<f32>())
             && plan.audio_feature_indptr.windows(2).all(|window| {
                 window[0] < window[1]
                     && window[0] % std::mem::size_of::<f32>() as u32 == 0
@@ -3356,11 +3372,11 @@ fn _assert_tarpc_types(_: ExecutorRpcRequest, _: ExecutorRpcResponse) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::engine::driver::{DriverBackend, DummyDriver};
     use driver_api::{
         EncodedMask, ExecutorRpcClient, LaunchPlan, ModelComponent, ProgramRegistration,
     };
     use driver_dummy::DummyDriverOptions;
-    use ::engine::driver::{DriverBackend, DummyDriver};
     use tensor_ir::container::{StageProgram, TraceContainer};
     use tensor_ir::registry::Stage;
 
@@ -3434,7 +3450,7 @@ mod tests {
         let ExecutorResponse::Hello(response) = response else {
             panic!("unexpected hello response {response:?}");
         };
-        response
+        *response
     }
 
     #[derive(Clone)]
@@ -3932,10 +3948,8 @@ mod tests {
                     tokio::spawn(request);
                 }),
         );
-        let new_client = driver_api::ExecutorRpcClient::new(
-            tarpc::client::Config::default(),
-            client_transport,
-        );
+        let new_client =
+            driver_api::ExecutorRpcClient::new(tarpc::client::Config::default(), client_transport);
         let client = new_client.client;
         tokio::spawn(new_client.dispatch);
         let (mut drivers, _, _) = fixture(1, 0);
@@ -4462,60 +4476,118 @@ mod tests {
         };
         let blob_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let blob_origin = format!("http://{}", blob_listener.local_addr().unwrap());
+        // Accept every connection and answer none of them. Each fetch this
+        // strands holds one encode reservation, and holds it until this task
+        // is dropped -- which happens BELOW, after the assertions that
+        // admission is held, rather than before them. The old version aborted
+        // the origin FIRST and then asserted the hold, which is to say it
+        // asserted "not yet released" inside a window it had itself opened.
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
         let slow_blob = tokio::spawn(async move {
-            let (stream, _) = blob_listener.accept().await.unwrap();
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            drop(stream);
+            let mut held = Vec::new();
+            loop {
+                let (stream, _) = blob_listener.accept().await.unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
         });
-        let mut context = tarpc::context::current();
-        context.deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
-        let cancelled_blob = client
-            .execute(
-                context,
-                ExecutorRequest::Encode(RemoteEncode {
-                    plan: LaunchPlan {
-                        token_ids: vec![0],
-                        image_grids: vec![1, 1, 1],
-                        image_pixel_indptr: vec![0, 4],
-                        image_patch_positions: vec![0, 0],
-                        image_anchor_rows: vec![0],
-                        ..Default::default()
-                    },
-                    blobs: vec![RemoteMediaBlob {
-                        kind: RemoteMediaKind::ImagePixels,
-                        hash: [1; 32],
-                        size: 4,
-                        origin: blob_origin,
-                    }],
-                }),
-            )
-            .await;
-        assert!(cancelled_blob.is_err());
-        slow_blob.abort();
-        let _ = slow_blob.await;
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
+        let blob_request = |seed: u8| {
+            ExecutorRequest::Encode(RemoteEncode {
+                plan: LaunchPlan {
+                    token_ids: vec![0],
+                    image_grids: vec![1, 1, 1],
+                    image_pixel_indptr: vec![0, 4],
+                    image_patch_positions: vec![0, 0],
+                    image_anchor_rows: vec![0],
+                    ..Default::default()
+                },
+                blobs: vec![RemoteMediaBlob {
+                    kind: RemoteMediaKind::ImagePixels,
+                    hash: [seed; 32],
+                    size: 4,
+                    origin: blob_origin.clone(),
+                }],
+            })
+        };
+
+        // MAX_CLIENT_BLOB_FETCHES of them, so the client is saturated by
+        // stranded fetches alone -- and ABANDONED rather than deadlined.
+        //
+        // A tarpc server enforces the request's deadline itself: when it
+        // passes, the handler future is dropped, `BlobFetchPermit::drop`
+        // releases the reservation, and the hold this test is about is over
+        // in microseconds. The old version set a 10ms deadline and then
+        // asserted the hold, so it was reading a race window rather than a
+        // state, and it lost that race about one run in four under load.
+        //
+        // Not awaiting the call is the honest way to say "the client stopped
+        // waiting": the server keeps the handler, the fetch stays stranded,
+        // and the reservation is held until the fetch fails -- which is the
+        // invariant, and which nothing here can accelerate.
+        let abandoned = (0..MAX_CLIENT_BLOB_FETCHES)
+            .map(|seed| {
+                let client = client.clone();
+                let request = blob_request(u8::try_from(seed).expect("a small seed"));
+                tokio::spawn(
+                    async move { client.execute(tarpc::context::current(), request).await },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // The fetches must be in flight before the hold can be observed.
+        // `authorize_blob` runs before the fetch, so a connection arriving at
+        // the blob origin means the reservation is already taken -- waited
+        // for rather than slept past.
+        let in_flight_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while accepted.load(std::sync::atomic::Ordering::SeqCst) < MAX_CLIENT_BLOB_FETCHES as usize
+        {
+            assert!(
+                std::time::Instant::now() < in_flight_by,
+                "only {} of {MAX_CLIENT_BLOB_FETCHES} blob fetches ever reached the origin",
+                accepted.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Two arrivals at once, both refused, because the reservations are
+        // already all held. The answer is asserted rather than the transport:
+        // a server that refuses promptly answers `Ok(Err(ResourceExhausted))`
+        // -- the round trip SUCCEEDED and carried a refusal -- and the old
+        // `is_err()` on the transport result scored exactly that as a
+        // failure, passing only when the deadline fired first and the
+        // refusal never arrived.
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let cancelled = (0..2)
+        let refused = (0..2)
             .map(|_| {
                 let client = client.clone();
                 let barrier = Arc::clone(&barrier);
                 let request = request();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    let mut context = tarpc::context::current();
-                    context.deadline =
-                        std::time::Instant::now() + std::time::Duration::from_millis(10);
-                    client.execute(context, request).await
+                    rpc(&client, request).await
                 })
             })
             .collect::<Vec<_>>();
-        for call in cancelled {
-            assert!(call.await.unwrap().is_err());
+        for call in refused {
+            let error = call.await.unwrap().expect_err("admission is held");
+            assert_eq!(error.kind, RemoteErrorKind::ResourceExhausted);
         }
 
         let error = rpc(&client, request()).await.unwrap_err();
         assert_eq!(error.kind, RemoteErrorKind::ResourceExhausted);
+
+        // ONLY NOW end the fetches, which is what makes the hold end: the
+        // origin goes away, the connections close, reqwest reports it, the
+        // actors retire and the reservations free.
+        slow_blob.abort();
+        let _ = slow_blob.await;
+        for call in abandoned {
+            call.abort();
+            let _ = call.await;
+        }
+
         // Held is asserted above, on the very next call; what is left to show
         // is that the hold ends. Retirement is driven by a cancelled fetch's
         // connection erroring out through reqwest, which has no deadline this

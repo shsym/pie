@@ -8,6 +8,10 @@
 //! `model_loader::plan::compile` + the marshalled-view verifier, the same
 //! pipeline a driver boot runs.
 //!
+//! Each checkpoint is authored against a [`Fixture`] row — the shape and
+//! the author, which is all a row ever was to this file — rather than
+//! against a catalog row it would not match. See that type for why.
+//!
 //! Regenerate after an intended change:
 //! `UPDATE_GOLDEN=1 cargo test -p pie-model --features contract --test family_contracts`
 //!
@@ -26,9 +30,12 @@ use model_loader::plan::{
 use model_loader::types::{BackendKind, CheckpointFormat, DType, Encoding, FileId, TensorId};
 use model_loader::verify::ContractView;
 
-use model::facts::ModelFacts;
-use model::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
+use model::catalog::{Deployed, LoadShape, Variant};
 use model::contract::author;
+use model::deployment::{Deployment, Refusal};
+use model::encoding::Encoding as StoredEncoding;
+use model::shared::builder::Builder;
+use model::shared::policy::{Mxfp4MoeRequest, Naming, Policy, Projections, RuntimeQuant};
 
 // ── fixture machinery ───────────────────────────────────────────────
 
@@ -114,11 +121,96 @@ fn target(tp_rank: u32, tp_size: u32) -> StorageTarget {
     }
 }
 
-fn facts(model_type: &str, layers: u32) -> ModelFacts {
-    ModelFacts {
-        model_type: model_type.to_string(),
-        num_hidden_layers: layers,
-        ..Default::default()
+/// The row a fixture checkpoint is authored against.
+///
+/// A test-local row rather than one out of the catalog, and the reason is
+/// the checkpoints below: 1- and 2-layer synthetic decoders, 64 wide, that
+/// no published model is. Identity is not what this file tests —
+/// [`identify`] has its own tests — so pinning these goldens to a shipped
+/// model's numbers would make them move the next time a vendor renames a
+/// size. What this file tests is the AUTHOR, and a row that states a shape
+/// and names an author is exactly what the deleted `HF_ROWS` row was: the
+/// same N:1 reuse, spelled as a call instead of as a table column.
+///
+/// One generic row parameterised by the author rather than a struct per
+/// family, because the fourteen rows below differ in nothing else — every
+/// field here is one the old `facts()` helper set, and the four a test
+/// ever reached past it (`head_dim`, `num_experts`, `num_kv_shared_layers`,
+/// `mamba_groups`) are four of [`LoadShape`]'s six. That is not a
+/// coincidence: `LoadShape` was cut to be the shape facts an authoring
+/// pass reads.
+///
+/// `tied_embeddings` is `true` in every row below and that is not
+/// decoration: HF's own default for `tie_word_embeddings` is true, so the
+/// `ModelFacts::default()` these fixtures were built on carried true, and
+/// several of these checkpoints ship no `lm_head` — `author_llama_like`
+/// reads `shape().tied_embeddings && !has_lm_head`, so flipping it would
+/// move goldens.
+///
+/// `head_dim` is `0` wherever the old facts left it there, including at
+/// tp=2. Zero is not "unknown, filled in later": it turns off the
+/// head-boundary check in the row-shard rule, which is the arithmetic
+/// these goldens were recorded under.
+///
+/// [`identify`]: model::catalog::identify
+struct Fixture {
+    id: &'static str,
+    shape: LoadShape,
+    author: model::contract::Author,
+}
+
+impl Variant for Fixture {
+    fn id(&self) -> &'static str {
+        self.id
+    }
+
+    fn manifest(&self) -> model::manifest::Manifest {
+        // Empty, and deliberately: a fixture's tensors are stated by its
+        // `*_checkpoint()` below and nothing here matches against them.
+        // These rows are reached by being NAMED, never by being
+        // identified, which is why they can sit outside `CATALOG` with no
+        // checkpoint in the world matching one by accident.
+        model::manifest::Manifest::new(self.shape.layers)
+    }
+
+    fn load_shape(&self) -> LoadShape {
+        self.shape
+    }
+
+    fn deployment(&self, _load: Deployed<'_>) -> Result<Deployment, Refusal> {
+        Err(Refusal::Unsupported(
+            "a contract fixture states a shape and an author, and is never served",
+        ))
+    }
+
+    fn author(&self, b: &mut Builder<'_>) -> Result<(), model_loader::error::Error> {
+        (self.author)(b)
+    }
+
+    #[cfg(feature = "forward")]
+    fn trace(
+        &self,
+        _class: model_compiler::trace::FireClass,
+        _load: Deployed<'_>,
+    ) -> Result<model_compiler::trace::ForwardPlan, Refusal> {
+        Err(Refusal::Unsupported(
+            "a contract fixture has no forward text; its family's own row does",
+        ))
+    }
+
+    /// Whichever template, because no fixture is ever formatted for.
+    ///
+    /// The one method here with no honest answer: `chat` is total — that
+    /// is the repair for `instruct::create`'s `_ => QwenInstruct` arm —
+    /// and a row that spans eleven families has no template of its own to
+    /// name. It is unreachable from a contract test, which is the only
+    /// reason a stand-in is admissible here and nowhere in the catalog.
+    #[cfg(feature = "chat")]
+    fn chat(
+        &self,
+        tokenizer: std::sync::Arc<tokenizer::Tokenizer>,
+    ) -> std::sync::Arc<dyn model::instruct::Instruct> {
+        std::sync::Arc::new(model::llama_3::chat::LlamaInstruct::new(tokenizer))
     }
 }
 
@@ -132,13 +224,18 @@ fn golden_path(name: &str) -> PathBuf {
 fn check(
     name: &str,
     metadata: &CheckpointMetadata,
-    facts: &ModelFacts,
+    row: &dyn Variant,
+    encoding: &StoredEncoding,
     target: &StorageTarget,
     policy: &Policy,
 ) {
-    let contract = author(facts, metadata, target, policy)
-        .unwrap_or_else(|err| panic!("{name}: authoring failed: {err}"))
-        .unwrap_or_else(|| panic!("{name}: no author for {}", facts.model_type));
+    // One unwrap where there were two, and the one that went is the
+    // improvement: the old registry answered `Ok(None)` for a `model_type`
+    // no row claimed, so every call site carried a second unwrap for a
+    // case that meant "the table is incomplete" rather than "this
+    // checkpoint is wrong". A caller holding a row cannot be in that case.
+    let contract = author(row, encoding, metadata, target, policy)
+        .unwrap_or_else(|err| panic!("{name}: authoring failed: {err}"));
 
     let mut fresh = serde_json::to_string_pretty(&contract).expect("serialize contract");
     fresh.push('\n');
@@ -163,12 +260,10 @@ fn check(
 
     let plan = compile_load_plan(metadata, &contract, target.clone())
         .unwrap_or_else(|err| panic!("{name}: compiling failed: {err}"));
-    if let Err(violations) =
-        model_loader::verify::verify(
-            &model_loader::verify::view_of(&plan),
-            Some(&ContractView::of(&contract)),
-        )
-    {
+    if let Err(violations) = model_loader::verify::verify(
+        &model_loader::verify::view_of(&plan),
+        Some(&ContractView::of(&contract)),
+    ) {
         let listed: Vec<String> = violations.iter().map(ToString::to_string).collect();
         panic!(
             "{name}: the plan does not honour its contract:\n  {}",
@@ -248,15 +343,100 @@ fn gemma4_checkpoint() -> CheckpointMetadata {
     ck.finish("gemma4")
 }
 
+/// The stated 16-wide head is the point of the row: `[64, 64]` is 4 heads
+/// of 16 or 2 of 32, and no extent in the checkpoint says which.
+static GEMMA4_CUDA: Fixture = Fixture {
+    id: "gemma4-fixture",
+    shape: LoadShape::dense(1, 16, true),
+    author: model::gemma_4::contract::author_gemma4,
+};
+
 #[test]
 fn gemma4_dense_cuda() {
-    let mut facts = facts("gemma4_text", 1);
-    facts.head_dim = 16;
     check(
         "gemma4_dense_cuda",
         &gemma4_checkpoint(),
-        &facts,
+        &GEMMA4_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
+        &Policy::default(),
+    );
+}
+
+// ── phi-3: fused qkv and gate/up, split source-side ─────────────────
+
+/// Phi-3 is the only family whose contract UNDOES a fusion.
+///
+/// `heads * head_dim == hidden` on purpose: `phi3_qkv_split` reads the
+/// q extent off `shape[1]`, the fused tensor's INPUT dim, so a fixture
+/// where those differ would pass while the arithmetic it pins does not
+/// hold. Phi-3's real rows all satisfy it -- mini is 32x96=3072 and
+/// medium 40x128=5120 -- and this fixture states the same relation at
+/// toy scale.
+fn phi3_checkpoint() -> CheckpointMetadata {
+    let (hidden, heads, kv_heads, head_dim, intermediate) = (64, 4, 2, 16, 96);
+    let mut ck = Checkpoint::new();
+    ck.push("model.embed_tokens.weight", &[128, hidden], bf16());
+    let p = "model.layers.0.";
+    ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
+    ck.push(
+        &format!("{p}self_attn.qkv_proj.weight"),
+        &[(heads + 2 * kv_heads) * head_dim, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}self_attn.o_proj.weight"),
+        &[hidden, heads * head_dim],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}post_attention_layernorm.weight"),
+        &[hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.gate_up_proj.weight"),
+        &[2 * intermediate, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.down_proj.weight"),
+        &[hidden, intermediate],
+        bf16(),
+    );
+    ck.push("model.norm.weight", &[hidden], bf16());
+    ck.finish("phi3")
+}
+
+static PHI3_CUDA: Fixture = Fixture {
+    id: "phi3-fixture",
+    shape: LoadShape::dense(1, 16, false),
+    author: model::phi_3::contract::author_phi3,
+};
+
+#[test]
+fn phi3_fused_cuda() {
+    check(
+        "phi3_fused_cuda",
+        &phi3_checkpoint(),
+        &PHI3_CUDA,
+        &StoredEncoding::dense(),
+        &target(0, 1),
+        &Policy::default(),
+    );
+}
+
+/// The same split under tensor parallelism, which is where a split that
+/// forgot it was sharding shows up: each rank must take its band of the
+/// q/k/v rows, not the whole tensor.
+#[test]
+fn phi3_fused_cuda_tp1_of_2() {
+    check(
+        "phi3_fused_cuda_tp1_of_2",
+        &phi3_checkpoint(),
+        &PHI3_CUDA,
+        &StoredEncoding::dense(),
+        &target(1, 2),
         &Policy::default(),
     );
 }
@@ -273,12 +453,19 @@ fn csm_checkpoint() -> CheckpointMetadata {
     ck.finish("csm")
 }
 
+static CSM_CUDA: Fixture = Fixture {
+    id: "csm-fixture",
+    shape: LoadShape::dense(1, 0, true),
+    author: model::csm::contract::author_csm,
+};
+
 #[test]
 fn csm_cuda() {
     check(
         "csm_cuda",
         &csm_checkpoint(),
-        &facts("csm", 1),
+        &CSM_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
         &Policy::default(),
     );
@@ -326,14 +513,19 @@ fn glm5_checkpoint() -> CheckpointMetadata {
     ck.finish("glm5")
 }
 
+static GLM5_CUDA: Fixture = Fixture {
+    id: "glm5-fixture",
+    shape: LoadShape::mixture(1, 0, 2, true),
+    author: model::glm_5::contract::author_glm5,
+};
+
 #[test]
 fn glm5_cuda() {
-    let mut facts = facts("glm_moe_dsa", 1);
-    facts.num_experts = 2;
     check(
         "glm5_cuda",
         &glm5_checkpoint(),
-        &facts,
+        &GLM5_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
         &Policy::default(),
     );
@@ -375,42 +567,72 @@ fn gpt_oss_checkpoint() -> CheckpointMetadata {
     ck.finish("gpt_oss_fam")
 }
 
+static GPT_OSS_CUDA: Fixture = Fixture {
+    id: "gpt-oss-fixture",
+    shape: LoadShape::mixture(1, 0, 2, true),
+    author: model::gpt_oss::contract::author_gpt_oss,
+};
+
 #[test]
 fn gpt_oss_routed_cuda() {
-    let mut facts = facts("gpt_oss", 1);
-    facts.num_experts = 2;
     check(
         "gpt_oss_routed_cuda",
         &gpt_oss_checkpoint(),
-        &facts,
+        &GPT_OSS_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
         &Policy::default(),
     );
 }
 
+/// A CUDA target that CLAIMS a native MXFP4 GEMM is refused, and the
+/// refusal names the transform it would need.
+///
+/// This asserted a successful compile until `adf7d33b4` ("One statement
+/// of what a device can do, and the Repack it claimed for nobody") took
+/// `Repack` out of `CUDA_TILE_MAP_MASK`, and then it failed for the
+/// right reason with the wrong assertion for four days.
+///
+/// `native_mxfp4_moe` does not mean "reads MXFP4" — it means "has a
+/// native MXFP4 *GEMM*", which in gpt-oss's contract selects a Marlin
+/// REPACK of the expert banks, work this tree did not port. A driver
+/// whose GEMM reads the stored banks directly wants the other branch,
+/// which is what `cuda_storage_target` sets.
+///
+/// So the interesting property is not that the native path works. It is
+/// that a target claiming a capability its tile map cannot serve is
+/// caught when the plan COMPILES, with the transform named, rather than
+/// mis-bound at launch. `gpt_oss_routed_cuda` above is the path a real
+/// CUDA driver takes.
 #[test]
-fn gpt_oss_native_cuda() {
-    let mut facts = facts("gpt_oss", 1);
-    facts.num_experts = 2;
+fn a_cuda_target_claiming_native_mxfp4_is_refused() {
     let mut target = target(0, 1);
     target.native_mxfp4_moe = true;
     let policy = Policy {
         moe_request: Mxfp4MoeRequest::NativeGemm,
         ..Policy::default()
     };
-    check(
-        "gpt_oss_native_cuda",
-        &gpt_oss_checkpoint(),
-        &facts,
+    let metadata = gpt_oss_checkpoint();
+    let contract = author(
+        &GPT_OSS_CUDA,
+        &StoredEncoding::dense(),
+        &metadata,
         &target,
         &policy,
+    )
+    .expect("authoring succeeds — the contract is legal, the TARGET is not");
+    let err = compile_load_plan(&metadata, &contract, target)
+        .expect_err("a Cuda target cannot serve a Repack");
+    let said = err.to_string();
+    assert!(
+        said.contains("Repack"),
+        "the refusal must name the transform the target lacks, or a reader \
+         cannot tell which capability was overclaimed: {said}"
     );
 }
 
 #[test]
 fn gpt_oss_streamed_cuda() {
-    let mut facts = facts("gpt_oss", 1);
-    facts.num_experts = 2;
     let policy = Policy {
         stream_routed_experts: true,
         ..Policy::default()
@@ -418,7 +640,8 @@ fn gpt_oss_streamed_cuda() {
     check(
         "gpt_oss_streamed_cuda",
         &gpt_oss_checkpoint(),
-        &facts,
+        &GPT_OSS_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
         &policy,
     );
@@ -463,14 +686,19 @@ fn qwen3_5_checkpoint() -> CheckpointMetadata {
     ck.finish("qwen3_5")
 }
 
+static QWEN3_5_CUDA: Fixture = Fixture {
+    id: "qwen3-5-fixture",
+    shape: LoadShape::dense(2, 16, true),
+    author: model::qwen_3_5::contract::author_qwen3_5,
+};
+
 #[test]
 fn qwen3_5_dense_cuda() {
-    let mut facts = facts("qwen3_5", 2);
-    facts.head_dim = 16;
     check(
         "qwen3_5_dense_cuda",
         &qwen3_5_checkpoint(),
-        &facts,
+        &QWEN3_5_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
         &Policy::default(),
     );
@@ -480,12 +708,11 @@ fn qwen3_5_dense_cuda() {
 /// reason to have its own contract, and it only exists at tp > 1.
 #[test]
 fn qwen3_5_dense_cuda_tp1_of_2() {
-    let mut facts = facts("qwen3_5", 2);
-    facts.head_dim = 16;
     check(
         "qwen3_5_dense_cuda_tp1_of_2",
         &qwen3_5_checkpoint(),
-        &facts,
+        &QWEN3_5_CUDA,
+        &StoredEncoding::dense(),
         &target(1, 2),
         &Policy::default(),
     );
@@ -552,16 +779,95 @@ fn qwen3_5_moe_checkpoint() -> CheckpointMetadata {
     ck.finish("qwen3_5_moe")
 }
 
+static QWEN3_5_MOE_CUDA: Fixture = Fixture {
+    id: "qwen3-5-moe-fixture",
+    shape: LoadShape::mixture(1, 16, 2, true),
+    author: model::qwen_3_5::contract::author_qwen3_5_moe,
+};
+
 #[test]
 fn qwen3_5_moe_cuda() {
-    let mut facts = facts("qwen3_5_moe", 1);
-    facts.head_dim = 16;
-    facts.num_experts = 2;
     check(
         "qwen3_5_moe_cuda",
         &qwen3_5_moe_checkpoint(),
-        &facts,
+        &QWEN3_5_MOE_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
+        &Policy::default(),
+    );
+}
+
+/// The same experts as a streamed GROUP rather than a stacked tensor.
+///
+/// `shared/moe.rs` writes both layouts and only the stacked one was
+/// pinned: the streamed goldens beside this one belong to gpt-oss and
+/// deepseek, which author their experts themselves. So the plain HF
+/// path -- the one qwen3-moe and GLM-5.2 both take -- had its group
+/// half unrun.
+///
+/// What the golden holds down is the ORDER inside `gate_up_proj`.
+/// `Expr::concat` of `[gate, up]` versus `[up, gate]` is selected by
+/// `gate_second`, produces an identically shaped tensor either way, and
+/// is read by the driver's activation -- so getting it backwards is a
+/// silently wrong model, not a load failure.
+#[test]
+fn qwen3_5_moe_streamed_cuda() {
+    let policy = Policy {
+        stream_routed_experts: true,
+        ..Policy::default()
+    };
+    check(
+        "qwen3_5_moe_streamed_cuda",
+        &qwen3_5_moe_checkpoint(),
+        &QWEN3_5_MOE_CUDA,
+        &StoredEncoding::dense(),
+        &target(0, 1),
+        &policy,
+    );
+}
+
+/// Streamed experts under TP, which is the layout's reason for existing.
+///
+/// A group is sharded BEFORE the halves join: one instance is one
+/// expert, so each half takes its rank's band of the intermediate axis
+/// and the concat happens on the local extents. The stacked path
+/// declines TP entirely -- see the case below -- so this is the only
+/// tensor-parallel expert layout the plain HF source has.
+#[test]
+fn qwen3_5_moe_streamed_cuda_tp1_of_2() {
+    let policy = Policy {
+        stream_routed_experts: true,
+        ..Policy::default()
+    };
+    check(
+        "qwen3_5_moe_streamed_cuda_tp1_of_2",
+        &qwen3_5_moe_checkpoint(),
+        &QWEN3_5_MOE_CUDA,
+        &StoredEncoding::dense(),
+        &target(1, 2),
+        &policy,
+    );
+}
+
+/// The stacked path DECLINES to shard, and the golden records what it
+/// leaves behind instead.
+///
+/// `hf_moe_expert_stacks` returns early when `tp_size != 1`: the stack
+/// joins E slabs along a new leading axis and nothing downstream slices
+/// that join per rank. So no `mlp.experts.gate_up_proj` is built, and
+/// the six per-expert tensors stay published — each sharded on its own,
+/// which is the layout that does survive TP.
+///
+/// Pinned because a contract missing its fused tensor looks exactly
+/// like a pass that failed to run, and here it is the intended output.
+#[test]
+fn qwen3_5_moe_stacked_declines_tp() {
+    check(
+        "qwen3_5_moe_stacked_declines_tp",
+        &qwen3_5_moe_checkpoint(),
+        &QWEN3_5_MOE_CUDA,
+        &StoredEncoding::dense(),
+        &target(1, 2),
         &Policy::default(),
     );
 }
@@ -613,15 +919,29 @@ fn nemotron_h_checkpoint() -> CheckpointMetadata {
     ck.finish("nemotron_h")
 }
 
+/// The two groups are the row's whole contribution: a Mamba mixer's B and
+/// C bands are `groups * state` rows of a fused tensor and the checkpoint
+/// only ever stores the product, so the shard rule cannot recover them.
+static NEMOTRON_H_CUDA: Fixture = Fixture {
+    id: "nemotron-h-fixture",
+    shape: LoadShape {
+        layers: 2,
+        head_dim: 0,
+        n_experts: 2,
+        mamba_groups: 2,
+        kv_shared_layers: 0,
+        tied_embeddings: true,
+    },
+    author: model::nemotron_h::contract::author_nemotron_h,
+};
+
 #[test]
 fn nemotron_h_cuda_tp1_of_2() {
-    let mut facts = facts("nemotron_h", 2);
-    facts.num_experts = 2;
-    facts.mamba_groups = 2;
     check(
         "nemotron_h_cuda_tp1_of_2",
         &nemotron_h_checkpoint(),
-        &facts,
+        &NEMOTRON_H_CUDA,
+        &StoredEncoding::dense(),
         &target(1, 2),
         &Policy::default(),
     );
@@ -678,12 +998,19 @@ fn kimi_checkpoint() -> CheckpointMetadata {
     ck.finish("kimi")
 }
 
+static KIMI_K2_CUDA: Fixture = Fixture {
+    id: "kimi-k2-fixture",
+    shape: LoadShape::dense(1, 0, true),
+    author: model::kimi_k2::contract::author_kimi,
+};
+
 #[test]
 fn kimi_k2_cuda() {
     check(
         "kimi_k2_cuda",
         &kimi_checkpoint(),
-        &facts("kimi_k2", 1),
+        &KIMI_K2_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
         &Policy::default(),
     );
@@ -733,14 +1060,19 @@ fn kimi_k3_checkpoint() -> CheckpointMetadata {
     ck.finish("kimi_k3")
 }
 
+static KIMI_K3_CUDA: Fixture = Fixture {
+    id: "kimi-k3-fixture",
+    shape: LoadShape::mixture(1, 0, 2, true),
+    author: model::kimi_k3::contract::author_kimi_k3,
+};
+
 #[test]
 fn kimi_k3_cuda() {
-    let mut facts = facts("kimi_k3", 1);
-    facts.num_experts = 2;
     check(
         "kimi_k3_cuda",
         &kimi_k3_checkpoint(),
-        &facts,
+        &KIMI_K3_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
         &Policy::default(),
     );
@@ -790,12 +1122,19 @@ fn deepseek_v4_checkpoint() -> CheckpointMetadata {
     ck.finish("deepseek_v4")
 }
 
+static DEEPSEEK_V4_CUDA: Fixture = Fixture {
+    id: "deepseek-v4-fixture",
+    shape: LoadShape::dense(1, 0, true),
+    author: model::deepseek_v4::contract::author_deepseek_v4,
+};
+
 #[test]
 fn deepseek_v4_eager_cuda() {
     check(
         "deepseek_v4_eager_cuda",
         &deepseek_v4_checkpoint(),
-        &facts("deepseek_v4", 1),
+        &DEEPSEEK_V4_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
         &Policy::default(),
     );
@@ -810,7 +1149,8 @@ fn deepseek_v4_streamed_cuda() {
     check(
         "deepseek_v4_streamed_cuda",
         &deepseek_v4_checkpoint(),
-        &facts("deepseek_v4", 1),
+        &DEEPSEEK_V4_CUDA,
+        &StoredEncoding::dense(),
         &target(0, 1),
         &policy,
     );
@@ -835,6 +1175,22 @@ fn mlx_policy() -> Policy {
         naming: Naming::Mlx,
         projections: Projections::InPlace,
         ..Policy::default()
+    }
+}
+
+/// What an `mlx-community/*-4bit` conversion declares about its FILES.
+///
+/// No method name, and that is the checkpoint's own shape rather than an
+/// omission: `mlx_lm` writes a bare `quantization` block with a width and
+/// a group size in it, and never a `quantization_config.quant_method`. The
+/// width is load-bearing — `push_mlx_affine_declared` answers an
+/// undeclared one with 4 bits, so an 8-bit checkpoint arriving as 0 is
+/// authored with twice the logical columns and no error anywhere.
+fn mlx_u4_g64() -> StoredEncoding {
+    StoredEncoding {
+        method: String::new(),
+        bits: 4,
+        group_size: 64,
     }
 }
 
@@ -876,15 +1232,26 @@ fn llama_mlx_checkpoint() -> CheckpointMetadata {
     ck.finish("llama_mlx")
 }
 
+/// The llama lineage at the Metal point in policy space.
+///
+/// The id is the family's and not this author's: `gemma4-fixture` and
+/// `gpt-oss-fixture` each name two rows in this file, one with an HF
+/// author and one with an MLX one, because `Naming` selected an AUTHOR and
+/// never a different model. That is the pairing `HF_ROWS` and `MLX_ROWS`
+/// spelled as one `model_type` with a row under it in each table.
+static LLAMA3_MLX: Fixture = Fixture {
+    id: "llama3-fixture",
+    shape: LoadShape::dense(1, 0, true),
+    author: model::shared::llama_like::contract::author_llama_mlx,
+};
+
 #[test]
 fn llama_mlx_metal() {
-    let mut facts = facts("llama3", 1);
-    facts.quant_bits = 4;
-    facts.quant_group_size = 64;
     check(
         "llama_mlx_metal",
         &llama_mlx_checkpoint(),
-        &facts,
+        &LLAMA3_MLX,
+        &mlx_u4_g64(),
         &metal_target(),
         &mlx_policy(),
     );
@@ -900,16 +1267,32 @@ fn llama_bf16_checkpoint() -> CheckpointMetadata {
     let p = "model.layers.0.";
     ck.push(&format!("{p}input_layernorm.weight"), &[hidden], bf16());
     for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-        ck.push(&format!("{p}self_attn.{proj}.weight"), &[hidden, hidden], bf16());
+        ck.push(
+            &format!("{p}self_attn.{proj}.weight"),
+            &[hidden, hidden],
+            bf16(),
+        );
     }
     ck.push(
         &format!("{p}post_attention_layernorm.weight"),
         &[hidden],
         bf16(),
     );
-    ck.push(&format!("{p}mlp.gate_proj.weight"), &[intermediate, hidden], bf16());
-    ck.push(&format!("{p}mlp.up_proj.weight"), &[intermediate, hidden], bf16());
-    ck.push(&format!("{p}mlp.down_proj.weight"), &[hidden, intermediate], bf16());
+    ck.push(
+        &format!("{p}mlp.gate_proj.weight"),
+        &[intermediate, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.up_proj.weight"),
+        &[intermediate, hidden],
+        bf16(),
+    );
+    ck.push(
+        &format!("{p}mlp.down_proj.weight"),
+        &[hidden, intermediate],
+        bf16(),
+    );
     ck.push("model.norm.weight", &[hidden], bf16());
     ck.finish("llama_bf16")
 }
@@ -927,7 +1310,10 @@ fn llama_mlx_metal_int4() {
     check(
         "llama_mlx_metal_int4",
         &llama_bf16_checkpoint(),
-        &facts("llama3", 1),
+        &LLAMA3_MLX,
+        // A stock BF16 release declares nothing about its files, which is
+        // the case `--quant int4` exists for.
+        &StoredEncoding::dense(),
         &metal_target(),
         &Policy {
             runtime_quant: RuntimeQuant::Int4,
@@ -948,12 +1334,15 @@ fn metal_refuses_a_requantization_it_cannot_encode() {
         // gpt-oss is in the list because its lowering encodes whatever the
         // request says -- so the refusal is the only thing the request can do
         // there, and an author that ignored it would be the odd one out.
-        for (family, checkpoint) in [
-            ("llama3", llama_bf16_checkpoint()),
-            ("gpt_oss", gptoss_mlx_checkpoint()),
-        ] {
+        let cases: [(&dyn Variant, CheckpointMetadata); 2] = [
+            (&LLAMA3_MLX as &dyn Variant, llama_bf16_checkpoint()),
+            (&GPT_OSS_MLX as &dyn Variant, gptoss_mlx_checkpoint()),
+        ];
+        for (row, checkpoint) in cases {
+            let family = row.id();
             let err = author(
-                &facts(family, 1),
+                row,
+                &StoredEncoding::dense(),
                 &checkpoint,
                 &metal_target(),
                 &Policy {
@@ -961,9 +1350,14 @@ fn metal_refuses_a_requantization_it_cannot_encode() {
                     ..mlx_policy()
                 },
             )
-            .expect_err(&format!("{family} runtime_quant={quant:?} should be refused"));
+            .expect_err(&format!(
+                "{family} runtime_quant={quant:?} should be refused"
+            ));
             let text = err.to_string();
-            assert!(text.contains("no encoder here"), "{family} {quant:?}: {text}");
+            assert!(
+                text.contains("no encoder here"),
+                "{family} {quant:?}: {text}"
+            );
             assert!(
                 text.contains("int4"),
                 "{family} {quant:?} refusal names the alternative: {text}"
@@ -984,12 +1378,12 @@ fn metal_refuses_a_requantization_it_cannot_encode() {
 /// name the two ways out, since both are real.
 #[test]
 fn an_unquantized_checkpoint_is_refused_unless_it_is_being_quantized() {
-    let mut facts = facts("llama3", 1);
-    facts.quant_bits = 4;
-    facts.quant_group_size = 64;
-
     let err = author(
-        &facts,
+        &LLAMA3_MLX,
+        // The config DECLARES affine-U4 and the files carry none of it,
+        // which is the disagreement being caught: a declaration is not a
+        // tensor.
+        &mlx_u4_g64(),
         &llama_bf16_checkpoint(),
         &metal_target(),
         &mlx_policy(),
@@ -1035,7 +1429,8 @@ fn llama_mlx_metal_int4_from_f16() {
     check(
         "llama_mlx_metal_int4_from_f16",
         &llama_f16_checkpoint(),
-        &facts("llama3", 1),
+        &LLAMA3_MLX,
+        &StoredEncoding::dense(),
         &metal_target(),
         &Policy {
             runtime_quant: RuntimeQuant::Int4,
@@ -1056,11 +1451,9 @@ fn llama_mlx_metal_int4_from_f16() {
 /// artifact is the same size as the first and gates identically.
 #[test]
 fn an_mlx_checkpoint_is_not_requantized_by_int4() {
-    let mut facts = facts("llama3", 1);
-    facts.quant_bits = 4;
-    facts.quant_group_size = 64;
     let contract = author(
-        &facts,
+        &LLAMA3_MLX,
+        &mlx_u4_g64(),
         &llama_mlx_checkpoint(),
         &metal_target(),
         &Policy {
@@ -1068,8 +1461,7 @@ fn an_mlx_checkpoint_is_not_requantized_by_int4() {
             ..mlx_policy()
         },
     )
-    .expect("authoring an MLX checkpoint with int4 succeeds")
-    .expect("llama has an author");
+    .expect("authoring an MLX checkpoint with int4 succeeds");
 
     assert!(
         !contract.tensors.iter().any(|t| t.name.ends_with(".bf16")),
@@ -1093,7 +1485,10 @@ fn an_mlx_checkpoint_is_not_requantized_by_int4() {
             tensor.encoding
         );
     }
-    assert!(seen >= 7, "fixture should carry every projection, saw {seen}");
+    assert!(
+        seen >= 7,
+        "fixture should carry every projection, saw {seen}"
+    );
 }
 
 fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {
@@ -1111,15 +1506,19 @@ fn qwen3_5_mlx_checkpoint() -> CheckpointMetadata {
     ck.finish("qwen3_5_mlx")
 }
 
+static QWEN3_5_MLX: Fixture = Fixture {
+    id: "qwen3-5-fixture",
+    shape: LoadShape::dense(1, 0, true),
+    author: model::qwen_3_5::contract::author_qwen3_5_mlx,
+};
+
 #[test]
 fn qwen3_5_mlx_metal() {
-    let mut facts = facts("qwen3_5", 1);
-    facts.quant_bits = 4;
-    facts.quant_group_size = 64;
     check(
         "qwen3_5_mlx_metal",
         &qwen3_5_mlx_checkpoint(),
-        &facts,
+        &QWEN3_5_MLX,
+        &mlx_u4_g64(),
         &metal_target(),
         &mlx_policy(),
     );
@@ -1141,18 +1540,31 @@ fn gemma4_mlx_checkpoint() -> CheckpointMetadata {
     ck.finish("gemma4_mlx")
 }
 
+/// The one row that states `kv_shared_layers`, and it states it because no
+/// tensor can: layer 1's k/v projections and k-norm SHIP in the file and
+/// must not be declared, and a shipped tensor cannot say "ignore me".
+static GEMMA4_MLX: Fixture = Fixture {
+    id: "gemma4-fixture",
+    shape: LoadShape {
+        layers: 2,
+        head_dim: 0,
+        n_experts: 0,
+        mamba_groups: 0,
+        kv_shared_layers: 1,
+        tied_embeddings: true,
+    },
+    author: model::gemma_4::contract::author_gemma4_mlx,
+};
+
 /// Layer 1 is KV-shared: its k/v projections and k-norm ship in the file
 /// and must not be declared — the golden is what pins that they are not.
 #[test]
 fn gemma4_mlx_metal() {
-    let mut facts = facts("gemma4_text", 2);
-    facts.quant_bits = 4;
-    facts.quant_group_size = 64;
-    facts.num_kv_shared_layers = 1;
     check(
         "gemma4_mlx_metal",
         &gemma4_mlx_checkpoint(),
-        &facts,
+        &GEMMA4_MLX,
+        &mlx_u4_g64(),
         &metal_target(),
         &mlx_policy(),
     );
@@ -1209,14 +1621,22 @@ fn gptoss_mlx_checkpoint() -> CheckpointMetadata {
     ck.finish("gptoss_mlx")
 }
 
+/// No declared width, on a checkpoint that is half MXFP4: the expert
+/// triplets carry their own scales and the BF16 attention is encoded by
+/// the lowering, so nothing here reads `bits`.
+static GPT_OSS_MLX: Fixture = Fixture {
+    id: "gpt-oss-fixture",
+    shape: LoadShape::mixture(1, 0, 2, true),
+    author: model::gpt_oss::contract::author_gpt_oss_mlx,
+};
+
 #[test]
 fn gptoss_mlx_metal() {
-    let mut facts = facts("gpt_oss", 1);
-    facts.num_experts = 2;
     check(
         "gptoss_mlx_metal",
         &gptoss_mlx_checkpoint(),
-        &facts,
+        &GPT_OSS_MLX,
+        &StoredEncoding::dense(),
         &metal_target(),
         &mlx_policy(),
     );

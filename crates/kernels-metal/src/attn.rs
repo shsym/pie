@@ -16,13 +16,13 @@ pub static KERNELS: &[KernelSig] = &[
     // the reorder reads how many values a kernel produces off the row, and a
     // statement writing three states them all after its inputs.
     kernel!(split_qkv_bf16 "split_qkv_bf16", file = Some("attn/split_qkv.metal"), launch = kernels::LaunchRule::SplitPacked,
-        operands = kernels::operands![
-            packed: Buf <- kernels::Source::In(0),
-            q: BufMut <- kernels::Source::Out(0),
-            k: BufMut <- kernels::Source::Out(1),
-            v: BufMut <- kernels::Source::Out(2),
-            params: Buf <- kernels::Source::Param(0),
-        ]),
+    operands = kernels::operands![
+        packed: Buf <- kernels::Source::In(0),
+        q: BufMut <- kernels::Source::Out(0),
+        k: BufMut <- kernels::Source::Out(1),
+        v: BufMut <- kernels::Source::Out(2),
+        params: Buf <- kernels::Source::Param(0),
+    ]),
     // 1 in attn_gate.metal
     kernel!(gate "gate", axes = &[BF16]),
     // 1 in kv_append.metal
@@ -42,6 +42,11 @@ pub static KERNELS: &[KernelSig] = &[
             k_head_stride: Usize <- kernels::Source::KvHeadStride,
             k_seq_stride: Usize <- kernels::Source::KvSeqStride,
         ],
+        // The STATEMENT's head width, not the fire's -- see
+        // `kernels::KernelSig::head_param`. This row already hands the kernel
+        // `head_dim` as param 0; the grid asked the fire for the same
+        // quantity, and gemma-4 states two.
+        head_param = Some(0),
         axes = &[BF16]),
     // 1 in kv_append_paged.metal
     // Sparse indices, and the gaps are stated. Buffers 4, 6-9 and 11 belong to
@@ -69,6 +74,15 @@ pub static KERNELS: &[KernelSig] = &[
             w_off: U32s <- kernels::Source::KvWriteOffset,
             ring_15: Buf,
         ],
+        // BOTH halves of the head shape, from the two params this row already
+        // hands the kernel. The kernel addresses the pool as
+        // `(slot * n_kv_heads + head) * head_dim + channel` with the
+        // statement's numbers; a grid built from the fire's covered
+        // `[256, 16]` where the statement said `[512, 4]`, so on every
+        // gemma-4 full-attention layer the top half of every KV head was
+        // never written and heads 4..15 landed in the next token's rows.
+        head_param = Some(0),
+        heads_param = Some(1),
         axes = &[BF16]),
     // 1 in logit_softcap.metal
     // gemma's logit softcap: `cap * tanh(x / cap)`, applied to the readout so

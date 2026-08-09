@@ -1,9 +1,14 @@
-//! One normalization of `config.json`, and a test that says so.
+//! NO normalization of `config.json`, and a test that says so.
 //!
-//! `pie.model/1` exists to make "what is this model made of" a question that
-//! is answered once, in Rust, at import — or, for a plain HF snapshot, by
-//! `worker/src/weights.rs` before any driver is created. What a driver reads
-//! is the answer, never the question.
+//! It was named for a weaker claim: `pie.model/1` existed to make "what is
+//! this model made of" a question answered ONCE, in Rust, at import. One
+//! normalizer instead of four.
+//!
+//! There is no normalizer. `catalog` states the answer as a `const`, so the
+//! question is not asked at run time at all, and the 845 lines that used to
+//! answer it are deleted along with the descriptor they produced. What this
+//! file still guards is the same perimeter for a stronger property: not
+//! "only one reader parses this file" but **nobody does**.
 //!
 //! That property was worth a source GREP for as long as the second normalizer
 //! could be new C++, in another language, behind an FFI boundary this crate
@@ -21,7 +26,8 @@
 //!
 //! What is left is the half a type still cannot hold: nothing stops a future
 //! reader in `model` or `engine` from opening `config.json` again, and
-//! `serde_json` is already in scope for the descriptor.
+//! `serde_json` is still in scope — `encoding.rs` needs it for the one
+//! question a `const` cannot answer.
 
 use std::path::{Path, PathBuf};
 
@@ -32,8 +38,6 @@ fn repo_root() -> PathBuf {
         .expect("crates/model has two ancestors")
         .to_path_buf()
 }
-
-
 
 // THE CUDA CLAIM IS STRUCTURAL NOW. `the_cuda_driver_has_no_config_json_parser`
 // walked `crates/driver-cuda/csrc/src` asking whether the C++ shell had
@@ -56,8 +60,7 @@ fn repo_root() -> PathBuf {
 //
 // What remains of this file is the RUST-side half below, which is the half a
 // type still cannot hold: nothing stops a future reader from opening
-// `config.json` again, and `serde_json` is already in scope for the
-// descriptor.
+// `config.json` again, and `serde_json` is still in scope.
 
 /// The **runtime** does not read `config.json` either.
 ///
@@ -72,16 +75,37 @@ fn repo_root() -> PathBuf {
 /// future reader from opening the file again, and `serde_json` is already in
 /// scope for the descriptor.
 ///
-/// `crates/model/src` now holds the normalizer itself and is still walked
-/// unexcepted, which is the point: [`model::config::normalize`] takes a
-/// `&serde_json::Value` and a path it only ever quotes in errors. Reading the
-/// file is the *caller's*, so even the one module allowed to normalize is not
-/// allowed to open.
+/// `crates/model/src` is walked WITH NO EXCEPTION, which it could not be
+/// before: it held the normalizer, and the normalizer was excused because
+/// `normalize` took a `&serde_json::Value` and a path it only quoted in
+/// errors. There is nothing to excuse now. The single reader that is left,
+/// [`model::encoding::Encoding::from_config_json`], takes the BYTES — it is
+/// handed a document it never located, so it cannot read the wrong one.
+///
+/// # The two drivers are walked here now
+///
+/// They were not, and three documents said they were. This file used to hold
+/// a metal half and a cuda half, each walking a `csrc/src` tree; both trees
+/// are deleted, both halves went with them, and what stayed was a Rust walk
+/// over `model` and `engine` only. So the citations naming this test as the
+/// guard on either driver had been pointing at a file that did not look at
+/// them — which is `north-star.md` rule 4's failure mode, in the very test
+/// written to name it.
+///
+/// Both driver trees are Rust now, so the same walk covers them: neither
+/// opens `config.json` today, and adding them costs one line each and turns
+/// "they do not" from a claim into a check. The stronger, family-level guard
+/// each driver needs is its own `no_family_names.rs`.
 #[test]
 fn the_runtime_does_not_read_config_json() {
     let root = repo_root();
     let mut found = Vec::new();
-    for rel in ["crates/model/src", "crates/engine/src"] {
+    for rel in [
+        "crates/model/src",
+        "crates/engine/src",
+        "crates/driver-metal/src",
+        "crates/driver-cuda/src",
+    ] {
         let dir = root.join(rel);
         let mut stack = vec![dir];
         while let Some(dir) = stack.pop() {
@@ -108,10 +132,11 @@ fn the_runtime_does_not_read_config_json() {
     }
     assert!(
         found.is_empty(),
-        "the runtime reads `config.json` again. Model facts come from the \
-         `pie.model/1` descriptor the worker hands it — normalized by \
-         `model::config` for a snapshot, carried compiled by a `.zt`:\n{}",
+        "the runtime reads `config.json` again. What a model is made of is a \
+         `catalog` row, stated as a `const` and matched to a checkpoint by \
+         its TENSORS; the file itself answers exactly one question, the \
+         declared encoding, and `model::encoding` is handed the bytes rather \
+         than the path so that it cannot be the second reader:\n{}",
         found.join("\n")
     );
 }
-

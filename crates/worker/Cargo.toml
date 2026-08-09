@@ -27,8 +27,8 @@ default = []
 # Each flavor turns on a DEPENDENCY, not a branch in this crate's build
 # script. Both drivers are Rust now, so what this crate needs from them is
 # that they be in the graph.
-driver-cuda = ["engine/driver-cuda-new"]
-driver-metal = ["engine/driver-metal-new"]
+driver-cuda = ["engine/driver-cuda"]
+driver-metal = ["engine/driver-metal"]
 driver-dummy = []
 nixl = ["dep:transport", "transport/nixl"]
 
@@ -112,10 +112,12 @@ model-compiler = { path = "../model-compiler" }
 # whole: `model` owns the shape it arrives in, `tokenizer` names the
 # objects that make up a `pie.tokenizer/1`.
 #
-# `config` is what used to be the `model-config` crate: it names `pie.model/1`
-# and the object it lives in, so the worker normalizes a snapshot and reads
-# the descriptor under the same name `convert` writes it under.
-model = { path = "../model", features = ["forward", "config"] }
+# `contract` is what names `model/config` and the `Encoding` read out of
+# it, so the worker lifts a snapshot's own `config.json` and reads it back
+# out of an artifact under the same name `convert` writes it under. It
+# used to ask for `config`, a feature that carried an 845-line normalizer
+# whose whole output the catalog now states as a `const`.
+model = { path = "../model", features = ["forward", "contract"] }
 tokenizer = { path = "../tokenizer" }
 
 # Pie websocket client — used by `pie run` to drive an inferlet against
@@ -126,6 +128,14 @@ client = { path = "../client" }
 [dev-dependencies]
 tempfile = "3"
 tensor-ir = { path = "../tensor-ir" }
+# The same `model`, with the one row that is not a model.
+#
+# `dummy_boot_uses_create_compile_load_sequence` writes a four-byte
+# checkpoint because what it checks is the create/compile/load SEQUENCE, not
+# a model. Identity is a manifest match now, so the dummy driver has to name
+# a row it can be held to, and the smallest real one is half a gigabyte of
+# embedding. See `model::test_rows`.
+model = { path = "../model", features = ["forward", "contract", "test-rows"] }
 
 [build-dependencies]
 # `kill(pid, 0)` for the stale-launch-state sweep: reachability only, never a

@@ -5,7 +5,7 @@
 //! — and that the half that does not refuses **by name** rather than by
 //! absence, panic, or a plausible wrong answer.
 
-#![cfg(all(feature = "driver-metal-new", target_vendor = "apple"))]
+#![cfg(all(feature = "driver-metal", target_vendor = "apple"))]
 
 use engine::driver::DriverBackend;
 
@@ -32,9 +32,9 @@ fn the_metal_backend_opens_a_device_and_states_what_it_is() {
 
 #[test]
 fn the_verbs_that_need_the_kv_pool_refuse_by_name() {
-    // The hole, stated. Every one of these is above a pool that does not
-    // exist yet; the executor above THEM is complete and device-tested, so
-    // the message says which half is missing.
+    // The ordering, stated. Every one of these is above a pool that does not
+    // exist until `load_model` allocates it, so the refusal names the backend
+    // and the step that was skipped rather than reporting a generic failure.
     let Ok((mut backend, _)) = DriverBackend::metal_create(b"{}") else {
         eprintln!("SKIP: no Metal 4 device");
         return;
@@ -44,7 +44,7 @@ fn the_verbs_that_need_the_kv_pool_refuse_by_name() {
         Ok(_) => panic!("a copy before a load has no pool to move within"),
     };
     assert!(
-        text.contains("driver-metal-new"),
+        text.contains("driver-metal"),
         "a refusal must name the backend that made it: {text}"
     );
     assert!(
@@ -52,15 +52,22 @@ fn the_verbs_that_need_the_kv_pool_refuse_by_name() {
         "and say which order was broken: {text}"
     );
 
-    // `resize_pool` still refuses, and its message says which half is missing
-    // so the next reader does not re-port machinery that is already there.
+    // `resize_pool` refuses too, and for a different reason than it used to:
+    // the resize is wired now (`pool.resize` through the stepper), so what is
+    // missing before a load is the POOL, not the machinery. A refusal that
+    // still described missing machinery would send the next reader to re-port
+    // something that is already there -- which is what this assertion is for.
     let text = match backend.resize_pool(&Default::default()) {
         Err(why) => format!("{why}"),
-        Ok(_) => panic!("the pool is a fixed allocation today"),
+        Ok(_) => panic!("there is no pool to resize before a load"),
     };
     assert!(
-        text.contains("already decide and plan"),
-        "the refusal should say what exists: {text}"
+        text.contains("driver-metal"),
+        "a refusal must name the backend that made it: {text}"
+    );
+    assert!(
+        text.contains("no KV pool") && text.contains("load_model"),
+        "and say what is absent and what would create it: {text}"
     );
 }
 
@@ -113,7 +120,7 @@ fn load_model_takes_one_descriptor_because_this_backend_holds_one_model() {
             .expect_err("/nonesuch holds no checkpoint")
     );
     assert!(
-        why.contains("[model] descriptor"),
+        why.contains("[model] config"),
         "model facts come from the descriptor the worker hands over, not from \
          a checkpoint this seam re-normalizes: {why}"
     );
@@ -262,7 +269,7 @@ fn package() -> ::driver_api::plan::LaunchPackage {
 /// nothing taken out: a checkpoint loads through `load_model`, a frame goes in
 /// through `launch`, and a command buffer retires.
 ///
-/// `driver-metal-new`'s own `device_real_weights` holds both fire classes to
+/// `driver-metal`'s own `device_real_weights` holds both fire classes to
 /// MLX token-for-token, but it stages the fire's tables itself. This is the
 /// path an ENGINE takes, and the distance between the two was two tables and
 /// two numbers until `model::tables` made it one place. A test that only ever
@@ -270,8 +277,10 @@ fn package() -> ::driver_api::plan::LaunchPackage {
 ///
 /// Gated on `PIE_METAL_SMOKE_CHECKPOINT` **and** on a descriptor: model facts
 /// come from the one the worker hands over, never from a checkpoint this seam
-/// re-normalizes (`crates/model/tests/one_normalizer.rs`). The test writes one
-/// beside the snapshot rather than reaching for a boot TOML.
+/// re-normalizes — and `crates/model/tests/one_normalizer.rs` now guards the
+/// stronger property, that NOTHING in the runtime or either driver opens a
+/// `config.json` at all. The test writes one beside the snapshot rather than
+/// reaching for a boot TOML.
 #[test]
 fn a_frame_reaches_the_device_through_the_seam() {
     let Some(snapshot) = std::env::var_os("PIE_METAL_SMOKE_CHECKPOINT") else {
@@ -280,19 +289,23 @@ fn a_frame_reaches_the_device_through_the_seam() {
     };
     let snapshot = std::path::PathBuf::from(snapshot);
 
-    // The descriptor, normalized ONCE and handed over as a worker would.
+    // The checkpoint's own `config.json`, handed over VERBATIM as a
+    // worker would.
+    //
+    // It used to be normalized here, into a `pie.model/1` descriptor,
+    // because that is what a driver read. Nothing normalizes now: what a
+    // model is made of is a `model::catalog` row matched to the
+    // checkpoint's tensors, and the file crosses only so the driver can
+    // read the declared encoding out of it — the one question a `const`
+    // cannot answer, because a group size is not an extent of anything.
     let raw = std::fs::read_to_string(snapshot.join("config.json"))
         .expect("the snapshot has a config.json");
-    let root: serde_json::Value = serde_json::from_str(&raw).expect("it parses");
-    let descriptor = model::config::descriptor(&root, snapshot.to_str().expect("utf8"))
-        .expect("it normalizes")
-        .to_string();
-    let dir = std::env::temp_dir().join("pie-metal-seam-descriptor");
+    let dir = std::env::temp_dir().join("pie-metal-seam-config");
     std::fs::create_dir_all(&dir).expect("a scratch dir");
-    let path = dir.join("descriptor.json");
-    std::fs::write(&path, &descriptor).expect("it writes");
+    let path = dir.join("config.json");
+    std::fs::write(&path, &raw).expect("it writes");
 
-    // TOML, which is what the boot config is — `[model] descriptor`.
+    // TOML, which is what the boot config is — `[model] config`.
     let config = format!("[model]\ndescriptor = \"{}\"\n", path.display());
     let Ok((mut backend, _)) = DriverBackend::metal_create(config.as_bytes()) else {
         eprintln!("SKIP: no Metal 4 device");

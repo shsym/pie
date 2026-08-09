@@ -499,7 +499,12 @@ fn packed_quant_source_requires_exact_affine_size() {
 fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK,
+        // A target claiming the native MXFP4 GEMM is claiming the Marlin
+        // repack that builds its operand. `CUDA_TILE_MAP_MASK` used to carry
+        // `Repack` for every CUDA target and so this pairing was implicit; it
+        // is stated now, because no driver in this tree sets the flag and a
+        // mask claiming a kernel nothing implements refused nothing.
+        tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK | model_loader::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
     };
@@ -555,7 +560,12 @@ fn gpt_oss_native_mxfp4_default_abi_lowers_to_repack_tile_maps() {
 fn a_repack_declaration_is_checked_against_its_transform() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK,
+        // A target claiming the native MXFP4 GEMM is claiming the Marlin
+        // repack that builds its operand. `CUDA_TILE_MAP_MASK` used to carry
+        // `Repack` for every CUDA target and so this pairing was implicit; it
+        // is stated now, because no driver in this tree sets the flag and a
+        // mask claiming a kernel nothing implements refused nothing.
+        tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK | model_loader::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
     };
@@ -588,7 +598,12 @@ fn a_repack_declaration_is_checked_against_its_transform() {
 fn gpt_oss_native_mxfp4_reads_each_interleaved_half_once() {
     let target = StorageTarget {
         backend: BackendKind::Cuda,
-        tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK,
+        // A target claiming the native MXFP4 GEMM is claiming the Marlin
+        // repack that builds its operand. `CUDA_TILE_MAP_MASK` used to carry
+        // `Repack` for every CUDA target and so this pairing was implicit; it
+        // is stated now, because no driver in this tree sets the flag and a
+        // mask claiming a kernel nothing implements refused nothing.
+        tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK | model_loader::plan::TILE_MAP_REPACK,
         native_mxfp4_moe: true,
         ..StorageTarget::default()
     };
@@ -660,7 +675,8 @@ fn gpt_oss_native_mxfp4_tp_resolves_the_rank_from_the_target() {
     let plan_at = |rank: u32| {
         let target = StorageTarget {
             backend: BackendKind::Cuda,
-            tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK,
+            tile_map_mask: model_loader::plan::CUDA_TILE_MAP_MASK
+                | model_loader::plan::TILE_MAP_REPACK,
             tp_rank: rank,
             tp_size: 2,
             native_mxfp4_moe: true,
@@ -1941,7 +1957,8 @@ fn a_padded_head_dim_materializes_zeros_where_no_source_covers() {
     };
 
     let plan = compile_load_plan(&metadata, &contract, StorageTarget::default()).unwrap();
-    let storage = model_loader::executor::host::execute_plan(&plan, &dir)
+    let storage = model_loader::executor::Execution::new(&plan, &dir)
+        .run()
         .expect("the padded plan does not execute");
     let got = storage.tensors.get("q_proj.weight").expect("materialized");
 

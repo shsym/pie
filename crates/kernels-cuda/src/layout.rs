@@ -88,7 +88,7 @@ pub static KERNELS: &[KernelSig] = &[
     // a slice.
     //
     // It had no row and no arm, and the reason it was never missed is
-    // worth keeping: `driver-cuda-new`'s shell built every fire row as
+    // worth keeping: `driver-cuda`'s shell built every fire row as
     // `samples: true`, so `sampled < window.len()` was false on every
     // fire and `lower::epilogue` never stated the gather. The moment the
     // shell read the step's real readout list, every prefill asked for
@@ -141,7 +141,7 @@ pub static KERNELS: &[KernelSig] = &[
             // row once that is divided out — which is exactly the
             // arithmetic the hand arm did, refusal on an unset `ple_dim`
             // included.
-            layers: I32 <- Source::InWidthOver(0, "ple_dim"),
+            layers: I32 <- Source::Div(&Source::Width(&Source::In(0)), &Source::CtxNonZero("ple_dim")),
             dim: I32 <- Source::Ctx("ple_dim"),
             stream: Stream <- Source::Ctx("stream"),
         ]),

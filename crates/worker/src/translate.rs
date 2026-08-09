@@ -96,7 +96,7 @@ fn build_model(
     let snapshot_dir = PathBuf::from(&group0_caps.snapshot_dir);
     // The metadata was lifted once when the model was resolved; this only
     // decides which of the two shapes the runtime is being handed. Only the
-    // tokenizer half varies -- the descriptor is there either way.
+    // tokenizer half varies -- the config is there either way.
     let tokenizer_path = if metadata.tokenizer.is_some() {
         snapshot_dir.clone()
     } else {
@@ -144,6 +144,7 @@ fn build_model(
     Ok(::engine::bootstrap::ModelConfig {
         name: m.name.clone(),
         arch_name: group0_caps.arch_name,
+        model_id: group0_caps.model_id,
         kv_page_size: group0_caps.kv_page_size as usize,
         tokenizer_path,
         metadata,
@@ -171,8 +172,7 @@ mod tests {
     fn fixture_metadata() -> model::ModelMetadata {
         model::ModelMetadata {
             tokenizer: None,
-            descriptor: br#"{"version":"pie.model/1","vocab_size":32,"num_hidden_layers":2}"#
-                .to_vec(),
+            config: br#"{"version":"pie.model/1","vocab_size":32,"num_hidden_layers":2}"#.to_vec(),
         }
     }
 
@@ -187,6 +187,7 @@ mod tests {
             max_forward_requests: 512,
             max_page_refs: 262144,
             arch_name: "qwen3".into(),
+            model_id: "qwen3-0.6b".into(),
             vocab_size: 151936,
             max_model_len: 4096,
             activation_dtype: "bfloat16".into(),
@@ -220,6 +221,7 @@ mod tests {
             vocab_size: caps.vocab_size,
             max_model_len: caps.max_model_len,
             arch_name: caps.arch_name.clone(),
+            model_id: caps.model_id.clone(),
             activation_dtype: caps.activation_dtype.clone(),
             snapshot_dir: caps.snapshot_dir.clone(),
             max_forward_tokens: caps.max_forward_tokens,

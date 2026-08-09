@@ -4,7 +4,7 @@
 //! them. The DSL invents TRACE names (`layer.3.qkv`) as it records a
 //! forward pass; a load contract invents PUBLISHED names
 //! (`model.layers.3.self_attn.qkv_proj.fused.weight`) as it authors the
-//! staging; and [`model::weight_names::wire`] is the one bridge between
+//! staging; and [`model::shared::weight_names::wire`] is the one bridge between
 //! them. A trace name `wire()` cannot answer reaches the driver's
 //! resolver, which returns `None` — and `Resolver::weight`'s own doc says
 //! what that is:
@@ -36,27 +36,27 @@
 //!
 //! **A name that resolves to the WRONG tensor.** This compares spellings,
 //! so a trace name `wire()` answers is a name it considers answered —
-//! whether or not the tensor behind it is the right one. gemma-2 is the
-//! live instance: it is a SANDWICH-norm family with four norms per layer,
-//! and `llama_like`'s pre-norm branch maps its `mlp_norm` to
+//! whether or not the tensor behind it is the right one. gemma-2 was the
+//! instance: it is a SANDWICH-norm family with four norms per layer, and
+//! `llama_like`'s pre-norm branch mapped its `mlp_norm` to
 //! `post_attention_layernorm` where the forward means
 //! `pre_feedforward_layernorm`. The name resolves; the tensor is wrong.
 //!
-//! It is latent rather than live — `contract::HF_ROWS` has no `gemma2`
-//! row, so the family has a forward and cannot be loaded — which is also
-//! why fixing it would be guessing at a contract nobody has written. It
-//! is written down here instead, because the shape of what a test misses
-//! belongs beside the test.
+//! That one is repaired — `weight_names::wire` branches on the SANDWICH
+//! PAIR rather than on `input_layernorm`, whose presence never told the
+//! two apart, and the repair has its own assertion beside it. The class
+//! is what stays uncaught here, so it is written down: the shape of what
+//! a test misses belongs beside the test.
 //!
 //! Layer indices are normalised to `layer.*`, because a trace at four
 //! layers and a `wire()` at eight would otherwise disagree about
 //! everything for no reason. The question is about SPELLINGS.
 
-#![cfg(all(feature = "forward", feature = "config"))]
+#![cfg(all(feature = "forward", feature = "contract"))]
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use model::config::HfConfig;
+use model::catalog::LoadShape;
 use model_compiler::lower::{Arg, Fire, Row, lower};
 use model_compiler::trace::{FireClass, ForwardPlan};
 
@@ -91,14 +91,49 @@ impl Scheme {
     /// nothing another scheme's gate would recognise.
     fn published(self) -> fn(&str) -> bool {
         match self {
-            Self::LlamaLike => |n: &str| {
-                !n.starts_with("model.language_model.") && !n.ends_with("self_attn.sinks")
-            },
+            Self::LlamaLike => {
+                |n: &str| !n.starts_with("model.language_model.") && !n.ends_with("self_attn.sinks")
+            }
             Self::GptOss => |n: &str| !n.starts_with("model.language_model."),
             Self::Gemma4 => |n: &str| n.starts_with("model.language_model."),
             Self::Qwen35 => |n: &str| {
-                n.starts_with("model.language_model.")
-                    && n != "model.language_model.embed_tokens_per_layer.weight"
+                if !n.starts_with("model.language_model.")
+                    || n == "model.language_model.embed_tokens_per_layer.weight"
+                {
+                    return false;
+                }
+                // A HYBRID stack, because that is what qwen3.5 is: three
+                // gated-delta-net layers then one full-attention layer,
+                // measured on `Qwen3.6-35B-A3B-4bit`, and each layer
+                // ships one kind's tensors and not the other's.
+                //
+                // This predicate used to answer yes to every name, which
+                // was harmless while `wire()` read a `layer_types` list
+                // off the config. It stopped being harmless when that
+                // branch started asking the CHECKPOINT — `w.has(q_proj)`
+                // is then true at every layer, the linear-attention arm
+                // never runs, and `conv`, `a_log`, `dt_bias`,
+                // `gate_norm` and the four `in_proj`s all became
+                // unreachable at once. The test reported the first of
+                // them as a seam gap; there is no gap, there was no
+                // hybrid checkpoint to ask.
+                let Some(rest) = n.strip_prefix("model.language_model.layers.") else {
+                    return true;
+                };
+                let Some((index, _)) = rest.split_once('.') else {
+                    return true;
+                };
+                let Ok(layer) = index.parse::<u32>() else {
+                    return true;
+                };
+                let full = layer % 4 == 3;
+                if n.contains(".self_attn.") {
+                    full
+                } else if n.contains(".linear_attn.") {
+                    !full
+                } else {
+                    true
+                }
             },
         }
     }
@@ -107,9 +142,14 @@ impl Scheme {
 /// Every trace name `wire()` can emit for a checkpoint of this scheme,
 /// layer-normalised.
 fn answerable(scheme: Scheme) -> BTreeSet<String> {
-    let hf = HfConfig { num_hidden_layers: 4, ..HfConfig::default() };
+    // Four layers and a 128-wide head: enough for the per-layer loops to
+    // run and for a KV-shared tail to be distinguishable from the layers
+    // that project their own. `wire()` reads only the layer count and the
+    // shared-tail length, which is why a `LoadShape` replaced the
+    // 136-field config this used to build.
+    let shape = LoadShape::dense(4, 128, false);
     let published = scheme.published();
-    let w = model::weight_names::wire(&hf, &published);
+    let w = model::shared::weight_names::wire(shape, &published);
     w.aliases
         .iter()
         .map(|(t, _)| normalise(t))
@@ -153,9 +193,21 @@ fn normalise(name: &str) -> String {
 /// trace records an `Arg::Weight("")` for the slot it does not fill.
 /// Nothing resolves it because nothing needs to.
 fn stems(plan: &ForwardPlan) -> BTreeSet<String> {
-    let rows: Vec<Row> = vec![Row { samples: true, ..Row::default() }; 4];
-    let l = lower(plan, &rows, Fire { captures_across_splits: false })
-        .expect("the corpus lowers");
+    let rows: Vec<Row> = vec![
+        Row {
+            samples: true,
+            ..Row::default()
+        };
+        4
+    ];
+    let l = lower(
+        plan,
+        &rows,
+        Fire {
+            captures_across_splits: false,
+        },
+    )
+    .expect("the corpus lowers");
     l.args
         .iter()
         .filter_map(|a| match a {
@@ -173,16 +225,16 @@ fn stems(plan: &ForwardPlan) -> BTreeSet<String> {
 /// family that has a golden and no row here is a family whose seam nobody
 /// is checking, and the two lists diverging is itself the bug.
 fn corpus() -> Vec<(&'static str, Scheme, ForwardPlan)> {
-    use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
     use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
     use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
     use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35HybridFacts};
+    use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
 
     vec![
         (
             "llama_like",
             Scheme::LlamaLike,
-            model::families::llama_like::forward::llama_like_cuda(
+            model::shared::llama_like::forward::llama_like_cuda(
                 &LlamaLikeFacts::qwen3_0_6b(),
                 &LlamaLikeCudaFacts::qwen3_0_6b_l40s(),
                 FireClass::Decode,
@@ -226,8 +278,8 @@ fn corpus() -> Vec<(&'static str, Scheme, ForwardPlan)> {
         (
             "gemma3n",
             Scheme::LlamaLike,
-            model::gemma3n::forward::gemma3n_cuda(
-                &model::gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
+            model::gemma_3n::forward::gemma3n_cuda(
+                &model::gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
                 FireClass::Decode,
             ),
         ),
@@ -242,8 +294,8 @@ fn corpus() -> Vec<(&'static str, Scheme, ForwardPlan)> {
         (
             "glm5",
             Scheme::LlamaLike,
-            model::glm5::forward::glm5_cuda(
-                &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+            model::glm_5::forward::glm5_cuda(
+                &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
                 FireClass::Decode,
             ),
         ),
@@ -295,27 +347,27 @@ const NOT_YET_WIRED: &[(&str, &[&str])] = &[
     ("llama_like", &[]),
     ("qwen3_5", &[]),
     ("gemma_4", &[]),
-    // TWO STEMS, AND BOTH ARE SPELLINGS. `llama_like`'s gemma branch
-    // wires `post_attention_layernorm` to `attn_norm` and
-    // `post_feedforward_layernorm` to `mlp_norm`; gemma-2's forward asks
-    // for `post_attn_norm` and `post_mlp_norm`. Both tensors are staged
-    // and named — the two halves of the seam simply chose different
-    // words, which is the cheapest possible instance of what this test
-    // exists to catch. `gemma_4`'s builder DOES emit these two spellings,
-    // which is how the union-of-schemes draft hid them.
-    ("gemma_2", &["layer.*.post_attn_norm", "layer.*.post_mlp_norm"]),
+    // WIRED, and the two missing names were the smaller half of it. This
+    // read "both halves of the seam chose different words" -- true, and
+    // it hid the real defect, which was that the word `mlp_norm` DID
+    // resolve, to `post_attention_layernorm`, where gemma-2's forward
+    // means `pre_feedforward_layernorm`. A test that asks what a family
+    // can NAME cannot see a name that resolves to the wrong tensor; the
+    // sandwich placement's own test in `weight_names` reads the target.
+    ("gemma_2", &[]),
     // WAS the row that bit: the only family with both a `FACTS_ROWS`
     // entry in the CUDA shell and a Prefill arm, so a gpt-oss checkpoint
     // loaded, reported itself healthy, and died at its first fire on
     // `UnknownWeight("layer.0.router")`. Wired now. The families below
     // owe the same debt and are not yet reachable, so theirs is not due.
     ("gpt_oss", &[]),
+    // Its two sandwich norms went with gemma-2's -- same placement, same
+    // branch. What is left is the AltUp and Laurel machinery, which is
+    // gemma3n's alone.
     ("gemma3n", &[
         "layer.*.altup_correct_norm",
         "layer.*.altup_norm",
         "layer.*.laurel_post_norm",
-        "layer.*.post_attn_norm",
-        "layer.*.post_mlp_norm",
     ]),
     // MLA and the latent cache: three families, one shape. `kv_b_proj`
     // and `q_a_norm` are the latent projection's two halves and all
@@ -398,8 +450,10 @@ fn every_traced_weight_is_a_name_wire_can_emit() {
     let mut actual: BTreeMap<&str, BTreeSet<String>> = BTreeMap::new();
     for (family, scheme, plan) in corpus() {
         let can = answerable(scheme);
-        let missing: BTreeSet<String> =
-            stems(&plan).into_iter().filter(|s| !can.contains(s)).collect();
+        let missing: BTreeSet<String> = stems(&plan)
+            .into_iter()
+            .filter(|s| !can.contains(s))
+            .collect();
         actual.insert(family, missing);
     }
 
@@ -412,8 +466,7 @@ fn every_traced_weight_is_a_name_wire_can_emit() {
 
     let mut report = String::new();
     for (family, missing) in &actual {
-        let want: BTreeSet<String> =
-            expected[family].iter().map(|s| (*s).to_string()).collect();
+        let want: BTreeSet<String> = expected[family].iter().map(|s| (*s).to_string()).collect();
         for joined in missing.difference(&want) {
             report.push_str(&format!(
                 "  {family}: `{joined}` is named by the forward pass and \
@@ -433,7 +486,7 @@ fn every_traced_weight_is_a_name_wire_can_emit() {
 
 /// The fact that could only ever be false.
 ///
-/// `abi_shell.rs` derives kimi's fused latent projection as
+/// `serve.rs` derives kimi's fused latent projection as
 /// `aliases.contains_key("layer.0.q_kv_a_fused")`. The contract publishes
 /// that join and the forward consumes it — but `wire()` has no kimi
 /// builder, so the alias is never created, the fact is permanently
@@ -450,7 +503,7 @@ fn kimis_fused_latent_projection_is_still_unreachable() {
     assert!(
         !can.contains("layer.*.q_kv_a_fused"),
         "a kimi builder landed: `wire()` can now emit `q_kv_a_fused`, so \
-         `abi_shell`'s `aliases.contains_key(\"layer.0.q_kv_a_fused\")` is \
+         `serve`'s `aliases.contains_key(\"layer.0.q_kv_a_fused\")` is \
          no longer permanently false. Check that the forward, the contract \
          and the driver agree before deleting this test."
     );

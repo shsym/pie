@@ -36,10 +36,14 @@ pub static KERNELS: &[KernelSig] = &[
             stream: Stream <- Source::Ctx("stream"),
             gate_second: Bool <- Source::Lit(Lit::Bool(false)),
         ]),
+    // TWO SPELLINGS OF THE UP PROJECTION. A trace that split the packed
+    // projection states both halves; one that did not leaves `up` to the
+    // join, which collected it as the statement's foreign operand. Same
+    // launch either way.
     kernel!(swiglu "mlp::swiglu_bf16",
         operands = operands![
             gate: Buf <- Source::In(0),
-            up: Buf <- Source::In(1),
+            up: Buf <- Source::Or(&Source::In(1), &Source::Aux(0)),
             y: BufMut <- Source::Out(0),
             num_elements: I32 <- Source::OutElements(0),
             stream: Stream <- Source::Ctx("stream"),
@@ -72,7 +76,7 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(swiglu_clamp "mlp::swiglu_clamp_bf16",
         operands = operands![
             gate: Buf <- Source::In(0),
-            up: Buf <- Source::In(1),
+            up: Buf <- Source::Or(&Source::In(1), &Source::Aux(0)),
             y: BufMut <- Source::Out(0),
             num_elements: I32 <- Source::OutElements(0),
             limit: F32 <- Source::Ctx("glu_limit"),
@@ -99,7 +103,7 @@ pub static KERNELS: &[KernelSig] = &[
     kernel!(situ "mlp::situ_bf16",
         operands = operands![
             gate: Buf <- Source::In(0),
-            up: Buf <- Source::In(1),
+            up: Buf <- Source::Or(&Source::In(1), &Source::Aux(0)),
             y: BufMut <- Source::Out(0),
             num_elements: I32 <- Source::OutElements(0),
             beta: F32 <- Source::Ctx("situ_beta"),
@@ -118,12 +122,16 @@ pub static KERNELS: &[KernelSig] = &[
             stream: Stream <- Source::Ctx("stream"),
         ]),
     kernel!(gaussian_topk "mlp::gaussian_topk_bf16",
+        in_place = &[(0, 0)],
         operands = operands![
-            x: BufMut,
-            n: I32,
-            dim: I32,
-            std_multiplier: F32,
-            stream: Stream,
+            x: BufMut <- Source::Out(0),
+            n: I32 <- Source::Rows,
+            dim: I32 <- Source::OutWidth(0),
+            // Per-layer, and the driver's own derivation: the config
+            // states `activation_sparsity` and the kernel wants
+            // `gaussian_inverse_cdf` of it.
+            std_multiplier: F32 <- Source::CtxByLayer("altup_std_mult"),
+            stream: Stream <- Source::Ctx("stream"),
         ]),
     // GeGLU-tanh is not a swiglu variant: `gelu_pytorch_tanh` on the
     // gate is a different function. The packed/pair split is the same

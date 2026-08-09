@@ -3,7 +3,7 @@
 //! The worker never downloads and never converts (R3). What it resolves is a
 //! name or a path to something already on disk, and under this plan that
 //! something is one `.zt` artifact: weights, compiled tokenizer and compiled
-//! model descriptor together, written by `pie model import`.
+//! checkpoint config together, written by `pie model import`.
 //!
 //! Two forms, told apart by shape rather than by what happens to exist:
 //!
@@ -49,12 +49,15 @@ impl Model {
 
     /// Everything the runtime and the drivers need, lifted in **one** open.
     ///
-    /// The descriptor is always produced: an artifact carries it compiled, and
-    /// a snapshot's `config.json` is normalized here by the same
-    /// `model::config` the artifact was written with. That is what lets
-    /// everything downstream — both drivers and the runtime's model service —
-    /// read one document instead of keeping a second path that parses the
-    /// files beside a snapshot.
+    /// The config is always produced: an artifact carries it embedded and a
+    /// snapshot has it on disk, and both hand over the SAME bytes. That is
+    /// what lets everything downstream read one document instead of keeping a
+    /// second path that parses the files beside a snapshot.
+    ///
+    /// One reader is left, and it wants three fields:
+    /// [`Encoding::from_config_json`](model::encoding::Encoding::from_config_json)
+    /// asks what quantization the checkpoint declares. Everything else the
+    /// old `pie.model/1` document carried is a catalog row's now.
     ///
     /// The tokenizer half stays optional, and all-or-nothing: half the
     /// tokenizer compiled and half probed from files is the skew the artifact
@@ -63,7 +66,7 @@ impl Model {
         let Model::Artifact(path) = self else {
             return Ok(model::ModelMetadata {
                 tokenizer: None,
-                descriptor: normalize_snapshot_descriptor(self.path())?,
+                config: lift_snapshot_config(self.path())?,
             });
         };
         // One parse. For a sharded artifact the manifest read opens and
@@ -71,18 +74,17 @@ impl Model {
         let checkpoint = model_loader::checkpoint::read::parse_checkpoint_metadata(path)
             .map_err(|err| anyhow!("cannot read {}: {err}", path.display()))?;
 
-        let descriptor = model_loader::checkpoint::read::read_meta(
-            &checkpoint,
-            model::config::DESCRIPTOR_OBJECT,
-        )?
-        .ok_or_else(|| {
-            anyhow!(
-                "artifact {} carries no {} descriptor; re-import it with \
-                 `pie model import`",
-                path.display(),
-                model::config::DESCRIPTOR_OBJECT,
-            )
-        })?;
+        let config =
+            model_loader::checkpoint::read::read_meta(&checkpoint, model::encoding::CONFIG_OBJECT)?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "artifact {} carries no {}; it was written when an artifact \
+                 carried a resolved `pie.model/1` document instead of the \
+                 checkpoint's own config. Re-import it with `pie model import`",
+                        path.display(),
+                        model::encoding::CONFIG_OBJECT,
+                    )
+                })?;
 
         let mut tokenizer = Vec::with_capacity(tokenizer::canonical::OBJECTS.len());
         for name in tokenizer::canonical::OBJECTS {
@@ -94,22 +96,43 @@ impl Model {
         }
         Ok(model::ModelMetadata {
             tokenizer: (!tokenizer.is_empty()).then_some(tokenizer),
-            descriptor,
+            config,
         })
     }
 }
 
-/// Normalize a snapshot's `config.json` into a `pie.model/1` descriptor.
+/// Lift a snapshot's `config.json`, verbatim.
 ///
-/// The same call `pie model convert` makes (`bin/pie/src/ops/convert.rs`), so
-/// serving a snapshot and serving the artifact converted from it hand the
-/// driver byte-identical documents.
+/// # Why verbatim, when this used to normalize
 ///
-/// A missing or unreadable `config.json` is an error here, not a fallback. It
-/// used to be one: the driver would find nothing and parse the file itself.
-/// That branch is what this function exists to delete, so restoring it as an
-/// error path would restore the thing being removed.
-fn normalize_snapshot_descriptor(path: &Path) -> Result<Vec<u8>> {
+/// It used to run the config through an 845-line normalizer into a
+/// `pie.model/1` descriptor — ~40 fields, resolved from a 136-field
+/// schema — so that a driver would not have to parse HuggingFace's
+/// spelling variations itself. That was the right shape of answer to
+/// the wrong question. Every one of those fields except three is a
+/// fact about the MODEL, and a model is a catalog row now: the row
+/// states its geometry, and a checkpoint is matched to it by its
+/// TENSORS rather than believed on the strength of what its config
+/// claims.
+///
+/// The three that remain are the declared quantization — method, bits,
+/// group size — and they are the only ones a row cannot state, because
+/// they are properties of the FILES and Qwen3-8B ships as four
+/// different sets of them. [`model::encoding::Encoding::from_config_json`]
+/// reads exactly those three, so what has to cross is the config
+/// itself.
+///
+/// Verbatim also removes a class of failure the normalizer had by
+/// construction: it was a second reader of a document the checkpoint
+/// already carries, and a normalizer that defaults a missing field
+/// cannot be told apart from a config that states that value.
+///
+/// A missing or unreadable `config.json` is an error here, not a
+/// fallback. It used to be one: the driver would find nothing and parse
+/// the file itself. That branch is what this function exists to delete,
+/// so restoring it as an error path would restore the thing being
+/// removed.
+fn lift_snapshot_config(path: &Path) -> Result<Vec<u8>> {
     // A snapshot may be the directory or a lone checkpoint file inside it.
     let dir = if path.is_dir() {
         path
@@ -125,16 +148,17 @@ fn normalize_snapshot_descriptor(path: &Path) -> Result<Vec<u8>> {
     let raw = std::fs::read_to_string(&config).map_err(|err| {
         anyhow!(
             "cannot read {}: {err}; a snapshot must carry the config.json its \
-             model descriptor is normalized from (`pie model import` writes an \
-             artifact that carries it already)",
+             encoding is read from (`pie model import` writes an artifact \
+             that carries it already)",
             config.display(),
         )
     })?;
-    let root: serde_json::Value = serde_json::from_str(&raw)
+    // Parsed only to REFUSE a config that is not JSON. A driver that
+    // received an unparseable document would refuse it too, but several
+    // frames later and with a snapshot already half-opened.
+    serde_json::from_str::<serde_json::Value>(&raw)
         .map_err(|err| anyhow!("cannot parse {}: {err}", config.display()))?;
-    let descriptor = model::config::descriptor(&root, &config.display().to_string())
-        .map_err(|err| anyhow!("cannot normalize {}: {err:#}", config.display()))?;
-    Ok(serde_json::to_vec(&descriptor)?)
+    Ok(raw.into_bytes())
 }
 
 /// `$PIE_HOME/models/` — the store `pie model import` writes into.
@@ -269,9 +293,9 @@ mod tests {
         assert!(resolve("").is_err());
     }
 
-    /// Writes an artifact carrying `descriptor` plus, optionally, the whole
+    /// Writes an artifact carrying `config` plus, optionally, the whole
     /// compiled tokenizer.
-    fn artifact(dir: &Path, descriptor: &[u8], whole_tokenizer: bool) -> Model {
+    fn artifact(dir: &Path, config: &[u8], whole_tokenizer: bool) -> Model {
         let path = dir.join("model.zt");
         let canonical = tokenizer::Tokenizer::from_vocab(&["a".to_string(), "b".to_string()])
             .to_canonical()
@@ -279,7 +303,7 @@ mod tests {
         let mut writer = CheckpointWriter::create(&path, &Default::default()).unwrap();
         // Ascending names: `model/…` sorts before `tokenizer/…`.
         writer
-            .add_meta(model::config::DESCRIPTOR_OBJECT, descriptor)
+            .add_meta(model::encoding::CONFIG_OBJECT, config)
             .unwrap();
         for (name, bytes) in canonical.objects() {
             if !whole_tokenizer && name == tokenizer::canonical::MERGE_TABLE {
@@ -309,12 +333,12 @@ mod tests {
     #[test]
     fn an_artifact_hands_over_its_compiled_metadata() {
         let dir = tempfile::tempdir().unwrap();
-        let descriptor = br#"{"version":"pie.model/1","vocab_size":7,"num_hidden_layers":4}"#;
-        let lifted = artifact(dir.path(), descriptor, true).metadata().unwrap();
+        let config = br#"{"version":"pie.model/1","vocab_size":7,"num_hidden_layers":4}"#;
+        let lifted = artifact(dir.path(), config, true).metadata().unwrap();
 
         let objects = lifted.tokenizer.as_ref().expect("no compiled tokenizer");
         assert_eq!(objects.len(), tokenizer::canonical::OBJECTS.len());
-        assert_eq!(lifted.descriptor, descriptor);
+        assert_eq!(lifted.config, config);
 
         // The runtime's own reconstruction, exercised here so a break shows up
         // as a worker test rather than only at serve time.
@@ -326,41 +350,53 @@ mod tests {
         })
         .unwrap();
         let rebuilt = tokenizer::Tokenizer::from_canonical(&rebuilt).unwrap();
-        assert_eq!(rebuilt.vocab_size(), 2);
+        // AGAINST THE ORIGINAL, not against a number. `from_vocab(["a","b"])`
+        // builds a byte-level tokenizer, so its vocabulary is 258 -- the 256
+        // single-byte tokens plus the two named ones -- and the literal `2`
+        // that used to be here was a guess about the constructor rather than
+        // a claim about the round trip. Comparing the two ends says the thing
+        // this test is named for, and says it whatever the constructor does.
+        let original = tokenizer::Tokenizer::from_vocab(&["a".to_string(), "b".to_string()]);
+        assert_eq!(rebuilt.vocab_size(), original.vocab_size());
     }
 
     /// All of the tokenizer or none of it: half compiled and half probed from
     /// files beside a snapshot is the skew the artifact removes.
     ///
-    /// The descriptor is unaffected — it is a different object with a
+    /// The config is unaffected — it is a different object with a
     /// different completeness question, and an artifact that carries one but
     /// not a whole tokenizer still has a model config worth reading.
     #[test]
     fn an_artifact_missing_part_of_its_tokenizer_hands_over_none_of_it() {
         let dir = tempfile::tempdir().unwrap();
-        let descriptor = br#"{"version":"pie.model/1","vocab_size":7}"#;
-        let lifted = artifact(dir.path(), descriptor, false).metadata().unwrap();
+        let config = br#"{"version":"pie.model/1","vocab_size":7}"#;
+        let lifted = artifact(dir.path(), config, false).metadata().unwrap();
         assert!(lifted.tokenizer.is_none());
-        assert_eq!(lifted.descriptor, descriptor);
+        assert_eq!(lifted.config, config);
     }
 
-    /// **Both input forms produce a descriptor.**
+    /// **Both input forms hand over the checkpoint's own config, byte
+    /// for byte.**
     ///
     /// This is the property that let the second and third normalizers go — the
     /// drivers' `config.json` parsers and the runtime's own key probes — so it
     /// is pinned rather than left implied. If a snapshot ever again reaches
-    /// them without a descriptor, there is nothing left to fall back to.
+    /// them without one, there is nothing left to fall back to.
+    ///
+    /// Verbatim is stronger than the normalized document it replaced: two
+    /// forms of the same model now hand over IDENTICAL bytes, where before
+    /// they handed over two normalizations that had to agree.
     #[test]
-    fn every_model_form_produces_a_descriptor() {
+    fn every_model_form_produces_the_checkpoints_config() {
         let dir = tempfile::tempdir().unwrap();
 
-        // The artifact form: the compiled bytes, read back rather than derived
-        // from a `config.json` it does not have.
-        let compiled = br#"{"version":"pie.model/1","vocab_size":7,"num_hidden_layers":4}"#;
+        // The artifact form: the embedded bytes, read back rather than
+        // derived from a `config.json` it does not have.
+        let compiled = br#"{"model_type":"llama","vocab_size":7,"num_hidden_layers":4}"#;
         let model = artifact(dir.path(), compiled, true);
-        assert_eq!(model.metadata().unwrap().descriptor, compiled);
+        assert_eq!(model.metadata().unwrap().config, compiled);
 
-        // The snapshot form: normalized here, from `config.json`, and with no
+        // The snapshot form: lifted here, from `config.json`, and with no
         // compiled tokenizer to hand over.
         let snap = dir.path().join("snapshot");
         std::fs::create_dir(&snap).unwrap();
@@ -375,19 +411,28 @@ mod tests {
         .unwrap();
         let lifted = Model::Snapshot(snap.clone()).metadata().unwrap();
         assert!(lifted.tokenizer.is_none());
-        let doc: serde_json::Value = serde_json::from_slice(&lifted.descriptor).unwrap();
-        assert_eq!(doc["version"], model::config::VERSION);
+        let doc: serde_json::Value = serde_json::from_slice(&lifted.config).unwrap();
+        // VERBATIM: the keys are the checkpoint's own spelling, not a
+        // normalizer's. `num_hidden_layers` and `vocab_size` are a row's
+        // answers now, and nothing downstream reads them from here — this
+        // asserts only that the bytes arrived unaltered.
         assert_eq!(doc["num_hidden_layers"], 2);
-        // The two fields the runtime reads out of it, so a schema change that
-        // dropped either shows up here rather than at boot.
         assert_eq!(doc["vocab_size"], 32);
+        assert_eq!(doc["model_type"], "llama");
+        // THE ONE FIELD A READER STILL WANTS. Absent here, which is not a
+        // defect: most checkpoints declare no quantization, and an absent
+        // block is an unquantized checkpoint rather than a missing answer.
+        assert!(
+            model::encoding::Encoding::from_config_value(&doc).is_none(),
+            "an unquantized snapshot declares nothing"
+        );
 
         // A checkpoint file inside the snapshot reads the config beside it.
         let gguf = snap.join("model.gguf");
         std::fs::write(&gguf, b"x").unwrap();
         assert_eq!(
-            Model::Snapshot(gguf).metadata().unwrap().descriptor,
-            lifted.descriptor
+            Model::Snapshot(gguf).metadata().unwrap().config,
+            lifted.config
         );
     }
 

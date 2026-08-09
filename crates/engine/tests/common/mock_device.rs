@@ -2,6 +2,13 @@
 //!
 //! These helpers keep the existing harness source compiling on top of direct
 //! driver-backend registration.
+#![allow(
+    dead_code,
+    reason = "this file is compiled into all 14 integration-test binaries (via \
+              `mod common;`) and into the grammar_wit bench (via `#[path]`), but \
+              each one uses a different subset of the harness, so `dead_code` here \
+              only ever means \"unused by *this* binary\" and never \"unused\""
+)]
 
 use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
@@ -194,6 +201,7 @@ fn register_dummy_driver(
         vocab_size,
         max_model_len: 8192,
         arch_name: "test-dummy".into(),
+        model_id: String::new(),
         activation_dtype: "f32".into(),
         snapshot_dir: String::new(),
         max_forward_tokens: 4096,

@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use anyhow::{Result, anyhow, bail, ensure};
+use driver_api::plan::ProgramRegistration;
 use driver_api::{
     DeviceFacts, DriverCapabilities, ModelLoadDesc, PIE_CHANNEL_DTYPE_ACT, PIE_CHANNEL_DTYPE_BOOL,
     PIE_CHANNEL_DTYPE_F32, PIE_CHANNEL_DTYPE_I32, PIE_CHANNEL_DTYPE_U32, PIE_CHANNEL_EXTERN_NONE,
@@ -20,7 +21,6 @@ use driver_api::{
     validate_instance_desc, validate_kv_copy_desc, validate_pool_resize_desc,
     validate_state_copy_desc,
 };
-use driver_api::plan::ProgramRegistration;
 use tensor_compiler::eval::interp::{
     ExternChannel, HostError, Instance as InterpInstance, NoKernels, PassInputs, Value,
 };
@@ -67,6 +67,10 @@ pub struct DummyDriverOptions {
     pub vocab_size: u32,
     pub max_model_len: u32,
     pub arch_name: String,
+    /// The catalog id the engine resolves to get layers, vocabulary and
+    /// the chat template. Unlike `arch_name` this is not decorative, which
+    /// is why it has no default worth writing down: see the `Default` impl.
+    pub model_id: String,
     pub activation_dtype: String,
     pub snapshot_dir: String,
     pub max_forward_tokens: u32,
@@ -104,6 +108,16 @@ impl Default for DummyDriverOptions {
             vocab_size: 32_000,
             max_model_len: 8192,
             arch_name: "dummy".to_string(),
+            // EMPTY, and deliberately not a real id.
+            //
+            // A default here would be a fixture claiming to be a model
+            // nobody asked for, and the engine would size a sampler and
+            // pick a chat template from it. Empty fails at
+            // `engine::model::register` with the nearest ids named, which
+            // is the failure a caller can act on. Callers that boot the
+            // engine set it; `worker::embedded_driver` identifies the
+            // checkpoint from its tensors to do so.
+            model_id: String::new(),
             activation_dtype: "f32".to_string(),
             snapshot_dir: String::new(),
             max_forward_tokens: 4096,
@@ -355,6 +369,7 @@ impl DummyDriver {
                 max_forward_requests: options.max_forward_requests,
                 max_page_refs: options.max_page_refs,
                 arch_name: options.arch_name,
+                model_id: options.model_id,
                 vocab_size: options.vocab_size,
                 max_model_len: options.max_model_len,
                 activation_dtype: options.activation_dtype,
@@ -551,8 +566,7 @@ impl DummyDriver {
             // host role, unseeded). Single-attachment channels keep their
             // instance-local interpreter ring.
             shared: if desc.extern_dir != PIE_CHANNEL_EXTERN_NONE
-                || (desc.host_role == driver_api::PIE_CHANNEL_HOST_ROLE_NONE
-                    && desc.seeded == 0)
+                || (desc.host_role == driver_api::PIE_CHANNEL_HOST_ROLE_NONE && desc.seeded == 0)
             {
                 let dtype = channel_program_dtype(desc.dtype)?;
                 let shape = tensor_ir::types::Shape::new(&shape)
@@ -1205,7 +1219,8 @@ fn process_launch_instance(instance: &LaunchInstanceWork) -> LaunchInstanceResul
                 };
             }
         }
-        let outcome = match run_instance_step(
+
+        match run_instance_step(
             &mut inner,
             &instance.instance.program,
             instance.instance.instance_id,
@@ -1225,8 +1240,7 @@ fn process_launch_instance(instance: &LaunchInstanceWork) -> LaunchInstanceResul
                 poison_instance(&mut inner, &mut notify_waits, &err.to_string());
                 PIE_TERMINAL_OUTCOME_FAILED
             }
-        };
-        outcome
+        }
     };
     LaunchInstanceResult {
         outcome,
@@ -1641,8 +1655,8 @@ fn ensure_endpoint_matches_program(
             // instances — the shared ring is ordered by the pipeline FIFO
             // (prefill→decode `tok_in` handoff). Host-visible or seeded
             // channels keep the one-attachment rule.
-            let device_only =
-                endpoint.host_role == tensor_ir::container::HostRole::None as u8 && !endpoint.seeded;
+            let device_only = endpoint.host_role == tensor_ir::container::HostRole::None as u8
+                && !endpoint.seeded;
             ensure!(
                 endpoint.extern_name.is_none() && (endpoint.attachments.is_empty() || device_only),
                 "private channel {} is already attached",
@@ -2292,14 +2306,14 @@ mod tests {
         PIE_CHANNEL_EXTERN_EXPORT, PIE_CHANNEL_HOST_ROLE_NONE, PIE_TERMINAL_OUTCOME_PENDING,
         PieChannelValueDesc,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
     use tensor_ir::container::{
         ChanDType, ChannelDecl, ExternDecl, PortBinding, PortSource, StageProgram, TraceContainer,
     };
     use tensor_ir::expand;
     use tensor_ir::registry::{Port, Stage};
     use tensor_ir::types::{Literal, Shape};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{Duration, Instant};
 
     /// The fixture summary flows into the reported capabilities verbatim —
     /// the dummy half of the driver→engine site-summary handshake (a real

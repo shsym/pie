@@ -21,22 +21,24 @@
 
 use std::path::PathBuf;
 
-use model::families::llama_like::forward::llama_like;
-use model::families::llama_like::forward::llama_like_cuda;
+use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
+use model::gemma_4::forward::gemma4_cuda;
+use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
+use model::gpt_oss::forward::gpt_oss_cuda;
+use model::qwen_3_5::forward::facts::{
+    Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts,
+};
 use model::qwen_3_5::forward::qwen3_5_full_attn_block;
 use model::qwen_3_5::forward::qwen3_5_gdn_block;
 use model::qwen_3_5::forward::qwen3_5_hybrid;
-use model::gemma_4::forward::gemma4_cuda;
-use model::gpt_oss::forward::gpt_oss_cuda;
 use model::qwen_3_5::forward::qwen3_5_hybrid_cuda;
 use model::qwen_3_5::forward::qwen3_5_moe_mlp_block;
 use model::qwen_3_5::forward::qwen3_5_moe_mlp_block_cuda;
-use model::families::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
-use model::gemma_4::forward::facts::{Gemma4CudaFacts, Gemma4Facts};
-use model::gpt_oss::forward::facts::{GptOssCudaFacts, GptOssFacts};
-use model::qwen_3_5::forward::facts::{Qwen35CudaFacts, Qwen35FullAttnFacts, Qwen35GdnFacts, Qwen35HybridFacts, Qwen35MoeMlpFacts};
+use model::shared::llama_like::forward::facts::{LlamaLikeCudaFacts, LlamaLikeFacts};
+use model::shared::llama_like::forward::llama_like;
+use model::shared::llama_like::forward::llama_like_cuda;
 use model_compiler::dsl::WeightRepr;
-use model_compiler::{FireClass, ForwardPlan, HookStage, OpKind};
+use model_compiler::{FireClass, ForwardPlan};
 
 fn golden_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -55,8 +57,12 @@ fn check(name: &str, facts: &LlamaLikeFacts) {
 /// comparison mean "these two files describe the same launches".
 fn plan_multiset(json: &str) -> std::collections::BTreeMap<String, usize> {
     let mut out = std::collections::BTreeMap::new();
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else { return out };
-    let Some(ops) = v.get("ops").and_then(|o| o.as_array()) else { return out };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return out;
+    };
+    let Some(ops) = v.get("ops").and_then(|o| o.as_array()) else {
+        return out;
+    };
     for op in ops {
         let Some(kind) = op.get("kind") else { continue };
         let name = match kind {
@@ -520,8 +526,6 @@ fn qwen3_5_hybrid_0_8b_cuda_prefill() {
     );
 }
 
-
-
 /// The first LOWERED goldens (north-star-dsl.md): the SAME llama_like
 /// text, traced with the CUDA backend facts and a fire class in hand, so
 /// the class arms run and the traced form states kernels. Decode, since
@@ -568,7 +572,6 @@ fn qwen3_0_6b_cuda_prefill() {
 // guard arm INSIDE the decode/prefill goldens above, which pin the
 // arm's op-list delta — the general QKV sequence in the fused
 // deployment's mask arm, the custom dispatch, no dequant.)
-
 
 // (The three SERVICE-class goldens are gone with the classes:
 // `.wiki/driver/graph.md` §4.2 retired CommitAdvance, StateOnly and
@@ -816,8 +819,8 @@ fn gemma_2_cuda_prefill() {
 fn gemma3n_cuda_prefill() {
     check_plan(
         "gemma3n.cuda.prefill",
-        &model::gemma3n::forward::gemma3n_cuda(
-            &model::gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
+        &model::gemma_3n::forward::gemma3n_cuda(
+            &model::gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
             FireClass::Prefill,
         ),
     );
@@ -835,11 +838,22 @@ fn nemotron_h_cuda_prefill() {
 }
 
 #[test]
+fn deepseek_v4_cuda_prefill() {
+    check_plan(
+        "deepseek_v4.cuda.prefill",
+        &model::deepseek_v4::forward::dsv4_cuda(
+            &model::deepseek_v4::forward::facts::Dsv4Facts::dsv4_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+#[test]
 fn gemma3n_cuda_decode() {
     check_plan(
         "gemma3n.cuda.decode",
-        &model::gemma3n::forward::gemma3n_cuda(
-            &model::gemma3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
+        &model::gemma_3n::forward::gemma3n_cuda(
+            &model::gemma_3n::forward::facts::Gemma3nFacts::gemma3n_synthetic(),
             FireClass::Decode,
         ),
     );
@@ -860,8 +874,8 @@ fn gemma_2_cuda_decode() {
 fn glm5_cuda_decode() {
     check_plan(
         "glm5.cuda.decode",
-        &model::glm5::forward::glm5_cuda(
-            &model::glm5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+        &model::glm_5::forward::glm5_cuda(
+            &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
             FireClass::Decode,
         ),
     );
@@ -875,6 +889,48 @@ fn kimi_k2_cuda_decode() {
             &model::kimi_k2::forward::facts::KimiFacts::kimi_k2(),
             &model::kimi_k2::forward::facts::KimiCudaFacts::kimi_k2_synthetic(),
             FireClass::Decode,
+        ),
+    );
+}
+
+// The PREFILL goldens for the three MLA texts that gained the class.
+//
+// They are not a second text: MLA's attention is one planned dispatch over a
+// `qo_indptr`, so the body is the same statements and the class reaches only
+// the trace's name. That is exactly why they are worth pinning — a golden
+// that differs from its decode sibling in more than the family name would
+// mean the class had leaked into the body, which is the thing these texts
+// claim it does not do.
+#[test]
+fn kimi_k2_cuda_prefill() {
+    check_plan(
+        "kimi_k2.cuda.prefill",
+        &model::kimi_k2::forward::kimi_cuda(
+            &model::kimi_k2::forward::facts::KimiFacts::kimi_k2(),
+            &model::kimi_k2::forward::facts::KimiCudaFacts::kimi_k2_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+#[test]
+fn kimi_k3_cuda_prefill() {
+    check_plan(
+        "kimi_k3.cuda.prefill",
+        &model::kimi_k3::forward::kimi_k3_cuda(
+            &model::kimi_k3::forward::facts::KimiK3Facts::kimi_k3_synthetic(),
+            FireClass::Prefill,
+        ),
+    );
+}
+
+#[test]
+fn glm5_cuda_prefill() {
+    check_plan(
+        "glm5.cuda.prefill",
+        &model::glm_5::forward::glm5_cuda(
+            &model::glm_5::forward::facts::Glm5Facts::glm5_106b_a12b(),
+            FireClass::Prefill,
         ),
     );
 }
