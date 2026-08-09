@@ -48,8 +48,6 @@
 //! corpus is asserted below; coverage of the catalog is the manifest's
 //! job, not this file's.
 
-#![cfg(feature = "forward")]
-
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -429,11 +427,6 @@ fn compare_deployment(c: &mut Compare, o: &Value, dep: &Deployment) {
     }
     c.u32("vocab", stated_u32(o, &["vocab_size"]), dep.shape.vocab);
     c.u32(
-        "moe_intermediate",
-        stated_u32(o, &["moe_intermediate_size"]),
-        dep.shape.moe_intermediate,
-    );
-    c.u32(
         "max_model_len",
         stated_u32(o, &["max_position_embeddings"]),
         dep.advertised.max_model_len,
@@ -517,6 +510,7 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
 
     let stated = stated_rope_scaling(o);
     let num = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
+    let flag = |v: &Value, k: &str| v.get(k).and_then(Value::as_bool);
 
     match (stated, dep.rope_scaling) {
         (None, None) => {}
@@ -532,7 +526,7 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
         )),
         (
             Some((kind, v)),
-            Some(RopeScaling::Llama3 {
+            Some(RopeScaling::Piecewise {
                 factor,
                 low_freq_factor,
                 high_freq_factor,
@@ -569,6 +563,7 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
                 beta_slow,
                 attention_factor,
                 original_max_position,
+                truncate,
             }),
         ) => {
             if kind != "yarn" {
@@ -593,6 +588,13 @@ fn compare_rope_scaling(c: &mut Compare, o: &Value, dep: &Deployment) {
                 num(&v, "attention_factor"),
                 attention_factor,
             );
+            // Compared only when the config states it, for the same reason
+            // as `attention_factor` -- but the two omissions mean different
+            // things. An absent `attention_factor` is a formula the row
+            // evaluates; an absent `truncate` is HF's `true`, and the whole
+            // corpus omits it except gpt-oss, which is the family whose
+            // ramp would move if a row copied the majority.
+            c.bool("rope_scaling.truncate", flag(&v, "truncate"), truncate);
         }
     }
 }

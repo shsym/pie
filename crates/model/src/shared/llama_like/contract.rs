@@ -129,3 +129,195 @@ fn llama_mlx_name(raw_name: &str, tied: bool) -> Result<Option<String>, Error> {
     }
     Ok(Some(format!("layers.{layer}.{member}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mapped(raw: &str, tied: bool) -> Option<String> {
+        llama_mlx_name(raw, tied).unwrap_or_else(|e| panic!("'{raw}' is refused: {e:?}"))
+    }
+
+    /// Every arm of the rename, stated as the pair it maps.
+    ///
+    /// This is the function that decides what the Metal binder will look
+    /// up. A wrong answer is not a crash: `Store::checkpoint_names` returns
+    /// an empty candidate list for a name it does not know, so a tensor
+    /// renamed wrongly is a tensor silently absent from the forward pass.
+    #[test]
+    fn every_name_the_metal_binder_reads_is_the_one_this_maps_to() {
+        for (raw, tied, expected) in [
+            ("model.embed_tokens.weight", false, "embed_tokens.weight"),
+            ("model.embed_tokens.weight", true, "shared_embedding.weight"),
+            ("lm_head.weight", false, "lm_head.weight"),
+            ("lm_head.weight", true, "shared_embedding.weight"),
+            ("model.norm.weight", false, "final_norm.weight"),
+            (
+                "model.layers.3.self_attn.q_proj.weight",
+                false,
+                "layers.3.self_attn.q_proj.weight",
+            ),
+            (
+                "model.language_model.layers.3.mlp.down_proj.weight",
+                false,
+                "layers.3.mlp.down_proj.weight",
+            ),
+        ] {
+            assert_eq!(
+                mapped(raw, tied).as_deref(),
+                Some(expected),
+                "'{raw}' with tied={tied}"
+            );
+        }
+    }
+
+    /// A tied checkpoint publishes ONE embedding under one name.
+    ///
+    /// `embed_tokens` and `lm_head` both become `shared_embedding` when the
+    /// weights are tied, which is what makes the tie real rather than a
+    /// claim: two names would be two allocations of the largest tensor in a
+    /// small model.
+    #[test]
+    fn tying_makes_the_two_embedding_names_one_name() {
+        assert_eq!(
+            mapped("model.embed_tokens.weight", true),
+            mapped("lm_head.weight", true),
+            "tied, the input and output embeddings are the same tensor"
+        );
+        assert_ne!(
+            mapped("model.embed_tokens.weight", false),
+            mapped("lm_head.weight", false),
+            "untied, they are two"
+        );
+    }
+
+    /// The tensors a text decode does not bind, and why each is skipped.
+    ///
+    /// Skipping is not the same as failing to map: a tower's weights are
+    /// real tensors that this deployment has no use for, and `inv_freq` is
+    /// DERIVED -- recomputed on the GPU from `rope_theta`, so a checkpoint
+    /// that persists it is shipping a number the kernel already has.
+    #[test]
+    fn the_towers_and_the_derived_frequencies_are_skipped_not_mapped() {
+        for raw in [
+            "model.visual.blocks.0.attn.qkv.weight",
+            "model.vision_tower.encoder.layer.0.mlp.fc1.weight",
+            "model.audio_tower.layers.0.conv.weight",
+            "visual.merger.mlp.0.weight",
+            "model.layers.0.self_attn.rotary_emb.inv_freq",
+        ] {
+            assert_eq!(
+                mapped(raw, false),
+                None,
+                "'{raw}' is not bound by a text decode"
+            );
+        }
+    }
+
+    /// The routed mixture, renamed here and refused here.
+    ///
+    /// A llama-like row can be a mixture -- the shape carries
+    /// `n_experts`, and two rows in this file's own spec state 128 and
+    /// 32 -- so the MLX rename asks the shared routed rule. Neither
+    /// answer it can give had ever been taken, and the two failures are
+    /// opposite:
+    ///
+    /// * A `switch_mlp` member left unrenamed is a name the Metal binder
+    ///   does not know, and `Store::checkpoint_names` answers an empty
+    ///   candidate list rather than an error -- the routed bank is
+    ///   simply absent from the forward pass and the model generates
+    ///   from its attention alone.
+    /// * A SHARED expert accepted on this schema is worse than absent:
+    ///   this family's mixture REPLACES the dense MLP, so there is no
+    ///   shared block to run and the tensor would be loaded, allocated,
+    ///   and never read.
+    ///
+    /// The `false` this text passes for `has_shared_expert` is that
+    /// second claim, and it is the manifest's claim too.
+    #[test]
+    fn the_routed_bank_is_renamed_and_a_shared_expert_is_refused() {
+        for (raw, want) in [
+            (
+                "model.layers.7.mlp.switch_mlp.gate_proj.weight",
+                "layers.7.mlp.experts.gate_proj.weight",
+            ),
+            (
+                "model.language_model.layers.7.mlp.switch_mlp.down_proj.scales",
+                "layers.7.mlp.experts.down_proj.scales",
+            ),
+        ] {
+            assert_eq!(mapped(raw, false), Some(want.to_string()), "{raw}");
+        }
+        for raw in [
+            "model.layers.7.mlp.shared_expert.up_proj.weight",
+            "model.layers.7.mlp.shared_experts.up_proj.weight",
+            "model.layers.7.mlp.experts.0.gate_proj.weight",
+        ] {
+            let refused = llama_mlx_name(raw, false)
+                .expect_err("this schema serves neither spelling")
+                .to_string();
+            assert!(refused.contains(raw), "the refusal names it: {refused}");
+        }
+    }
+
+    /// A name with no rule is refused, and the refusal names it.
+    ///
+    /// This is the arm the whole function is shaped around. Falling through
+    /// -- declaring the tensor under its checkpoint name -- produces a
+    /// contract that loads, an allocation that happens, and a binder that
+    /// never finds it. The tensor is simply not in the forward pass, and
+    /// the model generates.
+    #[test]
+    fn a_name_with_no_rule_is_refused_by_name() {
+        let refused = llama_mlx_name("encoder.block.0.weird.weight", false)
+            .expect_err("a name outside every rule is an error");
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains("encoder.block.0.weird.weight"),
+            "the refusal says which tensor it could not place: {message}"
+        );
+    }
+
+    /// The function's own output is a valid input.
+    ///
+    /// An already-lowered name passes through unchanged, which is what lets
+    /// a contract be re-authored over its own output without every name
+    /// growing a second `layers.` prefix.
+    #[test]
+    fn an_already_lowered_name_passes_through_unchanged() {
+        for raw in ["layers.0.self_attn.q_proj.weight", "final_norm.weight"] {
+            assert_eq!(
+                mapped(raw, false).as_deref(),
+                Some(raw),
+                "'{raw}' is already what the binder reads"
+            );
+        }
+    }
+
+    /// The tied fold and the pass-through claim disjoint names.
+    ///
+    /// The source orders the `lm_head.` arm before `already_lowered` and
+    /// says why: the head "is not an identity when tied". That reason is
+    /// sound and currently inoperative -- `already_lowered` does not accept
+    /// `lm_head.` at all, so swapping the two arms changes nothing today.
+    ///
+    /// What this states instead is the condition under which the ordering
+    /// WOULD start mattering. Adding `lm_head.` to `already_lowered`'s
+    /// table is a one-line change in another file, made by someone
+    /// lowering a family whose head really is pre-named, and it would make
+    /// a tied checkpoint publish `lm_head.weight` unchanged: two
+    /// allocations of the largest tensor in a small model, and a binder
+    /// looking up a name the tied deployment never declares.
+    #[test]
+    fn nothing_the_tied_fold_claims_is_a_name_the_pass_through_would_take() {
+        assert!(
+            !mlx::already_lowered("lm_head.weight"),
+            "the two arms are disjoint, which is why their order is free"
+        );
+        assert_eq!(
+            mapped("lm_head.weight", true).as_deref(),
+            Some("shared_embedding.weight"),
+            "and the tied head folds"
+        );
+    }
+}

@@ -26,22 +26,6 @@ use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::Dsv4Facts;
 
-/// Does this build provision the KV store a deployment asks for?
-///
-/// A property of the BINARY, not of any checkpoint — which is why it is
-/// stated here beside the projection rather than carried on a row. This
-/// is where `unbuilt_kv_store()` went: that method existed because a
-/// generation could hold a `FACTS_ROWS` row, load happily, report itself
-/// healthy and die at its first fire inside a walk. It answered with a
-/// STRING (`"the DSv4 compressed cache"`), and `deployment_of` then
-/// decided which store the string meant by asking whether it contained
-/// `"compress"` — so the answer to "can this binary serve this model"
-/// was a substring search over a sentence written for a human.
-#[must_use]
-pub fn kv_store_is_built(kv: &KvStyle) -> bool {
-    kv.has_a_store_in_this_build()
-}
-
 /// This row's tensors.
 ///
 /// # Where every name below comes from
@@ -172,32 +156,37 @@ pub fn manifest(f: &Dsv4Facts, tied_embeddings: bool) -> Manifest {
 /// A projection, and every value in it was already in the row. What the
 /// derivation this replaces did instead was re-read a resident
 /// `config.json` — and for this generation it did not even reach the
-/// numbers: it chose `KvStyle::Dsv4` by asking whether a family's
+/// numbers: it chose `KvStyle::CompressedPlane` by asking whether a family's
 /// `unbuilt_kv_store()` sentence contained the substring `"compress"`,
 /// and then filled the ratios with `Vec::new()`.
 ///
-/// [`Deployment::advertised`] is left DEFAULT here, and deliberately: a
-/// projection sees geometry and nothing else, while none of that
-/// struct's three answers is a shape. An arch label is a coarse family
-/// name a guest program matches on, and a context ceiling is a
-/// training-time fact two checkpoints of identical geometry can disagree
-/// about. The ROW states them, over the top of this.
+/// `advertised` arrives from the ROW as an argument rather than being
+/// derived here, because none of its three answers is a shape: an arch
+/// label is a coarse family name a guest program matches on, a context
+/// ceiling is a training-time fact two checkpoints of identical geometry
+/// can disagree about, and whether a tower ships is a question about the
+/// checkpoint's files. This function sees geometry and nothing else.
+///
+/// It is a PARAMETER and not a field the caller writes afterwards. The
+/// caller used to project, `?` the refusal, and only then assign the
+/// label -- which put the assignment past a refusal this build always
+/// takes, so the row's label was carried by no code that ran. Passing it
+/// in is what makes the projection total in fact and not only in the
+/// sentence above.
 ///
 /// # Errors
 ///
 /// [`Refusal::Unsupported`] when this build provisions no store for the
 /// row's [`KvStyle`] — which for this generation is every build, and is
 /// the honest answer rather than a load that dies at its first fire.
-pub fn deployment(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Result<Deployment, Refusal> {
-    let planned = plan(f, rope_theta, norm_eps);
-    if kv_store_is_built(&planned.kv) {
-        Ok(planned)
-    } else {
-        Err(Refusal::Unsupported(
-            "this build provisions no compressed KV store; the row's pooled \
-             block entries have nowhere to live",
-        ))
-    }
+pub fn deployment(
+    f: &Dsv4Facts,
+    rope_theta: f32,
+    norm_eps: f32,
+    advertised: Advertised,
+) -> Result<Deployment, Refusal> {
+    let planned = plan(f, rope_theta, norm_eps, advertised);
+    planned.provisioned()
 }
 
 /// The projection itself, which is TOTAL: a row's deployment is a fact
@@ -205,10 +194,10 @@ pub fn deployment(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Result<Deplo
 ///
 /// Separate from [`deployment`] so the two statements stay separable —
 /// "what this model needs" is the row's, "what this binary provides" is
-/// [`kv_store_is_built`]'s, and collapsing them is how a capability
+/// [`KvStyle::has_a_store_in_this_build`]'s, and collapsing them is how a capability
 /// question turns back into a family name.
 #[must_use]
-fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
+fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -> Deployment {
     let a = &f.attn;
     // The window is the UNCOMPRESSED reach and nothing else: everything
     // older than it is served by the compressed pass, which attends the
@@ -286,7 +275,7 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         // compressing layer that have to survive across fires, was
         // charged at zero bytes per token and came out of whatever the
         // KV pool did not use.
-        kv: KvStyle::Dsv4 {
+        kv: KvStyle::CompressedPlane {
             ratios: f.ratios.to_vec(),
         },
         // No recurrence: the compressed history is a CACHE keyed by
@@ -308,21 +297,20 @@ fn plan(f: &Dsv4Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         // The row's own, not a class default -- see `Dsv4MoeFacts`.
         norm_topk_prob: f.moe.norm_topk_prob,
         routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
-        // DEFAULT, and the row writes over it. None of the three
-        // answers in here is geometry: an arch label is a coarse family
-        // name, a context ceiling is a training-time fact, and whether a
-        // tower ships is a question about the checkpoint's files. A
-        // projection that filled them would be deriving a family name
-        // from a shape, which is the inference that put
+        // Carried, unread. None of the three answers in here is
+        // geometry: an arch label is a coarse family name, a context
+        // ceiling is a training-time fact, and whether a tower ships is
+        // a question about the checkpoint's files. A projection that
+        // filled them from what it can see would be deriving a family
+        // name from a shape, which is the inference that put
         // `Gemma4ForConditionalGeneration` in a table row it did not
         // belong in.
-        advertised: Advertised::default(),
+        advertised,
         // Unscaled, because nothing in this tree says otherwise.
         // Notable, because the deepseek lineage is where YaRN is
         // expected — v3 ships `rope_type: "yarn"` in the wild — but
@@ -374,7 +362,6 @@ pub const NO_METAL: &str = "deepseek-v4 has no Metal text in this build: its for
 /// input. Both fire classes trace — the compressed pass needs the block
 /// boundaries a fire's positions imply, and that is a per-TOKEN fact
 /// either class can state.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &Dsv4Facts,
@@ -419,15 +406,21 @@ mod tests {
     /// the only shape a driver here provisions.
     #[test]
     fn only_the_paged_store_is_built() {
-        assert!(kv_store_is_built(&KvStyle::Paged));
-        assert!(!kv_store_is_built(&KvStyle::Dsv4 {
-            ratios: vec![1, 2, 4]
-        }));
-        assert!(!kv_store_is_built(&KvStyle::Dsv4 { ratios: Vec::new() }));
-        assert!(!kv_store_is_built(&KvStyle::Mla {
-            kv_lora_rank: 512,
-            qk_rope_head_dim: 64
-        }));
+        assert!(KvStyle::Paged.has_a_store_in_this_build());
+        assert!(
+            !KvStyle::CompressedPlane {
+                ratios: vec![1, 2, 4]
+            }
+            .has_a_store_in_this_build()
+        );
+        assert!(!KvStyle::CompressedPlane { ratios: Vec::new() }.has_a_store_in_this_build());
+        assert!(
+            !KvStyle::Mla {
+                kv_lora_rank: 512,
+                qk_rope_head_dim: 64
+            }
+            .has_a_store_in_this_build()
+        );
     }
 
     /// The two ends of the stack, which every row in the catalog states
@@ -637,7 +630,7 @@ mod tests {
     /// substring.
     #[test]
     fn the_row_refuses_at_the_door_because_no_compressed_store_is_built() {
-        let err = deployment(&f(), 10_000.0, 1e-5)
+        let err = deployment(&f(), 10_000.0, 1e-5, Advertised::default())
             .expect_err("no build here provisions a compressor cache");
         assert!(matches!(err, Refusal::Unsupported(_)));
     }
@@ -648,7 +641,7 @@ mod tests {
     /// wrongly.
     #[test]
     fn the_plan_states_one_attention_row_per_layer() {
-        let d = plan(&f(), 10_000.0, 1e-5);
+        let d = plan(&f(), 10_000.0, 1e-5, Advertised::default());
         assert_eq!(d.layers, 6);
         assert_eq!(d.attention.len(), 6);
         assert_eq!(
@@ -663,7 +656,7 @@ mod tests {
     /// trace it fired.
     #[test]
     fn the_geometry_is_the_rows_own_numbers() {
-        let g = plan(&f(), 10_000.0, 1e-5).shape;
+        let g = plan(&f(), 10_000.0, 1e-5, Advertised::default()).shape;
         assert_eq!(g.hidden, 2048);
         assert_eq!(g.q_heads, 16);
         assert_eq!(g.kv_heads, 16, "K and V are one projection, one head each");
@@ -682,7 +675,7 @@ mod tests {
     /// of the KV pool.
     #[test]
     fn the_widest_mlp_is_the_dense_prefixs_and_not_the_mixtures() {
-        let g = plan(&f(), 10_000.0, 1e-5).shape;
+        let g = plan(&f(), 10_000.0, 1e-5, Advertised::default()).shape;
         assert_eq!(g.widest_mlp(), 5632);
         assert!(
             g.moe_intermediate > 0,
@@ -694,7 +687,7 @@ mod tests {
     /// on its own pages, and a PARTIAL rotation.
     #[test]
     fn every_layer_attends_its_own_pages_through_a_partial_rope() {
-        let d = plan(&f(), 10_000.0, 1e-5);
+        let d = plan(&f(), 10_000.0, 1e-5, Advertised::default());
         let want = 1.0 / (128.0_f32).sqrt();
         for (l, la) in d.attention.iter().enumerate() {
             assert_eq!(la.head_dim, 128);
@@ -726,18 +719,19 @@ mod tests {
             },
             10_000.0,
             1e-5,
+            Advertised::default(),
         );
         assert!(d.attention.iter().all(|la| la.window == -1));
     }
 
     /// The compression schedule reaches the driver, which is the whole
-    /// repair: `KvStyle::Dsv4 { ratios: Vec::new() }` charged a V4's
+    /// repair: `KvStyle::CompressedPlane { ratios: Vec::new() }` charged a V4's
     /// compressor cache at nothing per token.
     #[test]
     fn the_kv_style_carries_the_schedule_the_row_states() {
-        let d = plan(&f(), 10_000.0, 1e-5);
+        let d = plan(&f(), 10_000.0, 1e-5, Advertised::default());
         match &d.kv {
-            KvStyle::Dsv4 { ratios } => {
+            KvStyle::CompressedPlane { ratios } => {
                 assert_eq!(ratios.as_slice(), &[1, 2, 4]);
                 assert!(
                     !ratios.is_empty(),
@@ -753,14 +747,18 @@ mod tests {
     /// per-request state slabs for a stack that carries none.
     #[test]
     fn the_stack_carries_no_per_request_state() {
-        assert!(plan(&f(), 10_000.0, 1e-5).recurrent.is_none());
+        assert!(
+            plan(&f(), 10_000.0, 1e-5, Advertised::default())
+                .recurrent
+                .is_none()
+        );
     }
 
     /// The remaining answers, stated rather than inherited from a vtable
     /// default that disagreed with its own doc comment.
     #[test]
     fn the_serving_answers_are_stated_and_not_defaulted() {
-        let d = plan(&f(), 10_000.0, 1e-5);
+        let d = plan(&f(), 10_000.0, 1e-5, Advertised::default());
         assert_eq!(d.prefill, PrefillStyle::Planned);
         assert_eq!(d.attn_output, AttnOutput::DriverPinned);
         assert_eq!(d.norm, NormPlacement::Pre);
@@ -770,23 +768,31 @@ mod tests {
         assert!(d.towers.audio.is_none() && d.towers.vision.is_none());
     }
 
-    /// The label is CARRIED. A projection that rewrote it would be
-    /// inventing an arch name, which is the one string that survives the
-    /// refactor and the one a guest program matches on.
+    /// What the row advertises rides through the projection untouched.
+    ///
+    /// It is CARRIED and not derived because the derivation it replaces
+    /// read `model_type` and `max_position_embeddings` off a resident
+    /// `HfConfig` at load. A projection that filled the label in from
+    /// what it can see would be re-inventing the `architectures[0]`
+    /// inference that put `Gemma4ForConditionalGeneration` in a table row
+    /// it did not belong in.
     #[test]
-    fn the_projection_states_no_family_label_because_a_label_is_not_geometry() {
-        let d = plan(&f(), 10_000.0, 1e-5);
+    fn the_rows_advertised_label_is_carried_and_not_rewritten() {
+        let stated = Advertised {
+            arch: "deepseek_v4",
+            max_model_len: 163840,
+            media_encode: false,
+        };
+        let d = plan(&f(), 10_000.0, 1e-5, stated.clone());
         assert_eq!(
-            d.advertised,
-            Advertised::default(),
-            "a projection that fills this in has derived a family name from a shape",
+            d.advertised, stated,
+            "a projection that edits the label is inventing one, and one that \
+             defaults it has dropped what the row said"
         );
-        assert!(
-            d.advertised.arch.is_empty(),
-            "an empty label is a row that has not spoken yet"
-        );
-        assert_eq!(d.advertised.max_model_len, 0);
-        assert!(!d.advertised.media_encode);
+        // The default has to be distinguishable from the stated value, or
+        // the assertion above passes on a projection that ignores its
+        // argument entirely.
+        assert_ne!(stated, Advertised::default());
     }
 
     /// The ladder is used AS WRITTEN and no tower ships, and both are
@@ -800,7 +806,7 @@ mod tests {
     /// nothing here measured.
     #[test]
     fn the_rope_ladder_is_unscaled_and_no_tower_ships() {
-        let d = plan(&f(), 10_000.0, 1e-5);
+        let d = plan(&f(), 10_000.0, 1e-5, Advertised::default());
         assert!(
             d.rope_scaling.is_none(),
             "no committed config states a rescaling to read"
@@ -816,7 +822,6 @@ mod tests {
     /// Both fire classes trace, and they are different texts: the
     /// compressed pass reads its block boundaries from the positions a
     /// fire brings, and a decode's are not a prefill's.
-    #[cfg(feature = "forward")]
     #[test]
     fn both_fire_classes_have_a_text() {
         use model_compiler::trace::FireClass;

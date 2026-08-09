@@ -55,7 +55,7 @@ const NOT_YET_SERVABLE: &[&str] = &[
     "gemma-4-26b-a4b",
     // ── THE MLA LINEAGE ─────────────────────────────────────────────
     //
-    // All four state `KvStyle::Mla` or `KvStyle::Dsv4`, and this build
+    // All four state `KvStyle::Mla` or `KvStyle::CompressedPlane`, and this build
     // provisions neither store: a compressed KV plane and a positional
     // one do not fit the k/v pair the pager allocates.
     //
@@ -151,30 +151,26 @@ fn the_three_live_families_are_servable() {
 /// replay row gathers activations out of its slabs and a computing row
 /// does not, so no single op list serves both.
 mod fire_class {
-    use driver_api::local::{
-        PIE_RS_FLAG_BUFFER_WRITE, PIE_RS_FLAG_FOLD, PieStepDesc, PieU8Slice, PieU32Slice,
-    };
+    use driver_api::local::{PIE_RS_FLAG_BUFFER_WRITE, PIE_RS_FLAG_FOLD};
+    use driver_api::{LaunchPlan, StepSubmission};
     use driver_cuda::serve::fire_class_of;
     use model_compiler::trace::FireClass;
 
-    fn u32s(v: &[u32]) -> PieU32Slice {
-        PieU32Slice {
-            ptr: v.as_ptr(),
-            len: v.len(),
-        }
-    }
-
     /// A step carrying `requests` rows of recurrent state, with the given
     /// flags and buffer CSR. Everything else is a fire's ordinary shape.
-    fn step(flags: &[u8], buf_indptr: &[u32], slots: &[u32], sampling: &[u32]) -> PieStepDesc {
-        PieStepDesc {
-            rs_slot_ids: u32s(slots),
-            rs_slot_flags: PieU8Slice {
-                ptr: flags.as_ptr(),
-                len: flags.len(),
+    ///
+    /// It returns an OWNED step now. The `PieStepDesc` version returned a
+    /// struct of pointers into the caller's argument slices, which the C
+    /// shape had no way to tie a lifetime to.
+    fn step(flags: &[u8], buf_indptr: &[u32], slots: &[u32], sampling: &[u32]) -> StepSubmission {
+        StepSubmission {
+            plan: LaunchPlan {
+                rs_slot_ids: slots.to_vec(),
+                rs_slot_flags: flags.to_vec(),
+                rs_buffer_slot_indptr: buf_indptr.to_vec(),
+                sampling_indices: sampling.to_vec(),
+                ..Default::default()
             },
-            rs_buffer_slot_indptr: u32s(buf_indptr),
-            sampling_indices: u32s(sampling),
             ..Default::default()
         }
     }
@@ -259,7 +255,11 @@ const UNSERVABLE_GQA: &[&str] = &[
 
 #[test]
 fn every_deployable_row_is_servable_by_this_builds_decode_or_is_stated() {
-    use model::shared::llama_like::project::DECODE_GQA_GROUPS;
+    // MOVED. The list was `model`'s while the servable set was a fact about
+    // the model text; it is `driver_cuda::serve`'s now, because what a driver
+    // can serve is a fact about the driver. `project.rs:734` says so in the
+    // comment it left behind.
+    use driver_cuda::serve::DECODE_GQA_GROUPS;
 
     let stated: BTreeSet<&str> = UNSERVABLE_GQA.iter().copied().collect();
     let mut refused: BTreeSet<&str> = BTreeSet::new();
@@ -307,7 +307,11 @@ fn every_deployable_row_is_servable_by_this_builds_decode_or_is_stated() {
 /// the list and pass, having stopped asking.
 #[test]
 fn the_instantiated_set_is_the_one_the_kernels_were_built_for() {
-    use model::shared::llama_like::project::DECODE_GQA_GROUPS;
+    // MOVED. The list was `model`'s while the servable set was a fact about
+    // the model text; it is `driver_cuda::serve`'s now, because what a driver
+    // can serve is a fact about the driver. `project.rs:734` says so in the
+    // comment it left behind.
+    use driver_cuda::serve::DECODE_GQA_GROUPS;
     assert_eq!(
         DECODE_GQA_GROUPS,
         &[1, 2, 3, 4, 8],

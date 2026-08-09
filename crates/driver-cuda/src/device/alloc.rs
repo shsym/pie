@@ -450,6 +450,131 @@ pub unsafe fn read_raw_span(
     )
 }
 
+/// A host-to-device write into a RAW span — a base the caller knows names
+/// live device memory.
+///
+/// [`read_raw_span`]'s opposite, added for north-star §5 step 7: FlashInfer's
+/// planner used to write its descriptor into the workspace's page-locked
+/// mirror and issue its own `cudaMemcpyAsync` (`attention_flashinfer.cu:193`),
+/// and the Rust planner returns the bytes instead —
+/// `kernels_cuda_new::plan::Plan::int_upload` — precisely so that the copy
+/// lands beside the launch that reads it. This is the copy.
+///
+/// Prefer [`DeviceBuffer::write_at`], which checks the span against a length
+/// it owns. This exists for the case the plan is in: the destination is
+/// `AttentionWorkspaceView::int_buffer`, a base that arrives from the fire
+/// with only a byte count beside it and no [`DeviceBuffer`] in hand.
+///
+/// # Safety
+///
+/// `dst` must name at least `src.len()` writable device bytes for the duration
+/// of the copy, and `stream` must outlive it. `src` is read before this
+/// returns only if it is page-locked; for pageable memory the runtime stages
+/// it, so the caller must keep `src` alive until the stream is synchronised.
+///
+/// # Errors
+///
+/// The copy faulted.
+pub unsafe fn write_raw_span(dst: *mut c_void, src: &[u8], stream: StreamRef<'_>) -> Result<()> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    check_rt(
+        unsafe {
+            cudaMemcpyAsync(
+                dst,
+                src.as_ptr().cast(),
+                src.len(),
+                cudaMemcpyKind::cudaMemcpyHostToDevice,
+                stream.as_raw(),
+            )
+        },
+        "cudaMemcpyAsync (write_raw_span)",
+    )
+}
+
+/// A device-to-device copy between two RAW spans.
+///
+/// [`read_raw_span`]'s sibling, added for the same reason and by the same
+/// rule: `tower::qwen3_vl`'s scatter writes each image's merged tokens into
+/// the fire's hidden rows at `hidden + anchor * out_hidden`, and into the
+/// deepstack scratch at `scratch + d * n_rows * out_hidden + anchor *
+/// out_hidden`. Neither destination is a [`DeviceBuffer`] this crate holds —
+/// both arrive as a base pointer from the fire — so [`DeviceBuffer::write_at`]
+/// cannot express the copy, and §7's *"`device/` is the only place vendor
+/// vocabulary is correct"* says the operation is OFFERED here rather than
+/// spelled with a `cudaMemcpyAsync` in a `tower/` module.
+///
+/// The C++ this replaces is `qwen3_vl_tower.cu:505-509`'s two
+/// `cudaMemcpyAsync(..., cudaMemcpyDeviceToDevice, S)`.
+///
+/// # Safety
+///
+/// `src` must name at least `bytes` readable device bytes and `dst` at least
+/// `bytes` writable ones, both for the duration of the copy, and `stream`
+/// must outlive it. The two spans must not overlap — `cudaMemcpyAsync` is not
+/// a `memmove`.
+///
+/// # Errors
+///
+/// The copy faulted.
+pub unsafe fn copy_raw_span(
+    dst: *mut c_void,
+    src: *const c_void,
+    bytes: usize,
+    stream: StreamRef<'_>,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    check_rt(
+        unsafe {
+            cudaMemcpyAsync(
+                dst,
+                src,
+                bytes,
+                cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.as_raw(),
+            )
+        },
+        "cudaMemcpyAsync (copy_raw_span)",
+    )
+}
+
+/// A byte fill over a RAW span.
+///
+/// [`copy_raw_span`]'s reason, on the other side of the same call:
+/// `tower::qwen3_vl`'s scatter zeroes the WHOLE deepstack scratch
+/// (`qwen3_vl_tower.cu:397`) so the decoder can add it into the hidden rows
+/// as a plain whole-tensor residual — non-image rows contribute zero — and
+/// that buffer is the fire's, not one of ours.
+///
+/// Prefer [`DeviceBuffer::memset`] and [`DeviceBuffer::memset_at`], which
+/// check the span against a length they own.
+///
+/// # Safety
+///
+/// `dst` must name at least `bytes` writable device bytes for the duration of
+/// the fill, and `stream` must outlive it.
+///
+/// # Errors
+///
+/// The fill faulted.
+pub unsafe fn fill_raw_span(
+    dst: *mut c_void,
+    value: u8,
+    bytes: usize,
+    stream: StreamRef<'_>,
+) -> Result<()> {
+    if bytes == 0 {
+        return Ok(());
+    }
+    check_rt(
+        unsafe { cudaMemsetAsync(dst, i32::from(value), bytes, stream.as_raw()) },
+        "cudaMemsetAsync (fill_raw_span)",
+    )
+}
+
 impl DeviceBuffer {
     /// The device address, for a launcher argument.
     pub const fn as_ptr(&self) -> *mut c_void {

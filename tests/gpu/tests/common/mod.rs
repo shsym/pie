@@ -380,3 +380,113 @@ pub async fn run_inferlet(
 
     proc.wait_for_return().await
 }
+
+/// The standalone TOML for a Vulkan deployment.
+///
+/// `[driver] kernels` names the SPIR-V directory the seam reads at `create`
+/// and `kv_pages` sizes the pool. There is no `gpu_mem_utilization` here:
+/// this driver does not derive a pool from a fraction of the card, it is told
+/// how many pages to hold. `device` is stated because the config requires it
+/// and ignored because `Device::open` takes the first Vulkan device the
+/// loader reports -- a selector here would be a setting nothing acts on.
+pub fn vulkan_standalone_toml(artifact: &str, kernels: &str) -> String {
+    vulkan_standalone_toml_with_pages(artifact, kernels, 256)
+}
+
+/// The same, with the pool sized by the caller.
+///
+/// A test that wants the pool to RUN OUT needs this: 256 pages is four
+/// thousand tokens, which no gate here comes close to, so the driver's
+/// `Exhausted` answer and the engine's re-post are never taken at the default.
+#[must_use]
+pub fn vulkan_standalone_toml_with_pages(artifact: &str, kernels: &str, kv_pages: u32) -> String {
+    vulkan_standalone_toml_named(artifact, kernels, kv_pages, "qwen3")
+}
+
+/// The same, with `[model] name` stated by the caller.
+///
+/// The name is a LABEL, not a selector: the driver reads the architecture out
+/// of the artifact's embedded `model/config`, so a Qwen2 artifact serves a
+/// Qwen2 whatever this says. It is parameterised anyway because a gate that
+/// boots a second architecture under the first one's name reads as though the
+/// name were doing work, and the next person to change the boot path would
+/// have to re-derive that it is not.
+#[must_use]
+pub fn vulkan_standalone_toml_named(
+    artifact: &str,
+    kernels: &str,
+    kv_pages: u32,
+    name: &str,
+) -> String {
+    format!(
+        "         [server]\n\
+         port = 0\n\
+         \n\
+         [model]\n\
+         name = \"{name}\"\n\
+         model = \"{artifact}\"\n\
+         \n\
+         [driver]\n\
+         type = \"vulkan\"\n\
+         device = [\"vulkan:0\"]\n\
+         kernels = \"{kernels}\"\n\
+         kv_pages = {kv_pages}\n"
+    )
+}
+
+/// Boot the embedded standalone with the real Vulkan driver.
+///
+/// `PIE_VULKAN_ARTIFACT` names a `.zt` that `pie model build --backend
+/// vulkan` authored -- an artifact rather than a snapshot because this driver
+/// reads its declared quantization out of the embedded `model/config`, and
+/// one carrying its tokenizer because the runtime parses one at boot
+/// unconditionally. `PIE_KERNELS_VULKAN_SPV_DIR` names the compiled modules.
+/// A colon-separated list is accepted and the first entry used: a deployment
+/// serves one model, and the engine's own tests take the list.
+pub async fn boot_vulkan() -> Result<pie::StandaloneHandle> {
+    boot_vulkan_with_pages(256).await
+}
+
+/// The same, with the pool sized by the caller. See
+/// [`vulkan_standalone_toml_with_pages`].
+pub async fn boot_vulkan_with_pages(kv_pages: u32) -> Result<pie::StandaloneHandle> {
+    boot_vulkan_nth(0, "qwen3", kv_pages).await
+}
+
+/// Boot the `nth` artifact of `PIE_VULKAN_ARTIFACT` under `[model] name`.
+///
+/// One deployment serves one model, so every other boot here takes entry 0.
+/// A gate that means to prove a SECOND architecture cannot say that with an
+/// env var it shares with the first, and inventing a second variable would
+/// leave two places to keep in step. The list is already colon-separated
+/// because the engine's own tests take it whole, so the second entry is where
+/// a second model already lives.
+pub async fn boot_vulkan_nth(
+    nth: usize,
+    name: &str,
+    kv_pages: u32,
+) -> Result<pie::StandaloneHandle> {
+    let artifacts = std::env::var("PIE_VULKAN_ARTIFACT")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .context("PIE_VULKAN_ARTIFACT names the built artifact")?;
+    let artifact = artifacts
+        .split(':')
+        .nth(nth)
+        .filter(|v| !v.is_empty())
+        .with_context(|| {
+            format!(
+                "PIE_VULKAN_ARTIFACT has no entry {nth}: {artifacts:?}. A second entry is a \
+                 second model's `.zt`, built by `pie model build --backend vulkan`."
+            )
+        })?
+        .to_string();
+    let kernels = std::env::var("PIE_KERNELS_VULKAN_SPV_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .context("PIE_KERNELS_VULKAN_SPV_DIR names the compiled modules")?;
+    let (controller, gateway, worker) = derive_standalone(&vulkan_standalone_toml_named(
+        &artifact, &kernels, kv_pages, name,
+    ))?;
+    run_standalone(controller, gateway, worker).await
+}

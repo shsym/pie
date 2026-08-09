@@ -37,8 +37,16 @@ path = "src/lib.rs"
 # driver rather than a build error -- so the honest thing is to refuse to
 # build until a human says which runtime this binary will meet. `lib.rs`
 # turns the omission into a compile_error that says so.
-cuda-12 = ["_cuda", "cudarc/cuda-12080", "model-loader?/cuda-12"]
-cuda-13 = ["_cuda", "cudarc/cuda-13000", "model-loader?/cuda-13"]
+#
+# `kernels-cuda-new/cuda-1X` rides along, and it is not optional politeness:
+# that crate's runtime layer is the one that now COMPILES AND FIRES the JIT
+# rows (`bind::jit`), so it loads a libcudart in this process. Two crates in
+# one binary that disagreed about which would be one set of `cudarc` bindings
+# calling the other's runtime -- the `cudaGraphAddNode` arity trap above,
+# reached from a second direction. The version is selected in exactly one
+# place, here, and inherited.
+cuda-12 = ["_cuda", "cudarc/cuda-12080", "model-loader?/cuda-12", "kernels-cuda-new/cuda-12"]
+cuda-13 = ["_cuda", "cudarc/cuda-13000", "model-loader?/cuda-13", "kernels-cuda-new/cuda-13"]
 
 # Private: "some CUDA version was chosen". Modules are gated on this so that a
 # build with no version selected emits one actionable error instead of burying
@@ -56,25 +64,51 @@ _cuda = ["dep:cudarc"]
 # target that runs. See `src/lib.rs` for why that is safer than refusing
 # to build, and `src/gpu/mod.rs` for where the line runs.
 
-# The launch bridge (retirement plan phase A): build.rs generates the
-# `extern "C"` shim and the Rust bindings from the kernel table, compiles the
-# shim against the real headers, and links the kernels archive so
-# `launch::ffi` can actually be called. Off by default, deliberately: the
-# bridge needs the CUDA toolkit at BUILD time (real `cuda_runtime.h`, nvcc
-# for the archive), and this crate's toolkit-free build — cudarc resolves
-# symbols by `dlopen`, nothing links — is load-bearing for CI.
+# `bridge` STOOD HERE — `["_cuda", "kernels-cuda/native"]` — and north star
+# §6 has retired it. Its whole payload was the ARCHIVE: `build.rs` generated
+# the `extern "C"` shim and the Rust bindings from the kernel table, compiled
+# the shim against the real headers, and linked `libpie_launch_shim.a` so
+# `bind::abi::ffi` could be called.
 #
-# `kernels-cuda/native` rather than `dep:kernels-cuda`: the table itself is
-# now a plain dependency (see `[dependencies]`), because `bind::launch` reads
-# a row's launch rule with no shim in the build. What `bridge` adds is the
-# ARCHIVE, which is that crate's `native` feature and nothing else.
-bridge = ["kernels-cuda/native"]
+# It is gone because it gated nothing that exists. The census: 76 `#[cfg]`
+# attributes across 13 files carried it and exactly ONE — `bind::abi::ffi`,
+# whose body was `include!(launch_bindings.rs)` — had a body needing a symbol
+# the archive defines. 68 were fossils re-gated `_cuda` at `e88f1ffff`; three
+# were the row world's interpreters, deleted with the door at `c9ab3a936`;
+# the four `[[test]]` gates below are retired in this commit.
+#
+# > A `bridge` gate marks where the archive WAS, not where it IS.
+#
+# The archive is not "ported". `libpie_launch_shim.a` had ZERO members at the
+# cut: `emit_c_shim` emits one `pie_k_*` forwarder per STATED row, and no row
+# states operands since `table::ROW_TABLES` emptied. `kernels-cuda` still
+# builds it under its own `native` feature; nothing in this crate asks.
 
 # Phase D's door: the thirteen `pie_cuda_*` exports the engine binds
 # (retirement plan — "the cutover boundary, measured"). Implies `bridge`
 # (the shell runs the executor). MUTUALLY EXCLUSIVE with linking the C++
 # shell into the same binary: same symbols, one provider.
-abi = ["bridge", "dep:driver-api", "dep:model-loader", "model/forward", "model/contract"]
+# `_cuda` was inherited through `bridge` and is stated directly now; the
+# feature set an `abi` build resolves to is unchanged.
+abi = ["_cuda", "dep:driver-api", "dep:model-loader", "model/contract"]
+
+# `jit-parity` STOOD HERE and is deleted with `bind::dispatch_jit_probe`.
+#
+# It was the AOT-vs-JIT parity harness's half of the seam: a SECOND generated
+# `match` in which every row a `kernels-cuda-new` unit hosts took its JIT arm
+# whether or not it was routed, so one `BoundLaunch` could be fired both ways
+# and compared. Two dispatchers, because one cannot hold two arms for a
+# symbol.
+#
+# The window it existed for was explicitly narrow — *"routing a row deletes
+# its shim entry, so the only window in which its two implementations can be
+# compared is BEFORE the flip"* — and it is closed. Every row is routed;
+# `table::ROW_TABLES` is `&[]`. There is no unrouted row left to be the AOT
+# side of a comparison, so the probe compares a thing to itself.
+#
+# `tests/jit_parity.rs` is a two-line PLACEHOLDER-REFACTOR-SCAFFOLD with no
+# `[[test]]` stanza and was never the real target; it is left where it is,
+# because it is not this feature's and deleting it is a different question.
 
 [dependencies]
 # The CUDA version is pinned EXPLICITLY rather than through
@@ -105,6 +139,13 @@ cudarc = { version = "0.19.8", optional = true, default-features = false, featur
     # `CublasOps` behind `cuda::cublas::CublasHandle` makes the five handle
     # calls the C++ wrapper makes. Dynamically loaded like everything else.
     "cublas",
+    # The third: cuBLASLt, the mixed-precision matmul plane. `gemm/gemm.cpp`'s
+    # quantized arms — FP8-weight x bf16-activation, and DeepSeek's block-
+    # scaled W8A8 — are `cublasLtMatmul` and nothing else, and
+    # `bind::quant_gemm` issues them. Enabling this generates BINDINGS, not
+    # link flags: `fallback-dynamic-loading` still resolves every symbol with
+    # `dlopen` on first use, so a box with no CUDA toolkit still builds.
+    "cublaslt",
     # The second: PTIR's compile plane. The host emits ONE self-contained CUDA
     # translation unit per fused region and this driver carries no emitter, so
     # NVRTC is not an optimisation -- a program with a generated region cannot
@@ -146,9 +187,10 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 #
 # The `contract` because the library authors a load contract
 # (`model::boot::compile_load_plan` -> `model::contract::author_with_policy`),
-# and carries `model::encoding` with it. The `forward` because
-# `model::catalog`'s `deployment`/`trace` are gated on it and
-# `serve/{state,load}.rs` and `fire/launch.rs` all reach them.
+# and carries `model::encoding` with it. There is no second feature to name:
+# `model::catalog`'s `deployment`/`trace` used to be gated on a `forward`
+# feature that every consumer enabled, and it is deleted -- the family texts
+# are as ungated as the rows they belong to.
 #
 # Getting the OLD list to three took two wrong answers -- it said `config`
 # alone for a while and still built, then `contract` alone, and still built.
@@ -164,10 +206,7 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 # trap found three times is not going to be remembered the fourth.
 #
 # Not `chat`: the chat templates are not in the load path.
-model = { path = "../model", default-features = false, features = [
-    "contract",
-    "forward",
-] }
+model = { path = "../model", default-features = false, features = ["contract"] }
 
 # NO `libc`. It was here for `flock` and `open` on the profile cache —
 # the read -> merge -> rename has to be atomic against another process
@@ -207,21 +246,46 @@ model-loader = { path = "../model-loader", optional = true }
 # driver states its own configuration behind the ABI feature.
 toml = "1.1"
 
-# The bridge's other half: with `bridge` on, the same crate that provides the
-# table also builds `libpie_kernels_cuda.a` (its `native` feature, CMake +
-# nvcc) and publishes the link-search paths. The `-l` directives are OURS to
-# emit, in build.rs, because a static archive must follow the shim that
-# references it on the link line.
+# `kernels-cuda` STOOD HERE, and this paragraph is kept rather than deleted
+# because it is the reason someone would put it back.
 #
-# `default-features = false` and NOT optional, which is the change Tier A
-# made and the dev-dependency below predicted: *"This moves to
-# `[dependencies]` when the first launcher is actually called."* It is
-# called now. `bind::device` resolves a row's `pie_g_*` entry point AT RUN
-# TIME, so the driver cannot load a kernel image without the table that says
-# which kernels are in it -- the same argument, in the same words,
-# `driver-metal` makes about `kernels-metal`. Table-only costs no nvcc: what
-# `bridge` turns on is `native`, above.
-kernels-cuda = { path = "../kernels-cuda", default-features = false }
+# It said: *"THIS EDGE IS THE ONE THAT MATTERS, and after §21.11 it is the
+# only one: it is what turns on `native`, and `DEP_PIE_KERNELS_CUDA_LAUNCH_SHIM`
+# — the shim archive's directory — is readable in our build script because of
+# it."* Both halves are now false, and neither expired quietly:
+#
+# * `native` was turned on by `bridge`, and `bridge` is gone. The feature that
+#   this edge existed to enable no longer has a name in this manifest.
+# * **`build.rs` no longer reads that variable.** Step 6 removed the reader and
+#   left the reason. Its only mention there is the `///` at `build.rs:117`,
+#   which is history — the whole env surface of that script is
+#   `CARGO_FEATURE_ABI`, `CUDA_HOME` and `CUDA_PATH`, and `DEP_PIE_*` is not
+#   among them. `build.rs:118` already called the shim *"the last thread
+#   between this crate and `kernels-cuda`"* and recorded it cut.
+#
+# The run-time argument in the deleted text — *"`bind::device` resolves a
+# row's `pie_g_*` entry point AT RUN TIME, so the driver cannot load a kernel
+# image without the table"* — is still true and is still paid for. The table
+# arrives through `kernels-cuda-new` below, which is where the rows have lived
+# since §19; the archive's crate only ever `pub use`d them.
+
+# THE JIT, and where a migrated row now actually fires from.
+#
+# `bind::jit` used to hold a module cache of its own over `bind::nvrtc`'s unit
+# list; it forwards to this crate's `runtime::fire` instead. One cache per
+# process is the whole point -- two would compile the same unit twice, hold
+# two `CUmodule`s of it, and (the part that is not merely wasteful) key them
+# on two option sets, so the same row could be launched from cubins built with
+# different float flags depending on which half of the tree called it.
+#
+# `default-features = false` and NOT optional, exactly like `kernels-cuda`
+# above: layers 1 and 2 are rows and text, they cost no CUDA to depend on, and
+# the runtime layer arrives with the `cuda-1X` feature that selects the
+# version for everything else. That is why the feature lines above name it
+# rather than an `optional = true` here -- a binary that has chosen a runtime
+# gets this crate's runtime too, on the same libcudart, or it does not get one
+# at all.
+kernels-cuda-new = { path = "../kernels-cuda-new", default-features = false }
 
 # The kernel contract vocabulary: `KernelSig`, `Ty`, and `LaunchRule` -- the
 # grid shape a row states, which `bind::launch` evaluates. A regular
@@ -239,11 +303,28 @@ kernels = { path = "../kernels" }
 # leaves `native` off, so reading the table costs no nvcc.
 [dev-dependencies]
 kernels = { path = "../kernels" }
-kernels-cuda = { path = "../kernels-cuda", default-features = false }
-# The executor's binder test lowers a REAL deployment's traced form —
-# `forward` builds the family texts; the regular dependency above stays
-# `config`-only so the library never carries the tracer.
-model = { path = "../model", default-features = false, features = ["forward", "contract"] }
+# `kernels-cuda` STOOD HERE TOO, and it is the line that predicted its own
+# removal: *"This line is kept because removing it is a separate decision from
+# fixing the mechanism … **When it goes, nothing about linking changes.**"*
+# This is that separate decision, and the prediction is discharged unaltered.
+#
+# The measurement behind it is kept, because it is what stops the edge being
+# re-added as a link fix. It was never text: the tests spelled
+# `kernels_cuda::abi::*`, `kernels_cuda::norm_device::*` and
+# `kernels_cuda::<family>::KERNELS`, every one of which had become a `pub use`
+# of `kernels-cuda-new`, and they name `kernels_cuda_new` directly now. It was
+# never linkage either, and the experiment that said otherwise could not have
+# told: `cc`'s `cargo:rustc-link-lib=static=pie_launch_shim` defaults to
+# `+bundle`, so rustc copied the members into `libkernels_cuda.rlib` rather
+# than re-emitting a `-l`, and never loaded an `--extern` no source path
+# names — of the 118 rlibs on that link line, `libkernels_cuda-*.rlib` was not
+# one. Both sides of that experiment were the same failure.
+#
+# `cargo tree -e normal,build,dev | grep -c "kernels-cuda v"` was 2 across this
+# manifest and is now 0.
+# The executor's binder test lowers a REAL deployment's traced form, which
+# needs no feature of its own: the family texts are ungated.
+model = { path = "../model", default-features = false, features = ["contract"] }
 # The PRODUCER, for `tests/gpu_ptir_emitted.rs` only: that test authors a
 # trace, runs the host's real bind → compile → lower → emit chain over it, and
 # compiles the result — so it proves the emitter's CUDA and this driver's NVRTC
@@ -256,11 +337,33 @@ tensor-ir = { path = "../tensor-ir" }
 driver-api = { path = "../driver-api" }
 
 # The bridge generator: build.rs reads the SAME tables the tests read and
-# writes both halves of the flat ABI to OUT_DIR. Table-only (`native` off) —
-# generating text costs no nvcc; compiling the shim is `cc`'s job below.
+# writes both halves of the flat ABI to OUT_DIR. Table-only — generating text
+# costs no nvcc; compiling the shim is `cc`'s job below.
+#
+# `kernels-cuda` IS NOT HERE, and its absence is the point of this round.
+# It was, for as long as `abi::{emit_rust_bindings, emit_rust_dispatch}` lived
+# in the archive's crate — so a script that wanted a function from rows to
+# text named a crate whose other content is a CMake project, an nvcc build and
+# a `links` key. The emitters are `kernels_cuda_new::abi`'s now (they read
+# `table` and `device`, and always did), so this list is one line shorter and
+# `cargo tree -e normal,build,dev | grep -c "kernels-cuda v"` was 2 rather
+# than 3. THE TWO THAT REMAINED ARE BOTH GONE with this commit — they were
+# the archive under two names, one turning on `native` for a `bridge` feature
+# that no longer exists and one compiling the same archive under test — so
+# the count from this manifest is 0 and no section here names the crate.
 [build-dependencies]
-kernels-cuda = { path = "../kernels-cuda", default-features = false }
-cc = "1"
+# EMPTY, and it was `kernels-cuda-new` + `cc`.
+#
+# `kernels-cuda-new` supplied the family tables, `device::jit_dispatched` and
+# `unit::unit_of` so the generator could emit from the rows and refuse a
+# routed symbol no unit hosts — all of which answered with no feature, no
+# cudarc and no device, which is what let the check be a BUILD error instead
+# of an `Error::Unknown` on the first fire of a model text. There is nothing
+# left to generate, and `unit::unit_of` still answers that question in
+# `kernels-cuda-new`'s own tests. `cc` compiled nothing here; it was the
+# shim's, one crate over.
+#
+# `build.rs` is 136 lines and prints link directives.
 
 # `required-features` keeps `cargo test` with no CUDA feature reporting the
 # same one error the library does, instead of additionally failing to compile
@@ -286,12 +389,23 @@ cc = "1"
 name = "attn_score_parity"
 required-features = ["_cuda"]
 
+
 [[test]]
 name = "attn_ws_parity"
 required-features = ["_cuda"]
 
 [[test]]
 name = "cublas_handle_parity"
+required-features = ["_cuda"]
+
+# §45's parity gate. `_cuda`, because it constructs a `DispatchCtx` to hand
+# the ports — and that type is NOT the bridge's. Thirty-five fields: two
+# stream/handle pointers, scalars, three `Vec`s, a `BTreeMap`, and device
+# pointers. Not one comes from the C++ archive (BRIDGE_RETIREMENT.md §2.2),
+# and this comment asserting otherwise is how the gate spread: the type was
+# read through the attribute it carried instead of through its fields.
+[[test]]
+name = "gemm_service_parity"
 required-features = ["_cuda"]
 
 [[test]]
@@ -391,13 +505,20 @@ required-features = ["_cuda"]
 name = "caches_parity"
 required-features = ["_cuda"]
 
-[[test]]
-name = "launch_abi"
-required-features = ["_cuda"]
 
-[[test]]
-name = "bridge_smoke"
-required-features = ["_cuda", "bridge"]
+# `[[test]] bridge_smoke` STOOD HERE and is deleted with its subject.
+#
+# 5,097 lines that fired ONE generated binding end to end —
+# `quant::cast_fp32_to_bf16`, chosen because bf16 is the top half of the fp32
+# so the answer is bit-checkable on the host. Its first line was
+# `use driver_cuda::bind::abi::ffi;`, and `bind::abi::ffi` is deleted in this
+# commit: the module was `include!(launch_bindings.rs)` and that file is
+# generated per STATED row, of which there are none.
+#
+# It proved the plumbing, and the plumbing is what north star §5 replaced. A
+# row's launch is a `unit!` plus a `fn` now, and what smokes one is the
+# family's own tests in `kernels-cuda-new`.
+
 
 [[test]]
 name = "executor_bind"
@@ -405,15 +526,15 @@ required-features = ["_cuda"]
 
 [[test]]
 name = "real_prefill"
-required-features = ["_cuda", "bridge"]
+required-features = ["_cuda"]
 
 [[test]]
 name = "real_hybrid"
-required-features = ["_cuda", "bridge"]
+required-features = ["_cuda"]
 
 [[test]]
 name = "real_gemma4"
-required-features = ["_cuda", "bridge"]
+required-features = ["_cuda"]
 
 [[test]]
 name = "serve"
@@ -425,7 +546,7 @@ required-features = ["_cuda"]
 
 [[test]]
 name = "gpu_supergraph"
-required-features = ["_cuda", "bridge"]
+required-features = ["_cuda"]
 
 [[test]]
 name = "catalog_coverage"
@@ -435,9 +556,5 @@ required-features = ["_cuda", "abi"]
 name = "shape_analysis"
 required-features = ["_cuda"]
 
-# Tier A: the device-entry pilot. `_cuda` alone and NOT `bridge` -- the whole
-# claim is that a kernel can be launched with no shim in the build, so a test
-# that needed one would not be testing it.
-[[test]]
-name = "tier_a_pilot"
-required-features = ["_cuda"]
+
+

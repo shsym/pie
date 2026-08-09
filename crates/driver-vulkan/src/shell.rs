@@ -40,6 +40,7 @@ use model_compiler::trace::ForwardPlan;
 
 use crate::device::{Device, Failed, Pipelines, Unavailable};
 use crate::dispatch::Geometry;
+use crate::frames::{Launched, Unlaunched, pages_named, requests_of, tokens_of};
 use crate::pages::Book;
 use crate::resources::{Pool, Shape, Weights};
 use crate::turns::{Held, Serving, Step, Turn};
@@ -564,6 +565,281 @@ impl Shell {
     #[must_use]
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Serve one frame from the engine.
+    ///
+    /// # What this does that [`Self::step`] does not
+    ///
+    /// Nothing to the book. The engine's scheduler owns page allocation --
+    /// eviction, prefix sharing, the copy plans -- and hands down the physical
+    /// pages it chose; running those through this driver's own allocator would
+    /// give two allocators one page and no way to notice. See
+    /// [`crate::frames`].
+    ///
+    /// # The order, and why it is this one
+    ///
+    /// * admit first, WITHOUT side effects, so a refused frame can be
+    ///   re-posted rather than undone;
+    /// * grow the pool to the highest page the frame NAMES, since the pool
+    ///   may have been trimmed below a mark the scheduler was right to hand
+    ///   out;
+    /// * convert every step's CSRs BEFORE firing any of them, so a frame with
+    ///   a malformed third step does not append the first two;
+    /// * then fire, in the frame's own execution order, because step `n + 1`
+    ///   reads the cache step `n` appended.
+    ///
+    /// # Errors
+    ///
+    /// [`Unlaunched`]. A frame the pool cannot hold is an `Ok` answer --
+    /// [`Launched::Exhausted`] or [`Launched::Impossible`] -- and not an
+    /// error, because a full cache is a scheduling fact rather than a fault.
+    /// The two are different questions and are answered in different places:
+    /// `Impossible` is the ceiling, decided before anything is attempted;
+    /// `Exhausted` is the growth itself refusing, which cannot be known
+    /// without trying.
+    pub fn launch(&mut self, frame: &driver_api::FrameSubmission) -> Result<Launched, Unlaunched> {
+        if let Some(refused) = self.admit(frame)? {
+            return Ok(refused);
+        }
+
+        // Every step converted before any is fired. A frame whose third step
+        // does not close its CSR would otherwise have appended the first two
+        // steps' keys, and the scheduler's retry of the same frame would
+        // append them twice.
+        let mut work = Vec::with_capacity(frame.steps.len());
+        for step in &frame.steps {
+            work.push(self.prepare(&step.plan)?);
+        }
+
+        let mut out = Vec::with_capacity(work.len());
+        for (requests, tokens) in &work {
+            out.push(self.serve(requests, tokens)?);
+        }
+        Ok(Launched::Ran(out))
+    }
+
+    /// Make room for a frame, or say why there is none.
+    ///
+    /// `Ok(None)` is the admitted case. `Ok(Some(..))` is one of the two
+    /// refusals, which are answers rather than errors -- see [`Self::launch`],
+    /// whose first half this is.
+    ///
+    /// # Errors
+    ///
+    /// A frame of no steps, or a pool that will not grow.
+    pub fn admit(
+        &mut self,
+        frame: &driver_api::FrameSubmission,
+    ) -> Result<Option<Launched>, Unlaunched> {
+        if frame.steps.is_empty() {
+            return Err(Unlaunched::Malformed("a frame of no steps".to_string()));
+        }
+        let need = pages_named(frame);
+        // Against what the pool COULD hold rather than what it holds now: the
+        // pool gives pages back down to a high-water mark, and a frame past
+        // that mark is one it can serve after growing. Calling that impossible
+        // would have the scheduler permanently drop work it had correctly
+        // admitted, because the pool had been idle.
+        if need > self.pool.ceiling(&self.device) {
+            return Ok(Some(Launched::Impossible));
+        }
+        if need > self.pool.shape().pages {
+            // A resize that the device would not give memory for is
+            // `Exhausted`, not a fault. The distinction is the whole reason
+            // that variant exists, and until this it was produced nowhere:
+            // the ceiling above is measured against a heap's SIZE, so a frame
+            // that clears it can still be more than the device has FREE once
+            // the weights are resident. Faulting there would fail a request
+            // the scheduler could have served by evicting first -- and since
+            // a driver lane that faults now answers the token with the
+            // failure rather than hanging, that fault reaches the user.
+            if let Err(e) = self.pool.resize(&self.device, need) {
+                if e.is_out_of_memory() {
+                    return Ok(Some(Launched::Exhausted));
+                }
+                return Err(Unlaunched::Unstepped(crate::turns::Unstepped::Failed(e)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One admitted step's plan, checked and converted but not fired.
+    ///
+    /// # Errors
+    ///
+    /// [`Unlaunched`] naming the CSR that does not close, or the field this
+    /// driver does not serve.
+    pub fn prepare(
+        &self,
+        plan: &driver_api::LaunchPlan,
+    ) -> Result<(Vec<crate::resources::Request>, Vec<Vec<u32>>), Unlaunched> {
+        plan.validate_geometry()
+            .map_err(|e| Unlaunched::Malformed(format!("this frame's geometry: {e}")))?;
+        plan.validate_kv_writes(self.pool.shape().page_size)
+            .map_err(|e| Unlaunched::Malformed(format!("this frame's KV writes: {e}")))?;
+        // Before any conversion: a plan naming something this driver does not
+        // implement is refused by the field's own name rather than served
+        // without it. See `frames::unserved_in`.
+        if let Some(what) = crate::frames::unserved_in(plan) {
+            return Err(Unlaunched::Unserved(what));
+        }
+        Ok((requests_of(plan)?, tokens_of(plan)?))
+    }
+
+    /// Fire one prepared step.
+    ///
+    /// # Why this half is separate
+    ///
+    /// A frame whose steps are DEVICE-RESOLVED cannot be converted all at
+    /// once: step `n + 1`'s tokens are what step `n`'s program puts on a
+    /// channel, and they do not exist until step `n` has both fired and had
+    /// its program run. Such a frame is driven a step at a time --
+    /// prepare, fire, run the program, prepare the next -- which is what
+    /// these two halves are for. A frame of ordinary host-wire steps keeps
+    /// the stronger order [`Self::launch`] states.
+    ///
+    /// # Errors
+    ///
+    /// [`Unlaunched::Unstepped`] for a fire the device refused.
+    pub fn serve(
+        &mut self,
+        requests: &[crate::resources::Request],
+        tokens: &[Vec<u32>],
+    ) -> Result<Step, Unlaunched> {
+        let borrowed: Vec<&[u32]> = tokens.iter().map(Vec::as_slice).collect();
+        let serving = Serving {
+            plan: &self.text.decode,
+            prefill: &self.text.prefill,
+            geometry: self.text.geometry,
+            tier: self.tier,
+        };
+        let mut held = Held {
+            book: &mut self.book,
+            pool: &mut self.pool,
+            weights: &self.weights,
+        };
+        serving
+            .over(
+                &self.device,
+                &mut self.pipelines,
+                &self.modules,
+                &mut held,
+                requests,
+                &borrowed,
+            )
+            .map_err(Unlaunched::Unstepped)
+    }
+
+    /// Encode a program's stages without firing them.
+    ///
+    /// Refused by name, as `driver-cuda` and `driver-metal` refuse it. There
+    /// is no separate encode step in this driver: a fire records its own
+    /// command buffer inside [`Self::step`], and there is nothing for a caller
+    /// to hold between the two halves.
+    ///
+    /// # Errors
+    ///
+    /// Always [`Unlaunched::Unserved`].
+    pub fn encode(&mut self) -> Result<(), Unlaunched> {
+        Err(Unlaunched::Unserved(
+            "encode: a fire records and submits in one call, so there is no \
+             encoded frame to hand back",
+        ))
+    }
+
+    /// Move a recurrent state between slots.
+    ///
+    /// Refused by name. This driver serves attention models only -- there is
+    /// no recurrent-state pool to move anything between, and the plans it
+    /// lowers name none.
+    ///
+    /// # Errors
+    ///
+    /// Always [`Unlaunched::Unserved`].
+    pub fn copy_state(&mut self) -> Result<(), Unlaunched> {
+        Err(Unlaunched::Unserved(
+            "copy_state: no model this driver serves holds a recurrent state",
+        ))
+    }
+
+    /// What this shell can do, now that a model is loaded.
+    ///
+    /// # Why the driver answers this and the engine used to
+    ///
+    /// Every field below except the six in [`ModelFacts`] is a statement
+    /// about the DEVICE — how many pages the pool holds, which copy
+    /// directions the pool serves, which sinks the kernels honour, how wide a
+    /// fire the scratch can run. `engine`'s seam built the whole struct on
+    /// this driver's behalf, which put a fact about Vulkan in the crate that
+    /// dispatches to Vulkan, in a copy that had already drifted from the
+    /// `driver-wgpu` one beside it.
+    ///
+    /// The checkpoint half cannot be answered here and is handed in: this
+    /// crate keeps `model` and `model-loader` as dev-dependencies and
+    /// `tests/pure.rs` asserts that closure, so identifying a checkpoint is
+    /// not something it can do. `driver-metal` answers both halves because it
+    /// identifies the checkpoint itself.
+    #[must_use]
+    pub fn capabilities(&self, model: &driver_api::ModelFacts) -> driver_api::DriverCapabilities {
+        let shape = self.shape();
+        driver_api::DriverCapabilities {
+            abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
+            total_pages: shape.pages,
+            kv_page_size: shape.page_size,
+            // No swap pool and no recurrent-state cache: this driver has
+            // neither, and `copy_state` refuses by name for the same reason.
+            swap_pool_size: 0,
+            // Device to device, and only that. `Pool::copy_plan` moves whole
+            // pages inside the one KV buffer -- which is what a prefix-cache
+            // hit is -- and refuses any plan whose ends are not both this
+            // driver's own domain. Host directions stay off: there is no swap
+            // pool here, so a device-to-host copy has nowhere to land.
+            kv_copy_domain_mask: driver_api::KV_COPY_DEVICE_TO_DEVICE,
+            rs_cache_required: false,
+            rs_cache_slots: 0,
+            rs_cache_slot_bytes: 0,
+            // Not elastic. `resize_pool` here restages the whole KV buffer --
+            // `Pool::resize` -- so nothing can be given back page-wise, and
+            // both numbers are zero together, which is the condition
+            // `bootstrap` reads before it starts a trim task at all.
+            elastic_page_bytes: 0,
+            elastic_budget_pages: 0,
+            has_mtp_logits: false,
+            has_mtp_drafts: false,
+            has_value_head: false,
+            // Sinks this backend cannot honour. Every one of them would bind
+            // and then run as a silent no-op, which is worse than a refusal
+            // at the door.
+            has_kv_envelopes: false,
+            has_attn_score: false,
+            has_attn_page_mask: false,
+            has_lora: false,
+            model_site_summary: driver_api::ModelSiteSummary::default(),
+            device_geometry_port_mask: driver_api::PIE_DECODE_ENVELOPE_PORTS,
+            // The ceilings a batch is formed under, and they are the arena's:
+            // `Shell::open` sizes one fire's scratch, and a fire wider than
+            // this has nothing to run in.
+            max_forward_tokens: 4096,
+            max_forward_requests: 256,
+            max_page_refs: shape.pages,
+            // The row's answers, which this crate cannot read for itself.
+            arch_name: model.arch_name.clone(),
+            model_id: model.model_id.clone(),
+            vocab_size: model.vocab_size,
+            max_model_len: model.max_model_len,
+            hidden_size: model.hidden_size,
+            snapshot_dir: model.snapshot_dir.clone(),
+            activation_dtype: "bf16".to_string(),
+            // False about the BACKEND rather than about the row: there is no
+            // encode entry point here at all, so a model with a vision tower
+            // is served as its text half. `Shell::encode` refuses by name.
+            supports_media_encode: false,
+            kv_handle: None,
+            // The modules are read from disk already built; nothing upstream
+            // generates a kernel for this driver.
+            codegen_backend: String::new(),
+        }
     }
 
     /// The cache's shape.

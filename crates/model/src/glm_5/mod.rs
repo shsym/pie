@@ -21,7 +21,6 @@ pub mod contract;
 
 /// The declared forward — MLA plus a DSA indexer over a dense-prefix MoE
 /// stack.
-#[cfg(feature = "forward")]
 pub mod forward;
 
 /// The SHAPE, ungated: a catalog row is written in these words.
@@ -31,12 +30,12 @@ pub mod spec;
 /// its text.
 pub mod project;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::Advertised;
@@ -143,15 +142,7 @@ pub const VARIANTS: &[Glm5] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-///
-/// The `OnceLock` is only the widening from `&Glm5` to `&dyn Variant`;
-/// the rows themselves are `const` and in `.rodata`.
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Glm5);
 
 impl Glm5 {
     /// What a driver ADVERTISES about this row, as distinct from what it
@@ -219,9 +210,12 @@ impl Variant for Glm5 {
         load: Deployed<'_>,
     ) -> Result<crate::deployment::Deployment, crate::deployment::Refusal> {
         let _ = load;
-        let mut deployment = project::deployment(&self.shape, self.rope_theta, self.norm_eps)?;
-        deployment.advertised = self.advertised();
-        Ok(deployment)
+        project::deployment(
+            &self.shape,
+            self.rope_theta,
+            self.norm_eps,
+            self.advertised(),
+        )
     }
 
     /// # Errors
@@ -258,7 +252,6 @@ impl Variant for Glm5 {
     /// the refusal happened "before anything reaches here" — but nothing
     /// sequenced the two calls, so a build with no MLA latent store
     /// refused at the door and handed out a fire anyway.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -275,8 +268,14 @@ impl Variant for Glm5 {
         if let crate::catalog::Backend::Metal(_) = load.backend {
             return Err(crate::deployment::Refusal::Unsupported(project::NO_METAL));
         }
-        self.deployment(load)?;
-        Ok(project::trace(&self.shape, class))
+        // The plan this row WOULD fire. It cannot run in this build --
+        // `deployment` refuses for a store nothing provisions -- and it is
+        // written anyway, because the alternative is a row that stops being
+        // able to serve the day one is. `tests/a_store_this_build_does_not
+        // _provision.rs` holds the refusal so the day it changes is a test
+        // failure naming this line rather than a silent revival.
+        self.deployment(load)
+            .map(|_| project::trace(&self.shape, class))
     }
 
     /// ChatML, with the two role markers in the stop set beside
@@ -426,7 +425,6 @@ mod tests {
     /// Asking the gated one here is what let this test and
     /// `catalog::tests::a_row_that_cannot_deploy_cannot_trace_either`
     /// state opposite things about the same call.
-    #[cfg(feature = "forward")]
     #[test]
     fn every_row_traces_both_fire_classes() {
         use model_compiler::trace::FireClass;
@@ -617,7 +615,6 @@ mod tests {
     /// The comparison is against [`project::NO_METAL`] itself and not a
     /// paraphrase, so the sentence a caller is shown is the sentence
     /// this test pins — `csm`'s `NO_TRACE` sets the same shape.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_metal_load_is_refused_by_name_and_not_traced_as_a_llama() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
@@ -627,10 +624,13 @@ mod tests {
         let bind = MetalBinding {
             quant_group: 64,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: false,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         };
         assert!(!VARIANTS.is_empty());
         for v in VARIANTS {

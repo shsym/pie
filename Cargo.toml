@@ -85,7 +85,16 @@ members = [
     # split here is about what needs a GPU present, not about what a compiler
     # will accept.
     "crates/driver-vulkan",
-    "crates/driver-dummy",
+    # The WebGPU shell. The only driver in this list that is a
+    # `default-member`, and the reason is that it is the only one whose device
+    # half costs nothing to REACH: `wgpu` is pure Rust with no `-sys` crate
+    # anywhere in its closure, `naga` compiles the shaders in-process, and so a
+    # workspace sweep on any machine builds the whole crate and runs every test
+    # that does not need an adapter to answer. Its `native` feature gates only
+    # what asks a real adapter a question, which is a narrower line than either
+    # sibling's -- Metal splits on what a compiler accepts, Vulkan on what needs
+    # a GPU present, and this one on neither.
+    "crates/driver-wgpu",
 
     # -- model-*: what a model IS, and how it gets onto a device ------------
     # The two registries (`model_type` -> load-contract author, `arch_name` ->
@@ -105,11 +114,26 @@ members = [
 
     # -- kernels-*: the device kernels, and the words their tables use ------
     # `kernels` is bare for the reason `driver` is: it is the shared floor
-    # under a prefixed pair, holding what both backends' tables are written
-    # in rather than anything either backend does. The two implementation
-    # crates default to table-only -- `native` is what costs nvcc.
+    # under the prefixed backends, holding what all of their tables are
+    # written in rather than anything any one of them does.
     "crates/kernels",
-    "crates/kernels-cuda",
+    # `crates/kernels-cuda` STOOD HERE, and the sentence above it used to end
+    # "-- the two implementation crates default to table-only, `native` is
+    # what costs nvcc." There is no longer a CUDA pair to be the floor under
+    # and no `native` on this side to cost anything: the archive crate is
+    # deleted and the JIT below is the CUDA half entire.
+    # The JIT-native shape of the CUDA half: the table, the device sources
+    # carried in the binary, and the runtime that NVRTC-compiles and fires
+    # them. No CMake, no archive, no `links` key -- a kernel is text, so there
+    # is nothing to build ahead of time and nothing to link. It built beside
+    # `kernels-cuda` while both paths had to run, and HOLDS the rows both
+    # read: the seam that had it borrow them closed by moving the table here
+    # and inverting the edge, so `kernels-cuda` depended on this and
+    # re-exported what it used to own. That inversion is why the archive could
+    # be deleted at all -- the arrow pointed at this crate, so nothing here
+    # had to move when the other end went. A symbol still has exactly one
+    # contract; the crate that authors it is the one a row is written for.
+    "crates/kernels-cuda-new",
     "crates/kernels-metal",
     # The Vulkan tree. Its table is `kernels-metal`'s coverage, row for row, so
     # the two are comparable rather than merely parallel; what differs is the
@@ -118,6 +142,15 @@ members = [
     # costs `glslc` -- Vulkan has no runtime shader compiler, so GLSL -> SPIR-V
     # is a BUILD-time hop where Metal's is a run-time one.
     "crates/kernels-vulkan",
+    # The WebGPU tree. Its table is `kernels-metal`'s coverage, row for row, so
+    # all three are comparable rather than merely parallel. What differs is that
+    # this one costs NO TOOLCHAIN: WGSL is compiled by `naga`, which is Rust and
+    # ships inside `wgpu`, so a module is built by the process that dispatches
+    # it. There is no `native` feature here because there is no build product to
+    # gate -- the table, the shaders and every structural test are reachable on
+    # any machine that can build Rust, which is why this one is a
+    # `default-member` where its two siblings' device halves are not.
+    "crates/kernels-wgpu",
 
     # -- tensor-*: the guest-program toolchain ------------------------------
     # authoring eDSL -> PTIR -> planning -> CUDA/Metal codegen, plus the
@@ -164,15 +197,19 @@ default-members = [
     "crates/controller-api",
     "crates/worker-api",
     "crates/driver-api",
-    "crates/driver-dummy",
     "crates/driver",
+    # See the member comment: no SDK, no vendor driver, no adapter needed to
+    # build it or to run the tests that are not gated on `native`, so a sweep
+    # should carry it where it does not carry `driver-vulkan` or `driver-metal`.
+    "crates/driver-wgpu",
     "crates/model",
     "crates/model-compiler",
     "crates/model-loader",
     "crates/kernels",
-    "crates/kernels-cuda",
+    "crates/kernels-cuda-new",
     "crates/kernels-metal",
     "crates/kernels-vulkan",
+    "crates/kernels-wgpu",
     "crates/tensor-ir",
     "crates/tensor-dsl",
     "crates/tensor-compiler",
@@ -242,7 +279,16 @@ driver-cuda = ["worker/driver-cuda"]
 # Metal driver at all: `worker`'s `driver-metal` is what links the archive,
 # and this is the only package that builds a binary.
 driver-metal = ["worker/driver-metal"]
-driver-dummy = ["worker/driver-dummy"]
+# Vulkan, anywhere there is a loader and an ICD. No vendor or platform
+# condition on it: `worker`'s `driver-vulkan` is what puts the driver in the
+# graph, and this is the only package that builds a binary.
+driver-vulkan = ["worker/driver-vulkan"]
+# The WebGPU shell, which needs neither. Vulkan builds anywhere and RUNS where
+# an ICD is installed; this one carries its own way to every API -- Vulkan,
+# Metal, D3D12 and WebGPU through one pure-Rust binary, shaders included. Same
+# forwarding, and the same reason it lives here: this is the only package that
+# builds a binary.
+driver-wgpu = ["worker/driver-wgpu"]
 # Probe passthroughs to the embedded worker (→ runtime).
 profile-fire = ["worker/profile-fire"]
 

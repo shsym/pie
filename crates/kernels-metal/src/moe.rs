@@ -31,6 +31,13 @@ pub static KERNELS: &[KernelSig] = &[
     ]),
     kernel!(route_gather "route_gather", file = Some("moe/route.metal"),
     launch = kernels::LaunchRule::RouteRows,
+    // This statement's rows are the SORTED STACK, not the fire's tokens --
+    // `MoeRouteParams::padded`, the fifth word. It shares `RouteRows` with
+    // `combine_sorted`, whose rows ARE the fire's, which is why the extent is
+    // stated on the row and not decided by the rule. Given the fire's count
+    // the gather ran over a quarter of its own output at `top_k = 4` and left
+    // the rest whatever the arena held.
+    rows_param = Some(4),
     operands = kernels::operands![
         x: Buf <- kernels::Source::In(0),
         out: BufMut <- kernels::Source::Out(0),
@@ -84,18 +91,40 @@ pub static KERNELS: &[KernelSig] = &[
     // `biases` stays in the ABI and stays unread: the MXFP4 codec has no
     // separate bias plane, so the kernel takes the pointer and ignores it. A
     // row is positional, so dropping the slot would shift everything after it.
+    //
+    // Which is why it is `Buf` with NO source, the same way `qmv_routed`'s
+    // unread `bias` is. Copying the affine row wholesale gave it
+    // `Weight(2)` -- and a slot nothing reads then ate the index the slot
+    // the kernel DOES read needed, pushing `bias` to `Weight(3)`.
+    //
+    // `Weight(3)` is unreachable for this codec by counting:
+    // `MatW::scale_names` yields `.scales` alone for `Mxfp4Marlin`, so the
+    // list is two names long before `routed_qmv` appends `.bias` and three
+    // after. The affine row's indices are right for THREE codec names
+    // (`w`, `.scales`, `.zeros`), and that difference is the only thing the
+    // two rows may disagree about.
+    //
+    // Measured on `mlx-community/gpt-oss-20b-MXFP4-Q4`: the expert bank
+    // publishes `weight`, `scales` and `bias` and no `biases` at all, and
+    // the bias is `[32, 2880]` -- one value per output row, where a zero
+    // point would be `[32, 2880, 90]` per group beside the scales.
     kernel!(mxfp4_qmv_routed_bias "mxfp4_qmv_routed_bias",
     file = Some("quant/qmv.metal"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The matvec's row axis is `out_vec_size`, the second word, and not the
+    // output rectangle's width: a routed projection writes a whole token's
+    // `k` results end to end, so the value is `k` times as wide as one
+    // result. See `dsl::metal::routed_qmv`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),
-        biases: Buf <- kernels::Source::Weight(2),
+        biases: Buf,
         x: Buf <- kernels::Source::In(0),
         y: BufMut <- kernels::Source::Out(0),
         in_vec_size: I32 <- kernels::Source::Param(0),
         out_vec_size: I32 <- kernels::Source::Param(1),
-        bias: Buf <- kernels::Source::Weight(3),
+        bias: Buf <- kernels::Source::Weight(2),
         expert_ids: Buf <- kernels::Source::In(1),
         x_slot_stride: I32 <- kernels::Source::Param(2),
         x_row_stride: I32 <- kernels::Source::Param(3),
@@ -116,6 +145,11 @@ pub static KERNELS: &[KernelSig] = &[
     // Metal compiler.
     kernel!(qmv_routed "affine_qmv_routed", file = Some("quant/qmv.metal"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The matvec's row axis is `out_vec_size`, the second word, and not the
+    // output rectangle's width: a routed projection writes a whole token's
+    // `k` results end to end, so the value is `k` times as wide as one
+    // result. See `dsl::metal::routed_qmv`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),
@@ -137,6 +171,11 @@ pub static KERNELS: &[KernelSig] = &[
     // 1 in quantized_qmv.metal
     kernel!(qmv_routed_bias "affine_qmv_routed_bias", file = Some("quant/qmv.metal"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The matvec's row axis is `out_vec_size`, the second word, and not the
+    // output rectangle's width: a routed projection writes a whole token's
+    // `k` results end to end, so the value is `k` times as wide as one
+    // result. See `dsl::metal::routed_qmv`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),

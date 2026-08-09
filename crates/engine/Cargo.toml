@@ -17,7 +17,6 @@ path = "src/lib.rs"
 # maps driver-reported model sites onto its vocabulary.
 model-compiler = { path = "../model-compiler" }
 driver-api = { path = "../driver-api" }
-driver-dummy = { path = "../driver-dummy" }
 tensor-ir = { path = "../tensor-ir" }
 tensor-compiler = { path = "../tensor-compiler" }
 # THE CUTOVER, DONE. This was `driver-cuda-new` beside a C++ `driver-cuda`
@@ -30,6 +29,20 @@ driver-cuda = { path = "../driver-cuda", optional = true }
 # written in the same language should cost. Its device half is
 # `#[cfg(target_vendor = "apple")]`, so the seam below is too.
 driver-metal = { path = "../driver-metal", optional = true }
+
+# The Rust Vulkan shell, and the checkpoint reader it deliberately does not
+# have. `driver-vulkan` keeps `model-loader` a DEV-dependency and proves the
+# closure with a test, because a driver that depended on a checkpoint format
+# would be a driver that could not be handed bytes. So the conversion runs
+# here, on the side that already reads checkpoints.
+driver-vulkan = { path = "../driver-vulkan", optional = true }
+# The Rust WebGPU shell. Same arrangement as `driver-vulkan` above and for the
+# same reason -- it keeps `model-loader` a DEV-dependency and proves the
+# closure with `tests/pure.rs`, so the checkpoint is read on this side -- with
+# one thing neither sibling has: no SDK, no loader, no `-sys` crate anywhere in
+# its closure. See the `driver-wgpu` feature below.
+driver-wgpu = { path = "../driver-wgpu", optional = true }
+model-loader = { path = "../model-loader", default-features = false, optional = true }
 client = { path = "../client" }
 tokio = { version = "1.53", features = ["full"] }
 tokio-util = "0.7"
@@ -66,7 +79,7 @@ tokenizer = { path = "../tokenizer" }
 grammar = { path = "../grammar" }
 # `forward` for the site table, which traces a real declaration to work out
 # where a fire's hook sites are.
-model = { path = "../model", features = ["forward"] }
+model = { path = "../model" }
 rmp-serde = "1.3.1"
 blake3 = "1.8.5"
 num-traits = "0.2.19"
@@ -123,6 +136,70 @@ driver-cuda = ["dep:driver-cuda", "driver-cuda/cuda-13", "driver-cuda/abi"]
 # makes `driver_metal::gpu` an unresolved path IN THIS CRATE, which is the
 # better place to find out.
 driver-metal = ["dep:driver-metal", "driver-metal/metal-4"]
+# The Rust Vulkan shell's seam. A library call, like the Metal one, and gated
+# on the feature ALONE -- not on a target. Vulkan is a loader rather than a
+# platform: the same crate builds and runs on Linux, Windows and Android.
+#
+# `driver-vulkan/native` is not optional here for the same reason
+# `driver-metal/metal-4` is not: that crate has no default feature so its
+# portable half can be tested without a GPU, and a consumer that wants the
+# serving path has to say so. Omitting it makes `driver_vulkan::device` an
+# unresolved path IN THIS CRATE, which is the better place to find out.
+#
+# `model-loader` comes with it, because THIS crate loads the checkpoint for
+# that driver -- see `src/driver/backend/vulkan.rs` for why loading is on this
+# side of the seam and not the other.
+driver-vulkan = [
+    "dep:driver-vulkan",
+    "driver-vulkan/native",
+    "dep:model-loader",
+    # `catalog::identify`, `contract::author` and `boot::compile_load_plan_for`
+    # -- the identification and the load plan. This crate already takes
+    # `model` for `forward`; `contract` is the half that reads a publisher's
+    # checkpoint, and only this backend needs it.
+    "model/contract",
+]
+# The Rust WebGPU shell's seam. A library call, like the two above, and gated
+# on the feature ALONE.
+#
+# `driver-wgpu/native` is not optional here, for the reason
+# `driver-vulkan/native` and `driver-metal/metal-4` are not: that crate has no
+# default feature so its portable half -- which parses the WGSL it will
+# dispatch and checks it against the kernel table, with no adapter present --
+# can be tested without a GPU. Omitting it makes `driver_wgpu::device` an empty
+# module and `driver_wgpu::shell` absent, and the failure arrives at model load
+# instead of at `cargo build`.
+#
+# `model-loader` and `model/contract` come with it because THIS crate loads the
+# checkpoint for that driver, exactly as it does for Vulkan -- see
+# `src/driver/backend/wgpu.rs` for why loading is on this side of the seam.
+#
+# THE ARGUMENT THIS BACKEND HAS THAT NEITHER SIBLING DOES, for whoever decides
+# what ships on by default:
+#
+# `driver-cuda` needs a CUDA toolkit and an NVIDIA card. `driver-metal` needs a
+# Mac. `driver-vulkan` needs a loader and an ICD. This one needs NONE of them.
+# Its whole dependency closure is pure Rust -- `driver-wgpu/tests/pure.rs`
+# asserts that with `native` ON, which is the version of the claim that matters
+# -- `naga` compiles the shaders in-process so there is no module directory to
+# ship beside the binary, it builds for `wasm32-unknown-unknown` including the
+# browser backend (`tests/browser.rs`), and it reaches Vulkan, Metal, D3D12 and
+# WebGPU through one binary. Nothing about turning it on can fail to build on a
+# machine that can build the engine at all.
+#
+# That makes it the only driver that could reasonably be a DEFAULT feature.
+# This change deliberately does not make it one: the existing three are all
+# opt-in, "which backends a build carries" is a deployment policy rather than a
+# seam's decision, and `create` still opens an adapter -- so a default would
+# turn a machine with no GPU from "no backend compiled in" into "a backend that
+# fails at boot". The case is stated here so that whoever makes that call has
+# it in one place rather than reconstructing it.
+driver-wgpu = [
+    "dep:driver-wgpu",
+    "driver-wgpu/native",
+    "dep:model-loader",
+    "model/contract",
+]
 # Host-side performance probes. Each scenario is a separate flag so you
 # only pay for the probes you ask for — different domains have different
 # sample rates and different audiences. The `probe_<domain>!` macros in
@@ -141,16 +218,12 @@ tensor-ir = { path = "../tensor-ir" }
 # The same `model`, with the one row that is not a model. The mock harness
 # has to name a row because `model::register` resolves one; see
 # `tests/common/env.rs`'s `MOCK_MODEL_ID` and `model::test_rows`.
-model = { path = "../model", features = ["forward", "test-rows"] }
+model = { path = "../model", features = ["test-rows"] }
 criterion = { version = "0.8", features = ["html_reports"] }
 # Benchmarks must allocate the way production does. Every engine entry point
 # links `worker`, which sets mimalloc as the global allocator; a bench that
 # omitted it would measure glibc malloc and report a machine nobody runs.
 mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
-
-[[bench]]
-name = "grammar_wit"
-harness = false
 
 #[profile.release]
 #lto = "fat"

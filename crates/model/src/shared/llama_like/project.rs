@@ -15,48 +15,16 @@
 //! nothing held to the other two tables.
 
 // Only the texts name a backend, and only they are gated.
-#[cfg(feature = "forward")]
 use crate::catalog::{Backend, Deployed, MetalBinding};
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
-    PrefillStyle,
+    PrefillStyle, round_up_attn_head_dim,
 };
 use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::LlamaLikeFacts;
 
 use model_compiler::facts::{NormPlacement as SpecNorm, QkNorm};
-
-/// The attention head dims a CUDA build instantiates.
-///
-/// `kernels.def`'s `PIE_ATTN_HEAD_DIM` rows. It is a property of the
-/// BINARY, not of any checkpoint, which is why a row does not state it
-/// and why it was excluded from the descriptor when there was one.
-pub const ATTN_HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
-
-/// Smallest instantiated head dim that can hold `head_dim`, or
-/// `head_dim` itself when none can — the caller then surfaces the
-/// dispatch error rather than silently mis-sizing.
-#[must_use]
-pub fn round_up_attn_head_dim(head_dim: u32) -> u32 {
-    ATTN_HEAD_DIMS
-        .iter()
-        .copied()
-        .filter(|&d| d >= head_dim)
-        .min()
-        .unwrap_or(head_dim)
-}
-
-/// The GQA group sizes a CUDA decode instantiates.
-///
-/// FlashInfer's decode reports anything else by THROWING, and a throw
-/// crossing a C ABI is undefined behaviour. This was
-/// `refuse_unservable_gqa`, and it sat inside the llama lineage's
-/// derivation as though it were a property of that lineage. It is a
-/// property of the BUILD — every family reaching the same dispatch is
-/// subject to the same instantiation set — so it is stated here as a
-/// build capability and asked by [`Deployment::servable_by`].
-pub const DECODE_GQA_GROUPS: &[u32] = &[1, 2, 3, 4, 8];
 
 /// This row's tensors.
 ///
@@ -174,7 +142,7 @@ pub fn deployment(f: &LlamaLikeFacts, row: RowScalars) -> Deployment {
         norm_topk_prob,
         ..
     } = row;
-    let head_dim = round_up_attn_head_dim(f.head_dim).max(f.head_dim);
+    let head_dim = round_up_attn_head_dim(f.head_dim);
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
             // One shape for every layer, which is what this row was
@@ -237,7 +205,6 @@ pub fn deployment(f: &LlamaLikeFacts, row: RowScalars) -> Deployment {
         // gemmas that do not have projections of their own that say so.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         norm_topk_prob,
         // No router of this family states a scaling factor.
         routed_scaling: 1.0,
@@ -257,7 +224,6 @@ pub fn deployment(f: &LlamaLikeFacts, row: RowScalars) -> Deployment {
 /// Every field the old derivation hardcoded is hardcoded here, in one
 /// place, with the two that are not constants — the padded head dim and
 /// the TP width — coming from the row and the load respectively.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn cuda_facts(
     f: &LlamaLikeFacts,
@@ -296,7 +262,6 @@ pub fn cuda_facts(
 /// failure and the one the runtime compiler reports by listing what the
 /// shader does export — which is why `qmm_tile` is stated rather than
 /// left at the serde default of `(0, 0)`.
-#[cfg(feature = "forward")]
 pub const QMM_TILE: (u32, u32) = (16, 32);
 
 /// Why a SHARDED load has no Metal text here.
@@ -305,7 +270,6 @@ pub const QMM_TILE: (u32, u32) = (16, 32);
 /// thing compares against the same sentence the operator is shown,
 /// rather than against a paraphrase that can drift away from it — the
 /// discipline `csm::project::NO_TRACE` sets.
-#[cfg(feature = "forward")]
 pub const NO_METAL_SHARD: &str = "this Metal load states a tensor-parallel width above one and \
      `LlamaLikeMetalFacts` has no shard vocabulary: the CUDA facts carry \
      a `tp_size` that narrows every projection width in the text, and the \
@@ -326,11 +290,9 @@ pub const NO_METAL_SHARD: &str = "this Metal load states a tensor-parallel width
 ///
 /// The set is `sdpa_paged_decode`'s own axis, minus the page-shape tails
 /// (`_p32`, `_p32_sg8`), which are points of a different axis.
-#[cfg(feature = "forward")]
 pub const METAL_SDPA_HEAD_DIMS: &[u32] = &[64, 128, 256, 512];
 
 /// [`METAL_SDPA_HEAD_DIMS`] as a refusal.
-#[cfg(feature = "forward")]
 pub const NO_METAL_HEAD_DIM: &str = "this row's heads are a width `sdpa_paged.metal` does not \
      instantiate: the shader compiles the paged decode at 64, 128, 256 \
      and 512, and the text names `sdpa_paged_decode_bfloat16_d_<width>` \
@@ -348,11 +310,9 @@ pub const NO_METAL_HEAD_DIM: &str = "this row's heads are a width `sdpa_paged.me
 /// reading every scale from the wrong offset, which is the 909,207-NaN
 /// defect the MXFP4 arm was added to fix. MXFP4 is a different codec
 /// rather than another point and has its own symbol at group 32.
-#[cfg(feature = "forward")]
 pub const METAL_ROUTED_AFFINE: (u32, u32) = (64, 4);
 
 /// [`METAL_ROUTED_AFFINE`] as a refusal.
-#[cfg(feature = "forward")]
 pub const NO_METAL_ROUTED_ENCODING: &str = "this row's expert bank reached the device at an affine \
      point `quant/qmv.metal` does not instantiate the routed matvec at: \
      the shader compiles `affine_qmv_routed` only at group 64 / 4 bits, \
@@ -360,6 +320,30 @@ pub const NO_METAL_ROUTED_ENCODING: &str = "this row's expert bank reached the d
      another group dequantised by that kernel reads every scale from the \
      wrong offset and answers bf16 garbage, which is NaN more often than \
      not. Refused";
+
+/// A landing bias under a norm placement that lands through the shared
+/// closure.
+///
+/// The Metal text adds `o_bias` at two places: after the FUSED landing
+/// (`gemm_add`, the `Pre` arm), and it used to have a second copy inside
+/// the `land` closure the `Post` and `Sandwich` arms share. That second
+/// copy could not run -- gpt-oss is the only row in the catalog that
+/// publishes an `o_proj` bias and it norms `Pre` -- so it was a branch
+/// standing in for a decision nobody had made.
+///
+/// Deleting it alone would have made the pairing a SILENT DROP: the
+/// contract declares `o_bias`, the loader reads it off disk and stages
+/// it, and the text would never sum it. No shape error and no unbound
+/// symbol, just a per-channel offset missing from every layer. So the
+/// pairing is refused by name instead, and the day a checkpoint arrives
+/// with both, the refusal says which two facts it is holding rather
+/// than the model answering slightly wrong forever.
+pub const NO_METAL_NORMED_LANDING_BIAS: &str = "this row publishes a bias on its attention landing AND norms that \
+     landing's output, and the Metal text adds the landing bias only on \
+     the arm that fuses the residual into the projection. The normed \
+     arms land through a shared statement that has no bias in it, so \
+     this row would load the tensor, stage it, and never sum it. \
+     Refused rather than dropped";
 
 /// What this build's Metal kernels cannot run, asked of the FACTS.
 ///
@@ -386,8 +370,8 @@ pub const NO_METAL_ROUTED_ENCODING: &str = "this row's expert bank reached the d
 /// wrong. Every gemma row published today runs at head width 256,
 /// which the shader stamps; and gemma-4's only routed row,
 /// `gemma-4-26b-a4b`, is refused EARLIER and in its own words — this
-/// build has no routed-expert text for a gemma-4 block — so the affine
-/// point was never asked of it. Nothing was being mis-served. What was
+/// build cannot load a routed gemma-4 block — so the affine point was
+/// never asked of it. Nothing was being mis-served. What was
 /// true is that two doors could not have SAID so, and the first row to
 /// land at an unstamped width would have met `model-compiler`'s abort
 /// instead of a sentence.
@@ -410,7 +394,6 @@ pub const NO_METAL_ROUTED_ENCODING: &str = "this row's expert bank reached the d
 ///
 /// [`NO_METAL_SHARD`], [`NO_METAL_HEAD_DIM`] or
 /// [`NO_METAL_ROUTED_ENCODING`], in the order a load meets them.
-#[cfg(feature = "forward")]
 pub fn metal_kernel_refusal(
     f: &LlamaLikeFacts,
     m: &super::forward::facts::LlamaLikeMetalFacts,
@@ -428,6 +411,11 @@ pub fn metal_kernel_refusal(
     }
     // MXFP4 banks take their own symbol at group 32, so the affine
     // point is not asked of them.
+    if f.o_bias && f.norm_placement != SpecNorm::Pre {
+        return Err(crate::deployment::Refusal::Unsupported(
+            NO_METAL_NORMED_LANDING_BIAS,
+        ));
+    }
     if f.n_experts > 0
         && !bind.moe_mxfp4
         && (bind.quant_group, bind.quant_bits) != METAL_ROUTED_AFFINE
@@ -541,12 +529,21 @@ pub struct RowScalars {
     pub norm_topk_prob: bool,
 }
 
-/// The METAL binding facts for this row.
+/// The METAL binding facts for this load.
 ///
 /// The twin of [`cuda_facts`], and the split is the whole point: six
 /// fields come from `bind` because a LOAD observed them, one is this
-/// build's stamp ([`QMM_TILE`]), and every remaining field is the ROW's
-/// — projected here rather than sniffed from tensors by a driver.
+/// build's stamp ([`QMM_TILE`]), and the rest are the [`MetalRow`]
+/// scalars a Metal text names and `LlamaLikeFacts` does not hold.
+///
+/// # Why it takes no `LlamaLikeFacts`
+///
+/// It used to, and never read it — the parameter was a claim that the
+/// SHAPE matters to this projection, and it does not: a shape reaches
+/// the Metal text as `llama_like_metal`'s own first argument, and what
+/// is built here is the BINDING beside it. `cuda_facts` genuinely reads
+/// one (it pads the head dim), which is why the asymmetry is real and
+/// worth the two signatures differing.
 ///
 /// # What this replaces
 ///
@@ -582,17 +579,16 @@ pub struct RowScalars {
 /// NARROWS those extents, and the narrowed widths have to be stated
 /// somewhere the text will read instead of the row.
 ///
-/// So the four `false`s below are not the row's answers withheld:
+/// So the three `false`s below are not the row's answers withheld:
 /// each is a claim about what a checkpoint PUBLISHED, and the manifest
-/// is where this family makes that claim. `gate_up_fused` and
-/// `qkv_fused` are the load's binding, `v_from_k` is a manifest
+/// is where this family makes that claim. `gate_up_fused` is the load's
+/// binding, `v_from_k` is a manifest
 /// requirement, and `dense_beside_moe` is the routed/dense exclusion
 /// the manifest already enforces — a mixture's SHARED expert is a
 /// different structure, stated by `shared_intermediate` and emitted by
 /// the text off the row's facts without passing through here.
 ///
 /// [`LlamaLikeMetalFacts`]: super::forward::facts::LlamaLikeMetalFacts
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn metal_facts(
     row: RowScalars,
@@ -617,6 +613,7 @@ pub fn metal_facts(
         fuse_residual_gemv: bind.fuse_residual_gemv,
         paged_multi_batch: bind.paged_multi_batch,
         qmm_multi_batch: bind.qmm_multi_batch,
+        add_bias: bind.add_bias,
         // The checkpoint's own affine format. MLX stores the pair beside
         // the packed weight as `.scales` and `.biases`, which is a
         // zero-point layout, and the GROUP is asked of the load rather
@@ -637,6 +634,21 @@ pub fn metal_facts(
         // every scale comes from the wrong offset, and the fire that did
         // it produced 909,207 NaNs beginning at the first routed
         // projection of layer 0.
+        // The ROUTER GATE's own format, when the checkpoint published it
+        // wider than the stack it routes. `None` is "the same as the dense
+        // projections", which is every checkpoint but gpt-oss's -- and
+        // getting it wrong is the QUIET failure: a bank read at the wrong
+        // format is 909,207 NaNs, and a gate read at the wrong width is a
+        // fluent model routing every token to almost the right experts.
+        router_repr: (bind.router_quant_group != 0).then(|| {
+            model_compiler::dsl::WeightRepr::Scaled {
+                layout: model_compiler::dsl::ScaleLayout::PerGroup,
+                group: bind.router_quant_group,
+                axis: 0,
+                zero_point: true,
+            }
+        }),
+        router_bits: bind.router_quant_bits,
         moe_repr: bind
             .moe_mxfp4
             .then_some(model_compiler::dsl::WeightRepr::Mxfp4Marlin),
@@ -661,20 +673,6 @@ pub fn metal_facts(
         // Metal text refuses the packed arm at trace time for exactly
         // that reason.
         gate_up_fused: false,
-        // FALSE for the same reason and by the same evidence.
-        // `lowering::resolve` states it outright -- "`qkv` and `gate_up`
-        // are FUSED handles, and no Metal deployment has them" -- because
-        // `compile_load_plan` authors with `Projections::InPlace` and
-        // `dense_fused_projection_joins` returns before doing anything
-        // under that policy.
-        //
-        // The row's own `fused_qkv` says `true` on all eight llama-3 rows,
-        // and that is not wrong: its doc calls it "a *binding* fact, not
-        // an architecture fact", and the binding it was written against is
-        // CUDA's. A binding fact read off the row is a fact one backend
-        // stated for all of them, which is why the answer belongs here
-        // beside `gate_up_fused` and not there.
-        qkv_fused: false,
         // The row's epsilon and the row's rotary base, carried on
         // [`RowScalars`] because `LlamaLikeFacts` states neither — see
         // that struct for why a shape shared by twelve generations
@@ -842,7 +840,6 @@ pub fn metal_facts(
 /// which is why they are here rather than at a generation: twelve
 /// families share this text, so a width or an encoding it cannot name is
 /// a gap in the same one sentence for all of them.
-#[cfg(feature = "forward")]
 pub fn trace(
     f: &LlamaLikeFacts,
     row: RowScalars,
@@ -876,6 +873,46 @@ mod tests {
     /// published configs by `tests/catalog_differential.rs`, which is
     /// where a transcribed number belongs.
     const NORM_EPS: f32 = 1e-6;
+
+    /// A landing bias the normed arms would have dropped is refused.
+    ///
+    /// Two facts that are individually fine and jointly unserviceable:
+    /// `o_bias` says the checkpoint publishes a bias on `o_proj`, and a
+    /// non-`Pre` placement says the landing's output is normed, which
+    /// routes it through the shared closure that has no bias in it. Only
+    /// the fused arm adds one.
+    ///
+    /// The whole point of the refusal is that the alternative is
+    /// SILENT: the tensor is declared, read, staged and never summed, so
+    /// the model answers with a per-channel offset missing from every
+    /// layer and nothing faults. No row in the catalog pairs them today
+    /// -- gpt-oss publishes the bias and norms `Pre` -- which is exactly
+    /// why the pairing needs a name now rather than a bug report later.
+    #[test]
+    fn a_landing_bias_under_a_normed_landing_is_refused_by_name() {
+        use crate::deployment::Refusal;
+        let bind = binding(64, 4);
+        let metal = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
+        let mut f = LlamaLikeFacts::qwen3_0_6b();
+        f.o_bias = true;
+        for placement in [SpecNorm::Post, SpecNorm::Sandwich] {
+            f.norm_placement = placement;
+            assert_eq!(
+                metal_kernel_refusal(&f, &metal, Deployed::metal(&bind), &bind),
+                Err(Refusal::Unsupported(NO_METAL_NORMED_LANDING_BIAS)),
+                "{placement:?} lands through the closure with no bias in it"
+            );
+        }
+        // Either fact alone is serviceable, which is what makes the
+        // pairing worth stating.
+        f.norm_placement = SpecNorm::Pre;
+        metal_kernel_refusal(&f, &metal, Deployed::metal(&bind), &bind)
+            .expect("the fused arm adds the bias it publishes");
+        f.o_bias = false;
+        f.norm_placement = SpecNorm::Sandwich;
+        metal_kernel_refusal(&f, &metal, Deployed::metal(&bind), &bind)
+            .expect("a normed landing with no bias to drop is fine");
+    }
 
     /// The build's instantiation set, as a rounding rule rather than a
     /// table each caller re-derives.
@@ -951,16 +988,20 @@ mod tests {
         }
     }
 
-    /// The GQA ratios this build's decode instantiates. Outside the set
+    /// The GQA ratios a build's decode instantiates. Outside the set
     /// FlashInfer THROWS, and a throw crossing a C ABI is undefined
     /// behaviour — which is why the question is asked at the door.
+    ///
+    /// The SET is not stated here any more: it is the driver's
+    /// (`driver_cuda::serve::DECODE_GQA_GROUPS`), because it describes what
+    /// that build instantiated and not what this lineage is. What this crate
+    /// owes the question is the RATIO, which is what is asserted.
     #[test]
     fn the_gqa_set_is_the_builds_and_not_the_familys() {
-        assert_eq!(DECODE_GQA_GROUPS, &[1, 2, 3, 4, 8]);
         let g = deployment(&LlamaLikeFacts::qwen3_0_6b(), row(1e6, -1))
             .shape
             .gqa_group();
-        assert!(DECODE_GQA_GROUPS.contains(&g), "qwen3-0.6b's 2 is servable");
+        assert_eq!(g, 2, "qwen3-0.6b's 16 query heads over 8 kv heads");
         assert_eq!(Geometry::EMPTY.gqa_group(), 0, "no division by zero");
     }
 
@@ -1074,15 +1115,17 @@ mod tests {
 
     /// Two bindings of one checkpoint, which is what a `MetalBinding`
     /// is for: the g64/b4 publication and the g128/b8 one.
-    #[cfg(feature = "forward")]
     fn binding(group: u32, bits: u32) -> MetalBinding {
         MetalBinding {
             quant_group: group,
             quant_bits: bits,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: false,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         }
     }
 
@@ -1103,7 +1146,6 @@ mod tests {
 
     /// qwen3-0.6b's row, as the generation states it — a full-attention
     /// dense stack on one rope base.
-    #[cfg(feature = "forward")]
     fn qwen3_row() -> RowScalars {
         RowScalars {
             rope_theta: 1e6,
@@ -1125,7 +1167,6 @@ mod tests {
     /// checkpoint what it is, twice, is how the answers came to differ:
     /// a gemma read as a llama folded `(1 + w)` as `w` and dropped two
     /// norms per layer, and nothing faulted.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_metal_binding_is_the_loads_answer_and_the_rest_is_the_rows() {
         let bind = binding(64, 4);
@@ -1169,7 +1210,6 @@ mod tests {
     /// checkpoint and they differ in nothing else, which is why an
     /// encoding is a policy and not an identity — the module doc's rule,
     /// asked of the one projection that has to hold both.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_second_publication_of_one_row_moves_only_the_binding() {
         let four = binding(64, 4);
@@ -1197,7 +1237,6 @@ mod tests {
     /// Mistral-7B-v0.3 is the sharpest one available: it states a
     /// different rotary base, a different epsilon and — unlike every
     /// other row this projection serves — a WINDOW.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_second_row_states_its_own_window_and_its_own_base() {
         let f = LlamaLikeFacts::mistral_7b_v03();
@@ -1225,6 +1264,65 @@ mod tests {
         assert_eq!(full.window_left_at(0), -1);
     }
 
+    /// The SECOND head width — the one only a two-geometry row has.
+    ///
+    /// `metal_kernel_refusal` is shared, and the sibling above only ever
+    /// reaches its first head-dim gate because every row this projection
+    /// serves states one attention shape. gemma-4 is the only caller
+    /// that arrives with a `global_head_dim` at all, and every gemma-4
+    /// row states 512, which the shader does instantiate — so the second
+    /// gate has never once answered.
+    ///
+    /// It is the gate that matters more, not less: a row whose SLIDING
+    /// layers are a compiled width and whose FULL layers are not would
+    /// pass the first check and be admitted, then die inside the trace
+    /// with `model-compiler`'s panic on an undeclared launch — a
+    /// backtrace two thirds of the way through a load rather than a
+    /// refusal naming the row.
+    ///
+    /// Asserted through `metal_kernel_refusal` directly because no
+    /// projection in this module can produce a nonzero `global_head_dim`
+    /// to feed it, which is the very reason the gate went untried.
+    #[test]
+    fn a_full_layer_width_no_metal_shader_compiled_is_refused_too() {
+        use super::super::forward::facts::LlamaLikeMetalFacts;
+        use crate::deployment::Refusal;
+        let bind = binding(64, 4);
+        let f = LlamaLikeFacts::qwen3_0_6b();
+        assert!(
+            METAL_SDPA_HEAD_DIMS.contains(&f.head_dim),
+            "the sliding width must PASS, or this would be the sibling's test"
+        );
+        let base = metal_facts(qwen3_row(), Deployed::metal(&bind), &bind);
+        assert_eq!(
+            metal_kernel_refusal(&f, &base, Deployed::metal(&bind), &bind),
+            Ok(()),
+            "one attention shape is admitted"
+        );
+        for w in [96, 80, 192] {
+            let m = LlamaLikeMetalFacts {
+                global_head_dim: w,
+                ..base.clone()
+            };
+            assert_eq!(
+                metal_kernel_refusal(&f, &m, Deployed::metal(&bind), &bind),
+                Err(Refusal::Unsupported(NO_METAL_HEAD_DIM)),
+                "d_{w} full layers are not instantiated and must be refused"
+            );
+        }
+        for w in METAL_SDPA_HEAD_DIMS {
+            let m = LlamaLikeMetalFacts {
+                global_head_dim: *w,
+                ..base.clone()
+            };
+            assert_eq!(
+                metal_kernel_refusal(&f, &m, Deployed::metal(&bind), &bind),
+                Ok(()),
+                "d_{w} full layers are instantiated and must not be refused"
+            );
+        }
+    }
+
     /// The gemma-shaped fields are STATED zero, one at a time.
     ///
     /// `LlamaLikeMetalFacts` has no `Default` impl and this projection
@@ -1233,7 +1331,6 @@ mod tests {
     /// has no per-layer embeddings" is part of the measurement. This
     /// test is that discipline held rather than described — it fails if
     /// a future field is defaulted into existence.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_gemma_shaped_facts_are_stated_rather_than_defaulted() {
         let bind = binding(64, 4);
@@ -1265,7 +1362,6 @@ mod tests {
     /// no tile does not resolve at all, which is the better failure —
     /// so a `(0, 0)` here would be a fixture written before the field
     /// existed and not a deployment that wants no tile.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_gemm_tile_is_the_builds_stamp_and_not_the_rows() {
         let bind = binding(64, 4);
@@ -1285,7 +1381,6 @@ mod tests {
     /// produced 909,207 NaNs beginning at the first routed projection of
     /// layer 0. `None` is "the same as the dense projections", which is
     /// every checkpoint this family serves.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_expert_bank_names_its_own_format_only_when_the_load_left_one() {
         let plain = binding(64, 4);
@@ -1315,7 +1410,6 @@ mod tests {
     /// wrong frequencies from the second channel on, at every position
     /// but zero — degrading rather than failing, which is the shape of
     /// defect this catalog exists to make impossible.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_rescaled_ladder_is_a_table_and_a_plain_one_is_a_base() {
         let bind = binding(64, 4);
@@ -1337,7 +1431,6 @@ mod tests {
     /// list of eleven architecture strings and its `canonical()`
     /// reduction. The row is the dispatch; the backend is a parameter of
     /// the question.
-    #[cfg(feature = "forward")]
     #[test]
     fn one_row_traces_on_either_backend_and_says_which() {
         use model_compiler::trace::FireClass;
@@ -1371,7 +1464,6 @@ mod tests {
     /// rank's slice of the weights. That is not a crash — it is a
     /// projection reading past the end of its own tensor — so the door
     /// says no.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_sharded_metal_load_is_refused_rather_than_traced_at_full_width() {
         use crate::deployment::Refusal;
@@ -1414,7 +1506,6 @@ mod tests {
     /// "a width no kernel instantiates simply does not resolve, and the
     /// driver's row check reports it by name" -- said early enough to be
     /// a sentence.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_head_width_no_metal_shader_compiled_is_refused_by_name() {
         use crate::deployment::Refusal;
@@ -1457,7 +1548,6 @@ mod tests {
     /// `a_row_is_served_the_same_way_at_every_encoding` had to become
     /// one-directional: a pre-staging probe may be permissive, it may not
     /// be wrong.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_routed_bank_at_an_uninstantiated_affine_point_is_refused() {
         use crate::deployment::Refusal;

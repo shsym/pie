@@ -5,44 +5,25 @@
 //! names, answering what this deployment can do, and adopting a program.
 //! All of it happens before any fire; none of it happens again.
 
-use super::checked;
 use super::state::{CAPS_JSON, LoadedModel, Shell, retire};
 use crate::fire::launch::sg_trace;
 use crate::fire::scratch::Scratch;
+use driver_api::CompletionBroker;
 use driver_api::local::{
     PIE_STATUS_DRIVER_ERROR, PIE_STATUS_EXHAUSTED, PIE_STATUS_INVALID_ARGUMENT,
-    PIE_STATUS_UNSUPPORTED, PieDriver, PieDriverCaps, PieDriverCreateDesc, PieProgramDesc,
-    validate_create_out_params,
 };
 
-pub(crate) fn create_impl(
-    desc: *const PieDriverCreateDesc,
-    caps: *mut PieDriverCaps,
-) -> *mut PieDriver {
-    // `create` RETURNS A POINTER, not a status, so it cannot pass the
-    // validator's message back — it can only refuse. The message still
-    // reaches the log, which is the whole reason this call is here and not
-    // an `abi_version` test: a caller that got a null handle learns WHY
-    // from the line `checked` prints rather than from three candidate
-    // causes.
-    let Ok(desc) = checked(
-        desc,
-        driver_api::local::validate_driver_create_desc,
-        "create",
-    ) else {
-        return std::ptr::null_mut();
-    };
-    if validate_create_out_params(caps).is_err() {
-        eprintln!("[driver-cuda] create: the caps out-parameter must be non-null");
-        return std::ptr::null_mut();
-    }
-    // The boot TOML rides in `config_bytes`. Three keys are read today:
+/// Stand the shell up.
+///
+/// It took a `*const PieDriverCreateDesc` and answered a `*mut PieDriver`
+/// plus a JSON blob through a second out-parameter, and every refusal below
+/// returned a bare null — a caller learned WHICH of nine causes only from
+/// stderr. It takes the bytes and the broker now, and answers `Result`.
+pub(crate) fn create_impl(config_bytes: &[u8], broker: CompletionBroker) -> Result<Shell, i32> {
+    // The boot TOML rides in the bytes. Three keys are read today:
     // `[model] id`, `[model] config` and `[driver] runahead`.
-    let boot = (!desc.config_bytes.ptr.is_null())
-        .then(|| unsafe {
-            std::slice::from_raw_parts(desc.config_bytes.ptr, desc.config_bytes.len)
-        })
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    let boot = std::str::from_utf8(config_bytes)
+        .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
         .unwrap_or_default();
     let boot_config = boot
@@ -87,7 +68,7 @@ pub(crate) fn create_impl(
         Ok(f) => f,
         Err(e) => {
             eprintln!("[driver-cuda] create: {e:?}");
-            return std::ptr::null_mut();
+            return Err(PIE_STATUS_INVALID_ARGUMENT);
         }
     };
     // The pages can be written in every catalogued format — `kv_paged.cu`
@@ -108,7 +89,7 @@ pub(crate) fn create_impl(
              garbage logits.",
             kv_format.name()
         );
-        return std::ptr::null_mut();
+        return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
     let driver_u32 = |key: &str, default: u32| {
         boot.get("driver")
@@ -135,7 +116,7 @@ pub(crate) fn create_impl(
     // at create is what makes `[driver] device` mean anything.
     if let Err(e) = crate::device::Device::bind(device_ordinal) {
         eprintln!("[driver-cuda] create: cannot bind CUDA device {device_ordinal}: {e}");
-        return std::ptr::null_mut();
+        return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
 
     // A GROUP OF MORE THAN ONE IS REFUSED, and refusing is the whole point.
@@ -162,10 +143,18 @@ pub(crate) fn create_impl(
              one rank's partial answer as if it were the whole one. See \
              .wiki/new-driver/next.md, Priority 3."
         );
-        return std::ptr::null_mut();
+        return Err(PIE_STATUS_INVALID_ARGUMENT);
     }
-    let boxed = Box::new(Shell {
+    let facts: driver_api::DeviceFacts = match serde_json::from_str(CAPS_JSON) {
+        Ok(facts) => facts,
+        Err(error) => {
+            eprintln!("[driver-cuda] create: device facts JSON: {error}");
+            return Err(PIE_STATUS_DRIVER_ERROR);
+        }
+    };
+    Ok(Shell {
         caps: CAPS_JSON.as_bytes().to_vec(),
+        facts,
         boot_config,
         boot_model_id,
         runahead,
@@ -186,8 +175,7 @@ pub(crate) fn create_impl(
         programs: std::collections::BTreeMap::new(),
         instances: std::collections::BTreeMap::new(),
         next_id: 1,
-        notify: desc.runtime.notify,
-        notify_ctx: desc.runtime.ctx,
+        broker,
         fire_arrays: Scratch::default(),
         supergraph: crate::fire::recordings::Recordings::new(),
         kv: None,
@@ -204,21 +192,21 @@ pub(crate) fn create_impl(
         ptir_sessions: std::collections::BTreeMap::new(),
         ptir_programs: crate::program::Programs::new(),
         ptir_plans: std::collections::BTreeMap::new(),
-    });
-    let raw = Box::into_raw(boxed);
-    if let Some(out) = unsafe { caps.as_mut() } {
-        out.json_bytes = unsafe { (*raw).caps.as_ptr() };
-        out.json_len = unsafe { (*raw).caps.len() };
-    }
-    raw.cast()
+    })
 }
 
-pub(crate) fn destroy_impl(driver: *mut PieDriver) {
-    if !driver.is_null() {
-        let mut shell = unsafe { Box::from_raw(driver.cast::<Shell>()) };
+/// Teardown, as a destructor.
+///
+/// It was `destroy_impl(driver: *mut PieDriver)`, called by a
+/// `pie_cuda_destroy` export and doing `Box::from_raw` to take the shell
+/// back. Nothing leaks the shell any more, so the compiler runs this at the
+/// end of the owner's scope and the export has nothing left to do.
+impl Drop for Shell {
+    fn drop(&mut self) {
+        let shell = self;
         // EVERY QUEUED FIRE FIRST, because they may still be writing.
         //
-        // A fire that is on the stream when the driver is destroyed will run
+        // A fire that is on the stream when the driver is dropped will run
         // its stream-ordered callback against a `ChannelState` copy, and the
         // frees below would take that memory back underneath it. Waiting is
         // the only correct answer here: unlike the reclaim in `step_impl`
@@ -236,7 +224,7 @@ pub(crate) fn destroy_impl(driver: *mut PieDriver) {
         if let Some(swap) = &shell.swap {
             swap.free();
         }
-        // The handle is the DRIVER's now, so its destructor is the driver's
+        // The handle is the DRIVER's, so its destructor is the driver's
         // too — `CublasHandle` asserts it was released rather than dropped.
         if let Some(mut h) = shell.cublas.take() {
             h.release(&mut crate::device::cublas::LiveCublas);
@@ -254,7 +242,6 @@ pub(crate) fn destroy_impl(driver: *mut PieDriver) {
             drop(scratch.decode_plan_full);
             drop(scratch.prefill_plan);
         }
-        drop(shell);
     }
 }
 
@@ -361,7 +348,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
         weights: staged.spans,
         owned: staged.owned,
         aliases: std::collections::BTreeMap::new(),
-        gemma_layer_scalars: Vec::new(),
+        layer_scalars: Vec::new(),
         tp_size: state.tp_size,
     };
     wire_trace_names(&mut model);
@@ -380,7 +367,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
             // one is asking is the caller's to state.
             backend: model::catalog::Backend::Cuda,
             tp_size: state.tp_size,
-            layer_scalars: &model.gemma_layer_scalars,
+            layer_scalars: &model.layer_scalars,
         })
         .map_err(|e| i32::from(crate::Error::from(e)))?;
 
@@ -412,9 +399,9 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
              driver does not build — `pools::mla_cache` is ported and has \
              no forward path to serve",
         ),
-        model::deployment::KvStyle::Dsv4 { .. } => Some(
+        model::deployment::KvStyle::CompressedPlane { .. } => Some(
             "this checkpoint attends through a compressed KV plane, which this \
-             driver does not build — `pools::dsv4_compress_cache` is ported \
+             driver does not build — `pools::compressed_plane_cache` is ported \
              and has no forward path to serve",
         ),
     } {
@@ -435,12 +422,11 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
     //
     // It is asked HERE rather than in `model` because it is not a fact
     // about the checkpoint — it is a fact about what this build
-    // instantiated. `model` states the shape and names the set
-    // (`DECODE_GQA_GROUPS`); the driver is what decides that the set
-    // applies to it.
+    // instantiated, and `super::DECODE_GQA_GROUPS` is where this crate
+    // states it. `model` states the shape; the driver states the set.
     model
         .deployment
-        .servable_by(model::shared::llama_like::project::DECODE_GQA_GROUPS)
+        .servable_by(super::DECODE_GQA_GROUPS)
         .map_err(|why| -> i32 {
             // The refusal's OWN sentence, plus the numbers. `servable_by`
             // distinguishes a fractional ratio from an uninstantiated
@@ -452,7 +438,7 @@ pub(crate) fn load_impl(state: &mut Shell, snapshot: &std::path::Path) -> Result
                      instantiates {:?}",
                     model.deployment.shape.q_heads,
                     model.deployment.shape.kv_heads,
-                    model::shared::llama_like::project::DECODE_GQA_GROUPS,
+                    super::DECODE_GQA_GROUPS,
                 ),
             }
             .into()
@@ -680,8 +666,6 @@ fn synthetic_fire(
     page_size: i32,
     total_pages: u32,
 ) -> Result<(), i32> {
-    use driver_api::local::{PieFrameDesc, PieStepDesc, PieU32Slice, PieU64Slice};
-
     let reqs = usize::try_from(point.max_forward_requests)
         .unwrap_or(0)
         .min(instances.len());
@@ -733,45 +717,35 @@ fn synthetic_fire(
         let tail = per - (pages_each - 1) * page;
         kv_last_page_lens.push(u32::try_from(tail).unwrap_or(1));
         qo_indptr.push(u32::try_from((r + 1) * per).unwrap_or(0));
-        cells.push(driver_api::local::PieTerminalCell {
-            outcome: driver_api::local::PIE_TERMINAL_OUTCOME_PENDING,
-            reserved0: 0,
-        });
+        cells.push(driver_api::local::TerminalCell::pending());
     }
-    let cell_ptrs: Vec<*mut driver_api::local::PieTerminalCell> =
+    let cell_ptrs: Vec<*mut driver_api::local::TerminalCell> =
         cells.iter_mut().map(|c| c as *mut _).collect();
 
-    let u32s = |v: &[u32]| PieU32Slice {
-        ptr: v.as_ptr(),
-        len: v.len(),
-    };
-    let step = PieStepDesc {
-        roster_rows: u32s(&roster_rows),
-        sub_batch_indptr: u32s(&sub_batch_indptr),
-        sub_batch_class: u32s(&sub_batch_class),
-        terminal_cells: driver_api::local::PieTerminalCellPtrSlice {
-            ptr: cell_ptrs.as_ptr(),
-            len: cell_ptrs.len(),
+    let step = driver_api::StepSubmission {
+        plan: driver_api::LaunchPlan {
+            token_ids,
+            position_ids,
+            kv_page_indices,
+            kv_page_indptr,
+            kv_last_page_lens,
+            qo_indptr,
+            ..Default::default()
         },
-        token_ids: u32s(&token_ids),
-        position_ids: u32s(&position_ids),
-        kv_page_indices: u32s(&kv_page_indices),
-        kv_page_indptr: u32s(&kv_page_indptr),
-        kv_last_page_lens: u32s(&kv_last_page_lens),
-        qo_indptr: u32s(&qo_indptr),
+        roster_rows,
+        sub_batch_indptr,
+        sub_batch_class,
+        terminal_cells: cell_ptrs,
         ..Default::default()
     };
-    let frame = PieFrameDesc {
-        abi_version: driver_api::PIE_DRIVER_ABI_VERSION,
-        instance_ids: PieU64Slice {
-            ptr: instances.as_ptr(),
-            len: reqs,
-        },
+    let frame = driver_api::FrameSubmission {
+        instance_ids: instances[..reqs].to_vec(),
         required_kv_pages: u32::try_from(pages_total).unwrap_or(0),
-        steps: driver_api::local::PieStepDescSlice { ptr: &step, len: 1 },
+        steps: vec![step],
         ..Default::default()
     };
-    crate::fire::launch::step_impl(state, &frame, &step, None)
+    let step = &frame.steps[0];
+    crate::fire::launch::step_impl(state, &frame, step, None)
 }
 
 /// Answer the trace names a launch will ask for, from `model`'s tables.
@@ -833,7 +807,7 @@ fn wire_trace_names(model: &mut LoadedModel) {
             );
         }
     }
-    model.gemma_layer_scalars = wiring
+    model.layer_scalars = wiring
         .scalars
         .iter()
         .map(|n| {
@@ -875,8 +849,8 @@ fn wire_trace_names(model: &mut LoadedModel) {
 /// here rather than hidden in a constant.
 fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Vec<u8>, i32> {
     use crate::layout::memory_planner::{
-        DeviceMemory, DeviceProps, Family, ModelCosts, ModelShape, NoProfiles, PlannerConfig,
-        ProfileSource, plan,
+        DeviceMemory, DeviceProps, ModelCosts, ModelShape, NoProfiles, PlannerConfig,
+        ProfileSource, ShapeKnees, plan,
     };
     use crate::layout::model_costs::{CheckpointCosts, DiskProfiles};
 
@@ -972,11 +946,19 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
     // stand-in when no cache directory can even be derived.
     let disk = DiskProfiles::discover("").ok();
     let profiles: &dyn ProfileSource = disk.as_ref().map_or(&NoProfiles, |d| d);
-    let planned =
-        plan(&cfg, &shape, &props, mem, Family::Generic, &costs, profiles).map_err(|e| {
-            eprintln!("[driver-cuda] load_model: memory planner: {e:?}");
-            PIE_STATUS_EXHAUSTED
-        })?;
+    let planned = plan(
+        &cfg,
+        &shape,
+        &props,
+        mem,
+        ShapeKnees::default(),
+        &costs,
+        profiles,
+    )
+    .map_err(|e| {
+        eprintln!("[driver-cuda] load_model: memory planner: {e:?}");
+        PIE_STATUS_EXHAUSTED
+    })?;
     for note in &planned.notes {
         eprintln!("[driver-cuda] {note}");
     }
@@ -1069,9 +1051,9 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
         // encode arms refuse a deployment with no `gemma_vision` /
         // `gemma_audio`, so answering true without one would advertise a
         // call that is guaranteed to fail. Qwen3-VL is deliberately NOT
-        // here — its tower row (`vision::qwen3vl_scatter`) writes into
-        // the fire's hidden rows rather than handing host rows back, so
-        // it is an in-fire path and not an encode one.
+        // here — its tower (`tower::qwen3_vl::scatter`) writes into the
+        // fire's hidden rows rather than handing host rows back, so it is
+        // an in-fire path and not an encode one.
         supports_media_encode: deployment.advertised.media_encode,
         kv_handle: None,
         // This driver compiles its own PTIR through NVRTC; nothing upstream
@@ -1089,7 +1071,7 @@ fn capabilities_json(state: &mut Shell, snapshot: &std::path::Path) -> Result<Ve
 pub(crate) fn adopt_and_compile(
     state: &mut Shell,
     id: u64,
-    desc: &PieProgramDesc,
+    desc: &driver_api::ProgramRegistration,
     package: driver::driver_api::plan::LaunchPackage,
     kernels: &[driver_api::EmittedKernel],
 ) -> Result<(), i32> {

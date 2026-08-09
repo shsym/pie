@@ -111,9 +111,27 @@ pub enum WeightRepr {
 }
 
 /// Where a scaled weight's scales apply.
+///
+/// Two layouts, mirroring `model_loader::types::QuantGranularity` exactly —
+/// which is the only vocabulary a checkpoint can state a scale in, whether it
+/// SHIPS the scales (`contract::Scales::granularity`) or the loader encodes
+/// them (`plan/build.rs::ScaleLayout::for_encode`). A third variant,
+/// `PerTensor`, was here and named `gemm::act_x_wt_tensor_scaled`; it had no
+/// constructor anywhere in the workspace outside this file, and no checkpoint
+/// format in the tree could have grown one without the loader growing a
+/// granularity first. It is deleted rather than left as a route nothing can
+/// take. The entry point it named was `gemm::act_x_wt_tensor_scaled` in
+/// `kernels-cuda/csrc/src/gemm/gemm.hpp`, and THAT FILE IS DELETED TOO — the
+/// whole 2,216-line host program is `driver-cuda/src/fire/gemm.rs` now, and
+/// the PerTensor arm went with it because nothing constructed it. So
+/// re-stating this variant is no longer "a variant, an arm and a row": it is
+/// a variant, an arm, a row, AND a Rust body in `fire::gemm`, plus a loader
+/// granularity for a checkpoint to state it in. Read `fire::gemm`'s FP8
+/// notes first — the `returned == 0` heuristic latch that reached the FP8
+/// PerTensor path is recorded there, and is why this was never one more
+/// enum arm.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ScaleLayout {
-    PerTensor,
     PerChannel,
     PerGroup,
 }
@@ -186,10 +204,6 @@ impl MatW {
                 layout: ScaleLayout::PerChannel,
                 ..
             } => Some("gemm::act_x_wt_channel_scaled"),
-            WeightRepr::Scaled {
-                layout: ScaleLayout::PerTensor,
-                ..
-            } => Some("gemm::act_x_wt_tensor_scaled"),
         }
     }
 }
@@ -281,6 +295,14 @@ pub struct Layer {
     pub k_bias: MatW,
     pub v_bias: MatW,
     pub o_proj: MatW,
+    /// The attention landing's bias, for a family that publishes one.
+    ///
+    /// gpt-oss does, and its width is the model's, not the projection's --
+    /// `o_proj` maps heads back to `hidden`, so the bias is one number per
+    /// hidden channel. Separate from [`Layer::o_proj`] rather than folded
+    /// into a `gemm_bias` because the folded form is a different kernel with
+    /// a different accumulation order; see that function's doc.
+    pub o_bias: MatW,
     /// The PACKED gate‖up bank, for a deployment whose loader join
     /// materialised one.
     pub gate_up: MatW,
@@ -298,6 +320,14 @@ pub struct Layer {
     /// deployment simply never names these, exactly as a deployment whose
     /// loader did not join gate and up never names `gate_up`.
     pub router: MatW,
+    /// The router's bias -- one number per EXPERT, added to the logits
+    /// before the top-k.
+    ///
+    /// The most consequential bias in a mixture and the least forgiving. A
+    /// projection bias shifts an activation the next norm largely absorbs;
+    /// this one shifts a ranking, so a text that drops it does not compute
+    /// a slightly different answer, it routes to different experts.
+    pub router_bias: MatW,
     /// The expert banks. `MatW::name` carries no expert index -- the routed
     /// kernel indexes the bank by the slot it read, which is what makes it
     /// ONE weight rather than `n_experts` of them.
@@ -476,11 +506,13 @@ impl M {
             k_bias: mat("k_bias", f.kv_width),
             v_bias: mat("v_bias", f.kv_width),
             o_proj: mat("o_proj", f.hidden),
+            o_bias: mat("o_bias", f.hidden),
             gate_up: mat("gate_up", 2 * f.intermediate),
             gate_proj: mat("gate_proj", f.intermediate),
             up_proj: mat("up_proj", f.intermediate),
             down: mat("down", f.hidden),
             router: mat("router", f.n_experts),
+            router_bias: mat("router_bias", f.n_experts),
             expert_gate: mat("expert_gate", f.moe_intermediate),
             expert_up: mat("expert_up", f.moe_intermediate),
             expert_down: mat("expert_down", f.hidden),
@@ -1947,6 +1979,25 @@ pub fn seam(t: &Trace, def: &seam::Def, sees: &[&Val], layer: Option<u32>) {
 pub mod metal {
     use super::*;
 
+    /// The tile the sort rounds each expert's run up to.
+    ///
+    /// ONE, because the only routed projection this backend states is a
+    /// MATVEC: `qmv_routed` reads one row per thread block and indexes the
+    /// bank by that row's own expert, so grouping the rows buys locality
+    /// and nothing about a tile. At one, `moe_aligned_rows` is exactly the
+    /// route count and the sort is a pure permutation — no padding rows to
+    /// zero, no spare tiles, and `tile_expert` is one entry per row.
+    ///
+    /// It was `QMM_TILE`-shaped (sixteen) by inheritance
+    /// from a tiled matmul this text does not launch, which padded a
+    /// four-token fire's sixteen routes out to two hundred and fifty-six
+    /// rows — sixteen times the matvec work, and every padded row read by
+    /// the expert projection.
+    ///
+    /// A blocked path would state its own block here, and would then need
+    /// an extent for `tile_expert` that divides by it.
+    const ROUTE_BLOCK: u32 = 1;
+
     fn record(
         t: &Trace,
         layer: Option<u32>,
@@ -1996,6 +2047,39 @@ pub mod metal {
             layer,
         })
     }
+
+    /// [`with_params`], plus the scalars whose value is an extent the FIRE
+    /// decides -- see [`crate::trace::OpKind::Launch::param_extents`].
+    #[allow(clippy::too_many_arguments)]
+    fn with_extents(
+        t: &Trace,
+        layer: Option<u32>,
+        kernel: &str,
+        weights: Vec<String>,
+        state: Option<StateRef>,
+        params: Vec<u32>,
+        param_extents: Vec<(u8, Shape)>,
+        inputs: Vec<crate::trace::ValueId>,
+        out: Option<(Shape, DType)>,
+    ) -> Option<Val> {
+        let ids = t.with(layer, |b| {
+            b.launch_with_extents(
+                kernel,
+                weights,
+                state,
+                params,
+                param_extents,
+                inputs,
+                out.into_iter().collect(),
+            )
+        });
+        ids.first().map(|&id| Val {
+            t: t.clone(),
+            id,
+            layer,
+        })
+    }
+
 
     fn kv_state(kv: &Kv) -> Option<StateRef> {
         Some(StateRef {
@@ -2270,6 +2354,35 @@ pub mod metal {
                 &x.t,
                 (Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16),
             ),
+        );
+        or_regions(out, x)
+    }
+
+    /// `norm/add_bias.metal::add_bias_bfloat16` — the Qwen-2 family's q/k/v
+    /// projection biases, in place over the projection.
+    ///
+    /// One statement, and the value it produces is the value it was given:
+    /// the row declares `in_place = &[(0, 0)]`, so a driver binds one
+    /// allocation for both. The trace still names a result, the way
+    /// [`residual_add`] does, because a tape whose statements did not produce
+    /// values could not say what the next one reads.
+    ///
+    /// The width the kernel needs is the OUTPUT's row width, which the row
+    /// reads with `Source::OutWidth(0)` rather than taking as a stated scalar
+    /// — a bias vector's length is the projection's width, and the trace
+    /// already said that when it sized the value.
+    ///
+    /// [`residual_add`]: metal::residual_add
+    pub fn add_bias(x: &Val, w: &MatW) -> Val {
+        let shape = same_shape(x);
+        let out = record(
+            &x.t,
+            w.layer,
+            "add_bias_bfloat16",
+            vec![w.name.clone()],
+            None,
+            vec![x.id],
+            region_out(&x.t, shape),
         );
         or_regions(out, x)
     }
@@ -2965,40 +3078,61 @@ pub mod metal {
     /// FOUR outputs, and a text that named fewer would leave the combine
     /// reading whatever was in the buffer: the permutation, the per-row
     /// expert, the per-tile expert, and the inverse the combine reads back.
+    ///
+    /// # Two numbers, and neither is a constant
+    ///
+    /// `n` is the count of `(token, slot)` PAIRS the router chose, and
+    /// `padded` is the height of the SORTED STACK those pairs land in —
+    /// each touched expert's run rounded up to a whole tile. Both are
+    /// functions of the fire, so both ride [`OpKind::Launch::param_extents`]
+    /// and the constants written beside them are zero.
+    ///
+    /// They were one number, `n_experts * experts_per_token`, which is
+    /// neither: it is a property of the deployment. See
+    /// [`OpKind::Launch::param_extents`] for what that measured as.
     pub fn route_sort(
         expert_ids: &Val,
         n_experts: u32,
         experts_per_token: u32,
-        tile_rows: u32,
-        padded: u32,
         width: u32,
     ) -> (Val, Val, Val, Val) {
-        let pad = Dim::Const(padded);
+        let pairs = Shape(vec![Dim::Tokens, Dim::Const(experts_per_token)]);
+        let stack = Shape(vec![Dim::MoeAlignedRoutes {
+            top_k: experts_per_token,
+            experts: n_experts,
+            block: ROUTE_BLOCK,
+        }]);
         let ids = expert_ids.t.with(expert_ids.layer, |b| {
-            b.launch_with_params(
+            b.launch_with_extents(
                 "route_sort",
                 vec![],
                 None,
                 // `MoeRouteParams`, packed and SHARED with the gather so the
                 // sort's padding and the gather's bounds cannot disagree.
                 vec![
-                    padded,
+                    0,
                     n_experts,
                     experts_per_token,
-                    tile_rows,
-                    padded,
+                    ROUTE_BLOCK,
+                    0,
                     width,
                     width,
                 ],
+                vec![(0, pairs.clone()), (4, stack.clone())],
                 vec![expert_ids.id],
                 vec![
-                    (Shape(vec![pad]), DType::I32),
-                    (Shape(vec![pad]), DType::I32),
-                    (
-                        Shape(vec![Dim::Const(padded.div_ceil(tile_rows.max(1)))]),
-                        DType::I32,
-                    ),
-                    (Shape(vec![pad]), DType::I32),
+                    (stack.clone(), DType::I32),
+                    (stack.clone(), DType::I32),
+                    // One entry per TILE, and at [`ROUTE_BLOCK`] a tile is a
+                    // row -- so the stack's own extent is exact rather than
+                    // an upper bound. A blocked path would state its block
+                    // here and need an extent that divides by it.
+                    (stack.clone(), DType::I32),
+                    // Indexed by PAIR, not by position: `inv[i]` is where
+                    // pair `i` landed. `combine_sorted` reads it at
+                    // `token * k + slot`, which is why it is not the stack's
+                    // shape even when the two happen to be the same size.
+                    (pairs, DType::I32),
                 ],
             )
         });
@@ -3011,36 +3145,43 @@ pub mod metal {
     }
 
     /// `moe/route.metal::route_gather` — the rows, in expert order.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// One output row per sorted position, which is what the row's
+    /// [`kernels::KernelSig::rows_param`] tells the driver: this statement's
+    /// row axis is the stack, not the fire.
     pub fn route_gather(
         x: &Val,
         perm: &Val,
         n_experts: u32,
         experts_per_token: u32,
-        tile_rows: u32,
-        padded: u32,
         width: u32,
     ) -> Val {
-        with_params(
+        let stack = Dim::MoeAlignedRoutes {
+            top_k: experts_per_token,
+            experts: n_experts,
+            block: ROUTE_BLOCK,
+        };
+        with_extents(
             &x.t,
             x.layer,
             "route_gather",
             vec![],
             None,
             vec![
-                padded,
+                0,
                 n_experts,
                 experts_per_token,
-                tile_rows,
-                padded,
+                ROUTE_BLOCK,
+                0,
                 width,
                 width,
             ],
+            vec![
+                (0, Shape(vec![Dim::Tokens, Dim::Const(experts_per_token)])),
+                (4, Shape(vec![stack])),
+            ],
             vec![x.id, perm.id],
-            Some((
-                Shape(vec![Dim::Const(padded), Dim::Const(width)]),
-                DType::BF16,
-            )),
+            Some((Shape(vec![stack, Dim::Const(width)]), DType::BF16)),
         )
         .expect("the gather produces its rows")
     }
@@ -3049,11 +3190,13 @@ pub mod metal {
     ///
     /// `sel = row * slots_per_row + slot`, which is why the launch's row and
     /// slot axes are not interchangeable and why `slots_per_row` is stated.
+    #[allow(clippy::too_many_arguments)]
     pub fn routed_qmv(
         x: &Val,
-        expert_ids: &Val,
+        row_expert: &Val,
         w: &MatW,
         experts_per_token: u32,
+        in_vec: u32,
         biased: bool,
         bits: u32,
     ) -> Val {
@@ -3067,6 +3210,8 @@ pub mod metal {
         // `mlx-community/gpt-oss-20b-MXFP4-Q4` is not: its `quantization`
         // block lists 98 tensors as `affine/64/4` and leaves the expert banks
         // OUT, so they take the top-level default -- `mxfp4`, group **32**.
+        // The block has 122 entries; the 24 unaccounted for are the
+        // `mlp.router` gates at 64/**8**, a third format in the same file.
         // Dequantising that as affine-64 reads every scale from the wrong
         // offset, and bf16 garbage is NaN more often than not. The fire ran,
         // bound everything, and produced 909,207 NaNs starting at the first
@@ -3083,8 +3228,23 @@ pub mod metal {
             // symbol, and `quantized_qmv.metal` exports exactly one:
             // `mxfp4_qmv_routed_bias`, at group 32 and 4 bits, which is the
             // only shape MXFP4 has. There is no unbiased twin, which is why
-            // this arm ignores `biased`.
-            WeightRepr::Mxfp4Marlin => "mxfp4_qmv_routed_bias".to_string(),
+            // this arm ignores `biased` -- and, since the name is not
+            // decoration, why it must be HANDED one. See below.
+            //
+            // The point is spelled out because the arm KNEW it and did not
+            // write it: this returned the bare symbol, and a bare symbol is
+            // not an entry point. `quant/qmv.metal` exports exactly
+            // `mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4`, so the fire failed
+            // at pipeline construction with "exports no such entry point".
+            //
+            // The two numbers are literal here and derived on the affine arm
+            // for a reason that is not laziness. Affine's group and bits are
+            // the CHECKPOINT's -- its `quantization` block picks 64/4 or
+            // 128/8 -- so `affine_point` reads them off the repr. MXFP4's are
+            // the FORMAT's: E2M1 mantissas are four bits and an E8M0 block
+            // exponent covers thirty-two of them, and a checkpoint claiming
+            // any other pair would not be MXFP4.
+            WeightRepr::Mxfp4Marlin => "mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4".to_string(),
             repr => {
                 let point = affine_point(repr, bits);
                 if biased {
@@ -3095,16 +3255,70 @@ pub mod metal {
             }
         };
         let sym = sym.as_str();
-        let in_w = in_width(x);
+        // WHETHER the chosen symbol reads an additive bias, which is not the
+        // same question as `biased`: the affine pair has both instantiations
+        // and honours the caller, MXFP4 has only the biased one and reads a
+        // bias whatever was asked for.
+        //
+        // It decides the WEIGHT LIST, and that is why it has to be asked here.
+        // `qmv_routed_bias`'s twelfth parameter is `const device T* bias
+        // [[buffer(7)]]`, read per output row under `BIASED`, and it is a
+        // different tensor from the codec's zero-point plane at `buffer(2)` --
+        // one value per row against one per group. Handing the row only
+        // `quant_weights` left the kernel's `bias` naming a weight the
+        // statement does not have, which `driver-metal` bound as an address of
+        // zero and the kernel added to every logit.
+        //
+        // Nothing caught it because no catalog row states `moe_mxfp4`, so the
+        // one symbol that always reads a bias is the one nothing had run.
+        let mut weights = quant_weights(w);
+        if matches!(w.repr, WeightRepr::Mxfp4Marlin) || biased {
+            weights.push(format!("{}.bias", w.name));
+        }
+        // `sel = tid.x * slots_per_row + tid.z` is a SORTED POSITION, so the
+        // second operand is the sort's `row_expert` -- "the expert p reads,
+        // for the matvec path", in `route_sort`'s own words -- and not the
+        // router's `[Tokens, k]` choice. Given the latter the kernel read
+        // `ids[sel]` where `sel` ranges over the stack, which agrees with the
+        // routing only where the sort happened to be the identity.
+        //
+        // The two strides say the same thing about the INPUT. Every sorted
+        // row has its own activation, at `sel * in_vec`, and `sel` arrives
+        // factored as `(tid.x, tid.z)` -- so a row is `k` slots wide and a
+        // slot is one. `x_slot_stride` was zero, which is the kernel's own
+        // documented hazard: "reading slot 0 for every expert is not a crash
+        // -- it is four copies of the first expert's activation, which
+        // survives all the way to a plausible wrong token."
+        //
+        // `in_vec` is STATED rather than read off `x`'s trailing dim,
+        // because that dim is a whole token's `k` runs end to end and this
+        // number is one run. The caller knows which projection it is asking
+        // for; the shape cannot say.
         with_params(
             &x.t,
             w.layer,
             sym,
-            quant_weights(w),
+            weights,
             None,
-            vec![in_w, w.width, 0, in_w, experts_per_token],
-            vec![x.id, expert_ids.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(w.width)]), DType::BF16)),
+            vec![
+                in_vec,
+                w.width,
+                in_vec,
+                in_vec * experts_per_token,
+                experts_per_token,
+            ],
+            vec![x.id, row_expert.id],
+            // `k` results per token, end to end. The row axis of the MATVEC
+            // is `w.width` alone and the row states so (`grid_param`); this
+            // width is what the ELEMENTWISE activation between two of these
+            // has to cover, and an elementwise grid is `width * rows`.
+            Some((
+                Shape(vec![
+                    Dim::Tokens,
+                    Dim::Const(w.width * experts_per_token.max(1)),
+                ]),
+                DType::BF16,
+            )),
         )
         .expect("a routed projection produces its value")
     }
@@ -3371,41 +3585,6 @@ pub mod cuda {
         .expect("the norm+rope produces its value")
     }
 
-    /// `kernels::attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin`: the
-    /// fused decode QKV epilogue, over a device-carried window.
-    pub fn qkv_decode_fused_devwin(packed: &Val, l: u32, q_width: u32) -> Val {
-        record(
-            &packed.t,
-            Some(l),
-            "attn::qkv_decode_qk_norm_rope_write_kv_bf16_devwin",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![packed.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(q_width)]), DType::BF16)),
-        )
-        .expect("the fused epilogue produces its value")
-    }
-
-    /// `kernels::attn::write_kv_to_pages_bf16_devwin`: the page write, over
-    /// a device-carried window.
-    pub fn write_kv_to_pages_devwin(k: &Val, v: &Val, l: u32) {
-        record(
-            &k.t,
-            Some(l),
-            "attn::write_kv_to_pages_bf16_devwin",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![k.id, v.id],
-            None,
-        );
-    }
-
     /// `kernels::attn::write_kv_explicit_bf16_devwin`: the explicit-slot
     /// write, over a device-carried window.
     pub fn write_kv_explicit_devwin(k: &Val, v: &Val, l: u32) {
@@ -3615,20 +3794,6 @@ pub mod cuda {
         .expect("the scan produces its value")
     }
 
-    /// `kernels::gemm::act_x_wt_bf16_cublas`: the plain cuBLAS GEMM, named.
-    pub fn gemm_cublas(act: &Val, w: &str, n: u32) -> Val {
-        record(
-            &act.t,
-            act.layer,
-            "gemm::act_x_wt_bf16_cublas",
-            vec![w.to_string()],
-            None,
-            vec![act.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(n)]), DType::BF16)),
-        )
-        .expect("the gemm produces its value")
-    }
-
     /// `kernels::gemm::act_x_wt_bf16_out_fp32`: the same, accumulating to fp32.
     pub fn gemm_out_fp32(act: &Val, w: &str, n: u32) -> Val {
         record(
@@ -3706,23 +3871,12 @@ pub mod cuda {
         .expect("the gemm produces its value")
     }
 
-    /// `kernels::mlp::sigmoid_scalar_gate_add_bf16`: add `x` onto `out`,
-    /// each row scaled by its own sigmoid gate.
-    pub fn sigmoid_scalar_gate_add(out: &Val, x: &Val, gate: &Val, hidden: u32) -> Val {
-        record(
-            &out.t,
-            out.layer,
-            "mlp::sigmoid_scalar_gate_add_bf16",
-            vec![],
-            None,
-            vec![out.id, x.id, gate.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the gated add produces its value")
-    }
-
     /// `kernels::layout::split_bf16_rows`: split `[N, l+r]` into `[N, l]` and
-    /// `[N, r]`. The inverse of [`Self::concat_rows`].
+    /// `[N, r]`.
+    ///
+    /// Its inverse, `concat_rows`, was deleted in §54 — it had no caller and
+    /// no dispatch arm, and this one has both. An operation being half of a
+    /// pair is not a reason to keep the other half.
     pub fn split_rows(src: &Val, left_dim: u32, right_dim: u32) -> (Val, Val) {
         let outs = record_many(
             &src.t,
@@ -3827,137 +3981,30 @@ pub mod cuda {
         );
     }
 
-    /// `kernels::layout::copy_if_valid_slot`: a copy that skips requests
-    /// whose slot id is invalid.
-    ///
-    /// The graph-safe shape: the launch happens for every request every
-    /// time, and the slot id decides whether it does anything -- so the
-    /// dispatch is fixed and a CUDA graph replays.
-    pub fn copy_if_valid_slot(src: &Val, l: u32, width: u32) -> Val {
-        record(
-            &src.t,
-            Some(l),
-            "layout::copy_if_valid_slot",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![src.id],
-            Some((Shape(vec![Dim::Requests, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the copy produces its value")
-    }
-
-    // ── qwen3_5: the single-request GDN entries ────────────────────
+    // ── FOUR WRAPPERS WERE HERE AND ARE DELETED. §54. ──────────────
     //
-    // The unbatched twins of the `_batched` forms above: a legacy parity
-    // entrypoint and a single-request fast path. Same recurrence, one
-    // request, so they are not `whole` for the reason the batched ones are
-    // not -- their `B` is the batch, not a window into one.
-
-    /// `kernels::ssm::recurrent_gated_delta_step`: one decode step,
-    /// single request.
-    pub fn gdn_step_single(q: &Val, l: u32, heads: u32, v_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "ssm::recurrent_gated_delta_step",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Requests, Dim::Const(heads), Dim::Const(v_dim)]),
-                DType::F32,
-            )),
-        )
-        .expect("the step produces its value")
-    }
-
-    /// The same, with the state kept in bf16.
-    ///
-    /// A precision BINDING, not a variant: which one a deployment uses is a
-    /// load-time fact, exactly as the `_batched` pair above states it.
-    pub fn gdn_step_single_state_bf16(q: &Val, l: u32, heads: u32, v_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "ssm::recurrent_gated_delta_step_state_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Requests, Dim::Const(heads), Dim::Const(v_dim)]),
-                DType::F32,
-            )),
-        )
-        .expect("the step produces its value")
-    }
-
-    /// `kernels::ssm::chunk_gated_delta_prefill`: the chunked prefill,
-    /// single request.
-    pub fn gdn_prefill_single(q: &Val, l: u32, heads: u32, v_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "ssm::chunk_gated_delta_prefill",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(v_dim)]),
-                DType::F32,
-            )),
-        )
-        .expect("the prefill produces its value")
-    }
-
-    /// The same, with the state kept in bf16.
-    pub fn gdn_prefill_single_state_bf16(q: &Val, l: u32, heads: u32, v_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "ssm::chunk_gated_delta_prefill_state_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(v_dim)]),
-                DType::F32,
-            )),
-        )
-        .expect("the prefill produces its value")
-    }
-
-    /// `kernels::ssm::causal_conv1d_prefill_bf16`: the prefill conv,
-    /// single request.
-    pub fn causal_conv1d_prefill_single(x: &Val, weight: &str, l: u32, channels: u32) -> Val {
-        record(
-            &x.t,
-            Some(l),
-            "ssm::causal_conv1d_prefill_bf16",
-            vec![weight.to_string()],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![x.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(channels)]), DType::BF16)),
-        )
-        .expect("the conv produces its value")
-    }
+    // `copy_if_valid_slot`, `concat_rows`, `deinterleave_rows` and
+    // `deinterleave_vec`, for `layout::copy_if_valid_slot`,
+    // `layout::concat_bf16_rows`, `layout::deinterleave_rows_bf16` and
+    // `layout::deinterleave_vec_bf16`. Each had zero callers in
+    // `crates/model/src`, and so did the four symbols they recorded.
+    //
+    // They are recorded here rather than simply removed because their
+    // existence was the BUG, not an accident of it. §28: this surface was
+    // generated from launcher headers, so a wrapper existed for every
+    // launcher whether or not any model wanted one -- and a wrapper reads as
+    // demand to every tool that stops at it. Four `table::layout` rows were
+    // held live by nothing but these four functions. The rows went in the
+    // same edit, because `model/tests/kernels_table.rs::
+    // the_table_covers_the_dsl_surface` asserts this surface and that table
+    // are the same set, and half the edit fails it.
+    //
+    // If a model ever wants one of them back, the kernel is still there:
+    // `families::layout`'s device rows and the `.cuh` text are untouched,
+    // and `kernels-cuda-new/tests/launch_rules.rs` still fires
+    // `copy_if_valid_slot` three times as the tree's only witness for
+    // `LaunchRule::Single`. What has to come back is a row and a wrapper
+    // TOGETHER, with a caller.
 
     // ── qwen3_5: the rest ──────────────────────────────────────────
 
@@ -4023,57 +4070,6 @@ pub mod cuda {
             Some((Shape(vec![aligned, Dim::Const(width)]), DType::BF16)),
         )
         .expect("the gemm produces its value")
-    }
-
-    /// `kernels::mlp::chunked_swiglu_strided_bf16`: chunked swiglu over
-    /// strided rows.
-    pub fn chunked_swiglu_strided(x: &Val, intermediate: u32) -> Val {
-        record(
-            &x.t,
-            x.layer,
-            "mlp::chunked_swiglu_strided_bf16",
-            vec![],
-            None,
-            vec![x.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the activation produces its value")
-    }
-
-    /// `kernels::mlp::sigmoid_scalar_gate_strided_add_bf16`: the shared
-    /// expert's sigmoid-gated add, into a strided destination.
-    pub fn sigmoid_scalar_gate_strided_add(x: &Val, y: &Val, gate: &Val, width: u32) -> Val {
-        record(
-            &x.t,
-            x.layer,
-            "mlp::sigmoid_scalar_gate_strided_add_bf16",
-            vec![],
-            None,
-            vec![x.id, y.id, gate.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the gated add produces its value")
-    }
-
-    /// `kernels::layout::concat_bf16_rows`: join two row-aligned tensors
-    /// along the channel axis.
-    pub fn concat_rows(left: &Val, right: &Val, left_dim: u32, right_dim: u32) -> Val {
-        record(
-            &left.t,
-            left.layer,
-            "layout::concat_bf16_rows",
-            vec![],
-            None,
-            vec![left.id, right.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(left_dim + right_dim)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the concat produces its value")
     }
 
     /// `kernels::sample::lm_head_gemv_argmax_int8`: the readout and the argmax
@@ -4243,34 +4239,6 @@ pub mod cuda {
         .expect("the norm+rope produces its value")
     }
 
-    /// `kernels::layout::split_gate_up_bf16`: split a packed `[N, 2·I]` bank.
-    ///
-    /// By HALVES, unlike [`Self::deinterleave_rows`], which splits by parity.
-    /// Same shape, different layout, and the checkpoint decides which.
-    pub fn split_gate_up(packed: &Val, intermediate: u32) -> (Val, Val) {
-        let outs = record_many(
-            &packed.t,
-            packed.layer,
-            "layout::split_gate_up_bf16",
-            vec![],
-            vec![packed.id],
-            vec![
-                (
-                    Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                    DType::BF16,
-                ),
-                (
-                    Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                    DType::BF16,
-                ),
-            ],
-        );
-        let mut it = outs.into_iter();
-        let gate = it.next().expect("the split states two outputs");
-        let up = it.next().expect("the split states two outputs");
-        (gate, up)
-    }
-
     /// `kernels::quant::scale_rows_bf16`: scale each row by its own factor.
     pub fn scale_rows(x: &Val, scale: &Val, width: u32) -> Val {
         record(
@@ -4314,46 +4282,6 @@ pub mod cuda {
         .expect("the scale produces its value")
     }
 
-    /// `kernels::norm::residual_add_scale_rmsnorm_bf16`: residual add, a
-    /// scalar scale, and the next pre-norm, fused.
-    ///
-    /// gemma-4's end-of-layer shape. The scale sits BETWEEN the add and the
-    /// norm, which is why it is not [`Self::residual_add_rmsnorm`] with an
-    /// extra multiply somewhere.
-    pub fn residual_add_scale_rmsnorm(x: &Val, residual: &Val, weight: &str, hidden: u32) -> Val {
-        record(
-            &x.t,
-            x.layer,
-            "norm::residual_add_scale_rmsnorm_bf16",
-            vec![weight.to_string()],
-            None,
-            vec![x.id, residual.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the fused norm produces its value")
-    }
-
-    /// `kernels::attn::dispatch_attention_flashinfer_prefill_sm90_bf16`: the FA3
-    /// prefill, on Hopper.
-    pub fn flashinfer_prefill_sm90(q: &Val, l: u32, heads: u32, head_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "attn::dispatch_attention_flashinfer_prefill_sm90_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the attention produces its value")
-    }
-
     // ── mixtral / gpt-oss: the MXFP4 MoE path ──────────────────────
     //
     // gpt-oss ships its experts as MXFP4 -- 4-bit values with an E8M0
@@ -4363,21 +4291,6 @@ pub mod cuda {
     // no token extent at all. They are stated because they are launches the
     // fire performs, and a reader tracing where an operand came from should
     // find them on the tape.
-
-    /// `kernels::norm::add_bias_bf16_strided`: add a bias row into a strided
-    /// destination.
-    pub fn add_bias_strided(x: &Val, bias: &str, width: u32) -> Val {
-        record(
-            &x.t,
-            x.layer,
-            "norm::add_bias_bf16_strided",
-            vec![bias.to_string()],
-            None,
-            vec![x.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the bias add produces its value")
-    }
 
     /// `kernels::moe::add_moe_route_bias_bf16`: add each route's EXPERT
     /// bias, indexed by that route's expert.
@@ -4397,96 +4310,15 @@ pub mod cuda {
         .expect("the bias add produces its value")
     }
 
-    /// `kernels::attn::build_window_page_view`: a page view keeping only the
-    /// last `keep_pages` of each request.
-    ///
-    /// How sliding-window attention is expressed without a second cache: the
-    /// window is a VIEW over the same pages. `whole` -- it walks
-    /// `src_indptr[R+1]`.
-    pub fn build_window_page_view(t: &Trace, l: u32, keep_pages: u32) -> Val {
-        record(
-            t,
-            Some(l),
-            "attn::build_window_page_view",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![],
-            Some((
-                Shape(vec![Dim::Requests, Dim::Const(keep_pages)]),
-                DType::I32,
-            )),
-        )
-        .expect("the view produces its value")
-    }
+    // `build_window_page_view` and `build_full_split_view` WERE HERE and both
+    // wrappers are DELETED, with their `table::attn` rows and the two
+    // launchers in `kernels-cuda/csrc/src/attn/kv_paged.cu`. Nothing in
+    // `crates/model/src` named either wrapper or either symbol; both rows had
+    // `Source::Unbound` on every operand, so no dispatch was ever generated
+    // from them. The kernels are untouched and still have device rows in
+    // `kernels-cuda-new::families::attn`; `driver-cuda/src/fire/kv_paged.rs`
+    // is the host program now.
 
-    /// `kernels::attn::build_full_split_view`: describe one request's page
-    /// range as `splits` separate one-token requests.
-    ///
-    /// The KV-split decode shape: the same pages, presented as several
-    /// requests so the attention kernel parallelises over them, with the
-    /// partials merged afterwards by [`Self::combine_attn_outputs`].
-    pub fn build_full_split_view(t: &Trace, l: u32, splits: u32) -> Val {
-        record(
-            t,
-            Some(l),
-            "attn::build_full_split_view",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![],
-            Some((Shape(vec![Dim::Const(splits + 1)]), DType::I32)),
-        )
-        .expect("the view produces its value")
-    }
-
-    /// `kernels::layout::deinterleave_rows_bf16`: split a fused `[2·I, H]`
-    /// weight into its gate and up halves BY PARITY.
-    ///
-    /// A weight-layout fact: gpt-oss interleaves the two projections row by
-    /// row, so this is not the same as slicing the tensor in half. No token
-    /// extent — it transforms a weight.
-    pub fn deinterleave_rows(t: &Trace, l: u32, w: &str, i: u32, h: u32) -> (Val, Val) {
-        let outs = record_many(
-            t,
-            Some(l),
-            "layout::deinterleave_rows_bf16",
-            vec![w.to_string()],
-            vec![],
-            vec![
-                (Shape(vec![Dim::Const(i), Dim::Const(h)]), DType::BF16),
-                (Shape(vec![Dim::Const(i), Dim::Const(h)]), DType::BF16),
-            ],
-        );
-        let mut it = outs.into_iter();
-        let gate = it.next().expect("the split states two outputs");
-        let up = it.next().expect("the split states two outputs");
-        (gate, up)
-    }
-
-    /// `kernels::layout::deinterleave_vec_bf16`: the same, for the fused
-    /// per-expert bias vector.
-    pub fn deinterleave_vec(t: &Trace, l: u32, w: &str, i: u32) -> (Val, Val) {
-        let outs = record_many(
-            t,
-            Some(l),
-            "layout::deinterleave_vec_bf16",
-            vec![w.to_string()],
-            vec![],
-            vec![
-                (Shape(vec![Dim::Const(i)]), DType::BF16),
-                (Shape(vec![Dim::Const(i)]), DType::BF16),
-            ],
-        );
-        let mut it = outs.into_iter();
-        let gate = it.next().expect("the split states two outputs");
-        let up = it.next().expect("the split states two outputs");
-        (gate, up)
-    }
 
     /// `kernels::gemm::gemv3_bf16`: three GEMVs against one activation, in
     /// one launch.
@@ -4519,21 +4351,6 @@ pub mod cuda {
         let o1 = it.next().expect("gemv3 states three outputs");
         let o2 = it.next().expect("gemv3 states three outputs");
         (o0, o1, o2)
-    }
-
-    /// `kernels::mlp::gpt_oss_glu_strided_bf16`: gpt-oss's clamped GLU,
-    /// reading and writing strided.
-    pub fn gpt_oss_glu_strided(gate: &Val, up: &Val, width: u32) -> Val {
-        record(
-            &gate.t,
-            gate.layer,
-            "mlp::gpt_oss_glu_strided_bf16",
-            vec![],
-            None,
-            vec![gate.id, up.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the activation produces its value")
     }
 
     /// `kernels::norm::rmsnorm_bf16_with_fp16`: the norm, published in both
@@ -4625,75 +4442,34 @@ pub mod cuda {
         .expect("the transpose produces its value")
     }
 
-    /// `kernels::quant::mxfp4_moe_gate_up_decode_grouped_bf16`: the gate and
-    /// up projections for every route, grouped by expert.
-    pub fn mxfp4_moe_gate_up_decode_grouped(
-        act: &Val,
-        sorted_route_ids: &Val,
-        counts: &Val,
-        intermediate: u32,
-    ) -> (Val, Val) {
-        let outs = record_many(
-            &act.t,
-            act.layer,
-            "quant::mxfp4_moe_gate_up_decode_grouped_bf16",
-            vec![],
-            vec![act.id, sorted_route_ids.id, counts.id],
-            vec![
-                (
-                    Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                    DType::BF16,
-                ),
-                (
-                    Shape(vec![Dim::Tokens, Dim::Const(intermediate)]),
-                    DType::BF16,
-                ),
-            ],
-        );
-        let mut it = outs.into_iter();
-        let gate = it.next().expect("the projection states two outputs");
-        let up = it.next().expect("the projection states two outputs");
-        (gate, up)
-    }
-
-    /// `marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16`: the Marlin W4A16
-    /// grouped MoE GEMM.
-    ///
-    /// Namespaced in the symbol because it lives in the vendored `marlin_moe`
-    /// tree, the same way `ops::` entries do.
-    pub fn mxfp4_moe_gemm_w4a16(act: &Val, sorted_route_ids: &Val, width: u32) -> Val {
-        record(
-            &act.t,
-            act.layer,
-            "marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16",
-            vec![],
-            None,
-            vec![act.id, sorted_route_ids.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(width)]), DType::BF16)),
-        )
-        .expect("the gemm produces its value")
-    }
-
-    /// `kernels::attn::dispatch_attention_flashinfer_decode_bf16`: the bf16-typed
-    /// decode dispatch.
-    pub fn flashinfer_decode_bf16(q: &Val, l: u32, heads: u32, head_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "attn::dispatch_attention_flashinfer_decode_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the attention produces its value")
-    }
+    // `pub fn mxfp4_moe_gemm_w4a16` WAS HERE, and it was the last live
+    // reference in this workspace to a tree that no longer exists.
+    //
+    // It recorded the symbol `marlin_moe::launch_mxfp4_moe_gemm_w4a16_bf16`,
+    // and its doc said the name was namespaced "because it lives in the
+    // vendored `marlin_moe` tree, the same way `ops::` entries do". §47
+    // deleted that tree — both `csrc/third_party/marlin` and
+    // `csrc/third_party/marlin_moe`, 656 KB, with their CMake `option()`s,
+    // their `target_sources`/`target_include_directories`/
+    // `target_compile_definitions`, the `kernels.def`/`marlin.cu` shape
+    // reconciliation and the `PIE_CUDA_HAS_MARLIN_MOE` capability in
+    // `kernels_manifest.hpp`.
+    //
+    // Nothing called this builder. `table::moe`'s row went first (its
+    // `KernelSig::operands` was EMPTY, so no fire could ever have bound it),
+    // `driver-cuda/tests/launch_abi.rs:1538-1544` records the row's removal
+    // and states plainly that "nothing called `dsl::cuda::mxfp4_moe_gemm_w4a16`",
+    // and `weights/plan.rs`'s `native_mxfp4_moe = false` is a hard-coded
+    // constant in both constructors, so no plan ever reaches the lowering it
+    // served. A grep for `mxfp4_moe_gemm_w4a16` over every `.rs` in the
+    // workspace returns this comment and the `launch_abi` note.
+    //
+    // Left as prose rather than silently dropped because a DSL builder that
+    // records a symbol no table row and no C++ function backs is not a
+    // compile error — it is a `record()` that would produce a program the
+    // binder cannot lower, discovered at run time by whoever wrote the first
+    // call. That failure mode is exactly what the emptiness above rules out,
+    // and it is worth one paragraph to say the emptiness was measured.
 
     // ── deepseek_v4: hyper-connections ─────────────────────────────
     //
@@ -5112,43 +4888,6 @@ pub mod cuda {
         .expect("the rope produces its value")
     }
 
-    /// `kernels::attn::write_kv_to_pages_bf16`: the bf16-typed page write.
-    pub fn write_kv_to_pages_bf16(k: &Val, v: &Val, l: u32) {
-        record(
-            &k.t,
-            Some(l),
-            "attn::write_kv_to_pages_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![k.id, v.id],
-            None,
-        );
-    }
-
-    /// `kernels::attn::attention_naive_paged_bf16`: the bf16-typed naive paged
-    /// attention.
-    pub fn attention_naive_paged_bf16(q: &Val, l: u32, heads: u32, head_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "attn::attention_naive_paged_bf16",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads), Dim::Const(head_dim)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the attention produces its value")
-    }
-
     /// Which shape a quantized weight's SCALE has.
     ///
     /// Three fp8 forms, and the difference is not a tuning knob: one scale
@@ -5322,30 +5061,6 @@ pub mod cuda {
         .expect("the scan produces its value")
     }
 
-    /// `kernels::ssm::causal_conv1d_update_bf16`: the decode-step conv,
-    /// reading and advancing the per-request conv window.
-    ///
-    /// `whole`: it advances a slot's state in place, so a row window would
-    /// advance the wrong ones.
-    pub fn causal_conv1d_update(x: &Val, weight: &str, bias: &str, l: u32, channels: u32) -> Val {
-        record(
-            &x.t,
-            Some(l),
-            "ssm::causal_conv1d_update_bf16",
-            vec![weight.to_string(), bias.to_string()],
-            Some(StateRef {
-                store: StateStore::RecurrentState,
-                layer: l,
-            }),
-            vec![x.id],
-            Some((
-                Shape(vec![Dim::Requests, Dim::Const(channels)]),
-                DType::BF16,
-            )),
-        )
-        .expect("the conv produces its value")
-    }
-
     /// `kernels::ssm::zamba_rmsnorm_gated_bf16`: the grouped, gated output
     /// norm mamba's block ends with.
     pub fn zamba_rmsnorm_gated(x: &Val, gate: &Val, weight: &str, hidden: u32) -> Val {
@@ -5403,7 +5118,38 @@ pub mod cuda {
     /// The unpadded counterpart of [`Self::moe_align`], writing exact
     /// per-expert counts the host reads to build cuBLAS grouped shapes.
     /// `whole` for the same reason: the sort is over all routes.
-    pub fn moe_bucket_exact(topk_idx: &Val, num_experts: u32, top_k: u32) -> (Val, Val) {
+    ///
+    /// Returns `(sorted_route_ids, route_to_sorted_row, counts)` — the
+    /// permutation, its inverse, and the per-expert totals.
+    ///
+    /// # The third result is new, and its absence was a wrong-answer bug
+    /// waiting on a caller
+    ///
+    /// **This declared two results and the kernel writes three buffers.**
+    /// `moe_dispatch.cuh:907`'s parameter list is `topk_idx,
+    /// sorted_route_ids, route_to_sorted_row, counts_out, num_routes,
+    /// num_experts`, and `route_to_sorted_row` was named nowhere in this
+    /// crate — not here, not in the row that used to carry the symbol.
+    ///
+    /// A binding written from a two-result statement has one buffer with no
+    /// declared home, so it passes a null, and the store at `:952` is
+    /// `route_to_sorted_row[r] = out;` with **no null guard**. That is the
+    /// difference from [`Self::moe_align`], whose otherwise identical
+    /// inverse map is written behind `if (route_to_aligned_row != nullptr)`
+    /// and whose third result is therefore genuinely optional. Here it is
+    /// not optional: the declaration is what makes the buffer exist, and
+    /// without it the fire does not answer wrongly, it writes to null.
+    ///
+    /// **The order is the KERNEL's and not the convenient one.** `counts` is
+    /// the interesting output and was the second of two; it is the third of
+    /// three now, because a declaration list whose order matches the
+    /// parameter list is one a binding can read straight down. The cost of
+    /// the other choice is on record in this family: `moe::hash_route_lookup`
+    /// deleted a row that stated no `Source` on any operand, and the only
+    /// surviving statement of which input was which was `dsl.rs`'s own
+    /// argument vector.
+    pub fn moe_bucket_exact(topk_idx: &Val, num_experts: u32, top_k: u32) -> (Val, Val, Val) {
+        let routes = Shape(vec![Dim::Tokens, Dim::Const(top_k)]);
         let outs = record_many(
             &topk_idx.t,
             topk_idx.layer,
@@ -5411,14 +5157,16 @@ pub mod cuda {
             vec![],
             vec![topk_idx.id],
             vec![
-                (Shape(vec![Dim::Tokens, Dim::Const(top_k)]), DType::I32),
+                (routes.clone(), DType::I32),
+                (routes, DType::I32),
                 (Shape(vec![Dim::Const(num_experts)]), DType::I32),
             ],
         );
         let mut it = outs.into_iter();
-        let sorted = it.next().expect("the bucket states two outputs");
-        let counts = it.next().expect("the bucket states two outputs");
-        (sorted, counts)
+        let sorted = it.next().expect("the bucket states three outputs");
+        let inverse = it.next().expect("the bucket states three outputs");
+        let counts = it.next().expect("the bucket states three outputs");
+        (sorted, inverse, counts)
     }
 
     /// `kernels::ssm::build_nemotron_moe_ptrs_aligned_bf16`: the pointer
@@ -5447,21 +5195,6 @@ pub mod cuda {
             vec![topk_idx.id, topk_w.id, x.id],
             None,
         );
-    }
-
-    /// `kernels::moe::token_batched_weighted_sum_aligned_bf16`: combine the
-    /// aligned expert outputs back per token.
-    pub fn token_batched_weighted_sum_aligned(aligned_out: &Val, topk_w: &Val, hidden: u32) -> Val {
-        record(
-            &aligned_out.t,
-            aligned_out.layer,
-            "moe::token_batched_weighted_sum_aligned_bf16",
-            vec![],
-            None,
-            vec![aligned_out.id, topk_w.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the combine produces its value")
     }
 
     // ── KDA: Kimi Delta Attention ──────────────────────────────────
@@ -5713,27 +5446,6 @@ pub mod cuda {
     }
 
     // ── tensor-parallel shapes ─────────────────────────────────────
-
-    /// `kernels::layout::embed_bf16_vocab_shard`: gather from a vocab-SHARDED
-    /// embedding table.
-    ///
-    /// Under tensor parallelism the table is split along the vocabulary, so a
-    /// rank holds `[local_vocab, hidden]` starting at `vocab_offset` and
-    /// writes zeros for tokens outside its shard; the all-reduce that follows
-    /// makes the row whole. Row-shaped, so not `whole` — the shard is a
-    /// property of the WEIGHT, not of the row range.
-    pub fn embed_vocab_shard(t: &Trace, weight: &str, hidden: u32) -> Val {
-        record(
-            t,
-            None,
-            "layout::embed_bf16_vocab_shard",
-            vec![weight.to_string()],
-            None,
-            vec![],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the gather produces its value")
-    }
 
     /// `kernels::norm::residual_add_rmsnorm_bf16`: the residual add and the
     /// next block's pre-norm, fused.
@@ -6107,31 +5819,6 @@ pub mod cuda {
         .expect("the reorder produces its value")
     }
 
-    /// `kernels::moe::scatter_add_weighted_bf16`: fold the routed rows back
-    /// onto the residual stream, each scaled by its router weight.
-    ///
-    /// `out[dst_idx[i]] += src[i] · row_weights[i]`. `whole` because
-    /// `dst_idx` is route-global: a window over output ROWS is not a window
-    /// over routes.
-    pub fn scatter_add_weighted(
-        out: &Val,
-        src: &Val,
-        dst_idx: &Val,
-        row_weights: &Val,
-        hidden: u32,
-    ) -> Val {
-        record(
-            &out.t,
-            out.layer,
-            "moe::scatter_add_weighted_bf16",
-            vec![],
-            None,
-            vec![out.id, src.id, dst_idx.id, row_weights.id],
-            Some((Shape(vec![Dim::Tokens, Dim::Const(hidden)]), DType::BF16)),
-        )
-        .expect("the combine produces its value")
-    }
-
     // ── MLA: latent attention ──────────────────────────────────────
     //
     // deepseek_v4, glm5 and kimi_k3 all attend through a LATENT KV: the
@@ -6249,37 +5936,6 @@ pub mod cuda {
                     Dim::Const(heads),
                     Dim::Const(kv_lora_rank),
                 ]),
-                DType::BF16,
-            )),
-        )
-        .expect("the attention produces its value")
-    }
-
-    /// `kernels::attn::attention_flashinfer_prefill_custom`: the custom-mask
-    /// prefill in its PLAN-FREE form.
-    ///
-    /// The counterpart of [`Self::flashinfer_prefill_planless`]'s reasoning:
-    /// it takes the indptr arrays and the mask directly and builds its
-    /// R-shaped plan on the way in, so it owes its caller no prepare and
-    /// cannot be handed a row window. `whole`, and `FireWide` for the same
-    /// reason XQA is.
-    ///
-    /// gemma-3n binds this rather than the planned `flashinfer_custom` above,
-    /// which is a deployment fact and therefore something a declaration
-    /// states.
-    pub fn flashinfer_prefill_custom_planless(q: &Val, l: u32, heads: u32, head_dim: u32) -> Val {
-        record(
-            &q.t,
-            Some(l),
-            "attn::attention_flashinfer_prefill_custom",
-            vec![],
-            Some(StateRef {
-                store: StateStore::KvCache,
-                layer: l,
-            }),
-            vec![q.id],
-            Some((
-                Shape(vec![Dim::Tokens, Dim::Const(heads * head_dim)]),
                 DType::BF16,
             )),
         )
@@ -7157,8 +6813,8 @@ pub mod cuda {
     /// dots `norm_x` with the `[1, H]` gate row, sigmoids the scalar, and
     /// accumulates `shared` into the stream.
     ///
-    /// The general form is a `[Tokens, 1]` GEMM followed by
-    /// `kernels::mlp::sigmoid_scalar_gate_add_bf16`; this fused form runs when
+    /// The general form is a `[Tokens, 1]` GEMM followed by a scalar-gated
+    /// add; this fused form runs when
     /// the gate weight is bound unquantized and `N` is within the decode
     /// fast path's bound (1024). Every fire this text covers is under
     /// `cutlass_max_rows` (<= 512), so within the declaration's own row
@@ -7216,11 +6872,6 @@ pub mod cuda {
     /// here is what lets the body emit ONE op where the semantic text
     /// emits a WeightedSum and a ResidualAdd — the fusion is a kernel
     /// fact, so it belongs in the CUDA reading, not in the trace shape.
-    ///
-    /// The per-expert `kernels::moe::scatter_add_weighted_bf16` loop is the
-    /// OTHER combine, and it is not stated here: it runs once per expert
-    /// with a row count the host learned from a device readback, which
-    /// is a launch count no declaration fixes.
     pub fn weighted_sum(weights: &Val, x: &Val, hidden: u32, residual: Option<&Val>) -> Val {
         let mut inputs = vec![x.id, weights.id];
         if let Some(r) = residual {
@@ -8299,6 +7950,7 @@ mod seam_tests {
             weights: vec![],
             state: None,
             params: vec![],
+            param_extents: vec![],
         }
     }
 

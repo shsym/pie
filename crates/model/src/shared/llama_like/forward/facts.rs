@@ -265,6 +265,12 @@ pub struct LlamaLikeMetalFacts {
     /// take the top-level default -- `mxfp4`, group **32**. One checkpoint,
     /// two formats.
     ///
+    /// Three, in fact. The block names 122 tensors and not 98; the other 24
+    /// are the `mlp.router` gates at `affine`/64/**8**, and [`Self::router_repr`]
+    /// is where that one goes. Every count of "98" in this tree stopped at
+    /// the same place, because the router entries are the only ones in the
+    /// block with no `mode` key to read.
+    ///
     /// Reading the banks with the dense format is not a near miss. Every scale
     /// comes from the wrong offset, and bf16 garbage is NaN more often than
     /// not: the fire bound everything, ran, and produced 909,207 NaNs
@@ -276,6 +282,29 @@ pub struct LlamaLikeMetalFacts {
     /// [`Self::affine_bits`] for the expert banks; see [`Self::moe_repr`].
     #[serde(default)]
     pub moe_bits: u32,
+    /// How this deployment stores its ROUTER GATE, when that is not how it
+    /// stores its dense projections.
+    ///
+    /// [`Self::moe_repr`]'s twin and the third format in gpt-oss's file.
+    /// `mlx_lm` publishes the gate WIDER than the stack it routes -- 8 bits
+    /// inside a 4-bit model -- and it does so deliberately: the gate is a
+    /// tiny `[hidden, n_experts]` matrix whose error the whole mixture
+    /// inherits, so the bits are cheap there and expensive everywhere else.
+    ///
+    /// Getting it wrong is the failure mode this field exists to make
+    /// impossible, and it is the quiet one. An expert bank read at the wrong
+    /// format is 909,207 NaNs; a GATE read at the wrong width is a fluent
+    /// model routing every token to almost the right experts, measured at
+    /// cosine 0.84 against the reference logits with not one NaN to notice
+    /// it by.
+    ///
+    /// `None` is "the same as `proj_repr`", which is every other checkpoint,
+    /// including every non-MoE one.
+    #[serde(default)]
+    pub router_repr: Option<model_compiler::dsl::WeightRepr>,
+    /// [`Self::affine_bits`] for the router gate; see [`Self::router_repr`].
+    #[serde(default)]
+    pub router_bits: u32,
     /// The GEMM's `(row tile, column tile)`, as the entrypoint spells them.
     ///
     /// `affine_qmm_t` is instantiated over `(group × bits × bm × bn)`, so the
@@ -309,26 +338,6 @@ pub struct LlamaLikeMetalFacts {
     /// fire that runs.
     #[serde(default)]
     pub gate_up_fused: bool,
-    /// The deployment bound ONE packed `q‖k‖v` bank.
-    ///
-    /// The twin of [`Self::gate_up_fused`], and here for the same reason
-    /// its own doc gives about `LlamaLikeFacts::fused_qkv`: that field
-    /// says "this is a *binding* fact, not an architecture fact", and a
-    /// binding fact stated by the ROW is stated by whichever backend
-    /// wrote the row down. Eight llama-3 rows say `true`, which is CUDA's
-    /// answer, and Metal's is **false** — `compile_load_plan` authors
-    /// with `Projections::InPlace`, so the MLX path publishes
-    /// `self_attn.{q,k,v}_proj` separately and no Metal deployment has a
-    /// `qkv` handle at all (`lowering::resolve` says so in those words).
-    ///
-    /// It cost a whole checkpoint. `driver-metal/src/model/text.rs` used
-    /// to build `LlamaLikeFacts` itself and answer this from the staged
-    /// tensors; deleting it in favour of the catalog left the row's CUDA
-    /// answer reaching the Metal text, which asked for `layer.0.qkv` and
-    /// got `Unbound { symbol: "affine_qmv_fast_bfloat16_gs_64_b_4", why:
-    /// UnknownWeight("layer.0.qkv") }` on llama-3.2-1B.
-    #[serde(default)]
-    pub qkv_fused: bool,
     /// `rms_norm_eps`, the epsilon every norm of this deployment carries.
     ///
     /// A load-time fact and not a constant: it comes from the checkpoint's
@@ -338,6 +347,37 @@ pub struct LlamaLikeMetalFacts {
     /// spreads everywhere.
     #[serde(default)]
     pub rms_eps: f32,
+    /// This deployment can LAUNCH `norm::add_bias` — so the text may state
+    /// the Qwen-2 family's q/k/v projection biases.
+    ///
+    /// A capability, not an architecture fact: whether the biases EXIST is
+    /// [`LlamaLikeFacts::qkv_bias`], which reads the checkpoint and has said
+    /// `true` for Qwen-2 all along. This says whether the backend can act on
+    /// it, exactly as `fuse_residual_gemv` and `paged_multi_batch` do for
+    /// their kernels.
+    ///
+    /// It exists because the two claims came apart, quietly and for a long
+    /// time. No Metal-side kernel added a bias, so the shared Metal text
+    /// stated no bias for anyone, and a Qwen-2 served through it computed its
+    /// projections without them. That is not a crash and not a NaN: the
+    /// biases are small, the text stays fluent, and nothing downstream can
+    /// tell. `driver-vulkan` measured it — its numpy oracle answers
+    /// `[88204, 6100, 41777, 2930]` for Qwen-2.5-1.5B with the biases and
+    /// `[5937, 1560, 16925, 43715]` without, and the driver matched the
+    /// second, exactly.
+    ///
+    /// Serde-defaulted to FALSE, and the default is still the load-bearing
+    /// part: a deployment that has not said it can launch the kernel gets the
+    /// text it got before rather than a launch nobody has watched.
+    ///
+    /// `driver-metal` now says `true`. It said `false` for as long as its
+    /// binder had no `Source::OutWidth` arm — the row derives the bias's row
+    /// pitch from its own output rather than taking it as a scalar, and the
+    /// scalar layout's `_ => continue` swallowed the source without emitting
+    /// a slot. `lowering::dispatch::derived` resolves it and a table-walking
+    /// test now refuses the next source that would go the same way.
+    #[serde(default)]
+    pub add_bias: bool,
     /// `rope_theta`, the rotary base.
     ///
     /// Stated rather than defaulted for the reason `ModelFacts::rope_theta`
@@ -577,14 +617,43 @@ impl LlamaLikeMetalFacts {
                 limit: 7.0,
                 alpha: 1.702,
             },
-            // `rope_theta: 150000`, a plain geometric ladder.
+            // `rope_theta: 150000`, and a YaRN-rescaled ladder over it:
+            // `rope_scaling` states factor 32, beta_fast 32, beta_slow 1,
+            // `truncate: false`. A theta alone cannot express that, so the
+            // driver derives the table at load and answers it as
+            // `Source::RopeFrequencies`. This said `false` and called 150000
+            // "a plain geometric ladder" from the day it was written, which
+            // was true of nothing: the row has always carried the YaRN block.
             rope_theta: 150_000.0,
-            rope_freq_table: false,
+            rope_freq_table: true,
             rms_eps: 1e-5,
             // `sliding_window: 128`, ALTERNATING: every other layer attends
             // the window and the rest attend everything. `window_left_at`
             // reads the list per layer, which is what the accessor is for.
             window_left: (0..24).map(|l| if l % 2 == 0 { 128 } else { -1 }).collect(),
+            // The EXPERT BANKS' own encoding, which is not the projections'.
+            // `mlx-community/gpt-oss-20b-MXFP4-Q4`'s `quantization` block
+            // lists 122 tensors: 98 at affine/64/4, 24 `mlp.router` gates at
+            // affine/64/8, and the expert banks in neither list, so they take
+            // the top-level default: mxfp4, group 32, 4 bits.
+            // Measured off the tensors too — `experts.gate_proj.weight` is
+            // `[32, 2880, 360]` beside `scales` `[32, 2880, 90]`, and
+            // 2880/90 is 32.
+            //
+            // The 98 is a count that stops one entry short of the point.
+            // There are 122 overrides, not 98: the other 24 are the
+            // `mlp.router` gates at affine/64/EIGHT, and they are easy to
+            // miss because theirs are the only entries with no `mode` key at
+            // all. That is two affine points in one file, which is one more
+            // than the driver instantiates kernel sets for, and it is why
+            // `Loaded::affine_point` refuses this checkpoint by name.
+            //
+            // This fixture is the one thing that states gpt-oss's Metal
+            // facts, and it stated `moe_repr: None` by inheritance — an
+            // affine reading of an MXFP4 bank, which is the exact defect
+            // `routed_qmv`'s doc records as 909,207 NaNs.
+            moe_repr: Some(model_compiler::dsl::WeightRepr::Mxfp4Marlin),
+            moe_bits: 4,
             ..Self::synthetic()
         }
     }
@@ -604,6 +673,22 @@ impl LlamaLikeMetalFacts {
             per_layer_emb_dim: 256,
             kv_shared_layers: 4,
             dense_beside_moe: true,
+            // `sqrt(1024)`, and 1024 is the `hidden` of
+            // `LlamaLikeFacts::qwen3_0_6b()`, which is what both call sites
+            // pair this with.
+            //
+            // Not optional and not a width: `gemma_4::project::metal_facts`
+            // sets `embed_scale: sqrt(hidden)` UNCONDITIONALLY, so there is
+            // no gemma deployment that leaves it zero. This fixture did, and
+            // zero is the branch -- `llama_like_metal` reads
+            // `embed_scale > 0.0` and emits `embed_gather` instead of
+            // `embed_gather_scaled`, so the fixture whose doc says it is
+            // "the fixture a gemma4 text reads" made a different FIRST
+            // statement than any gemma. The comment at that branch already
+            // records one defect of exactly this shape, where the scale was
+            // read off the side network's width and silently dropped for
+            // gemma-4-31b.
+            embed_scale: 32.0,
             window_left: (0..24).map(|l| if l % 6 == 5 { -1 } else { 512 }).collect(),
             rope_theta: 1_000_000.0,
             // The SLIDING layers' base. gemma states both, and this fixture
@@ -691,12 +776,17 @@ impl LlamaLikeMetalFacts {
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            // TRUE, and no longer the odd one out among the three above it:
+            // all four are now read off `driver-metal`'s source. This one
+            // was false for the absence of a `Source::OutWidth` arm in its
+            // binder; `lowering::dispatch::derived` is that arm. A synthetic
+            // fixture states what the driver would answer today.
+            add_bias: true,
             // The value every routed row in this catalog publishes, and the
             // opposite of `Qwen3MoeConfig`'s class default -- see
             // `RowScalars::norm_topk_prob`.
             norm_topk_prob: true,
             // No Metal deployment publishes a fused bank; see the field.
-            qkv_fused: false,
             // The symbols this text names are the affine ones
             // (`affine_qmv_fast`, `embed_gather_4bit`), so the deployment
             // they describe is a quantized checkpoint. MLX stores the pair
@@ -712,6 +802,11 @@ impl LlamaLikeMetalFacts {
             // Uniform: the synthetic fixture's banks are the dense format.
             moe_repr: None,
             moe_bits: 0,
+            // `None` is "the same as the dense projections", and that is the
+            // right synthetic answer: a fixture that states a SECOND affine
+            // point states a checkpoint fact, and this file holds none.
+            router_repr: None,
+            router_bits: 0,
             // The narrowest rung `qmm_bm` can pick, so it is the one a short
             // window fires; `bn = 32` is the only column tile the residual
             // variant is instantiated at.
@@ -810,5 +905,184 @@ impl LlamaLikeCudaFacts {
             // Single GPU: no collective, so no threshold.
             all_reduce_p2p_max_rows: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// gpt-oss alternates: even layers see a window, odd layers see all.
+    ///
+    /// The fixture's callers are GPU tests in `driver-metal`,
+    /// `driver-vulkan` and `driver-cuda`, none of which run without a
+    /// device — so the numbers a conformance run compares against were
+    /// stated here and checked nowhere. An alternation that silently
+    /// became uniform would make every one of those tests agree with
+    /// itself about the wrong model.
+    #[test]
+    fn the_gpt_oss_fixture_alternates_its_window_layer_by_layer() {
+        let facts = LlamaLikeMetalFacts::gpt_oss_20b();
+        assert!(facts.attn_sinks, "every layer carries a per-head sink");
+        for layer in 0..24 {
+            let expected = if layer % 2 == 0 { 128 } else { -1 };
+            assert_eq!(
+                facts.window_left_at(layer),
+                expected,
+                "layer {layer}'s window"
+            );
+            assert_eq!(
+                facts.is_full_attention(layer),
+                layer % 2 == 1,
+                "layer {layer} attends the whole context only when unwindowed"
+            );
+        }
+    }
+
+    /// The window list is shorter than any real stack, and that is the rule.
+    ///
+    /// `window_left_at` clamps: the LAST entry covers the tail. A model
+    /// deeper than its own fixture therefore keeps the final layer's
+    /// window rather than falling off the end, which is what the drivers'
+    /// old fallback meant and what makes a 24-entry list safe to state for
+    /// a stack of any depth.
+    #[test]
+    fn a_layer_past_the_end_of_the_list_keeps_the_last_entry() {
+        // The tail entry is a REAL window rather than -1 on purpose. Asking
+        // this of `gpt_oss_20b` compares nothing: its last layer is odd, so
+        // its answer is -1 already, and a fallback that stopped clamping and
+        // returned -1 for everything past the end would agree with it.
+        let facts = LlamaLikeMetalFacts {
+            window_left: vec![128, 256],
+            ..LlamaLikeMetalFacts::synthetic()
+        };
+        assert_eq!(facts.window_left_at(0), 128);
+        assert_eq!(facts.window_left_at(1), 256);
+        for layer in [2, 3, 47, 9_999] {
+            assert_eq!(
+                facts.window_left_at(layer),
+                256,
+                "layer {layer} is past the end, where the tail entry governs"
+            );
+        }
+    }
+
+    /// An empty list means every layer attends everything.
+    ///
+    /// This is the case every non-windowed family takes, so it is the one
+    /// that would be noticed last if it broke.
+    #[test]
+    fn an_unstated_window_is_no_window_on_every_layer() {
+        let facts = LlamaLikeMetalFacts::synthetic();
+        assert!(
+            facts.window_left.is_empty(),
+            "the synthetic deployment states no window"
+        );
+        for layer in [0, 1, 7, 100] {
+            assert_eq!(facts.window_left_at(layer), -1, "layer {layer}");
+            assert!(facts.is_full_attention(layer));
+        }
+    }
+
+    /// gemma slides five layers in six, and rotates them at a DIFFERENT base.
+    ///
+    /// This is the fact whose loss is silent. gemma states two rotary bases
+    /// — one for the sliding layers and one for the full ones — and a
+    /// driver that read the single config value rotated twenty of
+    /// twenty-four layers at the wrong frequencies. Not a load error, not
+    /// a crash: wrong output at every position but zero.
+    #[test]
+    fn gemmas_sliding_layers_rotate_at_the_sliding_base() {
+        let facts = LlamaLikeMetalFacts::gemma_like();
+        assert_eq!(facts.rope_theta, 1_000_000.0);
+        assert_eq!(facts.rope_theta_sliding, 10_000.0);
+        assert_ne!(
+            facts.rope_theta, facts.rope_theta_sliding,
+            "the two bases differ, which is the whole reason for the accessor"
+        );
+
+        let mut sliding = 0;
+        for layer in 0..24 {
+            if facts.is_full_attention(layer) {
+                assert_eq!(
+                    facts.rope_theta_at(layer),
+                    facts.rope_theta,
+                    "full layer {layer} takes the global base"
+                );
+            } else {
+                sliding += 1;
+                assert_eq!(
+                    facts.rope_theta_at(layer),
+                    facts.rope_theta_sliding,
+                    "sliding layer {layer} takes the sliding base"
+                );
+            }
+        }
+        assert_eq!(sliding, 20, "twenty of twenty-four layers slide");
+    }
+
+    /// A deployment that states ONE base uses it on every layer.
+    ///
+    /// `rope_theta_sliding` of zero is "not stated", and the accessor has
+    /// to read that as "the one base" rather than as a base of zero — which
+    /// would divide the ladder by nothing and rotate every channel
+    /// identically.
+    #[test]
+    fn a_single_rotary_base_governs_the_windowed_layers_too() {
+        let facts = LlamaLikeMetalFacts::gpt_oss_20b();
+        assert_eq!(
+            facts.rope_theta_sliding, 0.0,
+            "gpt-oss states one base for a stack that does alternate windows"
+        );
+        for layer in 0..24 {
+            assert_eq!(
+                facts.rope_theta_at(layer),
+                150_000.0,
+                "layer {layer} rotates at the only base there is"
+            );
+        }
+    }
+
+    /// The gemma fixture carries the facts that make it gemma.
+    ///
+    /// Stated because this fixture is what a gemma-4 text reads in the
+    /// conformance runs, and the doc is explicit that the WIDTHS are
+    /// plausible rather than measured. These are not widths — they are
+    /// the structural claims, and a fixture that lost one would make the
+    /// gemma path test the llama path under a gemma name.
+    ///
+    /// Which is what happened. `embed_scale` was not on this list and was
+    /// not in the fixture, so it fell through `..synthetic()` at zero,
+    /// and zero is a BRANCH: `llama_like_metal` reads `embed_scale > 0.0`
+    /// and the gemma text was emitting `embed_gather` where every gemma
+    /// deployment emits `embed_gather_scaled`. `gemma_4::project::metal_facts`
+    /// sets it to `sqrt(hidden)` unconditionally -- there is no gemma row
+    /// that leaves it zero -- so the conformance text and the device fire
+    /// were both proving the wrong first statement, under a gemma name,
+    /// for as long as the fixture existed.
+    ///
+    /// A guard whose doc names the defect and whose list omits the field
+    /// is worse than no guard, because it is read as coverage.
+    #[test]
+    fn the_gemma_fixture_is_gemma_shaped_rather_than_llama_shaped() {
+        let facts = LlamaLikeMetalFacts::gemma_like();
+        assert!(matches!(facts.activation, Activation::Geglu));
+        assert_eq!(facts.logit_softcap, 30.0);
+        assert_eq!(facts.per_layer_emb_dim, 256);
+        assert_eq!(facts.kv_shared_layers, 4);
+        assert!(facts.dense_beside_moe);
+        assert!(
+            facts.embed_scale > 0.0,
+            "a gemma scales its embedding, and zero picks the other statement"
+        );
+
+        let plain = LlamaLikeMetalFacts::synthetic();
+        assert!(
+            matches!(plain.activation, Activation::SiluMul),
+            "and the base fixture it derives from is the llama-like one"
+        );
+        assert_eq!(plain.logit_softcap, 0.0);
+        assert_eq!(plain.per_layer_emb_dim, 0);
+        assert_eq!(plain.embed_scale, 0.0);
     }
 }

@@ -33,8 +33,8 @@ use model_compiler::lower::{CondRegion, Row};
 
 use crate::device::{
     GraphExec, PredicateWord, SLOT_HAS_CUSTOM_MASK, SLOT_HAS_LORA, SLOT_HAS_STAGE_HOOKS,
-    SLOT_HAS_WRITE_DESC, SLOT_TOKENS_GT, SLOT_TOKENS_LE, SLOT_WANTS_ATTN_SCORE, SLOT_WINDOW_ONE,
-    StreamRef,
+    SLOT_HAS_WRITE_DESC, SLOT_TOKENS_GT, SLOT_TOKENS_LE, SLOT_TOKENS_MULTIPLE,
+    SLOT_WANTS_ATTN_SCORE, SLOT_WINDOW_ONE, StreamRef,
 };
 use crate::error::{Error, Result};
 
@@ -58,6 +58,10 @@ pub fn predicate_of(slot: u32, param: u32, rows: &[Row]) -> Option<bool> {
         SLOT_HAS_WRITE_DESC => rows.iter().any(|r| r.write_desc),
         SLOT_TOKENS_LE => rows.len() as u32 <= param,
         SLOT_TOKENS_GT => rows.len() as u32 > param,
+        // `param == 0` is false rather than a division; see
+        // `GuardPred::TokensMultipleOf`, whose evaluation in
+        // `model_compiler::lower` this mirrors.
+        SLOT_TOKENS_MULTIPLE => param != 0 && (rows.len() as u32).is_multiple_of(param),
         SLOT_WANTS_ATTN_SCORE => rows.iter().any(|r| r.wants_scores),
         SLOT_HAS_CUSTOM_MASK => rows.iter().any(|r| r.custom_mask),
         SLOT_HAS_STAGE_HOOKS => rows.iter().any(|r| r.hooked),
@@ -171,12 +175,7 @@ impl BucketKey {
         _fire: model_compiler::trace::FireClass,
         model: u64,
     ) -> Self {
-        Self {
-            requests,
-            tokens,
-            model,
-            lora_shape: 0,
-        }
+        Self { requests, tokens, model, lora_shape: 0 }
     }
 
     /// The same key for a fire that staged adapters.
@@ -361,15 +360,7 @@ impl Recordings {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(
-            key,
-            Entry {
-                exec,
-                epoch,
-                digest: 0,
-                nodes: Vec::new(),
-            },
-        );
+        self.execs.insert(key, Entry { exec, epoch, digest: 0, nodes: Vec::new() });
         Ok(())
     }
 
@@ -395,15 +386,7 @@ impl Recordings {
         if let Some(why) = eligibility {
             return Err(why);
         }
-        self.execs.insert(
-            key,
-            Entry {
-                exec,
-                epoch,
-                digest,
-                nodes,
-            },
-        );
+        self.execs.insert(key, Entry { exec, epoch, digest, nodes });
         Ok(())
     }
 
@@ -647,10 +630,7 @@ mod tests {
     fn a_miss_is_not_an_error() {
         let mut c = Recordings::new();
         assert!(c.is_empty());
-        assert!(
-            c.get(BucketKey::new(1, 1, FireClass::Decode, 0), PlanEpoch::at(0))
-                .is_none()
-        );
+        assert!(c.get(BucketKey::new(1, 1, FireClass::Decode, 0), PlanEpoch::at(0)).is_none());
         assert_eq!(c.stats(), (0, 1, 0));
     }
 }
@@ -677,7 +657,7 @@ mod tests {
 /// makes that a deliberate line rather than an omission.
 ///
 /// Cheap: ~70 multiplies once per fire, against a graph launch.
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 #[must_use]
 pub fn capture_digest(
     ctx: &crate::bind::DispatchCtx,

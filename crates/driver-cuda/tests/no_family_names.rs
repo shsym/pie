@@ -44,9 +44,8 @@
 use std::collections::BTreeMap;
 
 /// The family names a driver must not be branching on.
-const FAMILIES: &[&str] = &[
-    "gemma", "qwen", "llama", "deepseek", "kimi", "nemotron", "glm", "gpt_oss",
-];
+const FAMILIES: &[&str] =
+    &["gemma", "qwen", "llama", "deepseek", "kimi", "nemotron", "glm", "gpt_oss"];
 
 /// Non-comment lines naming a family, per file, as of the move.
 ///
@@ -54,23 +53,112 @@ const FAMILIES: &[&str] = &[
 /// thing this test exists to catch.
 fn budget() -> BTreeMap<&'static str, usize> {
     [
-        // Cost per token differs by architecture, and that is arithmetic
-        // about bytes rather than a branch about behaviour.
-        ("layout/memory_planner.rs", 30),
-        // A kernel's name is its own.
-        // SYMBOL names, not a family branch: `ssm::nemotron_mamba_split_bf16`
-        // is what the kernel is CALLED, and the join reads its arity. The
-        // budget was fourteen while the arms were hand-written; the ten
-        // that left were the arms.
-        ("bind/mod.rs", 4),
-        // gemma-4's towers are a real family-specific ABI entry, and the
-        // next thing worth generalising.
-        ("serve/encode.rs", 7),
-        ("serve/transfer.rs", 4),
-        ("serve/load.rs", 3),
-        ("serve/state.rs", 2),
-        // Never listed until the counter learned to read `LoraGemma`.
-        ("fire/lora.rs", 3),
+        // ONE launcher symbol and ONE aliased import — still two, and the
+        // composition changed under it. Seven became five when the GQA
+        // instantiation set became this crate's own `serve::DECODE_GQA_GROUPS`,
+        // and five became
+        // two when the ~50 tower tensor paths moved to
+        // `model::shared::tower_names` — which owns the names AND the
+        // launcher order, because the stride (62 audio, 41 vision) is the
+        // ABI.
+        //
+        // Two is the FLOOR and not a deferral. What is left is the name of
+        // the function being called: an encode entry has to call some
+        // launcher, and this build's audio tower launcher is spelled that in
+        // `kernels-cuda`. Lowering it further means renaming the kernel,
+        // which is that crate's business and not a fact about this one —
+        // the same line `bind/mod.rs` used to sit on, except there the names
+        // were being MATCHED to make a routing decision, which is what made
+        // them removable.
+        //
+        // NEITHER half is a launcher symbol any more: both walks are Rust, in
+        // `tower/gemma4_vision.rs` and `tower/gemma4_audio.rs`, and this file
+        // reaches them through `use crate::tower::gemma4_* as *_tower`. Two
+        // imports instead of two call sites — the names are still stated,
+        // once each, where a reader goes to find out what `vis_tower` and
+        // `aud_tower` mean.
+        //
+        // The number did not move, and that is worth saying plainly rather
+        // than claiming a win: two C++ symbols became two Rust module names.
+        // What changed is not the count but what is behind it — the paragraph
+        // above said lowering it "means renaming the kernel, which is that
+        // crate's business", and that is now false in a useful way: there is
+        // no kernel to rename, only a module, and a module named for one
+        // model is the honest shape while `PieEncodeDesc` has a gemma-shaped
+        // ABI. Generalising that ABI is what lowers this to one.
+        ("serve/encode.rs", 2),
+        // THE TOWER WALKS, which are new and are the exception this test's
+        // own doc anticipated: "a file not in the table may have none at
+        // all… what stops a new dispatch site appearing somewhere quiet."
+        // A tower walk is not a dispatch site. It is the BODY of one named
+        // program — gemma-4's vision encoder is gemma-4's vision encoder,
+        // the way `fire/lora.rs` is allowed its three — and it moved into
+        // `src/` from `csrc/vision/gemma4_vision.cu`, where the counter
+        // could not see it and the name was no less present.
+        //
+        // Both numbers are floors reached on purpose, not what the port
+        // arrived at. `tower/gemma4_vision.rs` counted THIRTY-TWO when it
+        // was written: `Error::invalid("gemma4_vision", …)` at every
+        // refusal and `extent("gemma4_vision: rms rows", …)` at every
+        // conversion. Those are now `WHO` and a label, so the file names
+        // its tower once, on the `const`, and the messages are unchanged.
+        //
+        // IT IS ONE NOW, and the line that left was never a family name at
+        // all. The second was `pie_k_gemm_act_x_wt_bf16` — `gemm` + `act`
+        // reads as "gemma" once the underscores come out — and the dense
+        // GEMM's shim entry is gone: `gemm::act_x_wt_bf16` is on
+        // `execution::RUST_SERVED` and the tower calls
+        // `crate::fire::gemm::act_x_wt_bf16` directly. The `::` survives the
+        // flattening (`names_a_family` drops `_` and `-`, not `:`), so the
+        // false positive does not. **A false positive leaving is still a
+        // ratchet**: the budget must record it or the file gets a free
+        // mention nobody is making, which is exactly the silent-loosening
+        // failure this test's tail refuses.
+        //
+        // `tower/mod.rs` is TWO because it declares two submodules, and a
+        // `pub mod` line is the one place a module's own name cannot be
+        // aliased away. `tower/gemma4_audio.rs` is ONE: it was written at
+        // the floor the vision walk had to be edited down to, so it has the
+        // `WHO` const and nothing else — no cuBLAS call, because every one
+        // of its matmuls is `vision::k_matmul_bf16` rather than a `gemm`.
+        ("tower/mod.rs", 2),
+        ("tower/gemma4_vision.rs", 1),
+        ("tower/gemma4_audio.rs", 1),
+        // Never listed until the counter learned to read `LoraGemma`, and
+        // ZERO now — which is the outcome the `n == 0 && !contains_key`
+        // guard exists to keep on the books rather than let drop off it.
+        //
+        // All three were the same false positive `tower/gemma4_vision.rs`
+        // carried: `ffi::pie_k_gemm_act_x_wt_bf16`, three call sites in the
+        // ungrouped LoRA apply. They are `act_x_wt_bf16(..)` now, imported
+        // once as `use crate::fire::gemm::act_x_wt_bf16;` — and neither
+        // spelling flattens to a family name, because the `::` stays. The
+        // file never named a model and now it does not appear to either.
+        ("fire/lora.rs", 0),
+        // THREE, and not one of them is a family name — they are cuBLAS's
+        // own spelling. `cublasGemmAlgo_t` flattens to `cublasgemmalgot`,
+        // and `gemm` + `a` is "gemma" the same way `gemm_act` is. The three
+        // lines are the `use` that imports the type and the two `const`s
+        // that pin `CUBLAS_GEMM_DEFAULT_TENSOR_OP` and `CUBLAS_GEMM_DEFAULT`
+        // — the tensor-op pin every dense GEMM starts with, and the un-pinned
+        // retry the `NOT_SUPPORTED` arm needs.
+        //
+        // Listing it rather than working around it: the alternative is to
+        // alias the cuBLAS type to something that does not contain the
+        // letters, which would make the file lie about what it calls to
+        // satisfy a substring test. `names_a_family`'s own doc admits the
+        // trade — it flattens punctuation to catch `GemmaFacts`, and the
+        // price is `cublasGemmAlgo_t`. `bind/service.rs` and
+        // `bind/quant_gemm.rs` carry the same false positive from the same
+        // library.
+        ("fire/gemm.rs", 3),
+        // `bind/mod.rs` left this table entirely. Its four were the mamba
+        // join's kernel SYMBOLS — `ssm::nemotron_mamba_split_bf16` and its
+        // neighbours — matched by name to route values across statements.
+        // The wiring is stated on the declarations now
+        // (the publishers and the `Source::Aux`
+        // operands already there for the consumers), so the join is
+        // arithmetic over the table and names nothing.
     ]
     .into_iter()
     .collect()
@@ -118,11 +206,8 @@ fn count(path: &std::path::Path) -> usize {
 /// punctuation, then compare -- makes `GptOss`, `gpt_oss` and `gptoss`
 /// one name.
 fn names_a_family(line: &str) -> bool {
-    let flat: String = line
-        .chars()
-        .filter(|c| *c != '_' && *c != '-')
-        .flat_map(char::to_lowercase)
-        .collect();
+    let flat: String =
+        line.chars().filter(|c| *c != '_' && *c != '-').flat_map(char::to_lowercase).collect();
     FAMILIES.iter().any(|f| {
         let f: String = f.chars().filter(|c| *c != '_').collect();
         flat.contains(&f)
@@ -155,11 +240,7 @@ fn the_driver_does_not_learn_a_new_family() {
     let mut over = Vec::new();
     let mut unlisted = Vec::new();
     for f in &files {
-        let rel = f
-            .strip_prefix(&root)
-            .expect("under src")
-            .to_string_lossy()
-            .into_owned();
+        let rel = f.strip_prefix(&root).expect("under src").to_string_lossy().into_owned();
         let n = count(f);
         // NOT `if n == 0 { continue }`. A budgeted file that fell to
         // zero is the good outcome and it still has to be recorded, or
@@ -188,10 +269,9 @@ fn the_driver_does_not_learn_a_new_family() {
     // it happened.
     for (rel, &cap) in &budget {
         if cap > 0
-            && !files.iter().any(|f| {
-                f.strip_prefix(&root)
-                    .is_ok_and(|r| r.to_string_lossy() == *rel)
-            })
+            && !files
+                .iter()
+                .any(|f| f.strip_prefix(&root).is_ok_and(|r| r.to_string_lossy() == *rel))
         {
             over.push(format!("{rel}: budgeted {cap}, and the file is gone"));
         }
@@ -276,9 +356,7 @@ fn no_budget_line_outlives_what_it_was_for() {
         }
         let n = count(&path);
         if n < cap {
-            stale.push(format!(
-                "{rel}: budgeted {cap}, actually {n} -- lower the ceiling"
-            ));
+            stale.push(format!("{rel}: budgeted {cap}, actually {n} -- lower the ceiling"));
         }
     }
     assert!(

@@ -36,7 +36,6 @@
 //! wired — which is invisible from inside every module that exists. So
 //! it walks `catalog()`, and its lower bound on the row count is there
 //! because a walk of an empty iterator passes every assertion in it.
-#![cfg(feature = "forward")]
 
 use model::catalog::{self, Backend, Deployed, MetalBinding};
 use model::deployment::Refusal;
@@ -54,10 +53,20 @@ use model_compiler::trace::FireClass;
 const BINDING: MetalBinding = MetalBinding {
     quant_group: 64,
     quant_bits: 4,
+    router_quant_group: 0,
+    router_quant_bits: 0,
     moe_mxfp4: false,
     fuse_residual_gemv: true,
     paged_multi_batch: true,
     qmm_multi_batch: true,
+    // TRUE, and the only one of the four whose value is a copy of something
+    // this crate cannot see. `driver-metal::model::binding::build_kernels` is
+    // where the claim lives; the layering forbids a dependency on it, so this
+    // restates it and `every_role_the_mlx_map_answers_is_one_some_trace_asks
+    // _for` is what catches the restatement going stale — with `false` here,
+    // the Metal text states no bias, no trace asks for `q_bias`, and the map
+    // entry that answers it looks like dead weight.
+    add_bias: true,
 };
 
 /// The catalog is big enough that a walk of it means something.
@@ -186,8 +195,9 @@ fn every_row_either_traces_metal_or_refuses_it_in_words() {
 /// and `sdpa_paged.metal` instantiates 64, 128, 256 and 512, so the
 /// text would name a symbol no shader defines. CUDA pads to 128 and
 /// strips; Metal has no pad in the text. `gemma-4-26b-a4b` is a listed
-/// row that refuses because it has no text on ANY backend — the build
-/// has no routed-expert gemma-4 block, and it says the same to CUDA.
+/// row that refuses on ANY backend — the build cannot LOAD a routed
+/// gemma-4 block, and it says the same to CUDA. (The refusal used to
+/// say the text was missing. It is written; see `Gemma4::untraced`.)
 /// Neither is a generation losing Metal, and an equality cannot say so.
 ///
 /// So the two directions are stated separately, and the second is the
@@ -200,11 +210,11 @@ fn every_row_either_traces_metal_or_refuses_it_in_words() {
 /// the TEXT, and it is the claim that would have failed.
 #[test]
 fn the_rows_that_serve_metal_are_the_llama_like_ones() {
-    // The NINE generations whose forward reaches `llama_like_metal`: the
-    // seven that call the family projection directly, plus gemma-3 and
-    // gemma-4, whose own projections write their fields over the
-    // family's and call the same text.
-    let generations: [(&str, &[&'static dyn catalog::Variant]); 9] = [
+    // The TEN generations whose forward reaches `llama_like_metal`: the
+    // seven that call the family projection directly, plus gemma-3,
+    // gemma-4 and gpt-oss, whose own projections write their fields over
+    // the family's and call the same text.
+    let generations: [(&str, &[&'static dyn catalog::Variant]); 10] = [
         ("qwen_2", model::qwen_2::rows()),
         ("qwen_3", model::qwen_3::rows()),
         ("llama_3", model::llama_3::rows()),
@@ -214,6 +224,11 @@ fn the_rows_that_serve_metal_are_the_llama_like_ones() {
         ("olmo_3", model::olmo_3::rows()),
         ("gemma_3", model::gemma_3::rows()),
         ("gemma_4", model::gemma_4::rows()),
+        // The newest, and the one that took the most to get here: attention
+        // sinks, a clamped SwiGLU, mxfp4 expert banks, three kinds of bias
+        // the shared text did not state, and a YaRN ladder the driver's
+        // geometry declined to derive.
+        ("gpt_oss", model::gpt_oss::rows()),
     ];
     let expected: Vec<&'static str> = generations
         .iter()
@@ -285,9 +300,9 @@ fn the_rows_that_serve_metal_are_the_llama_like_ones() {
 ///   * The shared door refuses by [`NO_METAL_ROUTED_ENCODING`].
 ///     `qwen3-30b-a3b` and `qwen3-235b-a22b` are the rows that say so.
 ///   * gemma-4's door never gets the question. `gemma-4-26b-a4b` is
-///     refused EARLIER and by its own text — this build has no
-///     routed-expert text for a gemma-4 block — so its only routed row
-///     stops before any binding is consulted.
+///     refused EARLIER and by its own text — this build cannot load
+///     a routed gemma-4 block — so its only routed row stops before
+///     any binding is consulted.
 ///
 /// The first draft of this test asserted that gemma-4's door produced
 /// the routed refusal, on the assumption that a routed gemma-4 reached
@@ -310,6 +325,8 @@ fn no_door_serves_a_routed_bank_at_an_unstamped_point() {
     let unstamped = MetalBinding {
         quant_group: 128,
         quant_bits: 4,
+        router_quant_group: 0,
+        router_quant_bits: 0,
         moe_mxfp4: false,
         ..BINDING
     };
@@ -392,12 +409,16 @@ fn a_row_answers_the_same_way_at_every_encoding() {
         MetalBinding {
             quant_group: 32,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: true,
             ..BINDING
         },
         MetalBinding {
             quant_group: 128,
             quant_bits: 8,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: false,
             ..BINDING
         },
@@ -448,6 +469,8 @@ fn two_encodings_of_one_row_state_the_same_program() {
     let eight = MetalBinding {
         quant_group: 128,
         quant_bits: 8,
+        router_quant_group: 0,
+        router_quant_bits: 0,
         ..BINDING
     };
     let mut compared = 0usize;

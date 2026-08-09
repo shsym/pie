@@ -11,7 +11,6 @@
 //! each other.
 
 // Only the texts name a backend, and only they are gated.
-#[cfg(feature = "forward")]
 use crate::catalog::Deployed;
 use crate::deployment::{
     Advertised, AttnOutput, Deployment, Geometry, KvStyle, LayerAttention, NormPlacement,
@@ -85,14 +84,12 @@ pub fn manifest(f: &Gemma2Facts) -> Manifest {
             "layer.{}.self_attn.o_proj",
             [hidden, q],
         ))
-        // gemma-2 proper has no q/k norm. Stated as an ABSENCE rather
-        // than left unsaid, because a later gemma that does ship one
-        // must not match this row.
-        .either(
-            f.attn.qk_norm,
-            "layer.{}.self_attn.q_norm",
-            [u64::from(f.attn.head_dim)],
-        )
+        // gemma-2 has no q/k norm. Stated as an ABSENCE rather than left
+        // unsaid, because a later gemma that does ship one must not match
+        // this row. Unconditional: it was a fact per row until every row
+        // said the same thing, at which point the flag was a way for one
+        // of them to be wrong.
+        .with(TensorSpec::absent("layer.{}.self_attn.q_norm"))
         .with(TensorSpec::required("layer.{}.input_layernorm", [hidden]))
         .with(TensorSpec::required(
             "layer.{}.post_attention_layernorm",
@@ -131,7 +128,7 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
     // The checkpoint's own head dim, unpadded: 256 and 128 are both
     // instantiated, so the rounding is the identity here and the
     // question is asked rather than assumed.
-    let head_dim = crate::shared::llama_like::project::round_up_attn_head_dim(f.attn.head_dim);
+    let head_dim = crate::deployment::round_up_attn_head_dim(f.attn.head_dim);
     let attention = (0..f.layers)
         .map(|l| LayerAttention {
             // One shape for every layer, which is what this row was
@@ -206,7 +203,6 @@ pub fn deployment(f: &Gemma2Facts, rope_theta: f32, norm_eps: f32) -> Deployment
         // gemma-3 carries the per-head q/k norm and NO V norm: the two
         // are separate facts, and this row is where that is said.
         v_norm: false,
-        k_eq_v: false,
         // Dense: no router reads this.
         norm_topk_prob: true,
         // No router of this family states a scaling factor.
@@ -262,7 +258,6 @@ pub const NO_METAL: &str = "gemma-2 has no Metal text in this build: its forward
 /// load — no TP-sharded fused bank to ask about, no host scalars — and
 /// the three projections keep one shape so a reader can see which
 /// generation reads what.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &Gemma2Facts,
@@ -276,7 +271,13 @@ pub fn trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "contract")]
+    use crate::manifest::Observed;
     use crate::manifest::Presence;
+    #[cfg(feature = "contract")]
+    use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
+    #[cfg(feature = "contract")]
+    use model_loader::types::{DType, Encoding, FileId, TensorId};
 
     fn f() -> Gemma2Facts {
         Gemma2Facts::gemma_2_9b()
@@ -298,6 +299,66 @@ mod tests {
             assert_eq!(spec.presence, Presence::Required, "{name}");
             assert_eq!(spec.extents, vec![3584]);
         }
+    }
+
+    /// A checkpoint that DOES carry a q/k norm is not a gemma-2, and the
+    /// manifest says so rather than shrugging.
+    ///
+    /// This is the whole reason the absence is stated. A row that simply
+    /// left `q_norm` unmentioned would match a gemma-3 or gemma-4
+    /// checkpoint of the same width just as well as its own, and the
+    /// loader would then run gemma-2's trace -- which has no q/k norm in
+    /// it -- over weights that were trained with one. Every attention
+    /// head reads unnormalised queries; the model still produces text.
+    // `Observed::of` lives behind `contract`, which is not a default
+    // feature; without this the crate's own `cargo test` fails to compile
+    // rather than running one test fewer.
+    #[cfg(feature = "contract")]
+    #[test]
+    fn a_checkpoint_carrying_a_q_norm_is_refused_rather_than_matched() {
+        let m = manifest(&f());
+        let spec = m
+            .tensors
+            .iter()
+            .find(|t| t.name == "layer.{}.self_attn.q_norm")
+            .expect("the absence is stated, not left unsaid");
+        assert_eq!(spec.presence, Presence::Absent);
+
+        // And it is enforced: the row's own checkpoint, plus a q_norm.
+        let mut tensors: Vec<RawTensor> = m
+            .tensors
+            .iter()
+            .filter(|t| t.presence != Presence::Absent)
+            .enumerate()
+            .map(|(i, t)| RawTensor {
+                id: TensorId(u32::try_from(i).unwrap_or(0)),
+                name: t.name.clone(),
+                file_id: FileId(0),
+                file_offset: 0,
+                span_bytes: 2,
+                shape: t.extents.iter().map(|&e| e as i64).collect(),
+                encoding: Encoding::Raw(DType::BF16),
+            })
+            .collect();
+        let observed = |tensors: Vec<RawTensor>| {
+            Observed::of(&CheckpointMetadata {
+                files: Vec::new(),
+                tensors,
+            })
+        };
+        m.check(&observed(tensors.clone()))
+            .expect("the row does not match its own checkpoint");
+        tensors.push(RawTensor {
+            id: TensorId(9_999),
+            name: "layer.0.self_attn.q_norm".into(),
+            file_id: FileId(0),
+            file_offset: 0,
+            span_bytes: 2,
+            shape: vec![256],
+            encoding: Encoding::Raw(DType::BF16),
+        });
+        m.check(&observed(tensors))
+            .expect_err("a checkpoint with a q_norm is not this row");
     }
 
     /// Every extent is the row's arithmetic: 16 heads of 256 over a
@@ -349,18 +410,48 @@ mod tests {
         assert!(windows.contains(&-1) && windows.contains(&4096));
     }
 
-    /// The final cap reaches the deployment, and a checkpoint that
-    /// states `null` gets NO cap rather than a cap of zero applied or a
+    /// EITHER cap reaches the deployment, and a checkpoint that states
+    /// `null` for one gets NO cap rather than a cap of zero applied or a
     /// panic — which is what `synthetic--gemma-null-softcap.json` is in
-    /// the corpus to say.
+    /// the corpus to say, and it says it about both.
+    ///
+    /// Both halves, because the two caps are two fields in two places
+    /// and only the readout's had ever been asked. The attention one is
+    /// the half that fails quietly: `logit_softcap` reaching a readout
+    /// that should have none changes the sampled distribution and shows
+    /// up in output, while `attn_logit_softcap` rides as a DISPATCH
+    /// parameter into `AttnCtx::logits_soft_cap` — a `50.0` where the
+    /// checkpoint asked for none runs `50 * tanh(score / 50)` over every
+    /// score of every layer and the fire still completes.
+    ///
+    /// The `null` is not hypothetical for the attention cap either: it
+    /// is the field that was read as the literal `0.0` for the whole
+    /// life of the old derivation, so "no cap" is the value this path
+    /// has actually shipped.
     #[test]
-    fn a_null_final_softcap_is_no_cap_and_not_a_panic() {
+    fn a_null_softcap_is_no_cap_and_not_a_panic() {
         let capped = deployment(&f(), 10_000.0, 1e-6);
         assert_eq!(capped.logit_softcap, 30.0);
+        assert_eq!(capped.attn_logit_softcap, 50.0);
 
         let mut uncapped = f();
         uncapped.final_logit_softcap = false;
-        assert_eq!(deployment(&uncapped, 10_000.0, 1e-6).logit_softcap, 0.0);
+        let d = deployment(&uncapped, 10_000.0, 1e-6);
+        assert_eq!(d.logit_softcap, 0.0);
+        assert_eq!(
+            d.attn_logit_softcap, 50.0,
+            "the two caps are two fields; dropping one must not drop the other"
+        );
+
+        let mut unscored = f();
+        unscored.attn.attn_logit_softcap = false;
+        let d = deployment(&unscored, 10_000.0, 1e-6);
+        assert_eq!(
+            d.attn_logit_softcap, 0.0,
+            "`null` is no cap, and the attention kernel reads this field \
+             directly -- a 50 here caps every score of every layer"
+        );
+        assert_eq!(d.logit_softcap, 30.0, "and the readout still caps");
     }
 
     /// The launch geometry is the row's own numbers, so a fire and a

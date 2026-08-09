@@ -436,6 +436,9 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .map(|d| {
             driver::register_driver_backend(
                 driver::DriverSpec {
+                    // Overwritten by `register_driver_backend` from the
+                    // backend itself; see `DriverSpec::device_domain`.
+                    device_domain: ::driver_api::PIE_MEMORY_DOMAIN_HOST_PINNED,
                     num_kv_pages: d.total_pages,
                     limits: d.limits,
                     device_geometry_port_mask: d.device_geometry_port_mask,
@@ -624,7 +627,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
                             |kv| kv.committed_high_water_pages().max(1),
                         );
                         let capacity = capacities[ordinal] as u32;
-                        let unmap_ranges = vec![::driver_api::PiePoolRange {
+                        let unmap_ranges = vec![::driver_api::PoolRange {
                             page_index: u64::from(target),
                             page_count: u64::from(capacity - target),
                         }];

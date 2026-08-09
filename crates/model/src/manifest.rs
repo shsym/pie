@@ -83,6 +83,25 @@ pub struct TensorSpec {
     /// Logical rather than stored: see the module doc on quantization.
     pub extents: Vec<u64>,
     pub presence: Presence,
+    /// Other LAYOUTS the same quantity is published in.
+    ///
+    /// Not a spelling. A spelling is a rule in [`Observed::logical`],
+    /// written once and true of every row — which is why that function
+    /// carries three rules and no per-family table. This is for a
+    /// quantity two publications DIVIDE differently, where no
+    /// context-free renaming can make one name of two: gpt-oss's
+    /// gate/up bias is one `[experts, 2 * intermediate]` tensor from
+    /// OpenAI and two `[experts, intermediate]` tensors from MLX.
+    ///
+    /// Each alternative is a COMPLETE substitute — every name in it
+    /// must be published at extents that agree, or that alternative
+    /// does not apply. Half a layout is not a layout, and accepting one
+    /// would identify a checkpoint by a tensor it happens to share.
+    ///
+    /// Only consulted when the primary name is ABSENT, so a manifest
+    /// still states one layout and the rest are what a differently
+    /// divided publication may bring instead.
+    pub instead: Vec<Vec<(String, Vec<u64>)>>,
 }
 
 impl TensorSpec {
@@ -93,6 +112,7 @@ impl TensorSpec {
             name: name.into(),
             extents: extents.into(),
             presence: Presence::Required,
+            instead: Vec::new(),
         }
     }
 
@@ -106,6 +126,7 @@ impl TensorSpec {
             name: name.into(),
             extents: Vec::new(),
             presence: Presence::Required,
+            instead: Vec::new(),
         }
     }
 
@@ -116,6 +137,7 @@ impl TensorSpec {
             name: name.into(),
             extents: Vec::new(),
             presence: Presence::Absent,
+            instead: Vec::new(),
         }
     }
 
@@ -126,7 +148,28 @@ impl TensorSpec {
             name: name.into(),
             extents: extents.into(),
             presence: Presence::Optional,
+            instead: Vec::new(),
         }
+    }
+
+    /// Accept this quantity divided the way another publication divides
+    /// it.
+    ///
+    /// See [`Self::instead`]. Chainable, because a quantity may be
+    /// published more than two ways.
+    #[must_use]
+    pub fn or_published_as<N, S>(mut self, layout: impl IntoIterator<Item = (N, S)>) -> Self
+    where
+        N: Into<String>,
+        S: Into<Vec<u64>>,
+    {
+        self.instead.push(
+            layout
+                .into_iter()
+                .map(|(n, e)| (n.into(), e.into()))
+                .collect(),
+        );
+        self
     }
 }
 
@@ -213,6 +256,7 @@ impl Manifest {
         let mut faults = Vec::new();
         for (name, spec) in self.rows() {
             match (spec.presence, observed.extents(&name)) {
+                (Presence::Required, None) if applies(&spec.instead, observed) => {}
                 (Presence::Required, None) => faults.push(Fault::Missing(name)),
                 (Presence::Absent, Some(_)) => faults.push(Fault::Unexpected(name)),
                 (Presence::Required | Presence::Optional, Some(seen))
@@ -238,6 +282,30 @@ impl Manifest {
             Err(Mismatch { faults })
         }
     }
+}
+
+/// Is any of these layouts the one this checkpoint published?
+///
+/// A layout applies when EVERY name in it is published at extents that
+/// agree — see [`TensorSpec::instead`] for why half of one is not half
+/// an answer. The names go through [`Observed::logical`] like every
+/// other spec name, so an alternative is written in the same vocabulary
+/// as the row it stands in for.
+///
+/// The `.scales` companion is asked per name, exactly as the primary
+/// path asks it: an alternative layout is published by the same
+/// converter that packed everything else, so its halves are packed too.
+fn applies(layouts: &[Vec<(String, Vec<u64>)>], observed: &Observed) -> bool {
+    layouts.iter().any(|layout| {
+        !layout.is_empty()
+            && layout.iter().all(|(name, want)| {
+                let name = Observed::logical(name);
+                observed.extents(&name).is_some_and(|seen| {
+                    want.is_empty()
+                        || extents_agree(want, seen, observed.has(&format!("{name}.scales")))
+                })
+            })
+    })
 }
 
 /// Do a spec's extents describe the observed ones?
@@ -454,7 +522,35 @@ impl Observed {
             rest = &tail[digits..];
         }
         out.push_str(rest);
-        out
+        Self::global_spelling(out)
+    }
+
+    /// The two model-level tensors pie's own lowering renames.
+    ///
+    /// Layer-internal names survive the lowering unchanged, so the index
+    /// rewrite above is enough for all but two: the embedding table becomes
+    /// `shared_embedding` and the final norm becomes `final_norm`. Without
+    /// these an artifact `pie model build` wrote matches no row at all --
+    /// `qwen3-0.6b: missing embed_tokens; missing norm` -- which is the whole
+    /// catalog refusing the output of the tool that reads the catalog.
+    ///
+    /// `shared_embedding` is where a TIED model's `lm_head` went, and that
+    /// needs no arm: the row that ties is the row whose manifest says the
+    /// checkpoint publishes no `lm_head`, so an artifact that publishes none
+    /// matches it for the same reason the checkpoint did.
+    fn global_spelling(name: String) -> String {
+        for (lowered, checkpoint) in [("shared_embedding", "embed_tokens"), ("final_norm", "norm")]
+        {
+            if name == lowered {
+                return checkpoint.to_string();
+            }
+            if let Some(rest) = name.strip_prefix(lowered)
+                && rest.starts_with('.')
+            {
+                return format!("{checkpoint}{rest}");
+            }
+        }
+        name
     }
 }
 
@@ -868,6 +964,134 @@ mod tests {
 
     fn seen(pairs: &[(&str, &[u64])]) -> Observed {
         Observed::from_pairs(pairs.iter().map(|(n, s)| (*n, *s)))
+    }
+
+    /// A `pie model build` artifact reads as the checkpoint it was built
+    /// from.
+    ///
+    /// The lowering renames exactly two model-level tensors, and until this
+    /// was true `catalog::identify` answered `missing embed_tokens; missing
+    /// norm` for every MLX-named artifact the tool wrote -- so nothing built
+    /// for the Metal or Vulkan bind paths could be served at all.
+    #[test]
+    fn the_names_pie_lowers_to_read_as_the_names_it_lowered_from() {
+        assert_eq!(Observed::logical("shared_embedding.weight"), "embed_tokens");
+        assert_eq!(
+            Observed::logical("shared_embedding.scales"),
+            "embed_tokens.scales"
+        );
+        assert_eq!(Observed::logical("final_norm.weight"), "norm");
+        // The checkpoint spellings still answer themselves, which is the
+        // half that must not move: `model.` stripped, `.weight` dropped.
+        assert_eq!(
+            Observed::logical("model.embed_tokens.weight"),
+            "embed_tokens"
+        );
+        assert_eq!(Observed::logical("model.norm.weight"), "norm");
+        // A prefix is not a name. `final_normalizer` is nobody's tensor, but
+        // a rewrite that matched on the prefix alone would rename it.
+        assert_eq!(
+            Observed::logical("final_normalizer.weight"),
+            "final_normalizer"
+        );
+        assert_eq!(
+            Observed::logical("shared_embeddings.weight"),
+            "shared_embeddings"
+        );
+        // Layer-internal names survive the lowering unchanged, so the index
+        // rule is all they need -- both spellings, one row.
+        assert_eq!(
+            Observed::logical("layers.7.self_attn.q_proj.weight"),
+            "layer.{}.self_attn.q_proj"
+        );
+    }
+
+    /// A packed weight matches the row that states its LOGICAL width,
+    /// and only by a whole number of values per word.
+    ///
+    /// This is the one place a manifest gives ground. `Observed` divides
+    /// the encoding out where it can, but a converter that publishes
+    /// `[out, in/2]` raw `u8` beside a `.scales` companion has left no
+    /// encoding to divide -- the bit width is not knowable from the
+    /// shape, because 4 bits at group 64 and 8 bits at group 32 pack to
+    /// shapes no extent distinguishes.
+    ///
+    /// So the last axis is allowed to be the stated one divided by a
+    /// power of two, and NOTHING else is: every leading axis still has to
+    /// be exact, which is what keeps a vocabulary, a hidden width and a
+    /// head count refusing a row that does not own them.
+    #[test]
+    fn a_packed_last_axis_divides_by_a_power_of_two_and_by_nothing_else() {
+        let want = [151_936_u64, 2048];
+        for (case, got, agrees) in [
+            ("two values a word", vec![151_936, 1024], true),
+            ("four values a word", vec![151_936, 512], true),
+            ("thirty-two values a word", vec![151_936, 64], true),
+            ("a ragged word", vec![151_936, 683], false),
+            ("a ragged quotient", vec![151_936, 700], false),
+            ("wider than the row states", vec![151_936, 4096], false),
+            ("a zero axis", vec![151_936, 0], false),
+            (
+                "the vocabulary still has to be exact",
+                vec![151_935, 1024],
+                false,
+            ),
+            ("and so does its rank", vec![151_936, 4, 512], false),
+        ] {
+            assert_eq!(
+                extents_agree(&want, &got, true),
+                agrees,
+                "packed: {case} ({got:?})"
+            );
+            // None of it is allowed WITHOUT the companion that says the
+            // tensor is packed at all.
+            assert!(
+                !extents_agree(&want, &got, false),
+                "unpacked: {case} ({got:?}) was taken as this row"
+            );
+        }
+        // A quotient that is whole but not a power of two is no word
+        // either -- three values to a word is not a packing anything
+        // writes, and accepting it would let a row match a tensor whose
+        // width it does not actually state.
+        let odd = [151_936_u64, 1536];
+        assert!(extents_agree(&odd, &[151_936, 768], true), "two a word");
+        assert!(
+            !extents_agree(&odd, &[151_936, 512], true),
+            "three values a word was taken as a packing"
+        );
+
+        // And an exact match needs no give in either direction.
+        for packed in [false, true] {
+            assert!(extents_agree(&want, &[151_936, 2048], packed));
+        }
+    }
+
+    /// The companion is what says "packed", and it is asked for by name.
+    ///
+    /// A checkpoint that publishes a half-width weight with NO `.scales`
+    /// beside it is not a packed tensor -- it is a tensor of the wrong
+    /// width, and the row it half-resembles must refuse it.
+    #[test]
+    fn a_half_width_weight_is_this_row_only_when_its_scales_are_there() {
+        let m = Manifest::new(1).with(TensorSpec::required(
+            "layer.{}.self_attn.q_proj",
+            [4096_u64, 4096],
+        ));
+        let bare = seen(&[("layer.0.self_attn.q_proj", &[4096, 2048])]);
+        let paired = seen(&[
+            ("layer.0.self_attn.q_proj", &[4096, 2048]),
+            ("layer.0.self_attn.q_proj.scales", &[4096, 64]),
+        ]);
+        m.check(&paired).expect("a packed weight is this row");
+        let why = m.check(&bare).expect_err("a narrow weight is not");
+        assert!(
+            why.faults.iter().any(|f| matches!(
+                f,
+                Fault::Extent { want, got, .. } if want == &[4096, 4096] && got == &[4096, 2048]
+            )),
+            "{why:?}"
+        );
     }
 
     /// The vocabulary rule, which is what lets one spec row read a

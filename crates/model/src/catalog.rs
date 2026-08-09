@@ -176,11 +176,34 @@ impl LoadShape {
 pub struct MetalBinding {
     /// The affine quantisation group width the staged tensors carry.
     ///
-    /// Asked of the load rather than inferred from a tensor's shape,
-    /// because g64/b8 and g128/b4 pack to identical extents.
+    /// Asked of the load, which reads it off the TENSORS. This said it was
+    /// asked of the load "rather than inferred from a tensor's shape, because
+    /// g64/b8 and g128/b4 pack to identical extents", and they do not: for
+    /// 5760 columns those two are `scales` of 90 against 45 and packed
+    /// `weight` of 1440 `u32` against 720. Both extents distinguish them,
+    /// twice over, and `LoadPlan::affine_points` performs exactly those
+    /// divisions. What the load must not do is believe `config.json`, whose
+    /// block is a DEFAULT its per-tensor overrides may supersede for every
+    /// tensor in the file — `gpt-oss-20b-MXFP4-Q4` declares g32/b4 and holds
+    /// not one tensor at it.
     pub quant_group: u32,
     /// The affine quantisation bit width the staged tensors carry.
     pub quant_bits: u32,
+    /// The ROUTER GATE's own affine point, `(0, 0)` when it has none.
+    ///
+    /// `mlx_lm` publishes gpt-oss's gate at 8 bits inside a 4-bit stack,
+    /// deliberately: it is a tiny `[hidden, n_experts]` matrix whose error
+    /// the whole mixture inherits. Read at the stack's width the model stays
+    /// fluent and routes every token to almost the right experts — cosine
+    /// 0.84 against the reference logits, and not one NaN to notice it by.
+    ///
+    /// `(0, 0)` means "the same as [`Self::quant_group`]", which is every
+    /// other checkpoint and every non-MoE one. Asked of the load for the
+    /// reason [`Self::moe_mxfp4`] is: it is the CHECKPOINT's and not the
+    /// row's.
+    pub router_quant_group: u32,
+    /// The router gate's affine bit width; see [`Self::router_quant_group`].
+    pub router_quant_bits: u32,
     /// Whether the expert bank reached the device still in MXFP4.
     ///
     /// A fact about what the loader did — it transcodes to affine when
@@ -194,6 +217,16 @@ pub struct MetalBinding {
     pub paged_multi_batch: bool,
     /// Whether this build's quantised matmul takes more than one row.
     pub qmm_multi_batch: bool,
+    /// Whether this build can launch `norm::add_bias`, and so whether the
+    /// text may state the Qwen-2 family's q/k/v projection biases.
+    ///
+    /// See [`LlamaLikeMetalFacts::add_bias`], which this becomes: whether the
+    /// biases exist is the ROW's `qkv_bias`, and this is the other half of the
+    /// question -- the half that is about this build.
+    ///
+    /// [`LlamaLikeMetalFacts::add_bias`]:
+    ///     crate::shared::llama_like::forward::facts::LlamaLikeMetalFacts::add_bias
+    pub add_bias: bool,
 }
 
 /// Which driver is asking for the text.
@@ -348,7 +381,6 @@ pub trait Variant: Sync + Send + 'static {
     ///
     /// [`Refusal::Unsupported`](crate::deployment::Refusal) when this
     /// build has no text for the row, or none for the backend asking.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -391,6 +423,37 @@ pub fn catalog() -> &'static [&'static dyn Variant] {
 /// (`tests/sibling_isolation.rs`) applied to the catalog — and this is
 /// the one place they are gathered.
 type Rows = fn() -> &'static [&'static dyn Variant];
+
+/// A generation's `rows()`, which is the same four lines everywhere.
+///
+/// Nineteen generations wrote this function and all nineteen bodies
+/// hashed to one value — the flattening of a `const VARIANTS: &[T]` into
+/// the `&[&dyn Variant]` this table gathers. There is nothing in it a
+/// generation could get right or wrong, which is the test for whether a
+/// repetition is knowledge: `manifest()` differs everywhere and belongs
+/// to each family, and this differed nowhere.
+///
+/// It stays a per-generation `rows()` rather than becoming a blanket
+/// impl, because [`GENERATIONS`] gathers FUNCTIONS and a generation
+/// owning its own door is the isolation rule applied to the catalog.
+/// What is removed is the copy, not the ownership.
+#[macro_export]
+macro_rules! rows_of {
+    ($row:ty) => {
+        /// This generation's contribution to [`crate::catalog::catalog`].
+        #[must_use]
+        pub fn rows() -> &'static [&'static dyn $crate::catalog::Variant] {
+            static ROWS: std::sync::OnceLock<Vec<&'static dyn $crate::catalog::Variant>> =
+                std::sync::OnceLock::new();
+            ROWS.get_or_init(|| {
+                VARIANTS
+                    .iter()
+                    .map(|v| v as &'static dyn $crate::catalog::Variant)
+                    .collect()
+            })
+        }
+    };
+}
 
 const GENERATIONS: &[Rows] = &[
     crate::llama_3::rows,
@@ -452,7 +515,6 @@ pub fn ids() -> Vec<&'static str> {
 /// Rows whose [`Variant::deployment`] refuses are SKIPPED rather than
 /// panicking: a row this build cannot serve advertises nothing, which is
 /// the truthful answer for a label list.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn arches() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = catalog()
@@ -771,7 +833,8 @@ mod tests {
             if gathered.contains(&format!("crate::{m}::rows")) {
                 assert!(
                     !stated.contains_key(m),
-                    "{m} is in GENERATIONS and also listed as having no rows —                      delete the line, it left by gaining rows"
+                    "{m} is in GENERATIONS and also listed as having no rows — \
+                     delete the line, it left by gaining rows"
                 );
             } else {
                 rowless.push(*m);
@@ -1014,7 +1077,6 @@ mod tests {
     /// `gemma4forconditionalgeneration` — the second is the exact
     /// string the deleted `arch_stem` produced when its strip list was
     /// one entry short.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_family_label_is_coarser_than_an_id() {
         let arches = arches();
@@ -1046,7 +1108,6 @@ mod tests {
     /// `max_model_len` rides along because it fails the same way and
     /// worse: zero is not dropped anywhere, it is ADVERTISED, and a
     /// guest program that asks how much context it has is told none.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_servable_row_advertises_a_label_and_a_ceiling() {
         let mut silent = Vec::new();
@@ -1076,7 +1137,6 @@ mod tests {
     /// happily and die at its first fire, which is the failure
     /// `unbuilt_kv_store()` existed to paper over and this design
     /// removes rather than papers.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_row_that_cannot_deploy_cannot_trace_either() {
         use model_compiler::trace::FireClass;
@@ -1106,7 +1166,7 @@ mod tests {
 /// distinct names and indistinguishable manifests is precisely the
 /// defect `Unmatched::Ambiguous` exists to report.
 #[cfg(all(test, feature = "contract"))]
-mod identify_tests {
+pub(crate) mod identify_tests {
     use super::*;
     use crate::manifest::Presence;
     use model_loader::checkpoint::{CheckpointMetadata, RawTensor};
@@ -1122,7 +1182,7 @@ mod identify_tests {
     /// `Absent` rows are dropped and `Optional` ones kept: an optional
     /// name matches either way, and including it exercises the arm that
     /// must not turn a match into a miss.
-    fn checkpoint_of(row: &dyn Variant) -> CheckpointMetadata {
+    pub(crate) fn checkpoint_of(row: &dyn Variant) -> CheckpointMetadata {
         let manifest = row.manifest();
         let tensors = manifest
             .tensors

@@ -23,6 +23,71 @@
 //! As with [`super::page_mask::FirePageMask`], the arena is not owned by
 //! the capture, so `Drop` cannot release the slot; `release(&mut arena)`
 //! is the destructor and `Drop` only `debug_assert!`s it ran.
+//!
+//! # The capture pipeline, now that all four launches are routine calls
+//!
+//! [`ScoreOps`] is the seam every kernel this module fires goes through, and
+//! what is on the far side of it is now a `fn` call:
+//! `kernels_cuda_new::x::attn::attention_score_post::*` for three of them and
+//! `x::attn::attention_flashinfer::attn_score_fold_heads` for the fourth,
+//! each taking a [`Ctx`](kernels_cuda_new::jit::Ctx) on the fire's own stream.
+//! The chain that used to be here — `unit_of` -> `cache::module` ->
+//! `Args::bind` -> a hand-built `Launch` — is gone with the units: a routine
+//! names its own instantiation, and its argument list is a `fn` signature the
+//! Rust compiler checked rather than a `[ArgValue]` bound against a row. The
+//! capture pipeline reads:
+//!
+//! ```text
+//! decode   FA2 kernel   C++    dispatch_attention_flashinfer_decode_capture_bf16
+//!          normalize    RUST   ScoreOps::normalize_decode
+//!          fold_heads   RUST   ScoreOps::fold_heads
+//!
+//! prefill  FA2 kernel   C++    dispatch_attention_flashinfer_prefill_capture_bf16
+//!          normalize    RUST   ScoreOps::normalize_prefill
+//!          fold         RUST   ScoreOps::fold_prefill
+//! ```
+//!
+//! Only the FA2 kernel itself is still C++, and it is C++ for a reason that
+//! is written down rather than assumed: it is a template cross-product with
+//! hundreds of instantiations and no table rows (`new-horizon.md` §53).
+//! Everything downstream of it in the capture is Rust firing NVRTC'd device
+//! text out of `kernels-cuda-new/csrc/src/attn/attention_score_post.cuh`,
+//! whose root and three instantiations are
+//! [`kernels_cuda_new::x::attn::attention_score_post`].
+//!
+//! **Stream order is why `publish` is the home.** The launches were the tail
+//! of the capture dispatch, after `CUDA_CHECK(status)` and before it
+//! returned. `publish` runs on the fire's stream and nothing between the
+//! dispatch and it touches the score buffer, so issuing them here puts the
+//! same four kernels on the same stream in the same order. What changed is
+//! which language enqueues them.
+//!
+//! # What this cost, and what is owed
+//!
+//! The four launches carry four geometries the C++ stated literally, and the
+//! constants that state them went with the launches: `NORMALIZE_BLOCK` and
+//! `PREFILL_FOLD_GRID_Y` are `x::attn::attention_score_post`'s and
+//! `FOLD_GRID_Y`/`FOLD_BLOCK` are `x::attn::attention_flashinfer`'s. That is
+//! the point of the descent rather than a side effect: a block width whose
+//! `__shared__` reduction it has to match, and a grid-stride fanout that is
+//! not an extent, are facts about a kernel, and they now sit in the same file
+//! as the kernel's root. None of the four is a `kernels::LaunchRule` and none
+//! should become one.
+//!
+//! `tests/attn_score_parity.rs` hashes a recorder transcript of these ops
+//! against a golden produced from `model/attn_score.cu`. **That file was
+//! deleted in `4569b9e4b`**, so `tests/oracle/attn_score/run.sh` cannot run
+//! and the golden cannot be regenerated. The transcript therefore keeps its
+//! old shape: the parity `Recorder` implements the three new methods as
+//! silent no-ops, documented at the point of omission, because the C++
+//! program that golden describes never contained these launches — they were
+//! in a different translation unit the oracle never compiled.
+//!
+//! `tests/attn_score_post_geometry.rs` used to pin the operand ORDER against
+//! the four rows, and it cannot any more: it reads `unit::unit_of`, and the
+//! rows it read are gone. What replaces it is the `fn` signatures themselves
+//! — a swap inside the pointer run or inside the `int` run was the error that
+//! test existed for, and the two runs are now distinct Rust types.
 
 // stderr is the C++'s own refusal channel for these messages; routing them
 // anywhere else would change what the operator sees.
@@ -112,11 +177,66 @@ pub struct ScoreHookView<'a> {
 
 /// The stream ops a capture issues — recorders in the parity test, CUDA in
 /// the real driver.
+///
+/// Four of the six are kernel launches out of `attn/attention_score_post.cuh`
+/// and `attn/attention_flashinfer.cuh`. They are methods rather than free
+/// functions because the parity test substitutes a recorder for all of them at
+/// once; see the module header for which C++ launcher each replaced.
 pub trait ScoreOps {
     /// `cudaMemsetAsync` over the folded rows.
     fn memset_async(&mut self, dst: *mut u8, value: u8, bytes: usize);
     /// The CSR upload (`cudaMemcpyAsync`, host to device).
     fn upload_csr(&mut self, dst: *mut i32, src: &[i32]);
+    /// `kernels::attn::attn_score_normalize` — the DECODE capture's
+    /// divide-by-total, which ran as the tail of
+    /// `dispatch_attention_flashinfer_decode_capture_bf16`.
+    ///
+    /// In place: `scores` is read and written by the same block.
+    #[allow(clippy::too_many_arguments)]
+    fn normalize_decode(
+        &mut self,
+        scores: *mut f32,
+        score_indptr_d: *const i32,
+        kv_page_indptr_d: *const u32,
+        kv_last_page_lens_d: *const u32,
+        page_size: i32,
+        num_requests: i32,
+        num_q_heads: i32,
+    );
+    /// `kernels::attn::attn_prefill_score_normalize` — the PREFILL
+    /// capture's, which additionally strides the observation window.
+    #[allow(clippy::too_many_arguments)]
+    fn normalize_prefill(
+        &mut self,
+        scores: *mut f32,
+        score_indptr_d: *const i32,
+        qo_indptr_d: *const u32,
+        kv_page_indptr_d: *const u32,
+        kv_last_page_lens_d: *const u32,
+        page_size: i32,
+        num_requests: i32,
+        num_q_heads: i32,
+        window: i32,
+    );
+    /// `kernels::attn::attn_prefill_score_fold` — the prefill fold, which
+    /// collapses heads AND window rows into the published row.
+    ///
+    /// Not in place, unlike its two siblings: it reads `scores` and writes
+    /// `folded`, the same split [`Self::fold_heads`] makes.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_prefill(
+        &mut self,
+        scores: *const f32,
+        folded: *mut f32,
+        score_indptr_d: *const i32,
+        qo_indptr_d: *const u32,
+        kv_page_indptr_d: *const u32,
+        kv_last_page_lens_d: *const u32,
+        page_size: i32,
+        num_requests: i32,
+        num_q_heads: i32,
+        window: i32,
+    );
     /// `kernels::attn::attn_score_fold_heads`.
     #[allow(clippy::too_many_arguments)]
     fn fold_heads(
@@ -132,18 +252,30 @@ pub trait ScoreOps {
     );
 }
 
-/// The live [`ScoreOps`] (retirement plan phase B), behind `bridge` for the
-/// fold launch. The memset and the CSR upload are stream-ordered like the
-/// C++'s (`cudaMemsetAsync` / `cudaMemcpyAsync` on the fire's stream); the
-/// CSR source is pageable host memory in both drivers, which the runtime
-/// staging-copies — same behaviour, stated rather than assumed.
-#[cfg(feature = "bridge")]
+/// The live [`ScoreOps`] (retirement plan phase B). The memset and the CSR
+/// upload are stream-ordered like the C++'s (`cudaMemsetAsync` /
+/// `cudaMemcpyAsync` on the fire's stream); the CSR source is pageable host
+/// memory in both drivers, which the runtime staging-copies — same behaviour,
+/// stated rather than assumed.
+///
+/// # Why this is no longer `#[cfg(feature = "bridge")]`
+///
+/// It was, and only for `fold_heads`: that method called
+/// `bind::abi::ffi::pie_k_attn_attn_score_fold_heads`, a generated shim entry
+/// into `attention_flashinfer.cu`'s launcher, which exists only when the
+/// kernels archive is linked. **It no longer calls it.** The fold's device
+/// text is `kernels-cuda-new`'s `attn/attention_flashinfer` unit, NVRTC
+/// compiles it, and this method builds its own [`Launch`]. Nothing on this
+/// path needs the archive, so nothing on this path is gated on it — which is
+/// the whole claim of the migration made checkable: `_cuda` without `bridge`
+/// now reaches a real fold.
+#[cfg(feature = "_cuda")]
 #[derive(Debug, Clone, Copy)]
 pub struct LiveScoreOps {
     stream: *mut std::ffi::c_void,
 }
 
-#[cfg(feature = "bridge")]
+#[cfg(feature = "_cuda")]
 impl LiveScoreOps {
     /// Ops ordered on the fire's stream.
     #[must_use]
@@ -152,7 +284,40 @@ impl LiveScoreOps {
     }
 }
 
-#[cfg(feature = "bridge")]
+/// Refuse loudly, once, for any of the four launches.
+///
+/// **Every failure here is a panic and never a skip.** These kernels write
+/// the score rows a policy will read; a launch that silently did not happen
+/// leaves the memset pattern behind, and a payload published over it is a
+/// plausible row of zeros rather than a fault. That is the module header's
+/// `LostGeometry` argument applied to the launch itself.
+///
+/// The four used to go through a `fire_score_row` that resolved a symbol to a
+/// JIT unit, took the unit's row signature, compiled the unit and bound the
+/// values against that row. None of those steps exists now: each launch is a
+/// `fn` call whose argument list the Rust compiler checked, so what is left of
+/// that helper is this — the decision that a refusal is fatal.
+#[cfg(feature = "_cuda")]
+fn or_panic(what: &str, fired: Result<(), kernels::Refusal>) {
+    if let Err(why) = fired {
+        panic!("{what}: {why}");
+    }
+}
+
+/// A context on the fire's stream, for one launch.
+///
+/// # Safety
+///
+/// The caller of `publish` holds the fire's stream live across the launch —
+/// the same assertion the `pie_k_*` call made when it handed `self.stream` to
+/// a C++ launcher that put it in a `<<<>>>`.
+#[cfg(feature = "_cuda")]
+fn ctx_on(stream: *mut std::ffi::c_void) -> kernels_cuda_new::jit::Ctx {
+    // SAFETY: as stated above.
+    unsafe { kernels_cuda_new::jit::Ctx::on(stream) }
+}
+
+#[cfg(feature = "_cuda")]
 impl ScoreOps for LiveScoreOps {
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
     fn memset_async(&mut self, dst: *mut u8, value: u8, bytes: usize) {
@@ -177,6 +342,237 @@ impl ScoreOps for LiveScoreOps {
         assert!(code == cudaError::cudaSuccess, "cudaMemcpyAsync: {code:?}");
     }
 
+    /// The decode normalize, at the geometry this driver states.
+    ///
+    /// # What this replaced, line for line
+    ///
+    /// The tail of `dispatch_attention_flashinfer_decode_capture_bf16` in
+    /// `driver-cuda/csrc/attn/attention_flashinfer.cu`, immediately after
+    /// its `CUDA_CHECK(status)`:
+    ///
+    /// ```text
+    /// const dim3 grid(static_cast<unsigned>(cache.num_requests),
+    ///                 static_cast<unsigned>(cache.num_q_heads));
+    /// device::attn_score_normalize<<<grid, 256, 0, stream>>>(
+    ///     score_out, score_indptr_d, kv_page_indptr_d, kv_last_page_lens_d,
+    ///     cache.page_size);
+    /// ```
+    ///
+    /// Five operands, two grid extents, one block width. `kv_len` is derived
+    /// from the page CSR inside the body rather than passed, which is why no
+    /// length appears here — `attention_score_post.cuh` argues that beside
+    /// the body and this must not "helpfully" add one.
+    ///
+    /// # The guard
+    ///
+    /// `num_requests <= 0` returns. The C++ had no such guard because the
+    /// dispatch above it could not be reached with an empty fire; here the
+    /// guard is required, because a zero grid axis reaching a launch is a
+    /// refusal and would turn a legal no-op into one. `num_q_heads == 0` is
+    /// the same case on the other axis. The routine states the same two
+    /// refusals; this returns rather than forwarding them, because an empty
+    /// fire is not something to panic about.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
+    fn normalize_decode(
+        &mut self,
+        scores: *mut f32,
+        score_indptr_d: *const i32,
+        kv_page_indptr_d: *const u32,
+        kv_last_page_lens_d: *const u32,
+        page_size: i32,
+        num_requests: i32,
+        num_q_heads: i32,
+    ) {
+        use kernels_cuda_new::x::attn::attention_score_post::attn_score_normalize;
+
+        if num_requests <= 0 || num_q_heads <= 0 {
+            return;
+        }
+        assert!(
+            !scores.is_null() && !score_indptr_d.is_null(),
+            "attn_score_normalize: scores and score_indptr must be device pointers \
+             (scores={scores:?}, indptr={score_indptr_d:?})"
+        );
+
+        or_panic(
+            "attn_score_normalize",
+            attn_score_normalize(
+                &ctx_on(self.stream),
+                scores,
+                score_indptr_d,
+                kv_page_indptr_d,
+                kv_last_page_lens_d,
+                page_size,
+                num_requests,
+                num_q_heads,
+            ),
+        );
+    }
+
+    /// The prefill normalize.
+    ///
+    /// # What this replaced, line for line
+    ///
+    /// The tail of `dispatch_attention_flashinfer_prefill_capture_bf16`:
+    ///
+    /// ```text
+    /// const dim3 norm_grid(static_cast<unsigned>(cache.num_requests),
+    ///                      static_cast<unsigned>(cache.num_q_heads),
+    ///                      static_cast<unsigned>(window));
+    /// device::attn_prefill_score_normalize<<<norm_grid, 256, 0, stream>>>(
+    ///     score_out, score_indptr_d, qo_indptr_d, kv_page_indptr_d,
+    ///     kv_last_page_lens_d, cache.page_size, window);
+    /// ```
+    ///
+    /// `window` is BOTH the third grid extent and the last operand, and that
+    /// duplication is the launcher's, not an oversight to tidy: `blockIdx.z`
+    /// selects the window row and the operand bounds `rows = min(window,
+    /// qo_len)` inside the body. Passing one and deriving the other would be
+    /// a different kernel.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
+    fn normalize_prefill(
+        &mut self,
+        scores: *mut f32,
+        score_indptr_d: *const i32,
+        qo_indptr_d: *const u32,
+        kv_page_indptr_d: *const u32,
+        kv_last_page_lens_d: *const u32,
+        page_size: i32,
+        num_requests: i32,
+        num_q_heads: i32,
+        window: i32,
+    ) {
+        use kernels_cuda_new::x::attn::attention_score_post::attn_prefill_score_normalize;
+
+        if num_requests <= 0 || num_q_heads <= 0 || window <= 0 {
+            return;
+        }
+        assert!(
+            !scores.is_null() && !score_indptr_d.is_null() && !qo_indptr_d.is_null(),
+            "attn_prefill_score_normalize: scores, score_indptr and qo_indptr must be \
+             device pointers (scores={scores:?}, indptr={score_indptr_d:?}, \
+             qo={qo_indptr_d:?})"
+        );
+
+        or_panic(
+            "attn_prefill_score_normalize",
+            attn_prefill_score_normalize(
+                &ctx_on(self.stream),
+                scores,
+                score_indptr_d,
+                qo_indptr_d,
+                kv_page_indptr_d,
+                kv_last_page_lens_d,
+                page_size,
+                num_requests,
+                num_q_heads,
+                window,
+            ),
+        );
+    }
+
+    /// The prefill fold.
+    ///
+    /// # What this replaced, line for line
+    ///
+    /// The last two statements of
+    /// `dispatch_attention_flashinfer_prefill_capture_bf16`:
+    ///
+    /// ```text
+    /// const dim3 fold_grid(static_cast<unsigned>(cache.num_requests), 32u);
+    /// device::attn_prefill_score_fold<<<fold_grid, 256, 0, stream>>>(
+    ///     score_out, folded_out, score_indptr_d, qo_indptr_d,
+    ///     kv_page_indptr_d, kv_last_page_lens_d, cache.page_size,
+    ///     cache.num_q_heads, window);
+    /// ```
+    ///
+    /// `num_q_heads` is an OPERAND here and a grid extent in the normalize
+    /// above — the fold collapses the head axis rather than indexing it, so
+    /// it must know the count without having a block per head. See
+    /// `PREFILL_FOLD_GRID_Y` for why the second grid axis is `32` and why
+    /// that is not a rule.
+    ///
+    /// The null guard panics, matching [`Self::fold_heads`]: a fold that did
+    /// not run leaves `folded` holding the memset pattern, and the payload
+    /// published over it is a score row of zeros every downstream policy
+    /// will happily read.
+    #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
+    fn fold_prefill(
+        &mut self,
+        scores: *const f32,
+        folded: *mut f32,
+        score_indptr_d: *const i32,
+        qo_indptr_d: *const u32,
+        kv_page_indptr_d: *const u32,
+        kv_last_page_lens_d: *const u32,
+        page_size: i32,
+        num_requests: i32,
+        num_q_heads: i32,
+        window: i32,
+    ) {
+        use kernels_cuda_new::x::attn::attention_score_post::attn_prefill_score_fold;
+
+        if num_requests <= 0 {
+            return;
+        }
+        assert!(
+            !scores.is_null()
+                && !folded.is_null()
+                && !score_indptr_d.is_null()
+                && !qo_indptr_d.is_null(),
+            "attn_prefill_score_fold: scores, folded, score_indptr and qo_indptr must all \
+             be device pointers (scores={scores:?}, folded={folded:?}, \
+             indptr={score_indptr_d:?}, qo={qo_indptr_d:?})"
+        );
+
+        or_panic(
+            "attn_prefill_score_fold",
+            attn_prefill_score_fold(
+                &ctx_on(self.stream),
+                scores,
+                folded,
+                score_indptr_d,
+                qo_indptr_d,
+                kv_page_indptr_d,
+                kv_last_page_lens_d,
+                page_size,
+                num_requests,
+                num_q_heads,
+                window,
+            ),
+        );
+    }
+
+    /// The fold, fired at a geometry this driver states and no rule does.
+    ///
+    /// # What this replaced, line for line
+    ///
+    /// `attn::attn_score_fold_heads` in
+    /// `kernels-cuda/csrc/src/attn/attention_flashinfer.cu:812-832` — a
+    /// nine-argument host launcher whose whole body is two guards, a `dim3`
+    /// and a `<<<>>>`. The seven-argument kernel it launched is now
+    /// `kernels-cuda-new`'s `attn/attention_flashinfer` unit; the two guards
+    /// and the `dim3` are here. The launcher's remaining two arguments were
+    /// `num_requests`, which was only ever `grid.x`, and `stream`, which was
+    /// only ever the launch's — neither is a kernel operand, and this is
+    /// where that stops being invisible.
+    ///
+    /// # The guards, and why they are two different things
+    ///
+    /// `num_requests <= 0` returns, exactly as the C++ did. An empty fire is
+    /// not an error — the capture publishes an empty payload — and it must be
+    /// caught HERE, because a zero `grid.x` reaching
+    /// [`kernels_cuda_new::runtime::KernelModule::fire`] is `Error::Geometry`
+    /// and would turn a legal no-op into a refusal.
+    ///
+    /// A null buffer PANICS, because the C++ threw. This crate's C++ threw
+    /// through a shim that caught, and the catch is gone with the shim, so
+    /// the refusal has to be spelled in Rust or it is not spelled at all. It
+    /// is a panic and not a log-and-return for the reason the module header
+    /// gives about `LostGeometry`: a fold that does not run leaves `folded`
+    /// holding the memset pattern, and the payload published over it is a
+    /// score row of zeros that every downstream policy will happily read.
+    /// Silence here is a wrong answer, not a missing one.
     #[allow(clippy::not_unsafe_ptr_arg_deref)] // seam method; recorders share it
     fn fold_heads(
         &mut self,
@@ -189,8 +585,24 @@ impl ScoreOps for LiveScoreOps {
         num_q_heads: i32,
         folded: *mut f32,
     ) {
-        unsafe {
-            crate::bind::abi::ffi::pie_k_attn_attn_score_fold_heads(
+        use kernels_cuda_new::x::attn::attention_flashinfer::attn_score_fold_heads;
+
+        // `attention_flashinfer.cu:817` — `if (num_requests <= 0) return;`
+        if num_requests <= 0 {
+            return;
+        }
+        // `attention_flashinfer.cu:818-822` — the launcher's throw, as a
+        // refusal that cannot be mistaken for a fold.
+        assert!(
+            !raw.is_null() && !folded.is_null() && !score_indptr_d.is_null(),
+            "attn_score_fold_heads: scores, folded and score_indptr must all be device \
+             pointers (raw={raw:?}, folded={folded:?}, indptr={score_indptr_d:?})"
+        );
+
+        or_panic(
+            "attn_score_fold_heads_dev",
+            attn_score_fold_heads(
+                &ctx_on(self.stream),
                 raw,
                 score_indptr_d,
                 kv_page_indptr_d,
@@ -199,9 +611,8 @@ impl ScoreOps for LiveScoreOps {
                 num_requests,
                 num_q_heads,
                 folded,
-                self.stream,
-            );
-        }
+            ),
+        );
     }
 }
 
@@ -358,10 +769,7 @@ fn compute_decode_score_csr(
     scratch.raw_offsets.resize(requests + 1, 0);
     scratch.folded_offsets.clear();
     scratch.folded_offsets.resize(requests + 1, 0);
-    let mut totals = DecodeScoreCsrTotals {
-        raw_total: 0,
-        folded_total: 0,
-    };
+    let mut totals = DecodeScoreCsrTotals { raw_total: 0, folded_total: 0 };
     for r in 0..requests {
         let pages = kvpp[r + 1] - kvpp[r];
         let kv_len = if pages == 0 {
@@ -458,9 +866,7 @@ pub fn default_attn_score_window_from(value: Option<&std::ffi::OsStr>) -> u32 {
     }
     let mut parsed: i64 = 0;
     while i < bytes.len() && bytes[i].is_ascii_digit() {
-        parsed = parsed
-            .saturating_mul(10)
-            .saturating_add(i64::from(bytes[i] - b'0'));
+        parsed = parsed.saturating_mul(10).saturating_add(i64::from(bytes[i] - b'0'));
         i += 1;
     }
     let parsed = sign * parsed;
@@ -529,9 +935,7 @@ pub fn prepare_decode_score_capture<M: DeviceMemory>(
         return DecodeScoreCapturePlan::refused();
     }
     scratch.raw_offsets_i32.clear();
-    scratch
-        .raw_offsets_i32
-        .extend(scratch.raw_offsets.iter().map(|&v| v as i32));
+    scratch.raw_offsets_i32.extend(scratch.raw_offsets.iter().map(|&v| v as i32));
 
     let raw_bytes = usize::try_from(totals.raw_total).unwrap_or(usize::MAX) * 4;
     let folded_bytes = usize::try_from(totals.folded_total).unwrap_or(usize::MAX) * 4;
@@ -622,9 +1026,7 @@ impl LayerScoreCapture {
             return me;
         }
         scratch.raw_offsets_i32.clear();
-        scratch
-            .raw_offsets_i32
-            .extend(scratch.raw_offsets.iter().map(|&v| v as i32));
+        scratch.raw_offsets_i32.extend(scratch.raw_offsets.iter().map(|&v| v as i32));
         let Some(arena) = arena else {
             eprintln!(
                 "[pie-driver-cuda] score capture has no hook sideband arena; \
@@ -634,14 +1036,8 @@ impl LayerScoreCapture {
         };
         let requests = u32::try_from(obs.num_requests).unwrap_or(0);
         let indptr = std::mem::take(&mut scratch.raw_offsets_i32);
-        let acquired = me.buf.acquire(
-            ops,
-            arena,
-            totals.raw_total,
-            totals.folded_total,
-            &indptr,
-            requests,
-        );
+        let acquired =
+            me.buf.acquire(ops, arena, totals.raw_total, totals.folded_total, &indptr, requests);
         scratch.raw_offsets_i32 = indptr;
         if !acquired {
             return me;
@@ -670,10 +1066,25 @@ impl LayerScoreCapture {
         self.buf.indptr_d
     }
 
-    /// Fold heads and finalise the payload. The observation is re-read at
-    /// publish time exactly as the C++ re-reads `hooks_->observation`; a
-    /// fire whose geometry vanished mid-layer is an error, not a fold
-    /// against a stale view.
+    /// Normalize, fold heads and finalise the payload. The observation is
+    /// re-read at publish time exactly as the C++ re-reads
+    /// `hooks_->observation`; a fire whose geometry vanished mid-layer is an
+    /// error, not a fold against a stale view.
+    ///
+    /// # Two kernels, in the capture dispatch's order
+    ///
+    /// [`ScoreOps::normalize_decode`] runs first and
+    /// [`ScoreOps::fold_heads`] second, which is the order
+    /// `dispatch_attention_flashinfer_decode_capture_bf16` issued them in:
+    /// the normalize divides each `(request, head)` row by its total in
+    /// place, and the fold averages the normalised heads into the published
+    /// row. Reversing them would fold un-normalised scores and then divide
+    /// nothing — a plausible row, not a crash, which is why the order is
+    /// stated here rather than left to the reader.
+    ///
+    /// The normalize used to be the C++ dispatch's tail. It is here because
+    /// this is where the same stream reaches the same buffer at the same
+    /// point; see the module header.
     pub fn publish<O: ScoreOps>(
         &mut self,
         ops: &mut O,
@@ -692,6 +1103,16 @@ impl LayerScoreCapture {
         if !obs.usable() {
             return Err(ScoreError::LostGeometry);
         }
+        let num_q_heads = i32::try_from(self.num_q_heads).unwrap_or(0);
+        ops.normalize_decode(
+            self.buf.raw,
+            self.buf.indptr_d,
+            kv_page_indptr_d,
+            kv_last_page_lens_d,
+            page_size,
+            obs.num_requests,
+            num_q_heads,
+        );
         ops.fold_heads(
             self.buf.raw,
             self.buf.indptr_d,
@@ -699,7 +1120,7 @@ impl LayerScoreCapture {
             kv_last_page_lens_d,
             page_size,
             obs.num_requests,
-            i32::try_from(self.num_q_heads).unwrap_or(0),
+            num_q_heads,
             self.buf.folded,
         );
         self.payload = Some(AttentionScores {
@@ -716,11 +1137,7 @@ impl LayerScoreCapture {
     /// until [`Self::publish`] ran.
     #[must_use]
     pub const fn scores(&self) -> Option<&AttentionScores> {
-        if self.published {
-            self.payload.as_ref()
-        } else {
-            None
-        }
+        if self.published { self.payload.as_ref() } else { None }
     }
 
     /// The C++ destructor: hand the slot back and drop the depth.
@@ -736,10 +1153,7 @@ impl LayerScoreCapture {
 
 impl Drop for LayerScoreCapture {
     fn drop(&mut self) {
-        debug_assert!(
-            !self.buf.held,
-            "LayerScoreCapture dropped without release()"
-        );
+        debug_assert!(!self.buf.held, "LayerScoreCapture dropped without release()");
     }
 }
 
@@ -754,14 +1168,15 @@ pub enum ScoreError {
 
 /// RAII capture of one layer's PREFILL scores — SnapKV's observation
 /// window. Ports `LayerPrefillScoreCapture`: the raw rows carry the
-/// window factor, and publish launches nothing (folding is part of the
-/// capture dispatch, whose causal limits only it can derive).
+/// window factor, and [`Self::publish`] fires the window-aware normalize and
+/// the two-axis fold that were the C++ capture dispatch's tail.
 #[derive(Debug)]
 pub struct LayerPrefillScoreCapture {
     active: bool,
     published: bool,
     layer: u32,
     window: u32,
+    num_q_heads: u32,
     num_requests: u32,
     buf: ScoreBuffers,
     folded_offsets_h: *const u32,
@@ -788,6 +1203,7 @@ impl LayerPrefillScoreCapture {
             published: false,
             layer,
             window,
+            num_q_heads,
             num_requests: 0,
             buf: ScoreBuffers::default(),
             folded_offsets_h: std::ptr::null(),
@@ -904,11 +1320,66 @@ impl LayerPrefillScoreCapture {
         self.window as i32
     }
 
-    /// Finalise the folded row. Launches nothing.
-    pub fn publish(&mut self) {
+    /// Normalize, fold and finalise the folded row.
+    ///
+    /// # It used to launch nothing, and that is what changed
+    ///
+    /// The doc that stood here said "folding is part of the capture
+    /// dispatch, whose causal limits only it can derive". The second half is
+    /// still true — `qo_indptr` and the causal window are what bound
+    /// `rows = min(window, qo_len)`, and the kernels read them from the CSRs
+    /// rather than being told. The first half was an artefact of the fold
+    /// being C++: the dispatch derived nothing the caller could not pass,
+    /// and the four pointers below are exactly what it passed.
+    ///
+    /// So both launches are here now, in the dispatch's order:
+    /// [`ScoreOps::normalize_prefill`] divides each `(request, head,
+    /// window-row)` by its total in place, then
+    /// [`ScoreOps::fold_prefill`] collapses heads AND window rows into
+    /// `folded`. The order is load-bearing for the same reason the decode's
+    /// is — folding first would average un-normalised scores and produce a
+    /// plausible row rather than a fault.
+    ///
+    /// `qo_indptr_d` is the fire's query CSR, device side; the other three
+    /// arguments are the KV page CSR, the last-page lengths and the page
+    /// size, matching [`LayerScoreCapture::publish`].
+    pub fn publish<O: ScoreOps>(
+        &mut self,
+        ops: &mut O,
+        qo_indptr_d: *const u32,
+        kv_page_indptr_d: *const u32,
+        kv_last_page_lens_d: *const u32,
+        page_size: i32,
+    ) {
         if !self.active || self.published {
             return;
         }
+        let requests = i32::try_from(self.num_requests).unwrap_or(0);
+        let heads = i32::try_from(self.num_q_heads).unwrap_or(0);
+        let window = self.window();
+        ops.normalize_prefill(
+            self.buf.raw,
+            self.buf.indptr_d,
+            qo_indptr_d,
+            kv_page_indptr_d,
+            kv_last_page_lens_d,
+            page_size,
+            requests,
+            heads,
+            window,
+        );
+        ops.fold_prefill(
+            self.buf.raw,
+            self.buf.folded,
+            self.buf.indptr_d,
+            qo_indptr_d,
+            kv_page_indptr_d,
+            kv_last_page_lens_d,
+            page_size,
+            requests,
+            heads,
+            window,
+        );
         self.payload = Some(AttentionScores {
             values: self.buf.folded,
             offsets_h: self.folded_offsets_h,
@@ -921,11 +1392,7 @@ impl LayerPrefillScoreCapture {
     /// The published payload; `None` until [`Self::publish`] ran.
     #[must_use]
     pub const fn scores(&self) -> Option<&AttentionScores> {
-        if self.published {
-            self.payload.as_ref()
-        } else {
-            None
-        }
+        if self.published { self.payload.as_ref() } else { None }
     }
 
     /// The C++ destructor.
@@ -941,9 +1408,6 @@ impl LayerPrefillScoreCapture {
 
 impl Drop for LayerPrefillScoreCapture {
     fn drop(&mut self) {
-        debug_assert!(
-            !self.buf.held,
-            "LayerPrefillScoreCapture dropped without release()"
-        );
+        debug_assert!(!self.buf.held, "LayerPrefillScoreCapture dropped without release()");
     }
 }

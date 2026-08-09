@@ -8,7 +8,7 @@
 //! path asks for and in what order. This test reproduces the same sweep
 //! against the ports and requires the transcripts to be equal.
 //!
-//! Run `tests/oracle/caches/run.sh` to regenerate [`GOLDEN_FNV1A64`]. The
+//! `tests/oracle/caches/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated [`GOLDEN_FNV1A64`]. The
 //! pinned value is the **C++'s** hash, never this file's: a golden taken from
 //! the port would only prove the port agrees with itself.
 //!
@@ -20,9 +20,9 @@
 use std::fmt::Write as _;
 
 use driver_cuda::dtype::DType;
-use driver_cuda::layout::dsv4_geometry::compress_bytes_per_token;
+use driver_cuda::layout::compressed_plane_geometry::compress_bytes_per_token;
 use driver_cuda::layout::{KvCacheFormat, KvCacheScaleLayout, KvCacheScheme};
-use driver_cuda::pools::dsv4_compress_cache::DsV4CompressLayout;
+use driver_cuda::pools::compressed_plane_cache::CompressedPlaneLayout;
 use driver_cuda::pools::kv_cache::KvCacheLayout;
 use driver_cuda::pools::mla_cache::MlaCacheLayout;
 use driver_cuda::pools::swap_pool::SwapPoolLayout;
@@ -656,7 +656,8 @@ fn render_dsv4(out: &mut String) {
     for c in DS_CASES {
         let id = format!("dsv4/{}", c.label);
         let layout =
-            match DsV4CompressLayout::plan(c.ratios, c.layers, c.head_dim, c.pages, c.page_size) {
+            match CompressedPlaneLayout::plan(c.ratios, c.layers, c.head_dim, c.pages, c.page_size)
+            {
                 Err(e) => {
                     // The oracle prints `what()` for a `std::runtime_error`
                     // and the fixed tag `length_error` for the `resize` throw,
@@ -664,7 +665,7 @@ fn render_dsv4(out: &mut String) {
                     // contract. Which of the two applies is decided by the
                     // library, via the call name it attached to the error --
                     // this only reads that back.
-                    let text = if e.call() == "dsv4_compress_cache" {
+                    let text = if e.call() == "compressed_plane_cache" {
                         "length_error".to_owned()
                     } else {
                         e.to_string()

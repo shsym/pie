@@ -36,15 +36,14 @@ pub mod spec;
 /// Written in `model-compiler`'s tracing eDSL: ordinary Rust that runs at
 /// model-load time with the checkpoint's facts in hand and records what one
 /// pass computes. The traced form is what a driver executes.
-#[cfg(feature = "forward")]
 pub mod forward;
 
-// `Arc` is the chat aspect's alone: it is the tokenizer a template
-// is handed and the `dyn Instruct` it is returned as. `OnceLock`
-// widens this generation's rows and every aspect reads that.
+// `Arc` reaches this module only through `Variant::chat`, so the
+// import carries that method's gate. It used to ride along with
+// `OnceLock`, which `rows()` needed unconditionally until
+// `rows_of!` absorbed it.
 #[cfg(feature = "chat")]
 use std::sync::Arc;
-use std::sync::OnceLock;
 
 use crate::catalog::{Deployed, LoadShape, Variant};
 use crate::deployment::{Advertised, AudioTower, Deployment, Refusal, Towers, VisionTower};
@@ -258,12 +257,7 @@ pub const VARIANTS: &[Gemma4] = &[
     },
 ];
 
-/// This generation's contribution to [`crate::catalog::catalog`].
-#[must_use]
-pub fn rows() -> &'static [&'static dyn Variant] {
-    static ROWS: OnceLock<Vec<&'static dyn Variant>> = OnceLock::new();
-    ROWS.get_or_init(|| VARIANTS.iter().map(|v| v as &'static dyn Variant).collect())
-}
+crate::rows_of!(Gemma4);
 
 impl Gemma4 {
     /// The four numbers this row states that its shape cannot.
@@ -304,11 +298,56 @@ impl Gemma4 {
     /// for two questions" about `k_eq_v`: deployment is backend-blind
     /// and Metal deploys these rows. The routed bank is unwritten on
     /// both, and that is what this still says.
+    /// MEASURED against `mlx-community/gemma-4-26b-a4b-it-4bit`, and the
+    /// first sentence this refusal carried was wrong about its own reason.
+    ///
+    /// It said "no routed-expert TEXT", and the text is written.
+    /// `metal_shape` carries all three mixture facts, `metal_facts` sets
+    /// `dense_beside_moe: mixture.is_some()`, and
+    /// `llama_like_metal` has the branch -- a second `gated()` off the
+    /// same post-attention residual, added back -- plus `Activation::Geglu`
+    /// in the routed path. Lifting this refusal and running
+    /// `device_checkpoint_names` reaches the text and gets a different
+    /// answer: **90 names the text states are not tensors the load plan
+    /// publishes**, the routed bank and the dense MLP alike. The
+    /// checkpoint has them under exactly the spellings asked for. So the
+    /// missing half is the gemma-4 CONTRACT, not the forward.
+    ///
+    /// And the forward is not finished either, which the same measurement
+    /// shows and `mlx_lm/models/gemma4_text.py::DecoderLayer.__call__`
+    /// settles. Layer 0 of the A4B ships seven norms where the dense 31b
+    /// ships four, and the reference says what each is for:
+    ///
+    /// ```text
+    /// h1 = post_ffn_norm_1(mlp(pre_ffn_norm(h)))     // dense leg
+    /// h2 = post_ffn_norm_2(experts(pre_ffn_norm_2(h), router(h)))
+    /// h  = post_ffn_norm(h1 + h2) + residual         // join, THEN norm
+    /// ```
+    ///
+    /// Both legs read the same `h`. Each has its own pre-norm and its own
+    /// post-norm. The shared `post_feedforward_layernorm` lands on the
+    /// SUM, and in a mixture layer the dense leg's post-norm is
+    /// `post_feedforward_layernorm_1`, which a dense layer does not have
+    /// at all -- so the mixture changes the dense leg too. The Metal
+    /// branch has none of this: it chains off the post-dense residual,
+    /// reuses `mlp_norm` for the routed pre-norm, states no post-norm, and
+    /// adds instead of joining.
+    ///
+    /// The router is a sixth statement rather than a projection.
+    /// `Router.__call__` is `rms_norm(x, scale * hidden^-0.5)` -> project
+    /// -> top-k -> softmax -> `* per_expert_scale[indices]`. Both of those
+    /// weights are in the checkpoint, and nothing here states either.
+    ///
+    /// That is what makes this a refusal rather than a gap to walk past:
+    /// every one of those five tensors is small, so a build that ignored
+    /// them would run at full speed and be quietly wrong.
     fn untraced(&self) -> Option<Refusal> {
         if self.mixture.is_some() {
             return Some(Refusal::Unsupported(
-                "gemma-4 26B-A4B: this build has no routed-expert text for a gemma-4 block \
-                 (`gemma4_enable_moe`, 128 experts top-8); the dense rows serve",
+                "gemma-4 26B-A4B: the routed block is traced but not loadable here \
+                 (`gemma4_enable_moe`, 128 experts top-8) -- the contract publishes none \
+                 of `experts.switch_glu.*`, and the branch's own three norms and the \
+                 router's two scales are unstated; the dense rows serve",
             ));
         }
         None
@@ -395,7 +434,6 @@ impl Variant for Gemma4 {
     /// [`Refusal::Unsupported`] for the A4B, by the same predicate
     /// [`Self::deployment`] refuses on — a row that cannot be deployed
     /// cannot be traced.
-    #[cfg(feature = "forward")]
     fn trace(
         &self,
         class: model_compiler::trace::FireClass,
@@ -435,8 +473,11 @@ impl Variant for Gemma4 {
         // a row whose checkpoint ships no `v_proj` would be traced
         // against one here.
         //
-        // `Deployment::k_eq_v` states the measurement and this is the
-        // reader CUDA never grew. Refusing is the whole of what this
+        // `Gemma4Facts::k_eq_v` states the measurement and this is the
+        // reader CUDA never grew. `Deployment` used to carry a copy of
+        // it "for the driver to read"; no driver read it and none was
+        // going to, because the branch that needs it is HERE. Refusing
+        // is the whole of what this
         // file can honestly do about it: the alternative is a plan that
         // binds a tensor the checkpoint does not contain.
         if self.k_eq_v {
@@ -467,7 +508,6 @@ mod tests {
         rows,
     };
     // Only the Metal text's tests call the projection by name.
-    #[cfg(feature = "forward")]
     use super::project;
     use crate::deployment::{AttnOutput, PrefillStyle, Refusal};
 
@@ -798,9 +838,16 @@ mod tests {
             text.contains("gemma-4"),
             "the refusal must name the model: {text}"
         );
+        // This USED to ask for the token "routed-expert", which was the
+        // old sentence's own phrasing rather than anything a reader
+        // needs, and it was guarding a sentence that named the wrong
+        // missing leg: it said the routed TEXT was unwritten, and the
+        // text is written. What a reader must be able to grep is the
+        // tensor family the contract does not publish, so that is what
+        // this asks for now.
         assert!(
-            text.contains("routed-expert"),
-            "the refusal must name what is missing: {text}"
+            text.contains("switch_glu"),
+            "the refusal must name the tensors it cannot load: {text}"
         );
         assert!(
             text.contains("gemma4_enable_moe"),
@@ -884,7 +931,6 @@ mod tests {
     /// whose text does not exist — and what stops that is not a refusal
     /// but the widths: a gemma-4 traced as a generic llama would carry
     /// ONE attention shape, and this asserts the two.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_metal_load_traces_this_rows_two_attention_shapes_and_not_a_llamas() {
         use crate::catalog::{Backend, Deployed, MetalBinding};
@@ -893,10 +939,13 @@ mod tests {
         let bind = MetalBinding {
             quant_group: 64,
             quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
             moe_mxfp4: false,
             fuse_residual_gemv: true,
             paged_multi_batch: true,
             qmm_multi_batch: true,
+            add_bias: false,
         };
         assert!(!VARIANTS.is_empty());
         let mut two_shaped = 0usize;
@@ -921,21 +970,30 @@ mod tests {
             // generic llama states ONE `head_dim` and ONE `kv_heads`;
             // this row's full layers are twice as wide per head and
             // carry a quarter the KV heads, and the facts say so.
+            //
+            // Asserted rather than asked: `metal_facts` divides the
+            // rotary dim by this width, so a row that stated 0 would
+            // publish an infinite rotary fraction rather than take some
+            // other arm.
             let facts = project::metal_facts(&v.shape, v.row(), &bind);
-            if v.shape.global_head_dim > 0 {
-                two_shaped += 1;
-                assert_eq!(facts.global_head_dim, v.shape.global_head_dim);
-                assert_eq!(facts.global_kv_heads, v.shape.global_kv_heads);
-                let full = (0..v.shape.layers).find(|l| v.shape.is_full_attn(*l));
-                let slide = (0..v.shape.layers).find(|l| !v.shape.is_full_attn(*l));
-                if let (Some(full), Some(slide)) = (full, slide) {
-                    assert_ne!(
-                        facts.head_dim_at(full, v.shape.head_dim),
-                        facts.head_dim_at(slide, v.shape.head_dim),
-                        "`{}` reads one width at both layer kinds",
-                        v.id
-                    );
-                }
+            assert!(
+                v.shape.global_head_dim > 0,
+                "`{}` states no full-layer head dim, which is a llama and \
+                 not a gemma-4",
+                v.id
+            );
+            two_shaped += 1;
+            assert_eq!(facts.global_head_dim, v.shape.global_head_dim);
+            assert_eq!(facts.global_kv_heads, v.shape.global_kv_heads);
+            let full = (0..v.shape.layers).find(|l| v.shape.is_full_attn(*l));
+            let slide = (0..v.shape.layers).find(|l| !v.shape.is_full_attn(*l));
+            if let (Some(full), Some(slide)) = (full, slide) {
+                assert_ne!(
+                    facts.head_dim_at(full, v.shape.head_dim),
+                    facts.head_dim_at(slide, v.shape.head_dim),
+                    "`{}` reads one width at both layer kinds",
+                    v.id
+                );
             }
             // Two rotary bases, and `rope_theta_at` picks off the same
             // window list the widths do.

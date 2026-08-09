@@ -48,7 +48,7 @@ use model_compiler::trace::ForwardPlan;
 use crate::device::{Device, Pipelines};
 use crate::dispatch::Geometry;
 use crate::pages::{Book, Unhoused};
-use crate::resources::{Frame, Model, Pool, Unstageable, Weights};
+use crate::resources::{Frame, Model, Pool, Request, Unstageable, Weights};
 use crate::serve::{Fire, Fired, Logits, Modules, Unfired, Unread, fire, logits};
 use kernels_vulkan::Capability;
 
@@ -254,8 +254,211 @@ impl Serving<'_> {
                     .map_err(Unstepped::Unhoused)?,
             );
         }
+        let tokens: Vec<&[u32]> = turns.iter().map(|t| t.tokens.as_slice()).collect();
+        self.over(device, pipelines, modules, held, &requests, &tokens)
+    }
+
+    /// Fire over requests somebody else allocated pages for.
+    ///
+    /// # Why this exists beside [`Self::step`]
+    ///
+    /// There are two page allocators in this system and only one of them can
+    /// be right for a given caller. [`crate::pages::Book`] is this driver's
+    /// own: it decides which physical page a conversation gets, which is what
+    /// a server built on this crate alone needs. The ENGINE decides for
+    /// itself -- its scheduler hands down a `kv_page_indices` CSR naming
+    /// physical pages it chose, because it also runs eviction, prefix sharing
+    /// and the copy plans that move pages between conversations.
+    ///
+    /// A driver that ran the engine's frames through its own book would have
+    /// two allocators disagreeing about who owns page 7, and the disagreement
+    /// is silent: attention reads a page that holds another conversation's
+    /// keys and returns fluent text. So the engine's path does not touch the
+    /// book at all, and this is the seam where it joins.
+    ///
+    /// `tokens` is per REQUEST, parallel to `requests`, in the same order. It
+    /// is separate from the requests because a [`Request`] states positions
+    /// and pages -- where a row goes -- and says nothing about what is in it.
+    ///
+    /// # Errors
+    ///
+    /// [`Unstepped`], minus [`Unstepped::Unhoused`], which only a growth can
+    /// produce.
+    pub fn over<M: Modules>(
+        &self,
+        device: &Device,
+        pipelines: &mut Pipelines,
+        modules: &M,
+        held: &mut Held<'_>,
+        requests: &[Request],
+        tokens: &[&[u32]],
+    ) -> Result<Step, Unstepped> {
+        if requests.is_empty() {
+            return Err(Unstepped::Nothing);
+        }
+        let rows: usize = requests.iter().map(|r| r.positions.len()).sum();
+        let owned: Vec<Vec<u32>> = tokens.iter().map(|t| t.to_vec()).collect();
+        let mut step = self.tiled(
+            device,
+            pipelines,
+            modules,
+            held,
+            requests,
+            &owned,
+            0..rows,
+            0,
+        )?;
+        // The readout is the WHOLE fire's, whatever it was split into. Each
+        // sub-fire computed one for its own rows, which numbers a request's
+        // last row from the sub-fire's start; a caller asked about the turns
+        // it handed in.
+        let mut request_of_row = Vec::with_capacity(rows);
+        for (r, request) in requests.iter().enumerate() {
+            request_of_row.extend(std::iter::repeat_n(
+                u32::try_from(r).unwrap_or(u32::MAX),
+                request.positions.len(),
+            ));
+        }
+        step.readout_of = last_row_of(requests.len(), &request_of_row);
+        step.positions = requests
+            .iter()
+            .flat_map(|r| r.positions.iter().copied())
+            .collect();
+        Ok(step)
+    }
+
+    /// One fire, or as many tile-shaped ones as it takes.
+    ///
+    /// # The tile the GEMM does not have
+    ///
+    /// `affine_qmm_t` is compiled for row tiles of 16, 32 and 64 and nothing
+    /// narrower, and it reads its tile FROM the grid: a fire of 29 rows has
+    /// no grid over a 16-row tile that covers 29 rows and stops there, so
+    /// `geometry::eval` refuses it by name -- `PartialTile`. Every prompt
+    /// whose length is not a multiple of the tile is such a fire, which is
+    /// very nearly every prompt: "The capital of France is" is 29 tokens.
+    ///
+    /// `device.rs` used to say a caller above this crate owed the batching.
+    /// No caller does -- the engine hands down the tokens a request arrived
+    /// with -- and `driver-metal` refuses the same fire the same way, so this
+    /// is not a Vulkan gap but the first place the fleet walked into it.
+    ///
+    /// So the refusal is caught here and answered with fires the tile does
+    /// cover:
+    ///
+    /// * `rows >= tile`: a HEAD of `rows - rows % tile` and then a TAIL of
+    ///   exactly `tile` rows ending at the last row. The two OVERLAP, and the
+    ///   overlap is recomputation rather than a second answer: appending a
+    ///   token's KV writes the same bytes to the same slot whatever fire does
+    ///   it, and a row's attention reads a history that does not depend on
+    ///   which fire computed it. 29 rows is a 16-row fire and a 16-row fire,
+    ///   with rows 13..16 computed twice and the second answer kept.
+    /// * `rows < tile`: one row at a time, which is a decode and the path
+    ///   every step of every conversation already takes.
+    ///
+    /// The cost is one extra fire per prefill, or `rows` fires for a prompt
+    /// shorter than a tile. It is paid knowingly and it is the correctness
+    /// floor: the day a narrower tile is compiled, the same code splits into
+    /// smaller pieces without changing.
+    ///
+    /// `depth` bounds the recursion: a sub-fire may name a WIDER tile than
+    /// the one that sent it here -- the text picks its tile by row count --
+    /// and each split makes the pieces smaller, so the descent terminates,
+    /// but a bound that does not depend on that reasoning is cheaper than
+    /// trusting it.
+    #[allow(clippy::too_many_arguments)]
+    fn tiled<M: Modules>(
+        &self,
+        device: &Device,
+        pipelines: &mut Pipelines,
+        modules: &M,
+        held: &mut Held<'_>,
+        requests: &[Request],
+        tokens: &[Vec<u32>],
+        span: std::ops::Range<usize>,
+        depth: u32,
+    ) -> Result<Step, Unstepped> {
+        let (cut, cuts) = slice(requests, tokens, span.clone());
+        let borrowed: Vec<&[u32]> = cuts.iter().map(Vec::as_slice).collect();
+        let refused = match self.once(device, pipelines, modules, held, &cut, &borrowed) {
+            Ok(step) => return Ok(step),
+            Err(e) => e,
+        };
+        let rows = span.len();
+        let Some(tile) = partial_tile(&refused) else {
+            return Err(refused);
+        };
+        if depth >= 3 || tile == 0 {
+            return Err(refused);
+        }
+        if rows < tile {
+            // One row at a time. Fired in row order, because a row's
+            // attention reads the rows before it out of the cache and they
+            // have to be in it.
+            let mut whole: Option<Step> = None;
+            for row in span.clone() {
+                let one = self.tiled(
+                    device,
+                    pipelines,
+                    modules,
+                    held,
+                    requests,
+                    tokens,
+                    row..row + 1,
+                    depth + 1,
+                )?;
+                whole = Some(match whole {
+                    None => one,
+                    Some(so_far) => join(so_far, one, 0),
+                });
+            }
+            return whole.ok_or(Unstepped::Nothing);
+        }
+        let head = rows - rows % tile;
+        let a = self.tiled(
+            device,
+            pipelines,
+            modules,
+            held,
+            requests,
+            tokens,
+            span.start..span.start + head,
+            depth + 1,
+        )?;
+        if head == rows {
+            return Ok(a);
+        }
+        let b = self.tiled(
+            device,
+            pipelines,
+            modules,
+            held,
+            requests,
+            tokens,
+            span.end - tile..span.end,
+            depth + 1,
+        )?;
+        // The tail fire recomputed the last `tile - (rows - head)` rows of the
+        // head; its FIRST rows are those, and they are dropped here.
+        Ok(join(a, b, tile - (rows - head)))
+    }
+
+    /// One fire, over exactly the requests it is given.
+    #[allow(clippy::too_many_lines)]
+    fn once<M: Modules>(
+        &self,
+        device: &Device,
+        pipelines: &mut Pipelines,
+        modules: &M,
+        held: &mut Held<'_>,
+        requests: &[Request],
+        tokens: &[&[u32]],
+    ) -> Result<Step, Unstepped> {
+        if requests.is_empty() {
+            return Err(Unstepped::Nothing);
+        }
         let shape = held.pool.shape();
-        let frame = Frame::of(shape, &requests).map_err(Unstepped::Unstageable)?;
+        let frame = Frame::of(shape, requests).map_err(Unstepped::Unstageable)?;
         // EVERY ROW SAMPLES, and this is a workaround with a name.
         //
         // A frame's own seriation marks only the rows a request reads out, so
@@ -342,7 +545,7 @@ impl Serving<'_> {
         // order the turns arrived. A step that wrote them in turn order would
         // feed every conversation somebody else's token whenever the seriation
         // reordered anything, and the answer would still look like text.
-        let ids = place(turns, &frame.request_of_token);
+        let ids = place(tokens, &frame.request_of_token);
         held.pool
             .state(device, crate::binding::FireTable::TokenIds, &ids)
             .map_err(Unstepped::Failed)?;
@@ -386,9 +589,113 @@ impl Serving<'_> {
             fired,
             rows: frame.rows(),
             positions: frame.positions.clone(),
-            readout_of: last_row_of(turns.len(), &frame.request_of_token),
+            readout_of: last_row_of(requests.len(), &frame.request_of_token),
             pipelines: pipelines.built(),
         })
+    }
+}
+
+/// The tile a refusal names, if it is the tile refusal.
+///
+/// Reads through three layers -- a step's, a fire's and a dispatch's -- and
+/// that is the point: `Serving::tiled` acts on ONE condition and every other
+/// refusal has to pass through it untouched. Matching the whole path by hand
+/// is how a later variant that happens to carry a `tile` field stays
+/// unhandled instead of quietly becoming a split.
+fn partial_tile(why: &Unstepped) -> Option<usize> {
+    match why {
+        Unstepped::Unfired(Unfired::Unplannable {
+            why:
+                crate::dispatch::Undispatchable::Ungeometric {
+                    why: crate::geometry::Ungeometric::PartialTile { tile, .. },
+                },
+            ..
+        }) => Some(*tile as usize),
+        _ => None,
+    }
+}
+
+/// The rows `span` of `requests`, as requests of their own.
+///
+/// A request keeps ALL its pages whichever of its rows are taken: the pages
+/// are the conversation's history and a row attends the whole of it, so a
+/// sub-fire holding only the pages its own rows write to would attend a
+/// prefix of the conversation and answer fluently.
+fn slice(
+    requests: &[Request],
+    tokens: &[Vec<u32>],
+    span: std::ops::Range<usize>,
+) -> (Vec<Request>, Vec<Vec<u32>>) {
+    let (mut cut, mut cuts) = (Vec::new(), Vec::new());
+    let mut base = 0usize;
+    for (r, request) in requests.iter().enumerate() {
+        let n = request.positions.len();
+        let (lo, hi) = (span.start.max(base), span.end.min(base + n));
+        base += n;
+        if lo >= hi {
+            continue;
+        }
+        let (from, to) = (lo - (base - n), hi - (base - n));
+        cut.push(Request::of(
+            request.positions[from..to].to_vec(),
+            request.pages.clone(),
+        ));
+        cuts.push(
+            tokens
+                .get(r)
+                .map(|t| t.get(from..to.min(t.len())).unwrap_or(&[]).to_vec())
+                .unwrap_or_default(),
+        );
+    }
+    (cut, cuts)
+}
+
+/// Two sub-fires' answers, end to end, dropping `overlap` rows off the second.
+///
+/// The dropped rows are rows the first fire already computed. Both answers are
+/// the same numbers -- the same weights over the same history -- so which one
+/// is kept is not a choice about arithmetic; the LATER one is kept because it
+/// is the one whose fire wrote the cache last, and keeping the pair in that
+/// order is what makes the join independent of how the split was made.
+fn join(first: Step, second: Step, overlap: usize) -> Step {
+    let vocab = if first.logits.vocab == 0 {
+        second.logits.vocab
+    } else {
+        first.logits.vocab
+    };
+    let mut values = first.logits.values;
+    values.extend_from_slice(
+        second
+            .logits
+            .values
+            .get(overlap * vocab..)
+            .unwrap_or_default(),
+    );
+    let kept = second.logits.rows.saturating_sub(overlap);
+    Step {
+        logits: Logits {
+            rows: first.logits.rows + kept,
+            vocab,
+            values,
+        },
+        fired: Fired {
+            dispatches: first.fired.dispatches + second.fired.dispatches,
+            submissions: first.fired.submissions + second.fired.submissions,
+            blocks: first.fired.blocks + second.fired.blocks,
+            parsed: first.fired.parsed + second.fired.parsed,
+        },
+        rows: first.rows + second.rows.saturating_sub(overlap),
+        // Both rewritten by `over`, which is the only caller that knows the
+        // whole fire. Stated from the pieces anyway so that a `Step` out of
+        // `join` is never half-filled.
+        readout_of: first.readout_of.clone(),
+        positions: first
+            .positions
+            .iter()
+            .copied()
+            .chain(second.positions.iter().skip(overlap).copied())
+            .collect(),
+        pipelines: second.pipelines,
     }
 }
 
@@ -401,8 +708,8 @@ impl Serving<'_> {
 /// A turn with no row gets zero. That cannot happen for a turn a step grew,
 /// and answering with a row that exists beats a panic in a server loop.
 #[must_use]
-fn last_row_of(turns: usize, request_of_token: &[u32]) -> Vec<usize> {
-    let mut last = vec![0usize; turns];
+fn last_row_of(requests: usize, request_of_token: &[u32]) -> Vec<usize> {
+    let mut last = vec![0usize; requests];
     for (t, which) in request_of_token.iter().enumerate() {
         if let Some(slot) = last.get_mut(*which as usize) {
             *slot = t;
@@ -428,15 +735,15 @@ fn last_row_of(turns: usize, request_of_token: &[u32]) -> Vec<usize> {
 /// aborted a server on an arithmetic slip it could survive is worse than one
 /// that fires a wrong token.
 #[must_use]
-fn place(turns: &[Turn], request_of_token: &[u32]) -> Vec<u32> {
-    let mut taken = vec![0usize; turns.len()];
+fn place(tokens: &[&[u32]], request_of_token: &[u32]) -> Vec<u32> {
+    let mut taken = vec![0usize; tokens.len()];
     let mut ids = vec![0u32; request_of_token.len()];
     for (id, which) in ids.iter_mut().zip(request_of_token) {
         let which = *which as usize;
-        let Some(turn) = turns.get(which) else {
+        let Some(mine) = tokens.get(which) else {
             continue;
         };
-        *id = turn.tokens.get(taken[which]).copied().unwrap_or(0);
+        *id = mine.get(taken[which]).copied().unwrap_or(0);
         taken[which] += 1;
     }
     ids
@@ -458,7 +765,7 @@ mod tests {
     fn each_row_gets_its_own_turns_next_token() {
         let turns = [turn(1, &[11, 12, 13]), turn(2, &[21, 22])];
         assert_eq!(
-            place(&turns, &[0, 0, 0, 1, 1]),
+            place(&[&turns[0].tokens, &turns[1].tokens], &[0, 0, 0, 1, 1]),
             vec![11, 12, 13, 21, 22],
             "in order, the placement is the concatenation"
         );
@@ -472,7 +779,10 @@ mod tests {
     #[test]
     fn an_interleaved_frame_does_not_hand_a_turn_another_turns_token() {
         let turns = [turn(1, &[11, 12, 13]), turn(2, &[21, 22])];
-        assert_eq!(place(&turns, &[1, 0, 1, 0, 0]), vec![21, 11, 22, 12, 13]);
+        assert_eq!(
+            place(&[&turns[0].tokens, &turns[1].tokens], &[1, 0, 1, 0, 0]),
+            vec![21, 11, 22, 12, 13]
+        );
     }
 
     /// A turn's answer is its LAST row, not its first.
@@ -495,9 +805,9 @@ mod tests {
     #[test]
     fn a_row_with_no_token_left_is_zero() {
         let turns = [turn(1, &[11])];
-        assert_eq!(place(&turns, &[0, 0, 0]), vec![11, 0, 0]);
+        assert_eq!(place(&[&turns[0].tokens], &[0, 0, 0]), vec![11, 0, 0]);
         assert_eq!(
-            place(&turns, &[0, 7]),
+            place(&[&turns[0].tokens], &[0, 7]),
             vec![11, 0],
             "and so is an unknown turn"
         );

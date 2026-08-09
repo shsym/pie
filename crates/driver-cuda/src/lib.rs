@@ -153,7 +153,7 @@ pub mod layout;
 // is. The gate used to run per-file through `store/`, `model/` and
 // `tensor.rs`, and a per-file gate is discipline rather than structure:
 // it holds until someone adds a file, and the cost of it slipping was
-// measured — `memory_planner`, `mla_geometry` and `dsv4_geometry` sat
+// measured — `memory_planner`, `mla_geometry` and `compressed_plane_geometry` sat
 // parity-tested with zero callers for months, because the only builds
 // that could have noticed were builds that needed a GPU.
 //
@@ -208,6 +208,23 @@ pub mod fire;
 /// User programs: compile, cache, channel, run.
 #[cfg(feature = "_cuda")]
 pub mod program;
+
+/// The multimodal towers' host walks, in Rust: the arena, the per-image
+/// loop and every `<<<>>>` that used to be host C++ in
+/// `driver-cuda/csrc/vision`. **That directory no longer exists** — all
+/// three walks (gemma-4 vision, gemma-4 audio, qwen3-vl vision) are here,
+/// and nvcc compiles nothing for them.
+///
+/// `bridge` and not just `_cuda`: the vision tower's three GEMMs cross at
+/// `fire::gemm::act_x_wt_bf16` — the dense autotuner, in Rust, and the
+/// boundary `fire/lora.rs` uses for the same work. (That crossing was
+/// `bind::abi::ffi::pie_k_gemm_act_x_wt_bf16` until the row went on
+/// `execution::RUST_SERVED` and the shim entry with it.) All three walks
+/// take that route. Qwen3-VL's still crosses `abi` at one more place —
+/// FlashInfer's prefill dispatch, which north star §5 step 8 retires. Its
+/// only consumer, [`serve`], is gated on `abi`, which implies `bridge`.
+#[cfg(feature = "_cuda")]
+pub mod tower;
 
 /// The door. create / load / launch / transfer / close.
 #[cfg(all(feature = "_cuda", feature = "abi"))]

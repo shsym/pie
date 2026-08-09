@@ -92,6 +92,54 @@ fn texts() -> Vec<Text> {
                 experts_per_token: 8,
             },
         },
+        // The BIAS seam, and the reason is NOT that the symbol was
+        // uncovered. It was written here claiming to be the only entry
+        // with `qkv_bias: true`; a symbol census over all five says
+        // otherwise -- this text names 12 symbols and none of them is
+        // unique to it, because gpt-oss has attention biases too and has
+        // been carrying `add_bias_bfloat16` all along.
+        //
+        // What it adds, measured: `add_bias` evaluated at a SECOND
+        // geometry. gpt-oss reaches it at 64 q heads of 64, so the bias
+        // spans 4096 and 512; Qwen-2.5-1.5B reaches it at 12 q heads of
+        // 128, so 1536 and 256. `every_launch_of_every_text_becomes_a_
+        // legal_grid` is a per-text check evaluated at the text's own
+        // `Geometry`, and one shape is not a rule.
+        //
+        // And it states an INTENT the other entry holds by accident.
+        // gpt-oss is here for sinks, its own SwiGLU and MXFP4 banks; its
+        // biases are incidental, so a change to that fixture could take
+        // the whole bias seam with it and nothing would say so. This row
+        // is named for the seam, so losing it is a deletion rather than a
+        // side effect.
+        //
+        // `add_bias` is a CAPABILITY on the metal facts and `qkv_bias` is
+        // a fact about the checkpoint; `synthetic()` states the first and
+        // `qwen2_5_1_5b()` the second, and both must hold for the text to
+        // state the bias at all.
+        Text {
+            name: "llama_like (qwen2 qkv bias)",
+            plan: |class| {
+                use model::shared::llama_like::forward::facts::{
+                    LlamaLikeFacts, LlamaLikeMetalFacts,
+                };
+                model::shared::llama_like::forward::llama_like_metal(
+                    &LlamaLikeFacts::qwen2_5_1_5b(),
+                    &LlamaLikeMetalFacts::synthetic(),
+                    class,
+                )
+            },
+            // Qwen2.5-1.5B as measured: 12 q heads, 2 kv, hidden 1536 / 12.
+            // Standard rope over the whole head, so `rotary_dims == head_dim`.
+            geometry: Geometry {
+                q_heads: 12,
+                kv_heads: 2,
+                head_dim: 128,
+                rotary_dims: 128,
+                n_experts: 0,
+                experts_per_token: 0,
+            },
+        },
         // gpt-oss, and it joins the same way: attention SINKS, its own SwiGLU and
         // an alternating window are three facts, not a family. What is new is one
         // weight per layer and one symbol.
@@ -331,13 +379,14 @@ fn the_harness_covers_every_family_that_has_a_text() {
     // Counted rather than named: the list is short and its growth is the whole
     // remaining plan (`.wiki/new-driver/metal.md` task 5).
     //
-    // TWO entries over ONE text, and the gap is the interesting part: the
-    // mixture joined by naming a fixture rather than by being a family, so a
-    // routed FFN reaches the device with no second text and no per-family
-    // branch anywhere in the executor.
+    // FIVE entries over ONE text, and the gap is the interesting part: every
+    // one of them joined by naming a fixture rather than by being a family,
+    // so a routed FFN, attention sinks, a geglu with a softcap and a q/k/v
+    // bias all reach the device with no second text and no per-family branch
+    // anywhere in the executor.
     assert_eq!(
         texts().len(),
-        4,
+        5,
         "a Metal text or fixture landed or left. Add or remove its row in \
          `texts()` — everything above is per-text and a shape not listed is a \
          shape not checked."
@@ -586,6 +635,42 @@ fn a_row_that_states_its_operands_agrees_with_its_shader() {
 /// is read anyway — on this backend, whatever the last dispatch left there. So
 /// this counts them, and the count is the last measurable distance between the
 /// executor and a fire worth checking against a checkpoint.
+/// The slots a row leaves unbound on purpose, with the argument for each.
+///
+/// `(symbol, buffer, operand)`. A row is POSITIONAL, so a slot the kernel
+/// declares and nothing fills has to be listed rather than dropped — dropping
+/// it shifts every operand after it. What this table adds is WHY, per slot,
+/// and the test holds the set exactly: a new hole fails, and so does an
+/// argument whose slot has since been filled.
+const DELIBERATE: &[(&str, usize, &str)] = &[
+    // SEVEN buffers of a shared ring ABI `kv_append_paged` declares and does
+    // not read. Nothing fills them because nothing should.
+    ("kv_append_paged_bfloat16", 4, "ring_4"),
+    ("kv_append_paged_bfloat16", 6, "ring_6"),
+    ("kv_append_paged_bfloat16", 7, "ring_7"),
+    ("kv_append_paged_bfloat16", 8, "ring_8"),
+    ("kv_append_paged_bfloat16", 9, "ring_9"),
+    ("kv_append_paged_bfloat16", 11, "ring_11"),
+    ("kv_append_paged_bfloat16", 15, "ring_15"),
+    // A slot the OTHER instantiation of the same kernel fills. `sinks` is
+    // `LlamaLikeMetalFacts::attn_sinks`'s, and no text in `texts()` sets it;
+    // `bias` is `affine_qmv_routed_bias`'s; `per_expert_scale` is
+    // `router_topk_scaled`'s.
+    ("sdpa_paged_decode_bfloat16_d_128", 16, "sinks"),
+    ("affine_qmv_routed_bfloat16_gs_64_b_4", 7, "bias"),
+    ("router_topk_bfloat16", 4, "per_expert_scale"),
+    // The one hole that is a property of a CODEC rather than of a sibling
+    // instantiation. `biases` is the affine zero-point plane, and MXFP4 has
+    // none: its scales are E8M0 block exponents with nothing to subtract.
+    // The kernel takes the pointer and ignores it, which is why the slot may
+    // be empty — and why it may not be SOURCED. It was, from `Weight(2)`,
+    // copied index-for-index off the affine row, and that pushed the additive
+    // bias this symbol does read to a `Weight(3)` the codec's weight list
+    // never reaches. See `model_dispatch::the_mxfp4_expert_bank_reads_a_bias_
+    // and_is_handed_one`.
+    ("mxfp4_qmv_routed_bias_bfloat16_gs_32_b_4", 2, "biases"),
+];
+
 #[test]
 fn every_slot_a_row_names_is_a_slot_a_statement_fills() {
     let mut holes: Vec<String> = Vec::new();
@@ -615,28 +700,42 @@ fn every_slot_a_row_names_is_a_slot_a_statement_fills() {
         holes.len(),
         holes.join("\n")
     );
-    // TEN, measured 2026-08-11, and every one is named:
+    // Every one is NAMED rather than counted.
     //
-    //   kv_append_paged: SEVEN buffers of a shared ring ABI the kernel
-    //     declares and does not read (4, 6-9, 11, 15). A row is positional so
-    //     they are listed; nothing fills them because nothing should.
-    //   sdpa_paged_decode: `sinks`, which gpt-oss reads and `llama_like` has
-    //     none of. The slot waits for a text that has them.
-    //   affine_qmv_routed: `bias`, which `affine_qmv_routed_bias` is the
-    //     symbol for. Same shape as `sinks` — a slot the OTHER instantiation
-    //     of this kernel fills.
-    //   router_topk: `per_expert_scale`, likewise `router_topk_scaled`'s.
-    //
-    // So every remaining hole is DELIBERATE — a declared-but-unread ABI and a
-    // feature this family lacks — rather than a value the text forgot. That is
-    // a different thing from the fourteen this started at, and the number
-    // should be read as "slots waiting on another family", not as debt.
+    // This used to assert `holes.len() <= 10` against a paragraph listing
+    // which ten. A count is the weaker claim by exactly the amount that
+    // matters: it passes when a deliberate hole is filled and an accidental
+    // one opens in the same run, and it says nothing about WHICH slot the
+    // eleventh is. The paragraph was already doing the real work; this makes
+    // it the assertion.
+    let deliberate: BTreeSet<String> = DELIBERATE
+        .iter()
+        .map(|(symbol, slot, name)| format!("  {symbol}: buffer {slot} (`{name}`)"))
+        .collect();
+    let found: BTreeSet<String> = holes.iter().cloned().collect();
+    let opened: Vec<&String> = found.difference(&deliberate).collect();
+    let closed: Vec<&String> = deliberate.difference(&found).collect();
     assert!(
-        holes.len() <= 10,
-        "{} slots no statement fills, which is more than the ten that are \
-         deliberate. A slot nobody fills is read anyway.\n{}",
-        holes.len(),
-        holes.join("\n")
+        opened.is_empty(),
+        "{} slot(s) no statement fills and no argument covers. A slot nobody \
+         fills is read anyway.\n{}",
+        opened.len(),
+        opened
+            .iter()
+            .map(|h| h.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert!(
+        closed.is_empty(),
+        "{} slot(s) are argued for below and no row leaves them unbound. An \
+         excuse outliving its subject is how the next one gets believed.\n{}",
+        closed.len(),
+        closed
+            .iter()
+            .map(|h| h.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
 

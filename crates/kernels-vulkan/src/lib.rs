@@ -214,13 +214,20 @@ const EMPTY: KernelSig = KernelSig {
     sink: None,
     in_place: &[],
     depth_prefix_plan: false,
+    // A standing fact about this table, no longer annotating a field: no
+    // kernel here is a mamba block, and `Prepare::Ssm` does not appear in
+    // this file. That is why the aux-slot field this crate used to carry
+    // was always empty. Step 9 measured that field CUDA-only and
+    // consolidated it onto `kernels_cuda_new::x::Contract`, so the reason
+    // outlived the field.
+
+    args: &[],
     operands: &[],
-    returns: "",
     axes: &[],
     grid_param: None,
     head_param: None,
     heads_param: None,
-    lowered_as: None,
+    rows_param: None,
 };
 
 const fn copy_sig(k: &KernelSig) -> KernelSig {
@@ -235,13 +242,13 @@ const fn copy_sig(k: &KernelSig) -> KernelSig {
         sink: k.sink,
         in_place: k.in_place,
         depth_prefix_plan: k.depth_prefix_plan,
+        args: k.args,
         operands: k.operands,
-        returns: k.returns,
         axes: k.axes,
         grid_param: k.grid_param,
         head_param: k.head_param,
         heads_param: k.heads_param,
-        lowered_as: k.lowered_as,
+        rows_param: k.rows_param,
     }
 }
 

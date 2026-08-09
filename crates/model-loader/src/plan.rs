@@ -59,10 +59,11 @@ pub fn compile(
     let rewritten =
         crate::contract::rewrite::coalesce_direct_row_shards(contract, metadata, &target)?;
     let mut plan = build::build(metadata, &rewritten, target.clone())?;
+    // The pipeline ends with `lower-backend-tiling`, so a plan is never
+    // observable in a state where its tiling, fusion and kernel fields are
+    // still placeholders — and the validators after it get to see what it
+    // decided.
     plan.passes = pass::run_all(&mut plan)?;
-    // Runs last, so a plan is never observable in a state where its tiling and
-    // fusion fields are still placeholders.
-    passes::tile::lower(&mut plan);
     // Compiled from the *unrewritten* contract, because `groups` is not what
     // the row-shard rewrite looks at; each group is rewritten on its own inside
     // `group::compile_all`, where the sub-contract it applies to exists.
@@ -77,10 +78,42 @@ pub fn compiler_version() -> u64 {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryPlan {
     pub persistent_bytes: u64,
+    /// Device bytes the arena reserves BEYOND the resident tensors, for the
+    /// operands of transforms the device runs itself.
+    ///
+    /// The arena used to be defined as "the resident tensors, laid out", so
+    /// anything that was not a resident tensor was host memory by
+    /// construction — which is why no transform reading a file or an
+    /// intermediate could ever have its operands on the device, and why every
+    /// load-time kernel in this tree was unreachable
+    /// (`.wiki/fix/loader.md` §3.3).
+    ///
+    /// Bounded by the transform, not by the model: staging buffers are reused
+    /// across a schedule that runs one instruction at a time, so this is the
+    /// largest single staged operand and not their sum.
+    #[serde(default)]
+    pub scratch_bytes: u64,
     pub temporary_peak_bytes: u64,
     pub transform_scratch_peak_bytes: u64,
     pub checkpoint_read_bytes: u64,
     pub device_write_bytes: u64,
+}
+
+impl MemoryPlan {
+    /// What the caller has to allocate.
+    ///
+    /// The resident tensors and the staging region behind them, which is one
+    /// number because they are one allocation: every offset in the plan —
+    /// `persistent_offset`, `scratch_offset`, `BulkExtentWrite::dest_offset` —
+    /// is measured from the same base.
+    ///
+    /// A method rather than a wider `persistent_bytes`, because that field
+    /// answers a question three call sites still ask on its own: how much of
+    /// the arena holds tensors that outlive the load.
+    #[must_use]
+    pub fn arena_bytes(&self) -> u64 {
+        self.persistent_bytes.saturating_add(self.scratch_bytes)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,10 +223,64 @@ impl Default for StorageTarget {
 pub struct BufferDecl {
     pub id: BufferId,
     pub tensor: Option<TensorId>,
+    /// What this buffer's bytes ARE: the shape and encoding of the thing it
+    /// holds, stated on the buffer itself.
+    ///
+    /// This used to be reachable only through [`tensor`](Self::tensor), and
+    /// that indirection was the loader's largest silent defect. `tensor` says
+    /// "this buffer IS that declared tensor", which an intermediate is not:
+    /// the decoded operand a re-encode reads is nobody's tensor, so it had no
+    /// type, so the compiler could not pick a kernel for a transform reading
+    /// it and the executor could not even run one — `contract: buffer 2 has no
+    /// tensor type` was a `Cast` of an internal tensor failing outright, on
+    /// the host as well as the device (`.wiki/fix/loader.md` §3.3).
+    ///
+    /// The builder always had the answer. Every buffer is allocated from a
+    /// [`TensorDecl`], `declared` or not; all that was missing was writing the
+    /// type down when the buffer was not going to be bound by name.
+    ///
+    /// `tensor` stays, and stays `Option`, for the two things it actually
+    /// means: what to publish this buffer as, and which declaration to
+    /// finalize. Typing no longer asks it.
+    pub ty: crate::contract::TensorType,
     pub bytes: u64,
     pub alignment: u32,
     pub temporary: bool,
     pub persistent_offset: Option<u64>,
+    /// Where this buffer sits in the arena's SCRATCH region, if it is
+    /// staging.
+    ///
+    /// Separate from [`persistent_offset`](Self::persistent_offset) because
+    /// the two answer different questions, and three passes depend on the
+    /// difference. `persistent_offset` means "this is a resident tensor, laid
+    /// out" — [`spans::publish_spans`] publishes exactly those, and
+    /// `rewrite::extent_write_as_bulk` turns exactly those writes into
+    /// arena-absolute `BulkExtentWrite`s that `hoist_bulk_extent_writes` then
+    /// moves to the front of the schedule. A staging buffer must be neither:
+    /// it is not a tensor anyone names, and its write must stay where the
+    /// transform that reads it is, because scratch is REUSED and a hoisted
+    /// write would land in a slot another transform is still reading.
+    ///
+    /// Both are arena offsets, so anything asking merely "where is this
+    /// buffer" asks [`arena_offset`](Self::arena_offset) and gets one answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_offset: Option<u64>,
+}
+
+impl BufferDecl {
+    /// Where this buffer lives in the arena, resident or staging, or `None`
+    /// for a host-owned one.
+    #[must_use]
+    pub fn arena_offset(&self) -> Option<u64> {
+        self.persistent_offset.or(self.scratch_offset)
+    }
+
+    /// The dtype one element reads as — the logical one for a quantized
+    /// encoding, which is what a transform over it sees.
+    #[must_use]
+    pub fn dtype(&self) -> DType {
+        self.ty.encoding.dtype()
+    }
 }
 
 /// A file the plan reads from.
@@ -574,7 +661,10 @@ impl LoadPlan {
     /// names rather than a flag because **a checkpoint need not be uniform**:
     /// `mlx-community/gpt-oss-20b-MXFP4-Q4` names 98 tensors as affine/64/4
     /// in its `quantization` block and leaves the expert banks out, so those
-    /// take the top-level default — mxfp4, group 32.
+    /// take the top-level default — mxfp4, group 32. The block holds 122
+    /// entries, not 98; the other 24 name the `mlp.router` gates at 64/**8**.
+    /// So the one checkpoint carries THREE formats, and a set of names is the
+    /// only shape of answer that can carry that.
     ///
     /// Reading a bank with the dense format is not a near miss. Every scale
     /// comes from the wrong offset and bf16 garbage is NaN more often than
@@ -641,6 +731,89 @@ impl LoadPlan {
         points.sort_unstable();
         points.dedup();
         points
+    }
+
+    /// Each distinct affine point beside ONE tensor that arrives at it.
+    ///
+    /// [`Self::affine_points`] is a count, and a count is what a refusal
+    /// cannot act on: an operator told a checkpoint "arrives at 2 affine
+    /// points (g64/b4, g64/b8)" learns that it is refused and nothing about
+    /// what to do next. `gpt-oss-20b-MXFP4-Q4`'s second point belongs to its
+    /// 24 `mlp.router` gates and to nothing else, and a message that says so
+    /// is the difference between a dead end and a named one.
+    ///
+    /// The witness is the FIRST tensor at each point in declaration order,
+    /// which for every checkpoint this has been run against is the earliest
+    /// layer's — a name an operator can look up in the index.
+    ///
+    /// Sorted by point, for the same reason [`Self::affine_points`] is.
+    /// Every affine tensor's point, by name.
+    ///
+    /// [`Self::affine_point_of`] answers one name in a scan of the whole
+    /// declaration list; a driver that must answer several — and that must
+    /// not read [`Encoding`] and [`QuantScheme`] structurally to do it, which
+    /// is the coupling `mxfp4_tensor_names` exists to avoid — takes the map
+    /// once and asks it.
+    #[must_use]
+    pub fn affine_by_name(&self) -> std::collections::HashMap<String, (u32, u32)> {
+        self.tensors
+            .iter()
+            .filter_map(|t| match &t.encoding {
+                Encoding::Quant(spec)
+                    if spec.scheme != QuantScheme::Mxfp4E2M1E8M0 && spec.group_size > 0 =>
+                {
+                    Some((
+                        t.name.clone(),
+                        (spec.group_size, u32::from(spec.bits_per_element)),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The affine point ONE named tensor arrives at, if it is affine.
+    ///
+    /// The by-name form of [`Self::affine_points`], for a driver that must
+    /// know not just how many points a checkpoint holds but WHICH tensor
+    /// holds which. `driver-metal` puts two names to this — the expert bank
+    /// and the router gate — and a checkpoint that answers a third point for
+    /// anything else is one it refuses.
+    ///
+    /// `None` for a tensor that is absent, raw, or MXFP4: none of the three
+    /// is read at an affine point.
+    #[must_use]
+    pub fn affine_point_of(&self, name: &str) -> Option<(u32, u32)> {
+        self.tensors
+            .iter()
+            .find(|t| t.name == name)
+            .and_then(|t| match &t.encoding {
+                Encoding::Quant(spec)
+                    if spec.scheme != QuantScheme::Mxfp4E2M1E8M0 && spec.group_size > 0 =>
+                {
+                    Some((spec.group_size, u32::from(spec.bits_per_element)))
+                }
+                _ => None,
+            })
+    }
+
+    #[must_use]
+    pub fn affine_point_witnesses(&self) -> Vec<((u32, u32), String)> {
+        let mut out: Vec<((u32, u32), String)> = Vec::new();
+        for t in &self.tensors {
+            let Encoding::Quant(spec) = &t.encoding else {
+                continue;
+            };
+            if spec.scheme == QuantScheme::Mxfp4E2M1E8M0 || spec.group_size == 0 {
+                continue;
+            }
+            let point = (spec.group_size, u32::from(spec.bits_per_element));
+            if !out.iter().any(|(p, _)| *p == point) {
+                out.push((point, t.name.clone()));
+            }
+        }
+        out.sort_unstable_by_key(|(p, _)| *p);
+        out
     }
 }
 
@@ -753,6 +926,20 @@ mod plan_query_tests {
         plan.tensors
             .push(decl("layer.0.norm.weight", Encoding::Raw(DType::BF16)));
         assert_eq!(plan.affine_points(), vec![(64, 4), (64, 8)]);
+
+        // AND WHICH TENSOR MADE IT SO. The count above says a driver cannot
+        // serve this checkpoint; only the witness says the obstacle is the
+        // router gate, which is the sentence that names the next piece of
+        // work rather than ending the conversation.
+        assert_eq!(
+            plan.affine_point_witnesses(),
+            vec![
+                ((64, 4), "layer.0.q_proj.weight".to_string()),
+                ((64, 8), "layer.0.router.gate".to_string()),
+            ],
+            "each point beside the FIRST tensor declared at it, and neither \
+             the mxfp4 bank nor the raw norm is a witness to anything"
+        );
     }
 
     #[test]

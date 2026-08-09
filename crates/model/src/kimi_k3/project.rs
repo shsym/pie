@@ -17,21 +17,6 @@ use crate::manifest::{Manifest, TensorSpec};
 
 use super::spec::KimiK3Facts;
 
-/// Does this build provision the KV store a deployment asks for?
-///
-/// A property of the BINARY, not of any checkpoint — which is why it is
-/// stated here beside the projection rather than carried on a row. This
-/// is where `unbuilt_kv_store()` went: that method existed because a
-/// generation could hold a `FACTS_ROWS` row, load happily, report itself
-/// healthy, and die at its first fire inside a walk. It answered with a
-/// STRING (`"an MLA latent cache"`), and `deployment_of` then decided
-/// which store the string meant by asking whether it contained
-/// `"compress"`.
-#[must_use]
-pub fn kv_store_is_built(kv: &KvStyle) -> bool {
-    kv.has_a_store_in_this_build()
-}
-
 /// This row's tensors.
 ///
 /// # A hybrid's per-layer rows are a UNION, and they have to be
@@ -307,28 +292,33 @@ pub fn manifest(f: &KimiK3Facts, tied_embeddings: bool) -> Manifest {
 
 /// This row's deployment, or a refusal at the DOOR.
 ///
-/// [`Deployment::advertised`] is left DEFAULT here, and deliberately: a
-/// projection sees geometry and nothing else, while none of that
-/// struct's three answers is a shape. An arch label is a coarse family
-/// name a guest program matches on, and a context ceiling is a
-/// training-time fact two checkpoints of identical geometry can disagree
-/// about. The ROW states them, over the top of this.
+/// `advertised` arrives from the ROW as an argument rather than being
+/// derived here, because none of its three answers is a shape: an arch
+/// label is a coarse family name a guest program matches on, a context
+/// ceiling is a training-time fact two checkpoints of identical geometry
+/// can disagree about, and whether a tower ships is a question about the
+/// checkpoint's files. This function sees geometry and nothing else.
+///
+/// It is a PARAMETER and not a field the caller writes afterwards. The
+/// caller used to project, `?` the refusal, and only then assign the
+/// label -- which put the assignment past a refusal this build always
+/// takes, so the row's label was carried by no code that ran. Passing it
+/// in is what makes the projection total in fact and not only in the
+/// sentence above.
 ///
 /// # Errors
 ///
 /// [`Refusal::Unsupported`] when this build provisions no store for the
 /// row's [`KvStyle`] — which for this generation is every build, and is
 /// the honest answer rather than a load that dies at its first fire.
-pub fn deployment(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32) -> Result<Deployment, Refusal> {
-    let planned = plan(f, rope_theta, norm_eps);
-    if kv_store_is_built(&planned.kv) {
-        Ok(planned)
-    } else {
-        Err(Refusal::Unsupported(
-            "this build provisions no MLA latent store; the row's compressed \
-             KV has nowhere to live",
-        ))
-    }
+pub fn deployment(
+    f: &KimiK3Facts,
+    rope_theta: f32,
+    norm_eps: f32,
+    advertised: Advertised,
+) -> Result<Deployment, Refusal> {
+    let planned = plan(f, rope_theta, norm_eps, advertised);
+    planned.provisioned()
 }
 
 /// The projection itself, which is TOTAL: a row's deployment is a fact
@@ -336,10 +326,10 @@ pub fn deployment(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32) -> Result<Dep
 ///
 /// Separate from [`deployment`] so the two statements stay separable —
 /// "what this model needs" is the row's, "what this binary provides" is
-/// [`kv_store_is_built`]'s, and collapsing them is how a capability
+/// [`KvStyle::has_a_store_in_this_build`]'s, and collapsing them is how a capability
 /// question turns back into a family name.
 #[must_use]
-fn plan(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
+fn plan(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32, advertised: Advertised) -> Deployment {
     let a = &f.attn;
     // MLA's page row holds the LATENT plus the one shared rope half, and
     // not a head-split key — which is what this generation's
@@ -423,20 +413,19 @@ fn plan(f: &KimiK3Facts, rope_theta: f32, norm_eps: f32) -> Deployment {
         // Not a gemma: the gain is the multiplier, stored directly.
         norm_unit_offset: false,
         v_norm: false,
-        k_eq_v: false,
         norm_topk_prob: f.moe.norm_topk_prob,
         routed_scaling: f.moe.routed_scaling,
         mlp_gate: crate::deployment::MlpGate::Silu,
         scales: std::collections::BTreeMap::new(),
-        // DEFAULT, and the row writes over it. None of the three
-        // answers in here is geometry: an arch label is a coarse family
-        // name, a context ceiling is a training-time fact, and whether a
-        // tower ships is a question about the checkpoint's files. A
-        // projection that filled them would be deriving a family name
-        // from a shape, which is the inference that put
+        // Carried, unread. None of the three answers in here is
+        // geometry: an arch label is a coarse family name, a context
+        // ceiling is a training-time fact, and whether a tower ships is
+        // a question about the checkpoint's files. A projection that
+        // filled them from what it can see would be deriving a family
+        // name from a shape, which is the inference that put
         // `Gemma4ForConditionalGeneration` in a table row it did not
         // belong in.
-        advertised: Advertised::default(),
+        advertised,
         // Unscaled, because nothing in this tree says otherwise:
         // `synthetic--kimi-k3.json` states no `rope_scaling` block at
         // all, and the ladder is used as written. A row that invented a
@@ -534,7 +523,6 @@ pub const NO_METAL: &str = "kimi-k3 has no Metal text in this build: its forward
 ///
 /// [`Refusal::Unsupported`] when the row states a gated MLA output,
 /// which this build has no text for.
-#[cfg(feature = "forward")]
 pub fn trace(
     f: &KimiK3Facts,
     class: model_compiler::trace::FireClass,
@@ -982,7 +970,7 @@ mod tests {
     /// is a fire indexing past the end of it.
     #[test]
     fn the_deployment_states_one_attention_row_per_layer() {
-        let d = plan(&k3(), 10_000.0, 1e-5);
+        let d = plan(&k3(), 10_000.0, 1e-5, Advertised::default());
         assert_eq!(d.layers, 8);
         assert_eq!(d.attention.len(), 8);
         assert!(
@@ -996,7 +984,7 @@ mod tests {
     /// every query head reads the same latent plane.
     #[test]
     fn the_geometry_states_the_latent_plane_and_both_mlp_widths() {
-        let d = plan(&k3(), 10_000.0, 1e-5);
+        let d = plan(&k3(), 10_000.0, 1e-5, Advertised::default());
         let g = &d.shape;
         assert_eq!(g.hidden, 2048);
         assert_eq!(g.q_heads, 16);
@@ -1024,7 +1012,7 @@ mod tests {
     /// row.
     #[test]
     fn every_layer_attends_the_whole_context_at_the_dot_width() {
-        let d = plan(&k3(), 10_000.0, 1e-5);
+        let d = plan(&k3(), 10_000.0, 1e-5, Advertised::default());
         let expected = 1.0 / (192.0_f32).sqrt();
         for (l, a) in d.attention.iter().enumerate() {
             assert_eq!(a.window, -1, "layer {l} must not window a recurrence");
@@ -1047,7 +1035,7 @@ mod tests {
     #[test]
     fn the_full_attention_layers_state_no_rotation() {
         let f = k3();
-        let d = plan(&f, 10_000.0, 1e-5);
+        let d = plan(&f, 10_000.0, 1e-5, Advertised::default());
         for (l, a) in d.attention.iter().enumerate() {
             assert_eq!(a.rotary_dim, 0, "layer {l} rotates nothing");
             if f.is_full_attn(l as u32) {
@@ -1069,7 +1057,7 @@ mod tests {
     /// `config.json` to fill the very facts row that already held them.
     #[test]
     fn the_kv_style_is_mla_with_the_rows_own_ranks() {
-        let d = plan(&k3(), 10_000.0, 1e-5);
+        let d = plan(&k3(), 10_000.0, 1e-5, Advertised::default());
         assert_eq!(
             d.kv,
             KvStyle::Mla {
@@ -1084,7 +1072,7 @@ mod tests {
     #[test]
     fn the_linear_layers_get_slabs_and_the_full_attention_layers_do_not() {
         let f = k3();
-        let d = plan(&f, 10_000.0, 1e-5);
+        let d = plan(&f, 10_000.0, 1e-5, Advertised::default());
         let r = d
             .recurrent
             .as_ref()
@@ -1118,28 +1106,35 @@ mod tests {
     fn an_all_full_attention_schedule_asks_for_no_slabs() {
         let mut f = k3();
         f.full_attn_interval = 1;
-        let d = plan(&f, 10_000.0, 1e-5);
+        let d = plan(&f, 10_000.0, 1e-5, Advertised::default());
         assert!(d.recurrent.expect("still stated").linear_layers.is_empty());
     }
 
-    /// What the row advertises rides through untouched. It is carried
-    /// rather than derived because the derivation it replaces read
-    /// `model_type` and `max_position_embeddings` off a resident
-    /// `HfConfig`.
+    /// What the row advertises rides through the projection untouched.
+    ///
+    /// It is CARRIED and not derived because the derivation it replaces
+    /// read `model_type` and `max_position_embeddings` off a resident
+    /// `HfConfig` at load. A projection that filled the label in from
+    /// what it can see would be re-inventing the `architectures[0]`
+    /// inference that put `Gemma4ForConditionalGeneration` in a table row
+    /// it did not belong in.
     #[test]
-    fn the_projection_states_no_family_label_because_a_label_is_not_geometry() {
-        let d = plan(&k3(), 10_000.0, 1e-5);
+    fn the_rows_advertised_label_is_carried_and_not_rewritten() {
+        let stated = Advertised {
+            arch: "kimi_k3",
+            max_model_len: 131072,
+            media_encode: false,
+        };
+        let d = plan(&k3(), 10_000.0, 1e-5, stated.clone());
         assert_eq!(
-            d.advertised,
-            Advertised::default(),
-            "a projection that fills this in has derived a family name from a shape",
+            d.advertised, stated,
+            "a projection that edits the label is inventing one, and one that \
+             defaults it has dropped what the row said"
         );
-        assert!(
-            d.advertised.arch.is_empty(),
-            "an empty label is a row that has not spoken yet"
-        );
-        assert_eq!(d.advertised.max_model_len, 0);
-        assert!(!d.advertised.media_encode);
+        // The default has to be distinguishable from the stated value, or
+        // the assertion above passes on a projection that ignores its
+        // argument entirely.
+        assert_ne!(stated, Advertised::default());
     }
 
     /// The ladder is used AS WRITTEN and no tower ships, and both are
@@ -1150,7 +1145,7 @@ mod tests {
     /// measured.
     #[test]
     fn the_rope_ladder_is_unscaled_and_no_tower_ships() {
-        let d = plan(&k3(), 10_000.0, 1e-5);
+        let d = plan(&k3(), 10_000.0, 1e-5, Advertised::default());
         assert!(
             d.rope_scaling.is_none(),
             "no committed config states a rescaling to read"
@@ -1167,7 +1162,7 @@ mod tests {
     /// questions other generations answer differently.
     #[test]
     fn the_stack_is_planned_pre_norm_and_caps_nothing() {
-        let d = plan(&k3(), 10_000.0, 1e-5);
+        let d = plan(&k3(), 10_000.0, 1e-5, Advertised::default());
         assert_eq!(d.prefill, PrefillStyle::Planned);
         assert_eq!(d.attn_output, AttnOutput::DriverPinned);
         assert_eq!(d.norm, NormPlacement::Pre);
@@ -1181,7 +1176,7 @@ mod tests {
     /// at the first fire inside a walk.
     #[test]
     fn a_build_with_no_mla_store_refuses_the_row() {
-        let err = deployment(&k3(), 10_000.0, 1e-5)
+        let err = deployment(&k3(), 10_000.0, 1e-5, Advertised::default())
             .expect_err("no MLA store is built in this tree, so the row cannot be served");
         assert!(matches!(err, Refusal::Unsupported(_)));
     }
@@ -1190,16 +1185,15 @@ mod tests {
     /// whether or not this build can serve it.
     #[test]
     fn the_plan_exists_even_where_the_build_refuses_it() {
-        let planned = plan(&k3(), 10_000.0, 1e-5);
-        assert!(!kv_store_is_built(&planned.kv));
-        assert!(kv_store_is_built(&KvStyle::Paged));
-        assert!(!kv_store_is_built(&KvStyle::Dsv4 { ratios: Vec::new() }));
+        let planned = plan(&k3(), 10_000.0, 1e-5, Advertised::default());
+        assert!(!planned.kv.has_a_store_in_this_build());
+        assert!(KvStyle::Paged.has_a_store_in_this_build());
+        assert!(!KvStyle::CompressedPlane { ratios: Vec::new() }.has_a_store_in_this_build());
     }
 
     /// The text traces for both fire classes, and names this
     /// generation's own family string — the goldens are keyed on it, so
     /// a rename here is a rename of every recorded plan.
-    #[cfg(feature = "forward")]
     #[test]
     fn the_text_traces_for_both_fire_classes() {
         use model_compiler::trace::FireClass;
@@ -1217,7 +1211,6 @@ mod tests {
     /// A row whose MLA gates its output is refused rather than traced,
     /// because the text asserts on it. Turning that panic into a
     /// refusal is the whole reason `trace` returns a `Result`.
-    #[cfg(feature = "forward")]
     #[test]
     fn a_gated_mla_output_is_refused_and_not_traced() {
         use model_compiler::trace::FireClass;

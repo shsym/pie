@@ -195,7 +195,9 @@ fn a_module_that_reads_its_workgroup_count_is_launched_exactly() {
 /// `local_size_x = PIE_HEAD_DIM`, so its four modules are 64, 128, 256 and 512
 /// wide and a geometry that assumed any single number would undershoot three of
 /// them by up to 8x. `Elementwise` is 256 in nineteen modules and `(16, 16, 1)`
-/// in `geglu_tanh_strided`, which is indexed per (channel, row).
+/// in `geglu_tanh_strided`, which is indexed per (channel, row). `RouteRows`
+/// is the third: `add_bias` cannot round its y axis up, because unlike the
+/// `moe` rows it carries no `rows` scalar to guard against.
 ///
 /// Anything ELSE that varies is drift: two shaders under one rule that no
 /// longer agree about their decomposition. The list is closed on purpose, so
@@ -224,6 +226,14 @@ fn only_the_rules_that_are_allowed_to_vary_do() {
             "SdpaVector" => 4,
             // `geglu_tanh_strided` is laid out per (channel, row).
             "Elementwise" => 2,
+            // `add_bias` is 256 on x with one row per group; the two `moe`
+            // rows are (16, 16) because they carry `rows` in a params buffer
+            // and can guard the y axis. `add_bias` carries only its width, so
+            // it takes its row count from the grid itself and must not be
+            // rounded up on y. Both decompose the SAME grid -- the rule still
+            // hands out [width, rows, 1] -- so a driver dividing by each
+            // module's own `local` is right either way.
+            "RouteRows" => 2,
             _ => 1,
         };
         assert!(
@@ -392,6 +402,82 @@ fn no_rule_puts_work_on_an_axis_its_shader_never_reads() {
         "{} entrypoints are given work nobody will do:\n{}",
         bad.len(),
         bad.join("\n")
+    );
+    assert!(checked >= 180, "only {checked} entrypoints were checked");
+}
+
+/// The MIRROR of the check above, which is the dangerous direction.
+///
+/// `no_rule_puts_work_on_an_axis_its_shader_never_reads` asks `if !read &&
+/// given > 1` -- work handed to an axis nothing reads, which is WASTE. This
+/// asks the opposite: an axis the body READS that the rule leaves at one lane,
+/// which is DATA LOSS. Every index past the first on that axis is never
+/// dispatched, nothing faults, and the buffer keeps what it was allocated
+/// with.
+///
+/// They are different predicates and only the first was written, which is
+/// exactly why this crate did not catch `geglu_tanh_strided`: its body
+/// declared `local_size_y = 16` and read `gl_GlobalInvocationID.y` as the row
+/// under a rule (`Elementwise`) that puts one lane on y. Every row past 15 of
+/// gemma's per-layer-embedding gate was dropped, on every prefill longer than
+/// sixteen tokens, silently. The body is flat now; this is what would have
+/// said so.
+///
+/// Transcribed from `driver-wgpu`'s `no_module_reads_a_grid_axis_its_rule_
+/// leaves_flat`, which was written after the same defect was measured there.
+#[test]
+fn no_module_reads_a_grid_axis_its_rule_leaves_flat() {
+    let _ = modules!();
+    let mut checked = 0;
+    let mut found: Vec<String> = Vec::new();
+    for (name, rule, d) in table() {
+        if rule == Rule::Unstated || DECODE_ONLY.contains(&&*name) {
+            continue;
+        }
+        // 128 rows and not the 64 the sibling check uses, because this
+        // predicate is the other way round and 64 makes it lie. Every compiled
+        // GEMM tile divides 64, so `Rule::Qmm`'s y extent is
+        // `rows.div_ceil(bm)` = 1 for a `bm` of 64 -- one row tile, correctly
+        // one workgroup, and a body reading `gl_WorkGroupID.y` there is
+        // reading index 0 because index 0 is all there is. 128 is a multiple
+        // of every tile too and makes that axis two, so an axis that is flat
+        // is flat because the RULE flattened it.
+        let fire = Dims {
+            rows: 128,
+            ..dims_for(rule, d.local)
+        };
+        // LANES, not workgroups, and the difference is the whole predicate.
+        // `Rule::PerHead` puts `head_dim` lanes on x; a module 128 wide covers
+        // a 128-channel head in ONE workgroup, and a body reading
+        // `gl_GlobalInvocationID.x` there sees 0..127, not just 0. Measured
+        // against `groups` this check called that data loss. An axis is flat
+        // when the rule puts one LANE on it, because only then can the body
+        // never see an index above zero.
+        let Ok(g) = geometry::lanes(rule, fire, Module::loaded(&name, &d)) else {
+            continue;
+        };
+        for (axis, (&read, &given)) in d.grid_axes.iter().zip(g.iter()).enumerate() {
+            // A module whose own workgroup is wider than one on this axis may
+            // legitimately read a LOCAL index there -- `gl_LocalInvocationID.y`
+            // is a lane within the group and says nothing about the grid. Only
+            // a GLOBAL read of a flattened axis is the defect, and `grid_axes`
+            // is about the global builtins.
+            if read && given <= 1 {
+                found.push(format!(
+                    "`{name}` ({rule:?}) is indexed by axis {axis} and its rule \
+                     puts {given} workgroup there"
+                ));
+            }
+        }
+        checked += 1;
+    }
+    assert!(
+        found.is_empty(),
+        "{} entrypoints read a grid axis their rule flattens, so every index \
+         past the first on that axis is never written and the dispatch \
+         succeeds anyway:\n{}",
+        found.len(),
+        found.join("\n")
     );
     assert!(checked >= 180, "only {checked} entrypoints were checked");
 }
@@ -753,7 +839,7 @@ fn the_bindings_a_module_skips_are_the_ones_this_crate_calls_holes() {
         }
     }
 
-    assert_eq!(modules, 665, "a different number of modules is built");
+    assert_eq!(modules, 666, "a different number of modules is built");
     assert_eq!(holed, 165, "a different number of modules has a hole");
     assert_eq!(holes, 358, "a different number of holes in all");
     // `cast_qmm_input_bfloat16_to_float16` is the deepest: it shares a header

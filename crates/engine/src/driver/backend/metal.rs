@@ -50,15 +50,13 @@
 
 use anyhow::{Result, anyhow, bail};
 
-use crate::driver::FrameLaunchOutcome;
-use crate::driver::channel::RegisteredChannel;
-use crate::driver::command::{
-    ChannelRegistrationPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan, ProgramRegistration,
-    StateCopyPlan,
+use ::driver_api::{
+    BoundInstance, ChannelRegistrationPlan, CompletionBroker, Driver, FrameLaunchOutcome,
+    FrameSubmission, InstanceBindingPlan, KvCopyPlan, MediaEncodePlan, PoolResizePlan,
+    ProgramRegistration, RegisteredChannel, StateCopyPlan, SubmissionCompletion,
 };
-use crate::driver::completion::{CompletionBroker, SubmissionCompletion};
-use crate::driver::instance::{BoundInstance, InstanceBindingPlan};
-use crate::driver::submission::FrameSubmission;
+
+use super::settle_control;
 
 /// The Metal shell, behind the seam's fourteen verbs.
 ///
@@ -78,49 +76,43 @@ impl MetalDriver {
     ///
     /// No Metal 4 device, or a device whose queue could not be created. Both
     /// are boot conditions, not runtime ones.
-    pub fn create(config_bytes: &[u8]) -> Result<(Self, ::driver_api::DeviceFacts)> {
-        // `[model] config` and `[model] id`, read HERE because a boot
-        // TOML is the engine's format. A driver that parsed it would be the
-        // second thing entitled to an opinion about the file's shape, and the
-        // two would drift.
-        //
-        // The id is an OVERRIDE, not a selector: a checkpoint is matched to a
-        // `model::catalog` row by its tensors, and this exists for the one
-        // case tensors cannot settle — two shape-identical rows where the
-        // operator knows which download this is.
-        let boot = std::str::from_utf8(config_bytes)
-            .ok()
-            .and_then(|text| text.parse::<toml::Table>().ok());
-        let boot_config = boot.as_ref().and_then(|v| {
-            v.get("model")?
-                .get("config")?
-                .as_str()
-                .map(std::path::PathBuf::from)
-        });
-        let boot_model_id = boot
-            .as_ref()
-            .and_then(|v| Some(v.get("model")?.get("id")?.as_str()?.to_string()));
-        let shell = driver_metal::serve::Shell::open(boot_config, boot_model_id)
+    pub fn create(config_bytes: &[u8]) -> Result<Self> {
+        // ONE READER of the boot document, in `crate::driver::boot`. This
+        // site used to rebuild the `from_utf8` -> `toml::Table` ->
+        // `get("model")` chain itself, and so did the Vulkan and WebGPU seams
+        // beside it -- three readers of one format, inside the crate whose
+        // format it is, each quoting the same sentence about why a driver
+        // must not be the second one.
+        let boot = crate::driver::BootConfig::parse(config_bytes);
+        let shell = driver_metal::serve::Shell::open(boot.config, boot.model_id)
             .map_err(|e| anyhow!("metal shell: {e}"))?;
         let facts = shell.device_facts().clone();
-        Ok((
-            Self {
-                shell,
-                broker: CompletionBroker::new(),
-            },
-            facts,
-        ))
+        let _ = facts;
+        Ok(Self {
+            shell,
+            broker: CompletionBroker::new(),
+        })
+    }
+}
+
+impl Driver for MetalDriver {
+    fn kind(&self) -> &'static str {
+        "metal"
+    }
+
+    fn device_domain(&self) -> ::driver_api::DeviceDomain {
+        ::driver_api::PIE_MEMORY_DOMAIN_METAL_PRIVATE
     }
 
     /// The device's stated facts.
     #[must_use]
-    pub fn device_facts(&self) -> &::driver_api::DeviceFacts {
-        self.shell.device_facts()
+    fn device_facts(&self) -> Option<&::driver_api::DeviceFacts> {
+        Some(self.shell.device_facts())
     }
 
     /// Metal exports no KV handle: there is no cross-process sharing path.
     #[must_use]
-    pub fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
+    fn export_kv_handle(&self) -> Option<::driver_api::KvHandle> {
         self.shell.export_kv_handle()
     }
 
@@ -130,7 +122,7 @@ impl MetalDriver {
     ///
     /// More than one descriptor, a missing `config.json`, or a plan that will
     /// not compile or stage.
-    pub fn load_model(
+    fn load_model(
         &mut self,
         descs: Vec<::driver_api::ModelLoadDesc>,
     ) -> Result<::driver_api::DriverCapabilities> {
@@ -144,7 +136,7 @@ impl MetalDriver {
     ///
     /// A package the registry refuses (a channel whose shape it cannot serve,
     /// a stage it cannot read).
-    pub fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
+    fn register_program(&mut self, desc: &ProgramRegistration) -> Result<u64> {
         self.shell.register_program(desc).map_err(Into::into)
     }
 
@@ -153,10 +145,7 @@ impl MetalDriver {
     /// # Errors
     ///
     /// A shape or dtype the registry will not serve, or a duplicate id.
-    pub fn register_channel(
-        &mut self,
-        desc: &ChannelRegistrationPlan,
-    ) -> Result<RegisteredChannel> {
+    fn register_channel(&mut self, desc: &ChannelRegistrationPlan) -> Result<RegisteredChannel> {
         let binding = self.shell.register_channel(desc)?;
         Ok(RegisteredChannel {
             driver_id: desc.driver_id,
@@ -172,7 +161,7 @@ impl MetalDriver {
     ///
     /// A program id the registry does not hold, a channel an instance may not
     /// attach to, or a geometry class it does not serve.
-    pub fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
+    fn bind_instance(&mut self, desc: &InstanceBindingPlan) -> Result<BoundInstance> {
         let seeds: Vec<(u64, Vec<u8>)> = desc
             .seed_values
             .iter()
@@ -205,14 +194,17 @@ impl MetalDriver {
     /// text serves, or a device failure. Admission is NOT an error: a frame
     /// that does not fit reports [`FrameLaunchOutcome::Exhausted`], which the
     /// engine re-posts, or `Impossible` when no eviction could ever make room.
-    pub fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
+    fn launch(&mut self, frame: &FrameSubmission) -> Result<FrameLaunchOutcome> {
         match self.shell.launch(frame)? {
             driver_metal::serve::Launched::Exhausted => Ok(FrameLaunchOutcome::Exhausted),
             driver_metal::serve::Launched::Impossible => Ok(FrameLaunchOutcome::Impossible),
             driver_metal::serve::Launched::Ran { faults } => {
                 // Reported here rather than in the driver, because choosing a
-                // logging backend is not a library's business. A fault poisons
-                // the one instance and does not fail the frame.
+                // logging backend is not a library's business. A fault kills
+                // the one instance and does not fail the frame; the guest
+                // behind it learns of it from the poison word
+                // `driver::Registry::fire` publishes on the rings that
+                // instance's host reads, not from this line.
                 for (instance, why) in faults {
                     tracing::warn!(instance, %why, "metal: program faulted");
                 }
@@ -226,7 +218,7 @@ impl MetalDriver {
     ///
     /// Always. Media encode is unsupported on this backend, as it is on CUDA;
     /// both seams refuse rather than pretending.
-    pub fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
+    fn encode(&mut self, _plan: &mut MediaEncodePlan) -> Result<SubmissionCompletion> {
         bail!("driver-metal: media encode is unsupported on this backend")
     }
 
@@ -239,19 +231,17 @@ impl MetalDriver {
     ///
     /// A call before `load_model`, a refusal from the planner, or a copy that
     /// leaves a layer's region.
-    pub fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
+    fn copy_kv(&mut self, desc: &KvCopyPlan) -> Result<SubmissionCompletion> {
         self.shell.copy_kv(desc)?;
-        let (_raw, completion) = self.broker.pie_completion(1);
-        Ok(completion)
+        Ok(settle_control(&self.broker))
     }
 
     /// # Errors
     ///
     /// Always today: no model this backend serves has recurrent state.
-    pub fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
+    fn copy_state(&mut self, desc: &StateCopyPlan) -> Result<SubmissionCompletion> {
         self.shell.copy_state(desc)?;
-        let (_raw, completion) = self.broker.pie_completion(1);
-        Ok(completion)
+        Ok(settle_control(&self.broker))
     }
 
     /// Commit or release KV pages so the pool holds `target_pages`.
@@ -260,21 +250,22 @@ impl MetalDriver {
     ///
     /// No pool loaded; a target past what the pool reserved address space
     /// for; or an arena without the memory to grow back into.
-    pub fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
+    fn resize_pool(&mut self, desc: &PoolResizePlan) -> Result<SubmissionCompletion> {
         self.shell.resize_pool(desc)?;
-        // Settled already. `Stepper::trim` waits for the GPU to pass the
-        // unmap before it returns, and a growth is complete once the memory
-        // is attached -- there is nothing left in flight for a caller to wait
-        // on.
-        let (_raw, completion) = self.broker.pie_completion(1);
-        Ok(completion)
+        // The WORK is settled already -- `Stepper::trim` waits for the GPU to
+        // pass the unmap before it returns, and a growth is complete once the
+        // memory is attached. The COMPLETION is a separate fact, and this line
+        // used to get it wrong: it minted one and dropped the target, so the
+        // engine waited on an op nobody would ever settle. `settle_control`
+        // does both halves, in the order the engine's own check requires.
+        Ok(settle_control(&self.broker))
     }
 
     /// # Errors
     ///
     /// Never today; the registry accepts a close of an id it does not hold,
     /// because a close is idempotent from the scheduler's side.
-    pub fn close_instance(&mut self, id: u64) -> Result<()> {
+    fn close_instance(&mut self, id: u64) -> Result<()> {
         self.shell.close_instance(id);
         Ok(())
     }
@@ -282,7 +273,7 @@ impl MetalDriver {
     /// # Errors
     ///
     /// As [`Self::close_instance`].
-    pub fn close_channel(&mut self, id: u64) -> Result<()> {
+    fn close_channel(&mut self, id: u64) -> Result<()> {
         self.shell.close_channel(id);
         Ok(())
     }

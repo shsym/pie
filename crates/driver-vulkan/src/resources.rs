@@ -516,6 +516,46 @@ impl Pool {
         })
     }
 
+    /// The largest page count this pool could ever be grown to.
+    ///
+    /// # What it is for, and the only thing it is for
+    ///
+    /// Telling a demand that can never be met apart from one that cannot be
+    /// met now. A scheduler that waits on the first waits forever; one that
+    /// drops the second drops work it had correctly admitted.
+    /// [`crate::shell::Shell::launch`] is the one caller, and it answers
+    /// `Impossible` above this number and grows below it.
+    ///
+    /// # Why the halving
+    ///
+    /// [`Self::resize`] takes every new buffer BEFORE it frees an old one --
+    /// deliberately, so a failed growth leaves the pool intact -- so the peak
+    /// a growth needs is both sizes at once. A ceiling that ignored that
+    /// would admit a frame the resize then refuses, with nothing changed and
+    /// the scheduler none the wiser about why.
+    ///
+    /// # What it is not
+    ///
+    /// A promise. The heap is shared with this model's weights, with every
+    /// other process on the device, and with whatever the allocator has
+    /// fragmented, so a growth under this number can still fail. Too generous
+    /// is the safe direction: it turns a permanent refusal into a retried one
+    /// rather than the reverse.
+    #[must_use]
+    pub fn ceiling(&self, device: &Device) -> u32 {
+        // Both KV halves, every layer.
+        let per_page = (self.shape.page_size as u64)
+            .saturating_mul(self.shape.row())
+            .saturating_mul(self.shape.bytes as u64)
+            .saturating_mul(self.shape.layers as u64)
+            .saturating_mul(2);
+        if per_page == 0 {
+            return u32::MAX;
+        }
+        let held = per_page.saturating_mul(u64::from(self.shape.pages));
+        u32::try_from(device.budget().saturating_add(held) / per_page / 2).unwrap_or(u32::MAX)
+    }
+
     /// Grow or shrink the cache to `pages`, keeping what the pages that
     /// survive hold.
     ///
@@ -538,6 +578,20 @@ impl Pool {
     /// The pages that survive keep their contents, at the same page numbers.
     /// A shrink drops the tail; the caller owes the check that nobody holds a
     /// page in it, which [`crate::shell::Shell::resize_pool`] makes.
+    ///
+    /// # What it costs, which is why nobody calls it
+    ///
+    /// The POOL, twice: every layer's old buffer is read down to host memory
+    /// and a fresh one is written back up. The delta does not enter. Measured
+    /// at 256 pages of qwen3-0.6b, dropping ONE page takes 2.77 s and
+    /// dropping a hundred and twenty-six takes 0.74 s -- the deeper cut is
+    /// cheaper, because the destination it fills is smaller.
+    ///
+    /// That is why the Vulkan seam publishes `elastic_page_bytes: 0`, so the
+    /// engine's trim task never starts and this is reached only by
+    /// `Shell::admit` growing to a frame's own demand.
+    /// `giving_back_one_page_costs_what_giving_back_half_the_pool_costs`
+    /// pins it.
     ///
     /// # Errors
     ///
@@ -568,6 +622,30 @@ impl Pool {
         )
         .unwrap_or(usize::MAX);
         let bytes = usize::try_from(grown.layer_bytes()).unwrap_or(usize::MAX);
+        // ASKED FOR, before it is taken. The staging buffer below is a plain
+        // `vec![0u8; bytes]`, and a `Vec` that cannot be allocated ABORTS the
+        // process -- it does not return. Found by mutating `Shell::launch`'s
+        // admission check to admit everything: the frame asked for two billion
+        // pages, this line asked the allocator for seventy terabytes, and the
+        // test binary died with SIGABRT instead of reporting a refusal.
+        //
+        // The admission check is still the right place to answer a scheduler,
+        // and it is still there. This is the second line of defence, because a
+        // pool that can be killed by an arithmetic slip in a caller is not one
+        // a server can be built on.
+        {
+            let mut probe: Vec<u8> = Vec::new();
+            probe
+                .try_reserve_exact(bytes)
+                .map_err(|_| Failed::OutOfMemory {
+                    bytes: bytes as u64,
+                    // The HOST refused, not the device, and the caller's move is
+                    // the same either way: this is "not now", not "never". It
+                    // reads as a device refusal in the log, which is why `during`
+                    // says which allocation it was.
+                    during: "stage a resized cache",
+                })?;
+        }
 
         let mut fresh = Vec::with_capacity(self.keys.len() + self.values.len());
         for old in self.keys.iter().chain(&self.values) {

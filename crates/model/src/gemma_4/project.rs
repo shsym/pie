@@ -238,7 +238,15 @@ pub fn deployment(f: &Gemma4Facts, row: RowScalars, load: Deployed<'_>) -> Deplo
         mixture,
         sliding_window,
         norm_eps,
-        k_eq_v,
+        // Deliberately unread, and destructured by name rather than swept
+        // under a `..` so that a field added to the row still has to be
+        // answered here. `Deployment` used to carry a copy of this "for the
+        // driver to read"; no driver read it, because the two branches that
+        // need it are elsewhere — `metal_facts` turns it into `v_from_k`,
+        // and CUDA refuses on it in `Variant::trace`. What a rank allocates
+        // does not change: `k_eq_v` decides whether V has its own
+        // PROJECTION, not how many KV heads a layer has.
+        k_eq_v: _,
     } = row;
     let attention = (0..f.layers)
         .map(|l| layer_attention(f, sliding_window, l))
@@ -278,7 +286,10 @@ pub fn deployment(f: &Gemma4Facts, row: RowScalars, load: Deployed<'_>) -> Deplo
         // gemma-2's alone, and a zero here is "no cap" rather than a
         // cap at zero — which would flatten every score to `tanh(inf)`.
         attn_logit_softcap: 0.0,
-        ple_dim: i32::try_from(f.ple_dim).unwrap_or(0),
+        // The row's own `u32`, carried across unchanged. This was
+        // `i32::try_from(..).unwrap_or(0)`, which turned an
+        // out-of-range width into "no per-layer embeddings".
+        ple_dim: f.ple_dim,
         norm: NormPlacement::Pre,
         // THE EXCEPTION, and the reason this is a field rather than a
         // reading of the placement: gemma-4 sandwiches its norms like
@@ -291,7 +302,6 @@ pub fn deployment(f: &Gemma4Facts, row: RowScalars, load: Deployed<'_>) -> Deplo
         v_norm: true,
         // The ROW's, not the shape's: two gemma-4 checkpoints of one
         // geometry disagree about it.
-        k_eq_v,
         // As `metal_facts` records: gemma-4-26b-a4b ships no
         // `norm_topk_prob` key, and its router normalizes.
         norm_topk_prob: true,
@@ -389,7 +399,6 @@ fn scales(f: &Gemma4Facts, load: Deployed<'_>) -> BTreeMap<String, f32> {
 /// layers they belong to — the same split [`deployment`] makes, where
 /// `Geometry::head_dim` is the checkpoint's 256 and the 512 reaches a
 /// driver through `LayerAttention`.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn metal_shape(
     f: &Gemma4Facts,
@@ -432,6 +441,8 @@ pub fn metal_shape(
         fused_qkv: false,
         tied_embeddings: f.tied_embeddings,
         qkv_bias: false,
+        o_bias: false,
+        router_bias: false,
     }
 }
 
@@ -473,7 +484,6 @@ pub fn metal_shape(
 /// omitted `gemma3`, whose text it models. A row that projects itself
 /// cannot disagree with a list, because there is no list; the refusal
 /// that briefly stood in its place could, and did.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn metal_facts(
     f: &Gemma4Facts,
@@ -500,6 +510,7 @@ pub fn metal_facts(
         fuse_residual_gemv: bind.fuse_residual_gemv,
         paged_multi_batch: bind.paged_multi_batch,
         qmm_multi_batch: bind.qmm_multi_batch,
+        add_bias: bind.add_bias,
         proj_repr: WeightRepr::Scaled {
             layout: ScaleLayout::PerGroup,
             group: bind.quant_group,
@@ -507,13 +518,25 @@ pub fn metal_facts(
             zero_point: true,
         },
         affine_bits: bind.quant_bits,
+        // The ROUTER GATE's own format, when the checkpoint published it
+        // wider than the stack it routes. `None` is "the same as the dense
+        // projections", which is every checkpoint but gpt-oss's -- and
+        // getting it wrong is the QUIET failure: a bank read at the wrong
+        // format is 909,207 NaNs, and a gate read at the wrong width is a
+        // fluent model routing every token to almost the right experts.
+        router_repr: (bind.router_quant_group != 0).then(|| WeightRepr::Scaled {
+            layout: ScaleLayout::PerGroup,
+            group: bind.router_quant_group,
+            axis: 0,
+            zero_point: true,
+        }),
+        router_bits: bind.router_quant_bits,
         moe_repr: bind.moe_mxfp4.then_some(WeightRepr::Mxfp4Marlin),
         moe_bits: 4,
         qmm_tile: crate::shared::llama_like::project::QMM_TILE,
         // No Metal deployment publishes a fused bank; `compile_load_plan`
         // authors with `Projections::InPlace`.
         gate_up_fused: false,
-        qkv_fused: false,
         rms_eps: norm_eps,
         // The FULL layers' base is the model's, and the SLIDING layers'
         // is the second one. Stating both is what lets `rope_theta_at`
@@ -526,11 +549,12 @@ pub fn metal_facts(
         // heads and rotates 128 of its 512 channels.
         global_head_dim: f.global_head_dim,
         global_kv_heads: f.global_kv_heads,
-        full_partial_rotary: if f.global_head_dim == 0 {
-            0.0
-        } else {
-            f64::from(f.global_rotary_dim) as f32 / f.global_head_dim as f32
-        },
+        // A division, not a case. The two attention geometries ARE this
+        // family -- every gemma-4 row states a full-layer head dim, and a
+        // row answering 0 would be a llama. A guard for it is a branch no
+        // row can take, and `every_row_states_both_geometries` is what
+        // keeps that true.
+        full_partial_rotary: f64::from(f.global_rotary_dim) as f32 / f.global_head_dim as f32,
         // The ROW's, not the shape's: two gemma-4 checkpoints of one
         // geometry disagree about it, which is why `deployment` takes it
         // as a parameter and this does too.
@@ -594,7 +618,6 @@ pub fn metal_facts(
 /// per-layer window list is the row's, and it is not empty: gemma-4 is
 /// the generation where an empty list would have the trace say "attends
 /// everything" while the plan applied a 512-token window.
-#[cfg(feature = "forward")]
 #[must_use]
 pub fn trace(
     f: &Gemma4Facts,
@@ -1220,5 +1243,111 @@ mod tests {
                  `NormVariant::Plain` at all fourteen of its norm sites"
             );
         }
+    }
+
+    /// The one row-scalar `deployment` does not read, and the reason a
+    /// gemma-4-31b serves on Metal at all.
+    ///
+    /// `k_eq_v` says the full-attention layers read V out of the K
+    /// projection, so the checkpoint ships no `v_proj`. Three consumers
+    /// disagree about what to do with that and all three are right:
+    /// `metal_facts` hands it on as `v_from_k` and the Metal text serves
+    /// the row; `Variant::trace` refuses it on CUDA, whose hand-written
+    /// text matmuls a `v_proj` unconditionally; and this projection
+    /// ignores it, because what a rank ALLOCATES is unchanged — the KV
+    /// head count is a separate measurement.
+    ///
+    /// It had no test on the `true` side anywhere. Every constructor in
+    /// this module passes `false`, so the carry-through that makes the
+    /// claim true was only ever exercised at its uninteresting value.
+    #[test]
+    fn reading_v_out_of_k_reaches_the_metal_text_and_changes_no_allocation() {
+        use crate::catalog::MetalBinding;
+        let f = Gemma4Facts::gemma_4_e4b();
+        let row = |k_eq_v| RowScalars {
+            mixture: None,
+            sliding_window: E4B_WINDOW,
+            norm_eps: NORM_EPS,
+            k_eq_v,
+        };
+        let bind = MetalBinding {
+            quant_group: 64,
+            quant_bits: 4,
+            router_quant_group: 0,
+            router_quant_bits: 0,
+            moe_mxfp4: false,
+            fuse_residual_gemv: true,
+            paged_multi_batch: true,
+            qmm_multi_batch: true,
+            add_bias: false,
+        };
+        for k_eq_v in [false, true] {
+            assert_eq!(
+                super::metal_facts(&f, row(k_eq_v), &bind).v_from_k,
+                k_eq_v,
+                "the measurement reaches the text that branches on it"
+            );
+        }
+        assert_eq!(
+            deployment(&f, row(true), Deployed::single()),
+            deployment(&f, row(false), Deployed::single()),
+            "a projection that is not V's does not change what a rank reserves"
+        );
+    }
+
+    /// `full_partial_rotary` is a FRACTION, and the shape it is divided
+    /// out of does not appear beside it — so an inverted division reads
+    /// as a plausible float and nothing downstream refuses it. The
+    /// consumer clamps with `want.min(dim)`, which turns 4.0 into "rotate
+    /// every channel" rather than into an error: a full gemma-4 layer
+    /// would rotate 512 channels where the checkpoint rotates 128, and
+    /// the model would produce fluent nonsense at long range.
+    ///
+    /// Asserted where the fraction becomes a WIDTH rather than on the
+    /// float, because the width is the thing the kernel is launched with
+    /// and the two attention geometries answer it differently.
+    #[test]
+    fn a_full_layer_rotates_a_quarter_of_its_channels_and_a_sliding_one_all_of_them() {
+        use crate::catalog::MetalBinding;
+        let f = Gemma4Facts::gemma_4_e4b();
+        let m = super::metal_facts(
+            &f,
+            RowScalars {
+                mixture: None,
+                sliding_window: E4B_WINDOW,
+                norm_eps: NORM_EPS,
+                k_eq_v: false,
+            },
+            &MetalBinding {
+                quant_group: 64,
+                quant_bits: 4,
+                router_quant_group: 0,
+                router_quant_bits: 0,
+                moe_mxfp4: false,
+                fuse_residual_gemv: true,
+                paged_multi_batch: true,
+                qmm_multi_batch: true,
+                add_bias: false,
+            },
+        );
+        let full = (0..f.layers)
+            .find(|&l| f.is_full_attn(l))
+            .expect("gemma-4 interleaves full layers");
+        let sliding = (0..f.layers)
+            .find(|&l| !f.is_full_attn(l))
+            .expect("gemma-4 interleaves sliding layers");
+        assert_eq!(
+            m.rotary_dim_at(full, f.head_dim),
+            f.global_rotary_dim,
+            "the full layer rotates the row's stated {} of {} channels",
+            f.global_rotary_dim,
+            f.global_head_dim,
+        );
+        assert_eq!(
+            m.rotary_dim_at(sliding, f.head_dim),
+            f.head_dim,
+            "the fraction is the FULL layers' alone; a sliding layer \
+             rotates every one of its own channels"
+        );
     }
 }

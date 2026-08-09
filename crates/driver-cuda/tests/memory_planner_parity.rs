@@ -7,7 +7,7 @@
 //! grid through the Rust port and requires the transcripts to be
 //! byte-identical, then pins the **C++'s** FNV-1a 64 hash of it.
 //!
-//! Run `tests/oracle/memory_planner/run.sh` to regenerate the golden.
+//! `tests/oracle/memory_planner/run.sh` can no longer be run — its inputs were deleted, see `oracle_census.rs`. It is kept as the description of how this golden was taken, which is read but not re-derived. It once regenerated the golden.
 //!
 //! # Why this test exists in this shape
 //!
@@ -588,11 +588,21 @@ impl Sweep {
         case.envelopes = self.envelopes;
         case.rs_bf16 = self.rs_bf16;
 
-        let family = match m.fam {
-            Fam::Qwen35 => mp::Family::Qwen35,
-            Fam::Qwen35Moe => mp::Family::Qwen35Moe,
-            Fam::NemotronH => mp::Family::NemotronH,
-            _ => mp::Family::Generic,
+        // The knee eligibility the planner used to derive from a `Family`
+        // enum and a `model_id` string compare of its own. Stating it here is
+        // the point of the refactor: the oracle's vocabulary is the test's,
+        // and the planner only asks which knees apply.
+        //
+        // `raised_prefill_cap` / `page16_prefill_knee` stay FALSE, which is
+        // what the planner computed before: they were gated on
+        // `hf.model_id == "qwen3-8b"`, and `make_case` fills `model_id` from
+        // `model_type` (`"qwen3"`), so the compare never held here either.
+        let knees = mp::ShapeKnees {
+            raised_prefill_cap: false,
+            page16_prefill_knee: false,
+            wide_workspace_knee: m.fam == Fam::NemotronH,
+            tp_prefill_knee_2048: m.fam == Fam::Qwen35Moe,
+            mtp_draft_rows: matches!(m.fam, Fam::Qwen35 | Fam::Qwen35Moe),
         };
         let profiles = StubProfiles {
             shape: self.profile.clone(),
@@ -620,7 +630,7 @@ impl Sweep {
                             c.rs_bf16 = rs_bf16;
                             let hf = c.hf.clone();
                             let p = StubProfiles { shape, complaint };
-                            mp::plan(&cfg, &hf, &prop, mem, family, &c, &p)
+                            mp::plan(&cfg, &hf, &prop, mem, knees, &c, &p)
                         })
                     })
                     .collect();
@@ -631,7 +641,7 @@ impl Sweep {
             })
         } else {
             let hf = case.hf.clone();
-            vec![mp::plan(&cfg, &hf, &prop, mem, family, &case, &profiles)]
+            vec![mp::plan(&cfg, &hf, &prop, mem, knees, &case, &profiles)]
         };
 
         let render = |r: &Result<mp::Planned, mp::PlanError>| match r {
@@ -1042,7 +1052,9 @@ fn the_rust_planner_reproduces_the_cpp_transcript_byte_for_byte() {
     assert_eq!(
         fnv1a64(sw.out.as_bytes()),
         GOLDEN_FNV1A64,
-        "transcript diverged from the C++. Set MP_RUST_OUT=/tmp/rust.txt and \
-         MP_ORACLE_OUT=/tmp/cpp.txt, run tests/oracle/memory_planner/run.sh, and diff."
+        "transcript diverged from the C++. The oracle cannot be re-run to diff \
+         against (see `oracle_census.rs`), so the golden is the only record \
+         of the C++ and a divergence is THIS crate changing. Set \
+         MP_RUST_OUT=/tmp/rust.txt and read the transcript against the pin."
     );
 }

@@ -82,18 +82,33 @@ pub static KERNELS: &[KernelSig] = &[
     // omitting exactly that one because the MXFP4 codec has no separate bias
     // plane. Metal takes the pointer and ignores it for the same reason, so the
     // slot stays in the ABI and stays unread. `--bindings` checks this.
+    //
+    // A slot the shader does not declare cannot be sourced, and that is the
+    // one thing the copy got wrong: it gave the unread `biases` `Weight(2)`
+    // and pushed `bias` -- which the shader DOES declare and read -- to
+    // `Weight(3)`, an index this codec's weight list never reaches.
+    // `MatW::scale_names` yields `.scales` alone for `Mxfp4Marlin`, so the
+    // list runs `w`, `.scales`, `.bias`. Affine's runs one longer because it
+    // has a zero-point plane to name, and that is the only difference the two
+    // rows may carry.
     kernel!(mxfp4_qmv_routed_bias "mxfp4_qmv_routed_bias",
     file = Some("moe/qmv_routed.comp"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The row axis is `out_vec_size`, the second word, and NOT the output
+    // rectangle's width: a routed projection writes a whole token's `k`
+    // results end to end, so the width is `k` times as wide as one result.
+    // Stated here because the geometry that read the width instead had to
+    // guess `k`, and guessed four. See `geometry::lanes`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),
-        biases: Buf <- kernels::Source::Weight(2),
+        biases: Buf,
         x: Buf <- kernels::Source::In(0),
         y: BufMut <- kernels::Source::Out(0),
         in_vec_size: I32 <- kernels::Source::Param(0),
         out_vec_size: I32 <- kernels::Source::Param(1),
-        bias: Buf <- kernels::Source::Weight(3),
+        bias: Buf <- kernels::Source::Weight(2),
         expert_ids: Buf <- kernels::Source::In(1),
         x_slot_stride: I32 <- kernels::Source::Param(2),
         x_row_stride: I32 <- kernels::Source::Param(3),
@@ -114,6 +129,12 @@ pub static KERNELS: &[KernelSig] = &[
     // SPIR-V module lookup.
     kernel!(qmv_routed "affine_qmv_routed", file = Some("moe/qmv_routed.comp"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The row axis is `out_vec_size`, the second word, and NOT the output
+    // rectangle's width: a routed projection writes a whole token's `k`
+    // results end to end, so the width is `k` times as wide as one result.
+    // Stated here because the geometry that read the width instead had to
+    // guess `k`, and guessed four. See `geometry::lanes`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),
@@ -135,6 +156,12 @@ pub static KERNELS: &[KernelSig] = &[
     // 1 in moe/qmv_routed.comp
     kernel!(qmv_routed_bias "affine_qmv_routed_bias", file = Some("moe/qmv_routed.comp"),
     launch = kernels::LaunchRule::RoutedQmv,
+    // The row axis is `out_vec_size`, the second word, and NOT the output
+    // rectangle's width: a routed projection writes a whole token's `k`
+    // results end to end, so the width is `k` times as wide as one result.
+    // Stated here because the geometry that read the width instead had to
+    // guess `k`, and guessed four. See `geometry::lanes`.
+    grid_param = Some(1),
     operands = kernels::operands![
         w: Buf <- kernels::Source::Weight(0),
         scales: Buf <- kernels::Source::Weight(1),
