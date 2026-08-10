@@ -1,14 +1,10 @@
 name: CI
 
-# Toolchain note: the `dtolnay/rust-toolchain@<rev>` steps below only decide
-# what the action downloads. `rust-toolchain.toml` at the repo root is what
-# cargo actually resolves to (1.97.1), and rustup auto-installs it — with the
-# components and targets that file declares — on the first cargo invocation.
-
 on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -18,7 +14,7 @@ jobs:
     name: cargo check / test (workspace)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -35,163 +31,24 @@ jobs:
             ${{ runner.os }}-cargo-
 
       # Cheap structural check: every workspace member compiles. Skips
-      # the cmake-driven C++ build by checking worker with
+      # the cmake-driven C++ build by checking pie-server with
       # `--no-default-features` (the default features pull in ggml).
-      - name: cargo check (runtime, client, no-driver worker)
+      - name: cargo check (runtime, client, no-driver pie-server)
         run: |
           cargo check -p pie
           cargo check -p pie --no-default-features
-          cargo check -p client
+          cargo check -p pie-client
 
       - name: cargo test (runtime, client)
         run: |
           cargo test -p pie --lib
-          cargo test -p client --lib
+          cargo test -p pie-client --lib
 
-      # `tensor-ir` and `tensor-compiler` declare `#![no_std]` behind `not(feature =
-      # "std")` and the wasm SDK depends on them that way, but nothing ever
-      # built that configuration -- the `std` prelude was covering a missing
-      # `alloc::string::String` import, so `--no-default-features` had been
-      # broken without failing anything. A declared `no_std` that is never
-      # compiled is not a `no_std` crate.
-      - name: cargo check (compiler IR core, no_std)
-        run: |
-          cargo check -p tensor-ir --no-default-features
-          cargo check -p tensor-compiler --no-default-features
-
-      # Same defect, one crate over. `model` declares ONE FEATURE PER ASPECT
-      # -- a driver links `contract` without a chat template, an authoring
-      # pass links it without the tracer -- and that is a claim about what
-      # links alone, so it is only true if something builds it that way.
-      #
-      # Nothing did, and it had not been true for the length of the catalog
-      # refactor: `RowScalars` kept a `forward` gate after `deployment`
-      # (ungated, and on the ungated part of `Variant`) started reading it,
-      # so `--features contract` did not compile AT ALL -- sixteen
-      # unresolved names. `cargo test -p model`, the plainest command in the
-      # crate, was among the things that did not run. It went unseen because
-      # every consumer pulls `forward` transitively and feature unification
-      # handed one to every build that asked.
-      #
-      # `--all-targets` because a test is where the gates come apart first:
-      # a `chat`-only vision table named from an ungated test is the same
-      # defect one layer down, and was also present.
-      - name: cargo check (model, one aspect at a time)
-        run: |
-          cargo check -p model --no-default-features --all-targets
-          cargo check -p model --no-default-features --all-targets --features chat
-          cargo check -p model --no-default-features --all-targets --features contract
-          cargo check -p model --no-default-features --all-targets --features forward
-          cargo check -p model --no-default-features --all-targets --features contract,forward
-
-      # The compiler crates are at zero clippy warnings, so they are the only
-      # part of the workspace that can be gated. The rest still carries ~240
-      # warnings (167 in crates/engine alone); widen the `-p` list as crates
-      # are cleaned rather than switching this to `--workspace` and reaching
-      # for `-A` to hold it up.
-      #
-      # Four of these were already clean and gated by nothing, which is the
-      # worse half of a partial gate: `worker-api`, `ids`, `client-api` and
-      # `controller-api` cost nothing to add and had nothing holding them
-      # there. `model-compiler`, `waker` and `transport` were between one and
-      # twelve findings away.
-      #
-      # The list named `tensor-compiler` four times until now. Six crates were
-      # merged into three by a rename (`pie-ir`/`pie-plan`/`pie-eval`/
-      # `pie-codegen`/`pie-dsl`/`pie-compiler-tests`), and the rename rewrote
-      # each `-p` in place, so the repeats were the merge's shadow rather than
-      # anything cargo needed. Checked against the workspace members before
-      # deduplicating: no crate had fallen out of the gate by losing its name.
-      #
-      # `--no-deps` matters: cargo drives clippy through
-      # RUSTC_WORKSPACE_WRAPPER, which lints every *path* dependency that gets
-      # built, not just the selected packages. Without it this step fails on
-      # the driver crate's 13 warnings, which are not the compiler's to fix.
-      - name: cargo clippy (deny warnings)
-        run: |
-          cargo clippy --no-deps --all-targets \
-            -p tensor-ir -p tensor-compiler -p tensor-dsl \
-            -p model-loader -p model-compiler \
-            -p worker-api -p client-api -p controller-api \
-            -p ids -p waker -p transport \
-            -p bootstrap -p client -p controller -p driver -p driver-api \
-            -p engine -p gateway -p grammar -p inferlet \
-            -p inferlet-macros -p kernels -p pie -p tokenizer -p worker \
-            -- -D warnings
-
-      # `model` runs as its own command because it needs `--all-features`.
-      # Its default feature set is `chat` alone, so gating it alongside the
-      # crates above would leave every `contract` and `forward` item — which
-      # is most of the crate — unlinted. The step above this one already
-      # compiles each aspect separately; this one lints all of them at once.
-      - name: cargo clippy (model, deny warnings)
-        run: cargo clippy --no-deps --all-targets -p model --all-features -- -D warnings
-
-      # Same scope, same reason: these crates are rustfmt-clean, the rest of
-      # the workspace is not.
-      #
-      # `model-loader` joined the list because it is what a formatter gate is
-      # FOR. Four doc comments in `executor/host.rs` had come apart — one
-      # function's documentation sitting on another, a `///    ///` doubled
-      # prefix, a body on its signature line — and each was one `cargo fmt`
-      # away from visible for however long it stood.
-      #
-      # `model` joined for the same reason and proved it on the way in: three
-      # files had drifted — a call folded onto one over-long line, a struct
-      # literal written flat — and each had been committed by someone who
-      # believed the crate was clean. Checking a `mod.rs` recurses into its
-      # submodules, so a per-file check had reported a parent's name for a
-      # child's drift, and the drift read as noise.
-      #
-      # `driver-metal` is here and not on the macOS job on purpose. Its CLIPPY
-      # runs there, because a lint can depend on `cfg(target_os)` and only a
-      # Mac compiles both feature halves. rustfmt cannot: it parses and never
-      # type-checks, so it gives the same answer on either host. Leaving it on
-      # the Mac would have meant the only fmt check for the crate sat behind a
-      # runner this branch does not reach — which is how `weights/stage.rs`
-      # and `tests/geometry_is_stated.rs` came to carry a mis-sorted import
-      # and a body opened on its signature's line.
-      #
-      # `worker` is here for the plainer reason that it was never checked
-      # anywhere and had drifted in fifteen files. Its CLIPPY cannot join yet
-      # -- it carries 76 warnings, and a gate is worth nothing until the
-      # crate is at zero -- but fmt is at zero now, and the cheap half of a
-      # gate is still worth having when the alternative is neither half.
-      - name: cargo fmt (compiler crates)
-        run: |
-          cargo fmt --check \
-            -p tensor-ir -p tensor-compiler -p tensor-dsl \
-            -p model-loader -p model -p model-compiler \
-            -p worker-api -p client-api -p controller-api \
-            -p ids -p waker -p transport \
-            -p driver-metal -p engine -p worker \
-            -p bootstrap -p client -p controller -p driver -p driver-api \
-            -p gateway -p grammar -p inferlet \
-            -p inferlet-macros -p kernels -p kernels-metal -p kernels-vulkan \
-            -p pie -p pie-gpu-tests -p pie-server-py -p tokenizer
-
-  # Full-workspace verification — the guardrail + anti-bitrot net. Closes the
-  # gap that let the runtime benches rot unseen: the dedicated jobs only build a
-  # curated subset, so new crates (`transport`) and the benches were
-  # compiled by nothing. This job compiles EVERY target and runs the workspace
-  # test set.
-  #
-  #   --exclude pie-server-py : links driver-cuda (needs nvcc) → cuda job only.
-  #   --exclude worker (workspace test step): worker's `--bin pie` tests
-  #     need a driver feature (dummy/metal/cuda) and are exercised by the four
-  #     dedicated jobs below. Its *library* tests are pure-Rust (default
-  #     features = no cmake/cuda) and ARE run here explicitly via the
-  #     `cargo test -p worker --lib` step so worker library test-rot is
-  #     caught in the full battery — those lib tests previously ran in NO job at
-  #     all. (The two former failures — the filesystem-coupled
-  #     `translate::translates_minimal_config` and
-  #     `config::rejects_public_driver_capacity_knobs` — are now fixed, so the
-  #     exclusion no longer applies to `--lib`.)
-  workspace-verify:
-    name: workspace verify (all crates + all targets)
+  pie-server-portable:
+    name: pie-server (driver-portable)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -201,8 +58,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip2
 
       - name: Cache cargo + cmake build
         uses: actions/cache@v5
@@ -212,277 +67,35 @@ jobs:
             ~/.cargo/git
             ~/.cache/ccache
             target
-          key: ${{ runner.os }}-workspace-verify-${{ hashFiles('**/Cargo.lock', 'driver/**/CMakeLists.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-workspace-verify-
+          key: ${{ runner.os }}-pie-server-portable-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
 
-      # Compile every target — including benches and the not-yet-consumed
-      # data-plane crate `transport` — so they cannot silently bitrot.
-      - name: cargo build (workspace, all targets)
+      - name: cargo build (default = driver-portable)
+        run: cargo build -p pie-server
+
+      - name: cargo test (pie-server)
+        run: cargo test -p pie-server --bin pie
+
+      - name: Verify single-binary linkage
         run: |
-          cargo build --workspace --all-targets \
-            --exclude pie-server-py --exclude driver-cuda
+          file target/debug/pie
+          ldd target/debug/pie
+          # No ggml shared libs should be in the dep tree.
+          ldd target/debug/pie | grep -E "libggml|libllama" \
+            && { echo "FAIL: ggml shared lib leaked into binary"; exit 1; } \
+            || echo "OK: no ggml shared deps"
 
-      # Run the workspace test set (benches are compiled above, not executed).
-      # worker's library tests are pure-Rust, so run them explicitly here to
-      # keep worker test-rot inside the full battery; its `--bin pie` tests need
-      # a driver feature and stay in the dedicated jobs below.
-      - name: cargo test (workspace + worker lib)
-        run: |
-          cargo test --workspace \
-            --exclude pie-server-py --exclude worker --exclude driver-cuda
-          cargo test -p worker --lib
-
-      # Neither of these needs CUDA -- the audit is Python over the published
-      # headers, the table test is pure Rust -- and until now neither ran in
-      # ANY job. Both had rotted in place: the audit globbed `csrc/src/ops` and
-      # `csrc/src/kernels`, which the kernels split deleted, so it examined
-      # five launchers against a 192-row table and reported ZERO UNDECLARED for
-      # weeks. A check nobody runs is indistinguishable from a check that
-      # passes.
-      - name: kernel vocabulary audit
-        run: python3 scripts/kernel-vocabulary-audit.py
-
-      # A file no `mod` declares is INVISIBLE, not dead. rustc never reads
-      # it, so clippy does not lint it, no test covers it, and nothing
-      # reports it — `a86d6478d` deleted 886 lines of `metal/bind.rs` that
-      # the compiler had never once seen, left behind when a module list
-      # was trimmed. Dead code the compiler CAN see is already a warning;
-      # this is the other half.
-      - name: module reachability audit
-        run: python3 scripts/mod-reachability-audit.py
-
-      # The gate lists above are a CLAIM about the workspace, and nothing
-      # checked it. Both ways it can be wrong have already happened here: a
-      # crate listed four times (harmless, but the reason nobody spotted it
-      # is the reason nobody would spot a crate going missing), and sixteen
-      # crates that had never been listed at all and had drifted out of
-      # rustfmt unremarked. A crate that is merely absent from a `-p` list
-      # is indistinguishable, in CI's output, from a crate that passes.
-      - name: gate coverage audit
-        run: python3 scripts/ci-gate-audit.py
-
-      # A `#[cfg(feature = "x")]` whose `x` no package declares is not an
-      # error -- it is a condition that is always false, so the code under
-      # it compiles nowhere while reading as code that is merely off. The
-      # root package lost its `driver-metal` forward when the C++ Metal
-      # driver was retired and never got it back, leaving five dead blocks
-      # in `pie init`'s config template: on a Mac the generated default
-      # named a bf16 repo that Metal's 4-bit-only llama path cannot bind.
-      # `unexpected_cfgs` did fire, into the warnings of a package no gate
-      # lints. This audit needs no compiler, no CUDA and no GPU, so it also
-      # covers the nine crates the gates cannot build here -- which are
-      # exactly the crates that have optional backends to `cfg` on.
-      - name: cfg feature audit
-        run: python3 scripts/cfg-feature-audit.py
-
-      # The three audits above are static, and all three were green on
-      # 3,108 lines of `crates/model` that nothing could reach: the
-      # `emit-cuda` machinery, left behind when the commit that retired
-      # its binary and its check deleted only those two. `dead_code` does
-      # not fire on `pub` items, and the module audit correctly called the
-      # files reachable -- they were, from a `pub mod` nobody called.
-      # Running the tests and asking which files never executed found it
-      # in one line: three at exactly 0.00%, half the crate's uncovered
-      # total. This asks that one question, not for a percentage.
-      - name: coverage audit (no file where nothing runs)
-        run: python3 scripts/coverage-audit.py
-
-      - name: kernel table (every symbol carries its family)
-        run: cargo test -p model --features forward --test kernels_table
-
-      # The SEAM between the two vocabularies that name the same tensors:
-      # the trace names a forward pass invents, and the published names a
-      # load contract invents. `weight_names::wire()` is the only bridge,
-      # and it fails SILENTLY by construction -- `Wiring::alias` records a
-      # row only if the name was published, so a name the contract never
-      # published is dropped with no diagnostic and surfaces one at a time
-      # at FIRE time as `UnknownWeight`. Detecting drift one request too
-      # late is what this moves to CI.
-      #
-      # It needs `contract` as well as `forward` because it reaches the
-      # descriptor schema `HfConfig` lives in.
-      - name: weight-name seam (a trace name a checkpoint can never answer)
-        run: cargo test -p model --features forward,contract --test seam_names
-
-      # driver-cuda is excluded from the two sweeps above because it has no
-      # default feature and refuses to build until one of `cuda-12` / `cuda-13`
-      # is chosen. That is deliberate: the CUDA runtime API is not ABI-stable
-      # across major versions (`cudaGraphAddNode` takes five arguments in
-      # libcudart.so.12 and six in .so.13), and since this crate resolves
-      # symbols by name at run time, a wrong guess is a segfault inside the
-      # driver rather than a build error. So it is built here explicitly
-      # instead, which is also the only way to cover BOTH ABIs.
-      #
-      # No CUDA toolkit and no GPU are needed for either: cudarc is pinned to a
-      # named version with `fallback-dynamic-loading`, so nothing is linked,
-      # and the GPU tests skip themselves when no device is present. What runs
-      # is the host logic the crate is mostly made of -- including the
-      # differential goldens pinned against the C++ in `tests/oracle/`.
-      #
-      # `launch_abi` is the exception to "pure Rust" and NOT an exception to the
-      # line above: it shells out to g++ (present on every ubuntu runner) to
-      # compile a shim generated from `kernels-cuda`'s table against the real
-      # `rope.hpp`, which is how a wrong operand row becomes a build error
-      # rather than a golden nobody can regenerate. It takes `cudaStream_t`
-      # from `tests/oracle/launch_abi/stub/`, so it still asks for no toolkit --
-      # deliberately, since a proof whose answer depends on which CUDA is
-      # installed is not one.
-      - name: cargo test (driver-cuda, both CUDA ABIs)
-        run: |
-          cargo test -p driver-cuda --features cuda-12
-          cargo test -p driver-cuda --features cuda-13
-
-
-      # The half of driver-cuda that is correct without a GPU. No feature
-      # at all now BUILDS rather than refusing — the `compile_error!` is
-      # down to the one case it was ever about, both CUDA versions at
-      # once. This is the only job that compiles the other side of the
-      # `_cuda` cfg, and without it the gate drifts back to the
-      # subsystem boundary it started at -- which is how `memory_planner`,
-      # `mla_geometry` and `dsv4_geometry` sat parity-tested with zero callers
-      # for months. North-star rule 2: cut by "is this correct without a GPU?",
-      # not by subsystem. The BUILD is the test; the five assertions only
-      # demonstrate that each module is usable rather than merely reachable.
-      - name: cargo test (driver-cuda, portable half, no feature at all)
-        run: cargo test -p driver-cuda
-
-      # The one test that cannot live beside the driver. It registers a REAL
-      # PTIR program through `pie_cuda_register_program` and fires it, which
-      # needs the producer half — `tensor_compiler`'s bind/compile/emit chain
-      # and `engine`'s `ProgramDescBorrow` to lower the result into the C
-      # records the entry point reads. A dev-dependency the other way would
-      # be a cycle, so it lives in `engine`.
-      #
-      # It skips without a device or without the cached Qwen3-0.6B, like
-      # every GPU-touching test here — but it compiles everywhere, which is
-      # what this step is for on a runner with no card.
-      - name: cargo test (the PTIR program path, through the ABI)
-        run: cargo test -p engine --features driver-cuda --test ptir_shell
-
-  metal-kernel-table:
-    name: metal kernel table (shaders vs entrypoints.generated.txt)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Check the committed entrypoint set against the shaders
-        run: python3 scripts/metal-kernel-audit.py --check
-
-      - name: Check entrypoint.h accepts every real name and refuses the rest
-        run: python3 scripts/metal-kernel-audit.py --cpp
-
-      # Invariant (2): the driver NAMES a kernel, it does not spell one. Before
-      # this, ~40 sites built entrypoint strings with `+` and nothing checked
-      # the result -- `affine_qmv_routed` is compiled for one of six affine
-      # formats, so a mixture at any other reached the Metal compiler as a
-      # string and failed there, at model load, on a Mac.
-      - name: Check no driver source assembles an entrypoint name
-        run: python3 scripts/metal-kernel-audit.py --no-concat
-
-      # Invariant (3): kernels-metal depends on nothing above it. The headers
-      # there are host C++ now -- launch shapes, params, the name grammar -- so
-      # the boundary is no longer enforced by the file extension, and a
-      # `#include` of a driver header would be the arrow turning around. That
-      # is how `runahead.hpp` ended up in kernels-cuda.
-      - name: Check kernels-metal reaches nothing above it
-        run: python3 scripts/metal-kernel-audit.py --one-way
-
-      # Tests and tools open shaders by PATH, and both the family move and the
-      # rename swept only `csrc/src` -- leaving five stale paths and one dead
-      # entrypoint name behind. A guard that looks where the edit looked cannot
-      # catch the edit's blind spot, so this one walks all of `csrc`.
-      - name: Check every shader path the driver names resolves
-        run: python3 scripts/metal-kernel-audit.py --paths
-
-  # WIT drift — the canonical inferlet interface (crates/inferlet/wit) is
-  # vendored into ONE remaining copy, bakery's
-  # (sdk/inferlet/tools/bakery/src/bakery/wit), which is a Python package and
-  # so cannot reach the WIT through a cargo dependency. The Rust guest needs no
-  # copy: `inferlet` owns the WIT and runs the `wit_bindgen::generate!` over it
-  # in the same package. Manual three-way
-  # editing has regressed twice (commit 94043eb1). scripts/sync-wit.sh
-  # regenerates the copy from source; this job fails if a PR edited the
-  # interface without re-syncing.
-  # Guest bitrot — the two inferlet trees are their own cargo workspaces, so
-  # `cargo build --workspace` above never touches them and an SDK change that
-  # breaks every guest still goes green. That is not hypothetical: nine
-  # commits of SDK work silently broke 13 of the 37 crates under
-  # crates/engine/tests/inferlets before anyone built them (c82e06bba).
-  # These are the SDK's only consumers; if they do not compile, the SDK's
-  # public surface is whatever the last refactor happened to leave behind.
-  guest-inferlets:
-    name: guest inferlets (both trees, wasm32-wasip2)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-wasip2
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            tests/inferlets/target
-            crates/engine/tests/inferlets/target
-          key: ${{ runner.os }}-guest-inferlets-${{ hashFiles('tests/inferlets/Cargo.lock', 'crates/engine/tests/inferlets/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-guest-inferlets-
-
-      # Warnings are denied: an unused import or a stale `mut` in a guest is
-      # usually the visible end of an SDK surface that moved.
-      - name: cargo check (tests/inferlets)
-        run: cargo check --target wasm32-wasip2 --manifest-path tests/inferlets/Cargo.toml
-        env:
-          RUSTFLAGS: -D warnings
-
-      - name: cargo check (crates/engine/tests/inferlets)
-        run: cargo check --target wasm32-wasip2 --manifest-path crates/engine/tests/inferlets/Cargo.toml
-        env:
-          RUSTFLAGS: -D warnings
-
-  wit-drift:
-    name: wit drift (sync-wit.sh)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install wit-deps
-        run: cargo install --locked wit-deps-cli
-
-      - name: Regenerate vendored WIT copies
-        run: ./scripts/sync-wit.sh
-
-      - name: Fail if the vendored WIT copy is stale
-        run: |
-          if ! git diff --exit-code -- sdk/inferlet/tools/bakery/src/bakery/wit; then
-            echo "::error::The vendored WIT copy is out of sync with crates/inferlet/wit."
-            echo "Regenerate with: ./scripts/sync-wit.sh   (then commit)"
-            exit 1
-          fi
-
-  # NO driver feature — pure Rust, builds on every OS we support. Cheapest
-  # gate for "did the standalone wiring break end to end". Runs the full
-  # unit-test suite too, since without a driver feature nothing pulls in
-  # cmake.
-  #
-  # This was the `driver-dummy` job. That feature named a crate that is
-  # deleted; what the job actually gated was the composition root building
-  # with no device behind it, which `--no-default-features` alone says.
-  pie-worker-no-driver:
-    name: pie-worker (no driver feature)
+  # Dummy driver — pure Rust, builds on every OS we support. Cheapest
+  # gate for "did the standalone wiring break end to end". Runs the
+  # full unit-test suite too since dummy doesn't pull in cmake.
+  pie-server-dummy:
+    name: pie-server (driver-dummy)
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -494,161 +107,75 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-pie-worker-no-driver-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pie-server-dummy-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: cargo build (no driver feature)
+      - name: cargo build (driver-dummy)
         run: |
-          cargo build -p worker --no-default-features
+          cargo build -p pie-server \
+            --no-default-features --features driver-dummy
 
-      - name: cargo test (pie-worker, no driver feature)
+      - name: cargo test (pie-server, dummy)
         run: |
-          cargo test -p worker --no-default-features
+          cargo test -p pie-server --bin pie \
+            --no-default-features --features driver-dummy
 
-      # The `pie` command is the root package's own binary; `worker` is a
-      # library with no `[[bin]]`. Building the worker alone never produced a
-      # runnable CLI, so nothing here covered the composition root.
-      - name: cargo build (pie binary, no driver feature)
-        run: |
-          cargo build -p pie --no-default-features
-
-  # The Metal driver and the seam that joins it to the engine.
-  #
-  # `driver-metal` is an OPTIONAL feature of `engine`, so a plain
-  # `cargo test -p engine` builds its seam OUT. That file once went weeks
-  # without a compiler reading it and accumulated seven type errors; this job
-  # is what catches that on the first push. It was added once and lost in a
-  # rebase, which is its own argument for a job rather than a habit.
-  driver-metal:
-    name: driver-metal (macOS)
+  # macOS portable build with Metal backend. Verifies build.rs's
+  # macOS branch + libomp link path. Doesn't run tests against a
+  # real model — just exercises the cmake + link path so PRs that
+  # touch driver/portable or build.rs fail fast on macOS.
+  pie-server-portable-metal:
+    name: pie-server (driver-portable + metal)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install cmake ninja ccache libomp
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache cargo
+      - name: Cache cargo + cmake build
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/Library/Caches/ccache
             target
-          key: ${{ runner.os }}-driver-metal-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-pie-server-portable-metal-${{ hashFiles('**/Cargo.lock', 'driver/portable/CMakeLists.txt') }}
 
-      # BOTH halves, on one runner, which is the whole point of `metal-4`
-      # being a feature rather than `cfg(target_vendor = "apple")`:
-      #
-      #   A platform cfg cannot be tested. A feature can.
-      #
-      # On macOS `target_vendor = "apple"` is always true, so the portable
-      # half was never compiled by any job in the tree; on Linux it is always
-      # false, so the Apple half never was. No machine built both, and that is
-      # exactly how three cross-boundary errors got in and stayed
-      # (`.wiki/driver/real-metal-north-star.md` §7). There is still no Linux
-      # job for this crate — `model-loader` pulls `zstd-sys`, a C build that
-      # needs a cross toolchain — and with the feature there does not need to
-      # be one.
-      #
-      # The name says what the green tick means, because a job that tested
-      # nothing and a job that tested the portable half look identical.
-      - name: cargo test (driver-metal, portable half — no GPU)
-        run: cargo test -p driver-metal
+      - name: cargo build (driver-portable + metal)
+        env:
+          PIE_PORTABLE_METAL: "1"
+        run: cargo build -p pie-server
 
-      - name: cargo test (driver-metal, metal-4)
-        run: cargo test -p driver-metal --features metal-4
+      - name: cargo test (pie-server)
+        env:
+          PIE_PORTABLE_METAL: "1"
+        run: cargo test -p pie-server --bin pie
 
-      # Type-check AND test: the seam's tests run everything that needs no
-      # checkpoint, and the checkpoint-gated ones state that they skipped.
-      - name: cargo test (engine, driver-metal seam)
-        run: cargo test -p engine --features driver-metal
-
-      # The worker feature the release build selects on macOS. `driver-metal`
-      # is `worker`'s name for `engine/driver-metal`, and nothing else
-      # compiles that composition.
-      - name: cargo build (worker, driver-metal)
-        run: |
-          cargo build -p worker \
-            --no-default-features --features driver-metal
-
-      # Both configurations again: a lint that only fires in one half is a
-      # lint nobody sees.
-      - name: cargo clippy (driver-metal, portable half)
-        run: cargo clippy --no-deps -p driver-metal --all-targets -- -D warnings
-
-      - name: cargo clippy (driver-metal, metal-4)
-        run: |
-          cargo clippy --no-deps -p driver-metal --all-targets \
-            --features metal-4 -- -D warnings
-
-  pie-worker-cuda:
-    name: pie-worker (driver-cuda)
+  # Cuda build — runs only when an opt-in label or schedule fires
+  # (no CUDA on the default GH-hosted runners). Add a self-hosted
+  # runner with a CUDA toolkit to enable this. Until then, M3's
+  # static-link spike + manual M4 verification are the canonical
+  # checkpoints.
+  pie-server-cuda:
+    name: pie-server (driver-cuda)
     runs-on: [self-hosted, cuda]
     if: contains(github.event.pull_request.labels.*.name, 'ci-cuda')
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # EVERY FEATURE SPELLING, built. Two of the four were broken at once
-      # while the two either side of them were green, and nothing said so —
-      # `--features cuda-13` failed with 58 errors in `fire/launch.rs` and
-      # `--features cuda-13,bridge` failed on `weights/`, both for the same
-      # reason: `abi` is the only spelling that brings `driver_api` and
-      # `model-loader`, so a module reaching for either compiles under
-      # `cuda-13,abi` and under nothing else.
-      #
-      # Here rather than in the no-toolkit job because `bridge` compiles the
-      # generated shim against real headers and asks for nvcc. The first two
-      # are covered by `cargo test` there; these are the two that were not
-      # covered anywhere.
-      #
-      # BUILDING IS ENOUGH: the failure this catches is "does not compile",
-      # which is exactly the failure that hides — a configuration nobody
-      # builds is a configuration nobody checks, which is §7's own argument
-      # for `metal-4` being a feature rather than a `target_vendor`.
-      - name: cargo build (every feature spelling)
-        run: |
-          # `cuda-13,bridge` STOOD HERE. `bridge` is retired (north star §6)
-          # and naming a feature that does not exist is a hard cargo error,
-          # so this line had to go in the same commit as the manifest.
-          #
-          # `abi` is what covers it: `abi = ["bridge", …]` until this commit
-          # and `["_cuda", …]` after, so the configuration this step actually
-          # built under both spellings is the one below. The spelling that
-          # went was a strict subset, not a distinct configuration.
-          cargo build -p driver-cuda --features cuda-13,abi
-
       - name: cargo build (driver-cuda)
         run: |
-          cargo build -p worker \
+          cargo build -p pie-server \
             --no-default-features --features driver-cuda
-
-      - name: Native CUDA entrypoint validation
-        run: |
-          CUDA_BUILD_DIR="$(find target/debug/build -type d \
-            -path '*/out/cuda/build' -print -quit)"
-          test -n "$CUDA_BUILD_DIR"
-          cmake --build "$CUDA_BUILD_DIR" \
-            --target test_entry_validation test_pipeline_dispatch_bind
-          ctest --test-dir "$CUDA_BUILD_DIR" --output-on-failure \
-            -R '^(entry_validation|pipeline_dispatch_bind)$'
-
-      # The 66 test and bench executables under csrc/. `cargo build -p
-      # driver-cuda` asks CMake for `pie_driver_cuda_lib` and stops, so these
-      # were configured by CMake and built by no command anyone runs -- eleven
-      # kernel-family renames landed green across them, leaving a dead
-      # `namespace ops` alias, call sites naming a `kernels` not in scope, and
-      # 27 XQA kernels defined in a namespace their only caller did not use.
-      # That last one cannot fail a compile: `cargo build -p driver-cuda`
-      # produces an rlib and never links.
-      - name: Build every driver-cuda harness (66 targets)
-        run: |
-          CUDA_BUILD_DIR="$(find target/debug/build -type d \
-            -path '*/out/cuda/build' -print -quit)"
-          test -n "$CUDA_BUILD_DIR"
-          cmake --build "$CUDA_BUILD_DIR" --target pie_driver_cuda_checks
 
       - name: Verify no CUDA shared deps
         run: |

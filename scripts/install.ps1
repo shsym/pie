@@ -1,11 +1,12 @@
 # pie installer - served at https://pie-project.org/install.ps1
 #
 #   irm https://pie-project.org/install.ps1 | iex
+#   $env:PIE_FLAVOR = "portable-cuda"; irm https://pie-project.org/install.ps1 | iex
 #   $env:PIE_VERSION = "0.4.0"; irm https://pie-project.org/install.ps1 | iex
 #
 # Environment overrides:
 #   PIE_VERSION       Release tag (default: 0.4.0).
-#   PIE_FLAVOR        cuda (the only published Windows build; native CUDA, default).
+#   PIE_FLAVOR        portable-vulkan | portable-cuda (default: portable-vulkan).
 #   PIE_INSTALL_DIR   Install location for pie.exe (default: %LOCALAPPDATA%\Pie\bin).
 #   PIE_REPO          GitHub owner/name (default: pie-project/pie).
 #   PIE_DOWNLOAD_BASE Override the asset base URL (default: GitHub releases).
@@ -110,11 +111,14 @@ function Save-Url($Url, $OutFile) {
 
 function Get-AssetName($Flavor) {
     switch ($Flavor.ToLowerInvariant()) {
-        "cuda" {
+        { $_ -in @("portable", "vulkan", "portable-vulkan") } {
+            return "pie-x86_64-windows-vulkan.zip"
+        }
+        { $_ -in @("cuda", "portable-cuda") } {
             return "pie-x86_64-windows-cuda.zip"
         }
         default {
-            Stop-WithError "no '$Flavor' build for windows/x86_64. The only published Windows build is 'cuda' (native CUDA; requires an NVIDIA GPU)."
+            Stop-WithError "no '$Flavor' build for windows/x86_64. Valid flavors: vulkan, cuda."
         }
     }
 }
@@ -138,7 +142,7 @@ $repo = Get-EnvOrDefault "PIE_REPO" "pie-project/pie"
 $version = Get-EnvOrDefault "PIE_VERSION" "0.4.0"
 $installDir = Get-EnvOrDefault "PIE_INSTALL_DIR" (Join-Path $env:LOCALAPPDATA "Pie\bin")
 $downloadBase = Get-EnvOrDefault "PIE_DOWNLOAD_BASE" "https://github.com/$repo/releases/download/$version"
-$flavor = Get-EnvOrDefault "PIE_FLAVOR" "cuda"
+$flavor = Get-EnvOrDefault "PIE_FLAVOR" "portable-vulkan"
 $asset = Get-AssetName $flavor
 $url = "$downloadBase/$asset"
 

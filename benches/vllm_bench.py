@@ -2,31 +2,19 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import json
-import os
-import sys
 import time
 from typing import Any
 
 from common import (
-    ArrivalPacer,
     RequestResult,
     add_mode_subcommands,
-    arrival_schedule,
-    add_output_dump_args,
     cuda_profiler_start,
     cuda_profiler_stop,
     finish,
-    gpu_clock_state,
-    hash_output_tokens,
     hf_chat_prompts_and_counts,
     make_prompts,
     maybe_set_cpu_affinity,
-    print_first_output,
-    request_max_tokens,
-    request_max_tokens_varies,
-    run_timed_warmup_sync,
     summarize,
     visible_cuda_devices,
 )
@@ -131,29 +119,8 @@ def run(args: argparse.Namespace):
     llm_kwargs = {}
     if args.attention_backend:
         llm_kwargs["attention_config"] = {"backend": args.attention_backend}
-    if getattr(args, "moe_backend", None):
-        # `auto` is not always the fastest thing the installed vLLM can run:
-        # on sm_100 it picked TRITON for gpt-oss even though vLLM's own
-        # gpt-oss priority list puts the FlashInfer TRTLLM MXFP4 kernels
-        # ahead of it. Being able to name the backend is what makes
-        # "is this baseline hobbled?" a measurement instead of an argument.
-        llm_kwargs["kernel_config"] = {"moe_backend": args.moe_backend}
     if args.enforce_eager:
         llm_kwargs["enforce_eager"] = True
-    if getattr(args, "num_gpu_blocks_override", 0):
-        llm_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
-    if getattr(args, "block_size", 0):
-        llm_kwargs["block_size"] = args.block_size
-    if getattr(args, "kv_cache_dtype", "auto") != "auto":
-        llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
-    # Chunked prefill decides how much a prefill costs the decode it rides
-    # with, which is the axis that separates a uniform-output-length run from a
-    # fanned one: with uniform lengths completions synchronise and prefills
-    # arrive in bursts, so most steps are pure decode; fan them and most steps
-    # carry a prefill. Exposed so that attribution can be tested by toggling it
-    # rather than inferred from a correlation.
-    if getattr(args, "no_chunked_prefill", False):
-        llm_kwargs["enable_chunked_prefill"] = False
     speculative_config = None
     if args.speculative_config is not None:
         speculative_config = json.loads(args.speculative_config)
@@ -203,7 +170,7 @@ def run(args: argparse.Namespace):
                     "max_num_batched_tokens": args.max_num_batched_tokens,
                     "tensor_parallel_size": args.tp_size,
                     "max_model_len": args.max_model_len,
-                    "enable_prefix_caching": args.prefix_caching,
+                    "enable_prefix_caching": False,
                     "disable_log_stats": False,
                     **llm_kwargs,
                 },
@@ -219,7 +186,7 @@ def run(args: argparse.Namespace):
         max_num_batched_tokens=args.max_num_batched_tokens,
         tensor_parallel_size=args.tp_size,
         max_model_len=args.max_model_len,
-        enable_prefix_caching=args.prefix_caching,
+        enable_prefix_caching=False,
         disable_log_stats=False,
         **llm_kwargs,
     )
@@ -229,18 +196,6 @@ def run(args: argparse.Namespace):
         max_tokens=args.max_tokens,
         ignore_eos=args.ignore_eos,
     )
-
-    def sampling_for(i: int) -> "SamplingParams":
-        mt = request_max_tokens(args, i)
-        if mt == args.max_tokens:
-            return sampling
-        return SamplingParams(
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=mt,
-            ignore_eos=args.ignore_eos,
-        )
-
     if args.warmup:
         warmup_sampling = sampling
         if args.warmup_max_tokens is not None:
@@ -250,70 +205,39 @@ def run(args: argparse.Namespace):
                 max_tokens=args.warmup_max_tokens,
                 ignore_eos=args.ignore_eos,
             )
-        def warmup_pass() -> None:
-            llm.generate(prompts[: args.warmup], warmup_sampling)
-
-        warmup_pass()
-        # Optional duration-based extension of the warmup; see common.py.
-        run_timed_warmup_sync(
-            warmup_pass, args.warmup_seconds, label="vllm")
+        llm.generate(prompts[: args.warmup], warmup_sampling)
 
     spec_metrics_before = _vllm_spec_metrics(llm)
-    clocks_at_start = gpu_clock_state()
     run_prompts = prompts[args.warmup:]
     run_prompt_counts = prompt_counts[args.warmup:]
     results: list[RequestResult] = []
-    first_output_text: str | None = None
-
-    def record(out: Any, req_wall: float, prompt_count: int) -> None:
-        nonlocal first_output_text
-        token_ids = [int(t) for t in out.outputs[0].token_ids]
-        result = RequestResult(
-            True,
-            float(req_wall),
-            len(token_ids),
-            prompt_count,
-        )
-        result.output_token_sha256 = hash_output_tokens(token_ids)
-        if getattr(args, "dump_all_token_ids", False):
-            result.output_token_ids = token_ids
-        if getattr(args, "dump_all_texts", False):
-            result.output_text = out.outputs[0].text
-        if first_output_text is None:
-            first_output_text = out.outputs[0].text
-        results.append(result)
-
     cuda_profiler_start(args.cuda_profiler_capture)
     start = time.perf_counter()
     try:
         if args.mode == "latency":
-            for i, (p, prompt_count) in enumerate(
-                zip(run_prompts, run_prompt_counts),
-                start=args.warmup,
-            ):
+            for p, prompt_count in zip(run_prompts, run_prompt_counts):
                 req_start = time.perf_counter()
-                outputs = llm.generate([p], sampling_for(i))
+                outputs = llm.generate([p], sampling)
                 req_wall = time.perf_counter() - req_start
                 for out in outputs:
-                    record(out, req_wall, prompt_count)
+                    results.append(
+                        RequestResult(
+                            True,
+                            float(req_wall),
+                            len(out.outputs[0].token_ids),
+                            prompt_count,
+                        )
+                    )
         else:
-            measured_sampling = (
-                [
-                    sampling_for(args.warmup + i)
-                    for i in range(len(run_prompts))
-                ]
-                if request_max_tokens_varies(args)
-                else sampling
-            )
-            outputs = llm.generate(run_prompts, measured_sampling)
+            outputs = llm.generate(run_prompts, sampling)
             for out, prompt_count in zip(outputs, run_prompt_counts):
-                record(out, 0.0, prompt_count)
+                results.append(
+                    RequestResult(True, 0.0, len(out.outputs[0].token_ids), prompt_count)
+                )
     finally:
         wall = time.perf_counter() - start
         cuda_profiler_stop(args.cuda_profiler_capture)
-        clocks_at_end = gpu_clock_state()
     spec_metrics_after = _vllm_spec_metrics(llm)
-    print_first_output(args, first_output_text)
 
     summary = summarize(
         mode=args.mode,
@@ -322,7 +246,7 @@ def run(args: argparse.Namespace):
         results=results,
         wall_s=wall,
         config={
-            "enable_prefix_caching": args.prefix_caching,
+            "enable_prefix_caching": False,
             "max_num_seqs": max_num_seqs,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "attention_backend": args.attention_backend,
@@ -334,277 +258,8 @@ def run(args: argparse.Namespace):
             "unique_prompts": args.unique_prompts,
             "cuda profiler capture": args.cuda_profiler_capture,
             "cpu affinity": cpu_affinity,
-            "warmup seconds": args.warmup_seconds,
-            "gpu clocks at start": clocks_at_start,
-            "gpu clocks at end": clocks_at_end,
             "warmup max tokens": args.warmup_max_tokens,
             **_vllm_spec_delta(spec_metrics_after, spec_metrics_before),
-        },
-    )
-    return summary, results
-
-
-def run_streaming(args: argparse.Namespace):
-    """tput with per-token client stamps via the AsyncLLM streaming engine.
-
-    Vantage mirrors pie's --report-timing client: a closed loop of
-    `concurrency` in-flight requests, TTFT stamped on the first token
-    delivery after submit, inter-token gaps stamped per delivery event.
-    """
-    import asyncio
-
-    from vllm import SamplingParams
-    from vllm.engine.arg_utils import AsyncEngineArgs
-    from vllm.v1.engine.async_llm import AsyncLLM
-
-    cpu_affinity = maybe_set_cpu_affinity(args, visible_cuda_devices(args.tp_size))
-    n = args.num_requests
-    prompts, prompt_counts = hf_chat_prompts_and_counts(
-        args.model, args.system, make_prompts(args, n + args.warmup)
-    )
-    if args.concurrency == 0:
-        max_num_seqs = max(1, args.num_requests)
-    else:
-        max_num_seqs = args.concurrency
-    engine_kwargs = {}
-    if args.enforce_eager:
-        engine_kwargs["enforce_eager"] = True
-    if getattr(args, "num_gpu_blocks_override", 0):
-        engine_kwargs["num_gpu_blocks_override"] = args.num_gpu_blocks_override
-    if getattr(args, "block_size", 0):
-        engine_kwargs["block_size"] = args.block_size
-    if getattr(args, "attention_backend", None):
-        engine_kwargs["attention_config"] = {"backend": args.attention_backend}
-    # Same override as the offline path. This one matters more, because every
-    # cell of the B200 comparison runs through `tput` -- it is the only mode
-    # that stamps per-token deliveries -- so a knob wired only into `run()`
-    # would silently do nothing.
-    if getattr(args, "moe_backend", None):
-        engine_kwargs["kernel_config"] = {"moe_backend": args.moe_backend}
-    engine = AsyncLLM.from_engine_args(
-        AsyncEngineArgs(
-            model=args.model,
-            trust_remote_code=True,
-            gpu_memory_utilization=args.gpu_mem_util,
-            max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            tensor_parallel_size=args.tp_size,
-            max_model_len=args.max_model_len,
-            enable_prefix_caching=args.prefix_caching,
-            disable_log_stats=False,
-            **engine_kwargs,
-        )
-    )
-    sampling = SamplingParams(
-        temperature=args.temperature,
-        top_p=args.top_p,
-        max_tokens=args.max_tokens,
-        ignore_eos=args.ignore_eos,
-    )
-
-    def sampling_for(i: int) -> "SamplingParams":
-        mt = request_max_tokens(args, i)
-        if mt == args.max_tokens:
-            return sampling
-        return SamplingParams(
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=mt,
-            ignore_eos=args.ignore_eos,
-        )
-
-    async def stream_one(
-        request_id: str,
-        prompt,
-        prompt_count: int,
-        params=None,
-        measured_epoch_monotonic_ns: int | None = None,
-    ) -> RequestResult:
-        start = time.perf_counter()
-        send_monotonic_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
-        client_send_s = (
-            (send_monotonic_ns - measured_epoch_monotonic_ns)
-            / 1_000_000_000.0
-            if measured_epoch_monotonic_ns is not None
-            else None
-        )
-        ttft_s = None
-        last_tick = None
-        gaps_us: list[int] = []
-        token_arrival_s: list[float] = []
-        token_arrival_monotonic_ns: list[int] = []
-        n_tokens = 0
-        # `ignore_eos` pins the token count to max_tokens whatever the model
-        # emitted, so a correctness gate has to read the text. The offline
-        # `run()` path already returns it; this one dropped it, which left
-        # the streaming path -- the only one that reports inter-token gaps --
-        # ungateable.
-        want_text = getattr(args, "dump_all_texts", False) or getattr(
-            args, "dump_first_text", False
-        )
-        text: str | None = None
-        try:
-            async for out in engine.generate(
-                prompt, params or sampling, request_id
-            ):
-                now = time.perf_counter()
-                now_monotonic_ns = time.clock_gettime_ns(
-                    time.CLOCK_MONOTONIC
-                )
-                if want_text:
-                    text = out.outputs[0].text
-                new_total = len(out.outputs[0].token_ids)
-                if new_total > n_tokens:
-                    if measured_epoch_monotonic_ns is not None:
-                        token_arrival_s.extend(
-                            [
-                                (
-                                    now_monotonic_ns
-                                    - measured_epoch_monotonic_ns
-                                )
-                                / 1_000_000_000.0
-                            ]
-                            * (new_total - n_tokens)
-                        )
-                        token_arrival_monotonic_ns.extend(
-                            [now_monotonic_ns] * (new_total - n_tokens)
-                        )
-                    if ttft_s is None:
-                        ttft_s = now - start
-                    else:
-                        gaps_us.append(int((now - last_tick) * 1e6))
-                    last_tick = now
-                    n_tokens = new_total
-            returned = time.perf_counter()
-            returned_monotonic_ns = time.clock_gettime_ns(
-                time.CLOCK_MONOTONIC
-            )
-            return RequestResult(
-                True,
-                returned - start,
-                n_tokens,
-                prompt_count,
-                ttft_s=ttft_s,
-                intertoken_us=gaps_us or None,
-                client_send_s=client_send_s,
-                token_arrival_s=token_arrival_s or None,
-                token_arrival_monotonic_ns=(
-                    token_arrival_monotonic_ns or None
-                ),
-                client_return_s=(
-                    (
-                        returned_monotonic_ns
-                        - measured_epoch_monotonic_ns
-                    )
-                    / 1_000_000_000.0
-                    if measured_epoch_monotonic_ns is not None
-                    else None
-                ),
-                process_id=request_id,
-                output_text=text,
-            )
-        except Exception as e:  # noqa: BLE001
-            return RequestResult(
-                False,
-                time.perf_counter() - start,
-                n_tokens,
-                prompt_count,
-                error=f"{type(e).__name__}: {e}",
-            )
-
-    pacer = ArrivalPacer(
-        arrival_schedule(
-            n, args.arrival_rate, args.arrival_process, args.arrival_seed
-        )
-    )
-
-    async def drive() -> tuple[list[RequestResult], float, float, int]:
-        if args.warmup:
-            for j, p in enumerate(prompts[: args.warmup]):
-                await stream_one(f"warmup-{j}", p, prompt_counts[j])
-
-        # Submit ALL requests at t=0 — concurrency is enforced engine-side by
-        # max_num_seqs, exactly like pie's tput client (all launch_process at
-        # once, engine admission = concurrency). A client-side semaphore here
-        # would stop the TTFT clock during queueing that pie's clock counts,
-        # making the comparison asymmetric.
-        epoch_unix_s = time.time()
-        epoch_monotonic_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
-        profiler_task = None
-        if (
-            args.cuda_profiler_capture
-            and args.cuda_profiler_duration_s > 0
-        ):
-            async def capture_profiler_window() -> None:
-                await asyncio.sleep(args.cuda_profiler_delay_s)
-                cuda_profiler_start(True)
-                try:
-                    await asyncio.sleep(args.cuda_profiler_duration_s)
-                finally:
-                    cuda_profiler_stop(True)
-
-            profiler_task = asyncio.create_task(capture_profiler_window())
-        else:
-            cuda_profiler_start(args.cuda_profiler_capture)
-        start = time.perf_counter()
-        pacer.start()
-
-        async def offer(i: int) -> RequestResult:
-            await pacer.wait(i)
-            return await stream_one(
-                f"req-{i}",
-                prompts[args.warmup + i],
-                prompt_counts[args.warmup + i],
-                sampling_for(args.warmup + i),
-                epoch_monotonic_ns,
-            )
-
-        try:
-            results = list(
-                await asyncio.gather(*(offer(i) for i in range(n)))
-            )
-        finally:
-            if profiler_task is None:
-                cuda_profiler_stop(args.cuda_profiler_capture)
-            else:
-                if not profiler_task.done():
-                    profiler_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await profiler_task
-        return (
-            results,
-            time.perf_counter() - start,
-            epoch_unix_s,
-            epoch_monotonic_ns,
-        )
-
-    try:
-        results, wall, epoch_unix_s, epoch_monotonic_ns = asyncio.run(drive())
-    finally:
-        engine.shutdown()
-
-    summary = summarize(
-        mode=args.mode,
-        engine="vllm",
-        model=args.model,
-        results=results,
-        wall_s=wall,
-        config={
-            "streaming_client": True,
-            "client timing epoch unix s": epoch_unix_s,
-            "client timing epoch monotonic ns": epoch_monotonic_ns,
-            "enable_prefix_caching": args.prefix_caching,
-            "max_num_seqs": max_num_seqs,
-            "max_num_batched_tokens": args.max_num_batched_tokens,
-            "enforce_eager": args.enforce_eager,
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-            "ignore_eos": args.ignore_eos,
-            "unique_prompts": args.unique_prompts,
-            "cpu affinity": cpu_affinity,
-            "arrival_rate": args.arrival_rate,
-            "arrival_process": args.arrival_process,
-            **pacer.stats(),
         },
     )
     return summary, results
@@ -614,51 +269,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="vLLM canonical latency/throughput benchmark")
     add_mode_subcommands(parser)
     for sp in parser._subparsers._group_actions[0].choices.values():
-        add_output_dump_args(sp)
         sp.add_argument("--attention-backend", default=None)
-        sp.add_argument(
-            "--moe-backend",
-            default=None,
-            help="Override vLLM's MoE kernel choice (kernel_config.moe_backend): "
-                 "auto, triton, flashinfer_trtllm, flashinfer_cutlass, marlin, "
-                 "... Default None leaves vLLM's own 'auto' selection alone, "
-                 "which is what a deployment gets and therefore what the "
-                 "headline baseline should report.",
-        )
         sp.add_argument("--enforce-eager", action="store_true")
-        sp.add_argument(
-            "--no-chunked-prefill", action="store_true",
-            help="disable vLLM's chunked prefill. Prefill then does not share "
-                 "a step with decode, which is the mechanism a fanned "
-                 "--output-spread is thought to tax.")
-        sp.add_argument(
-            "--num-gpu-blocks-override",
-            type=int,
-            default=0,
-            help="Exact KV block count. Paired with --block-size 16 this is "
-                 "the token-for-token match to pie's `total_pages` driver "
-                 "option, so both engines can be sized by the same budget "
-                 "instead of by a calibrated memory fraction.",
-        )
-        sp.add_argument(
-            "--block-size",
-            type=int,
-            default=0,
-            help="KV block size in tokens. 0 leaves vLLM's default; set 16 to "
-                 "match pie's page size when using --num-gpu-blocks-override.",
-        )
-        sp.add_argument(
-            "--prefix-caching",
-            action=argparse.BooleanOptionalAction,
-            default=False,
-        )
         sp.add_argument("--max-num-batched-tokens", type=int, default=None)
-        sp.add_argument(
-            "--kv-cache-dtype",
-            default="auto",
-            help="vLLM KV cache dtype. DeepSeek-V4 needs 'fp8' because its "
-                 "fp8_ds_mla cache layout refuses anything else.",
-        )
         sp.add_argument(
             "--speculative-config",
             default=None,
@@ -693,120 +306,9 @@ def main() -> None:
             action="store_true",
             help="Print the vLLM LLM kwargs used by the benchmark before loading.",
         )
-        sp.add_argument(
-            "--report-timing",
-            action="store_true",
-            help="Collect per-request TTFT and inter-token gap distributions. "
-                 "Switches tput mode to the AsyncLLM streaming engine with a "
-                 "closed-loop client (mirrors pie's client vantage: stamps on "
-                 "token delivery, all requests submitted at t=0 when "
-                 "num_requests == concurrency).",
-        )
-        sp.add_argument(
-            "--report-arrivals",
-            action="store_true",
-            help="Collect absolute per-token client arrivals without enabling "
-            "additional latency reporting.",
-        )
     args = parser.parse_args()
-    # vLLM refuses in-process data parallelism ("not supported for
-    # single-process usage and may hang"), so a replica is a process. The
-    # parent shards the request set, runs one child per replica pinned to
-    # its own tp-size-wide slice of the devices, and merges the results —
-    # which is what `data_parallel_offline.py` demonstrates, reduced to
-    # what this benchmark needs.
-    if args.dp_size > 1 and not os.environ.get("_VLLM_BENCH_REPLICA"):
-        summary, results = run_data_parallel(args)
-        finish(summary, results, args.json_out)
-        return
-    if (
-        getattr(args, "report_timing", False)
-        or getattr(args, "report_arrivals", False)
-    ) and args.mode == "tput":
-        summary, results = run_streaming(args)
-    else:
-        summary, results = run(args)
+    summary, results = run(args)
     finish(summary, results, args.json_out)
-
-
-def run_data_parallel(args):
-    """Fan the request set out over `dp_size` single-replica children.
-
-    Wall clock is the max over children (they run concurrently), so
-    throughput sums and latency percentiles pool — the same numbers a
-    real DP deployment would report."""
-    import subprocess
-    import tempfile
-
-    total = args.requests if args.mode == "latency" else args.num_requests
-    per = [total // args.dp_size] * args.dp_size
-    for i in range(total % args.dp_size):
-        per[i] += 1
-
-    procs, outs = [], []
-    tmpdir = tempfile.mkdtemp(prefix="vllm-dp-")
-    for replica, count in enumerate(per):
-        if count == 0:
-            continue
-        devices = ",".join(
-            str(replica * args.tp_size + i) for i in range(args.tp_size))
-        out = os.path.join(tmpdir, f"replica{replica}.json")
-        outs.append(out)
-        # Forward the parent's own argv rather than reconstructing it from
-        # the namespace: `store_true` flags have no `--no-` form, and the
-        # namespace cannot tell them from `BooleanOptionalAction` ones.
-        # Only the per-replica options are rewritten.
-        rewritten = {"--dp-size", "--json-out", "--requests", "--num-requests"}
-        forwarded, skip_next = [], False
-        for token in sys.argv[1:]:
-            if skip_next:
-                skip_next = False
-                continue
-            if token in rewritten:
-                skip_next = True
-                continue
-            if any(token.startswith(f"{flag}=") for flag in rewritten):
-                continue
-            forwarded.append(token)
-        argv = [sys.executable, os.path.abspath(__file__), *forwarded]
-        argv += ["--json-out", out]
-        argv += (["--requests", str(count)] if args.mode == "latency"
-                 else ["--num-requests", str(count)])
-        env = {**os.environ, "CUDA_VISIBLE_DEVICES": devices,
-               "_VLLM_BENCH_REPLICA": str(replica)}
-        procs.append(subprocess.Popen(argv, env=env))
-    failures = [p.wait() for p in procs]
-    if any(rc != 0 for rc in failures):
-        raise RuntimeError(f"vllm data-parallel replica failed: {failures}")
-
-    # Wall clock is the SLOWEST replica's own measured window, not the
-    # parent's subprocess lifetime — the children spend minutes loading
-    # weights before they start measuring, and counting that would report
-    # a 35B model's throughput as a fraction of its real value. The
-    # replicas run concurrently, so the max is the wall the merged set
-    # would have seen.
-    merged: list = []
-    wall = 0.0
-    for path in outs:
-        with open(path) as fh:
-            payload = json.load(fh)
-        wall = max(wall, float(payload["summary"]["wall_s"]))
-        for record in payload["requests"]:
-            merged.append(RequestResult(**record))
-    summary = summarize(
-        mode=args.mode,
-        engine="vllm",
-        model=args.model,
-        results=merged,
-        wall_s=wall,
-        config={
-            "data_parallel_size": args.dp_size,
-            "tensor_parallel_size": args.tp_size,
-            "dp_replica_requests": per,
-            "max_tokens": args.max_tokens,
-        },
-    )
-    return summary, merged
 
 
 if __name__ == "__main__":
