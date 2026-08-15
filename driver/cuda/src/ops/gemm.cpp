@@ -1907,6 +1907,40 @@ bool gemm_fp8_blockwise_w8a8_impl(
         ctx.fp8_block_supported = false;
         return reject("no-algo");
     }
+    // Debug probe (active only while act-dumping): per call, hash the
+    // quantized activation bytes and scales and print the chosen algo, to
+    // pin which of the three per-call variables moves between two forwards
+    // whose declared inputs are bit-identical.
+    if (std::getenv("PIE_ACT_DUMP_DIR") != nullptr) {
+        cudaStreamSynchronize(stream);
+        const std::size_t abytes =
+            static_cast<std::size_t>(M) * static_cast<std::size_t>(K);
+        const std::size_t sbytes = static_cast<std::size_t>(M) *
+            static_cast<std::size_t>(k_blocks) * sizeof(float);
+        std::vector<unsigned char> ha(abytes), hs_(sbytes);
+        cudaMemcpy(ha.data(), act_fp8, abytes, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hs_.data(), act_scale, sbytes, cudaMemcpyDeviceToHost);
+        auto fnv = [](const unsigned char* p, std::size_t n) {
+            std::uint64_t h = 1469598103934665603ull;
+            for (std::size_t i = 0; i < n; ++i) {
+                h ^= p[i]; h *= 1099511628211ull;
+            }
+            return h;
+        };
+        const std::uint64_t* aw =
+            reinterpret_cast<const std::uint64_t*>(&heur.algo);
+        std::fprintf(stderr,
+            "[fp8gemm] M=%d N=%d K=%d act_fp8=%p h_act=%016llx h_scale=%016llx"
+            " algo=%llx %llx %llx %llx ws=%p wsb=%zu\n",
+            M, N, K, act_fp8,
+            static_cast<unsigned long long>(fnv(ha.data(), abytes)),
+            static_cast<unsigned long long>(fnv(hs_.data(), sbytes)),
+            static_cast<unsigned long long>(aw[0]),
+            static_cast<unsigned long long>(aw[1]),
+            static_cast<unsigned long long>(aw[2]),
+            static_cast<unsigned long long>(aw[3]),
+            ctx.workspace, ctx.workspace_bytes);
+    }
     const float alpha = 1.f;
     LT_CHECK(cublasLtMatmul(
         ctx.handle, desc.d, &alpha,
