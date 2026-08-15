@@ -1322,6 +1322,9 @@ void full_attn_layer_body(
     const float eps = cfg.rms_norm_eps;
     NcclComm* tp = (T > 1) ? fwd_cfg.tp_comm : nullptr;
 
+    act_dump_bf16(act_dump_layer_tag("norm_x", model_layer).c_str(),
+                  ws.norm_x.data(), N, H, stream);
+
     // ── q/k/v projections (q is 2× wide for the output gate) ──────
     const int qgkv_dim = 2 * Hq + 2 * Hk;
     const bool use_fused_qgkv =
@@ -1374,6 +1377,16 @@ void full_attn_layer_body(
         static_cast<std::uint32_t>(N),
         static_cast<std::uint32_t>(Hq),
         static_cast<std::uint32_t>(model_layer), stream);
+    // Post-norm, post-rope: the q/k that actually enter attention and the
+    // exact k/v bytes about to be written to the paged cache. If these are
+    // bit-identical across two runs but `attn_v` below differs, the
+    // divergence entered through the paged-KV *read*, not the projections.
+    act_dump_bf16(act_dump_layer_tag("q_a", model_layer).c_str(),
+                  ws.q.data(), N, Hq, stream);
+    act_dump_bf16(act_dump_layer_tag("k_a", model_layer).c_str(),
+                  ws.k.data(), N, Hk, stream);
+    act_dump_bf16(act_dump_layer_tag("v_a", model_layer).c_str(),
+                  ws.v.data(), N, Hk, stream);
 
     // ── Write K/V to paged cache ──────────────────────────────────
     auto kv_view = cache.layer_view(kv_layer);
@@ -1424,9 +1437,13 @@ void full_attn_layer_body(
             qo_indptr_h, kv_page_indptr_h,
             N, R, num_q_heads_local, attn_ws, stream);
     }
+    act_dump_bf16(act_dump_layer_tag("attn_v", model_layer).c_str(),
+                  ws.attn_out.data(), N, Hq, stream);
     // ── Output gate: attn_out *= sigmoid(gate) ────────────────────
     kernels::launch_sigmoid_gate_inplace_bf16(
         ws.attn_out.data(), la.fa_gate.data(), N * Hq, stream);
+    act_dump_bf16(act_dump_layer_tag("attn_gate", model_layer).c_str(),
+                  ws.attn_out.data(), N, Hq, stream);
     invoke_stage_hook(
         StageHookPoint::OnAttn, ws.q.data(),
         static_cast<std::uint32_t>(N),
@@ -1449,6 +1466,11 @@ void full_attn_layer_body(
             ws.y.data(), ws.norm_y.data(),
             static_cast<std::size_t>(N) * H, stream);
     }
+    // Post o_proj + residual (fused via beta=1 on TP=1). vLLM's `attn_out`
+    // tap (o_proj without residual) is recoverable offline as post_attn
+    // minus the previous layer's `out_*` dump.
+    act_dump_bf16(act_dump_layer_tag("post_attn", model_layer).c_str(),
+                  ws.y.data(), N, H, stream);
 }
 
 }  // namespace
