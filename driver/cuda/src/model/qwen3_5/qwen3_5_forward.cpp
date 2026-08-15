@@ -1351,6 +1351,10 @@ void full_attn_layer_body(
             ws.norm_x.data(), make_weight_view(Lw.fa_v_proj, Lw.fa_v_proj_quant),
             ws.v.data(), N, Hk, H);
     }
+    // Raw K projection, before k_norm/RoPE: separates GEMM nondeterminism
+    // from the norm/rope kernels.
+    act_dump_bf16(act_dump_layer_tag("k_gemm", model_layer).c_str(),
+                  ws.k.data(), N, Hk, stream);
     kernels::launch_split_q_gate_bf16(
         la.fa_qg_packed.data(), ws.q.data(), la.fa_gate.data(),
         N, num_q_heads_local, d, stream);
@@ -1362,6 +1366,8 @@ void full_attn_layer_body(
     kernels::launch_rmsnorm_gemma_bf16(
         ws.k.data(), Lw.fa_k_norm->data(), ws.k.data(),
         N * num_kv_heads_local, d, eps, stream);
+    act_dump_bf16(act_dump_layer_tag("k_norm", model_layer).c_str(),
+                  ws.k.data(), N, Hk, stream);
 
     // ── Partial RoPE ──────────────────────────────────────────────
     kernels::launch_rope_partial_bf16(
