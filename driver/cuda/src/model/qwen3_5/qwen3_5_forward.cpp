@@ -1324,6 +1324,21 @@ void full_attn_layer_body(
 
     act_dump_bf16(act_dump_layer_tag("norm_x", model_layer).c_str(),
                   ws.norm_x.data(), N, H, stream);
+    // Buffer identity probe: cublasLt kernel choice depends on pointer
+    // alignment, so history-dependent workspace addresses would explain a
+    // deterministic ULP-level GEMM wobble with bit-identical inputs.
+    if (act_dump_active() && !act_dump_capturing(stream)) {
+        std::fprintf(stderr,
+            "[fa-ptr] step=%d L=%d N=%d norm_x=%p qg=%p k=%p v=%p "
+            "gate_up=%p attn_out=%p fused_w=%d gate_up_numel=%zu\n",
+            act_dump_step(), model_layer, N,
+            ws.norm_x.data(), la.fa_qg_packed.data(), ws.k.data(),
+            ws.v.data(),
+            ws.gate_up_fused.empty() ? nullptr : ws.gate_up_fused.data(),
+            ws.attn_out.data(),
+            Lw.fa_qgkv_proj_fused != nullptr ? 1 : 0,
+            static_cast<std::size_t>(ws.gate_up_fused.numel()));
+    }
 
     // ── q/k/v projections (q is 2× wide for the output gate) ──────
     const int qgkv_dim = 2 * Hq + 2 * Hk;
