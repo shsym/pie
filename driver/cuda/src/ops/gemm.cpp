@@ -1750,6 +1750,16 @@ void gemm_fp8_dequant_then_bf16_fallback(
         DequantWeightCache::Key{w_fp8, w_scale_fp32_dev, N, K, group_size,
                                 static_cast<int>(scale_kind)},
         weight_elems * 2, &needs_fill);
+    // Debug probe (act-dump runs only): the cache decides whether this GEMM
+    // reads a cached dequant buffer or the shared scratch; the buffer address
+    // feeds cublasLt kernel selection, so a history-dependent hit/miss flips
+    // reduction order for bit-identical inputs.
+    if (std::getenv("PIE_ACT_DUMP_DIR") != nullptr) {
+        std::fprintf(stderr,
+            "[dqw] w=%p M=%d N=%d K=%d cached=%d fill=%d buf=%p\n",
+            w_fp8, M, N, K, bf16_w != nullptr ? 1 : 0,
+            needs_fill ? 1 : 0, bf16_w);
+    }
     if (bf16_w != nullptr && !needs_fill) {
         gemm_bf16_impl(cublas_handle, act, bf16_w, y, M, N, K, beta);
         return;
