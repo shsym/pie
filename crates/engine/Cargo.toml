@@ -1,0 +1,258 @@
+[package]
+name = "engine"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "Programmable Inference Engine (Pie)"
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "engine"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# tart: the declared-forward toolchain — the fire planner's site table
+# maps driver-reported model sites onto its vocabulary.
+#
+# Two entries since the toolchain split, and they are the two HALVES this
+# crate actually touches: `lower` (the launch list, read by the site table's
+# cost model) and the traced form's vocabulary. The authoring eDSL is not in
+# the graph — the engine schedules forward passes and does not write them.
+model-compiler = { path = "../model-compiler" }
+model-ir = { path = "../model-ir" }
+driver-api = { path = "../driver-api" }
+tensor-ir = { path = "../tensor-ir" }
+tensor-compiler = { path = "../tensor-compiler" }
+# THE CUTOVER, DONE. This was `driver-cuda-new` beside a C++ `driver-cuda`
+# that supplied the same thirteen `pie_cuda_*` symbols, so which archive
+# the seam linked was the whole switch and `backend/cuda.rs` was unchanged
+# either way. There is one now, and it has the name.
+driver-cuda = { path = "../driver-cuda", optional = true }
+# The Rust Metal shell. Unlike `driver-cuda` this is not linked for an
+# archive: the seam calls it as a plain Rust library, which is what a driver
+# written in the same language should cost. Its device half is
+# `#[cfg(target_vendor = "apple")]`, so the seam below is too.
+driver-metal = { path = "../driver-metal", optional = true }
+
+# The Rust Vulkan shell, and the checkpoint reader it deliberately does not
+# have. `driver-vulkan` keeps `model-loader` a DEV-dependency and proves the
+# closure with a test, because a driver that depended on a checkpoint format
+# would be a driver that could not be handed bytes. So the conversion runs
+# here, on the side that already reads checkpoints.
+driver-vulkan = { path = "../driver-vulkan", optional = true }
+# The Rust WebGPU shell. Same arrangement as `driver-vulkan` above and for the
+# same reason -- it keeps `model-loader` a DEV-dependency and proves the
+# closure with `tests/pure.rs`, so the checkpoint is read on this side -- with
+# one thing neither sibling has: no SDK, no loader, no `-sys` crate anywhere in
+# its closure. See the `driver-wgpu` feature below.
+driver-wgpu = { path = "../driver-wgpu", optional = true }
+model-loader = { path = "../model-loader", default-features = false, optional = true }
+client = { path = "../client" }
+tokio = { version = "1.53", features = ["full"] }
+parking_lot = "0.12"
+tarpc = { version = "0.37", features = ["serde1"] }
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.1"
+rand = { version = "0.10.2", features = ["std_rng", "sys_rng"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing = "0.1.44"
+tracing-appender = "0.2"
+tracing-opentelemetry = "0.33"
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+# default-features off: the default set drags in the HTTP transports
+# (`http-proto` → prost/opentelemetry-http → a second reqwest client) which
+# `telemetry.rs` never reaches — it only ever calls `.with_tonic()`.
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "grpc-tonic",
+    "trace",
+    "metrics",
+] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+# default-features off, because wasmtime's default set is the *tooling*
+# build, not the embedder one: `wat`/`wit-parser` (text and WIT parsing we
+# never do — inferlets arrive as binary components), `cache` (module cache on
+# disk), `coredump`, `profiling`, `debug-builtins`, the three GC collectors,
+# `stack-switching` and `threads` (no guest uses them). Everything the engine
+# actually reaches is listed here.
+wasmtime = { version = "47.0.1", default-features = false, features = [
+    "runtime",
+    "std",
+    "anyhow",
+    "async",
+    "backtrace",
+    "cranelift",
+    "parallel-compilation",
+    "component-model",
+    "component-model-async",
+    "pooling-allocator",
+    "addr2line",
+    "demangle",
+] }
+# p1 off (it is a default): nothing here links preview1 — the engine only ever
+# calls `p2::add_to_linker_async` and `p3::add_to_linker`, and p1 is what drags
+# in wiggle → witx → a second, ancient `wast`.
+wasmtime-wasi = { version = "47.0.1", default-features = false, features = ["p2", "p3"] }
+# `default-send-request` stays on (it is a default): it is what supplies the
+# blanket `WasiHttpHooks::send_request`, and its rustls is the ring build, not
+# aws-lc.
+wasmtime-wasi-http = { version = "47.0.1", default-features = false, features = [
+    "p2",
+    "p3",
+    "default-send-request",
+] }
+# Names `http::uri::Scheme` for the wasi:http@0.3 network-policy hook
+# (ProcessCtx::PieHttpHooks); shared with wasmtime-wasi-http's http 1.x.
+http = "1"
+bytes = "1.12.1"
+uuid = { version = "1.24.0", features = ["serde", "v4"] }
+dashmap = "6.2.1"
+boxcar = "0.2.14"
+thiserror = "2.0.19"
+futures = "0.3.33"
+waker = { path = "../waker" }
+tokenizer = { path = "../tokenizer" }
+grammar = { path = "../grammar" }
+# `forward` for the site table, which traces a real declaration to work out
+# where a fire's hook sites are.
+model = { path = "../model" }
+blake3 = "1.8.5"
+fancy-regex = "0.18.0"
+async-trait = "0.1.91"
+wasm-encoder = { version = "0.254.0", features = ["wasmparser"] }
+wasmparser = "0.254.0"
+wasm-metadata = "0.254.0"
+libc = "0.2"
+# default-features off so reqwest's `default-tls` (native-tls → openssl) is
+# never pulled in: it dynamically links libssl.so.1.1, which doesn't exist on
+# OpenSSL-3 distros (Ubuntu 22.04+) and breaks the manylinux_2_28 release
+# binary. rustls is statically linked and distro-independent.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "charset"] }
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
+rustc-hash = "2.1"
+smallvec = "1"
+lru = "0.18.1"
+ipnet = "2"
+
+[features]
+default = []
+# The CUDA shell. It used to share these symbols with a C++ archive of the
+# same name, and enabling both was a duplicate-symbol error -- the right
+# failure, since the seam must not be ambiguous about which driver it is
+# calling. Only one supplies them now.
+#
+# It needs a CUDA runtime ABI chosen, for the reason that crate's own
+# `compile_error!` gives: guessing wrong is a segfault inside the driver
+# rather than a build error.
+driver-cuda = ["dep:driver-cuda", "driver-cuda/cuda-13", "driver-cuda/abi"]
+# The Rust Metal shell's seam. No archive and no `extern "C"`: this one is a
+# library call, so the feature owes nothing but the dependency and the
+# driver's own device gate.
+#
+# `driver-metal/metal-4` is NOT optional here. That crate deliberately has no
+# default feature, so that `cargo test -p driver-metal` reaches its portable
+# half; a consumer that wants the serving path has to say so. Omitting it
+# makes `driver_metal::gpu` an unresolved path IN THIS CRATE, which is the
+# better place to find out.
+driver-metal = ["dep:driver-metal", "driver-metal/metal-4"]
+# The Rust Vulkan shell's seam. A library call, like the Metal one, and gated
+# on the feature ALONE -- not on a target. Vulkan is a loader rather than a
+# platform: the same crate builds and runs on Linux, Windows and Android.
+#
+# `driver-vulkan/native` is not optional here for the same reason
+# `driver-metal/metal-4` is not: that crate has no default feature so its
+# portable half can be tested without a GPU, and a consumer that wants the
+# serving path has to say so. Omitting it makes `driver_vulkan::device` an
+# unresolved path IN THIS CRATE, which is the better place to find out.
+#
+# `model-loader` comes with it, because THIS crate loads the checkpoint for
+# that driver -- see `src/driver/backend/vulkan.rs` for why loading is on this
+# side of the seam and not the other.
+driver-vulkan = [
+    "dep:driver-vulkan",
+    "driver-vulkan/native",
+    "dep:model-loader",
+    # `catalog::identify`, `contract::author` and `boot::compile_load_plan_for`
+    # -- the identification and the load plan. This crate already takes
+    # `model` for `forward`; `contract` is the half that reads a publisher's
+    # checkpoint, and only this backend needs it.
+    "model/contract",
+]
+# The Rust WebGPU shell's seam. A library call, like the two above, and gated
+# on the feature ALONE.
+#
+# `driver-wgpu/native` is not optional here, for the reason
+# `driver-vulkan/native` and `driver-metal/metal-4` are not: that crate has no
+# default feature so its portable half -- which parses the WGSL it will
+# dispatch and checks it against the kernel table, with no adapter present --
+# can be tested without a GPU. Omitting it makes `driver_wgpu::device` an empty
+# module and `driver_wgpu::shell` absent, and the failure arrives at model load
+# instead of at `cargo build`.
+#
+# `model-loader` and `model/contract` come with it because THIS crate loads the
+# checkpoint for that driver, exactly as it does for Vulkan -- see
+# `src/driver/backend/wgpu.rs` for why loading is on this side of the seam.
+#
+# THE ARGUMENT THIS BACKEND HAS THAT NEITHER SIBLING DOES, for whoever decides
+# what ships on by default:
+#
+# `driver-cuda` needs a CUDA toolkit and an NVIDIA card. `driver-metal` needs a
+# Mac. `driver-vulkan` needs a loader and an ICD. This one needs NONE of them.
+# Its whole dependency closure is pure Rust -- `driver-wgpu/tests/pure.rs`
+# asserts that with `native` ON, which is the version of the claim that matters
+# -- `naga` compiles the shaders in-process so there is no module directory to
+# ship beside the binary, it builds for `wasm32-unknown-unknown` including the
+# browser backend (`tests/browser.rs`), and it reaches Vulkan, Metal, D3D12 and
+# WebGPU through one binary. Nothing about turning it on can fail to build on a
+# machine that can build the engine at all.
+#
+# That makes it the only driver that could reasonably be a DEFAULT feature.
+# This change deliberately does not make it one: the existing three are all
+# opt-in, "which backends a build carries" is a deployment policy rather than a
+# seam's decision, and `create` still opens an adapter -- so a default would
+# turn a machine with no GPU from "no backend compiled in" into "a backend that
+# fails at boot". The case is stated here so that whoever makes that call has
+# it in one place rather than reconstructing it.
+driver-wgpu = [
+    "dep:driver-wgpu",
+    "driver-wgpu/native",
+    "dep:model-loader",
+    "model/contract",
+]
+# Host-side performance probes. Each scenario is a separate flag so you
+# only pay for the probes you ask for — different domains have different
+# sample rates and different audiences. The `probe_<domain>!` macros in
+# `src/scheduler/probe.rs` expands to zero code when its feature is off.
+#
+# Adding a new domain: define it under `src/scheduler/probe.rs` (or an
+# `src/scheduler/probe/` submodule) with its probe-holder
+# struct + `probe_<domain>!` macro pair, then add a feature flag here.
+profile-fire = []          # per-fire scheduler lifecycle (90×/sec at conc=256)
+profile-hot-path = ["profile-fire"]  # convenience bundle
+profile-all = ["profile-fire"]       # everything
+
+[dev-dependencies]
+tempfile = "3"
+# The text-format parser, for tests only. The linker tests build their
+# fixtures as `(module ...)` source, which `Module::new` will only accept
+# with `wat` on; nothing in the engine itself ever compiles text, so the
+# parser has no business in a shipped binary. Dev-dependencies are not built
+# for `cargo build`, which is exactly the line we want here.
+wasmtime = { version = "47", default-features = false, features = ["wat"] }
+tensor-ir = { path = "../tensor-ir" }
+# The same `model`, with the one row that is not a model. The mock harness
+# has to name a row because `model::register` resolves one; see
+# `tests/common/env.rs`'s `MOCK_MODEL_ID` and `model::test_rows`.
+model = { path = "../model", features = ["test-rows"] }
+criterion = { version = "0.8", features = ["html_reports"] }
+# Benchmarks must allocate the way production does. Every engine entry point
+# links `worker`, which sets mimalloc as the global allocator; a bench that
+# omitted it would measure glibc malloc and report a machine nobody runs.
+mimalloc = { version = "0.1", features = ["local_dynamic_tls"] }
+
+#[profile.release]
+#lto = "fat"
+#codegen-units = 1

@@ -1,29 +1,498 @@
 # Top-level Cargo workspace for the host-side Rust crates.
 #
-# Members are the crates that build for the host (Linux/macOS x86_64/aarch64).
-# Wasm-target crates (`inferlets/*`, `sdk/rust/*`) are intentionally excluded —
-# they have their own Cargo.lock files and target `wasm32-wasip2`, so mixing
-# them into this workspace's resolver would pull wasm-only deps into the host
-# build graph.
+# ONE workspace, ONE lockfile. Every Rust crate in the repo is a member and
+# lives under `crates/`; the only Rust outside it is `sdk/server/python`, which
+# stays beside the python package it ships with (maturin convention).
+#
+# Guest-target crates (`crates/inferlet`, wasm32-wasip2) are MEMBERS but sit
+# outside `default-members`: that is what gives them this lockfile — the old
+# excluded `sdk/rust` workspace resolved tensor-dsl a second, independent time —
+# while keeping them out of host sweeps. CI builds them explicitly with
+# `--target wasm32-wasip2`. `tests/inferlets` stays excluded: those carry their
+# own lockfiles on purpose, as fixtures of a published guest contract.
 [workspace]
-resolver = "2"
+# Resolver 3 is the edition-2024 default and is MSRV-aware: it will not pick a
+# dependency version that needs a newer rustc than the `rust-version` declared
+# below. Nothing in the current lockfile changes under it — the point is that a
+# future `cargo update` cannot silently raise the floor.
+resolver = "3"
 members = [
-    "runtime",
-    "client/rust",
-    "server",
-    "driver/bridge",
-    "driver/bridge-macros",
-    "driver/dummy",
-    "driver/weight_loader",
-    "sdk/python-server",
+    # -- serving fabric and its foundation leaves (bare names) ---------------
+    # Process skeleton: CLI flag skeleton, path/config sourcing, tracing +
+    # /metrics, signal/panic/exit lifecycle. Depends on no role lib. Also ships
+    # the `pie-env` diagnostic bin ("do this role's boot preconditions hold").
+    "crates/bootstrap",
+    "crates/engine",
+    # Role libraries (pure libs: run(Config) -> Handle; no bin, never dep each other).
+    "crates/controller",
+    "crates/gateway",
+    "crates/worker",
+    "crates/client",
+    "crates/transport",
+    # Keystone leaf: BPE tokenizer (encode/decode) loaded from HF tokenizer.json.
+    "crates/tokenizer",
+    # Constrained-decoding grammar engine (EBNF/regex/json-schema/matcher/bitmask).
+    "crates/grammar",
+    # X0 tensor-waker substrate (leaf crate; loom-model-checked in isolation).
+    "crates/waker",
+    # Id atoms, serde leaf — what the roles and the contracts all sit on.
+    "crates/ids",
+
+    # -- boundary contracts, suffix-named after their subject ---------------
+    # `-api` = wire/message contract, `-abi` = the repr(C) FFI contract. They
+    # stay extracted because roles never dep each other, bidirectional pairs
+    # would cycle, and the driver contract has a non-Rust consumer.
+    "crates/client-api",
+    "crates/controller-api",
+    "crates/worker-api",
+    "crates/driver-api",
+
+    # -- driver-*: execution shells ----------------------------------------
+    # `driver` is the C++ substrate both shells interpret the ABI with; the two
+    # native shells build their own `csrc/` and are OS-exclusive.
+    # The PTIR channel plane, shared by both Rust shells. It was `src/pipeline/`
+    # inside `driver-metal` until the CUDA shell reached the same file, and
+    # the move cost nothing because not one line of it named a Metal type --
+    # the directory already built and tested on Linux while the crate around it
+    # did not. A `default-member`, unlike every driver below it: it needs no
+    # GPU, no toolkit and no OS, so there is no reason a workspace sweep should
+    # not carry its tests.
+    "crates/driver",
+    # The CUDA shell. It was `driver-cuda-new` while the C++ `driver-cuda`
+    # still existed, on the same terms the Metal one was, and took the name
+    # when that one went. Unlike either C++ shell it builds ANYWHERE:
+    # `cudarc` is pinned to a named CUDA version with `fallback-dynamic-loading`,
+    # so there is no link line and no toolkit probe, and the host logic this
+    # crate is mostly made of stays testable on a box with no GPU. It is
+    # outside `default-members` all the same -- linking a CUDA shell into a
+    # sweep should be a choice, and that is the rule the siblings follow.
+    "crates/driver-cuda",
+    # The Metal shell. It was `driver-metal-new` while the C++ `driver-metal`
+    # still existed; that one was retired (2026-08-10) and this took the name.
+    # A member so it shares this lockfile and so a workspace sweep on a Mac
+    # sees it; outside `default-members` because selecting a Metal shell on a
+    # Linux box should be a choice, which is the rule its siblings follow.
+    #
+    # Unlike the C++ shell it replaced, it does BUILD on a non-Apple host:
+    # everything that names a Metal type is behind
+    # `cfg(target_vendor = "apple")`, and what is left is the shader-include
+    # splicer and the tuning table, which are the two parts with logic worth
+    # testing and no reason to need a GPU.
+    "crates/driver-metal",
+    # The Vulkan execution shell. Unlike the Metal one, its DEVICE half builds
+    # and tests on the same Linux hosts the rest of the workspace is developed
+    # on -- Vulkan is not a platform, it is a loader -- so the portable/device
+    # split here is about what needs a GPU present, not about what a compiler
+    # will accept.
+    "crates/driver-vulkan",
+    # The WebGPU shell. The only driver in this list that is a
+    # `default-member`, and the reason is that it is the only one whose device
+    # half costs nothing to REACH: `wgpu` is pure Rust with no `-sys` crate
+    # anywhere in its closure, `naga` compiles the shaders in-process, and so a
+    # workspace sweep on any machine builds the whole crate and runs every test
+    # that does not need an adapter to answer. Its `native` feature gates only
+    # what asks a real adapter a question, which is a narrower line than either
+    # sibling's -- Metal splits on what a compiler accepts, Vulkan on what needs
+    # a GPU present, and this one on neither.
+    "crates/driver-wgpu",
+
+    # -- model-*: what a model IS, and how it gets onto a device ------------
+    # The two registries (`model_type` -> load-contract author, `arch_name` ->
+    # chat template), the twenty generations they dispatch to, the vocabulary
+    # those share, and the `pie.model/1` descriptor (`config`, ex
+    # `model-config`) that every one of them is parameterized by -- one crate,
+    # module per generation, feature per aspect.
+    "crates/model",
+    # The forward-pass toolchain, in the three layers `tensor-*` is already in
+    # and for the same reason. It was ONE crate (`model-compiler`, all five
+    # modules) until the consumer sets were read off the tree and found to be
+    # DISJOINT: `crates/model` writes declarations and never lowers one,
+    # every driver lowers and never writes one, and no crate in the workspace
+    # wanted both halves. What that cost was `driver-metal`, `driver-vulkan`
+    # and `driver-wgpu` each compiling `dsl::cuda`'s 4,469 lines -- an
+    # authoring surface for a backend they are not -- to reach `lower`, which
+    # they reached without calling a line of it.
+    #
+    # The traced form: the op vocabulary, the plan container and the
+    # `TraceBuilder` a declaration records onto, the seam words, and the
+    # signature tables a plan is checked against at trace time. The floor both
+    # halves stand on, and it names no family, no `Val` and no device.
+    "crates/model-ir",
+    # The authoring eDSL: typed weight handles, tape-carrying values, and the
+    # raw kernel-signature surfaces (`cuda`, `metal`) a lowered declaration is
+    # written against. Depended on by `crates/model` and NOTHING else -- which
+    # is the fact the split turned from a convention into a build rule. Carries
+    # the tracer fingerprint (`compiler_version()`), whose hash covers this
+    # tree and `model-ir`'s, because the tracer is both of them.
+    "crates/model-dsl",
+    # Lowering alone now: traced form + the engine's rows + one fire ->
+    # rectangles, operands, buffers. Keeps the name because a compiler is what
+    # turns a representation into what a machine runs, which is what is left
+    # here once the surface and the IR are their own crates.
+    "crates/model-compiler",
+    # Weight loader: checkpoints -> verified device-memory layouts. Consumed by
+    # drivers at cold start, not by the serving runtime. One crate: the drivers
+    # link the rlib and pass Rust types, and a device's arena crosses as an
+    # `ArenaBacking` rather than as a second executor inside each driver.
+    "crates/model-loader",
+
+    # -- kernels-*: the device kernels, and the words their tables use ------
+    # `kernels` is bare for the reason `driver` is: it is the shared floor
+    # under the prefixed backends, holding what all of their tables are
+    # written in rather than anything any one of them does.
+    "crates/kernels",
+    # The JIT-native shape of the CUDA half: the table, the device sources
+    # carried in the binary, and the runtime that NVRTC-compiles and fires
+    # them. No CMake, no archive, no `links` key -- a kernel is text, so
+    # there is nothing to build ahead of time and nothing to link.
+    #
+    # It carried a `-new` suffix until it took this line, and a headstone
+    # STOOD HERE in its place: the plain name belonged to an ahead-of-time
+    # archive crate -- `libpie_kernels_cuda.a` out of CMake, a
+    # `links = "pie_kernels_cuda"` key, a `native` feature that cost nvcc --
+    # deleted at `85c6c674b`. The `-new` was never a version. It was the
+    # contrast with that crate, and a name that distinguishes A from B
+    # distinguishes nothing once B is gone; holding the plain name vacant for
+    # a crate that will not return is the same mistake pointing the other
+    # way. So the suffix came off. The archive is still discussed all over
+    # this tree's comments, because it is where most of this device code came
+    # from, and every one of those mentions now says which crate it means at
+    # the point where it stands.
+    #
+    # The sentence above this block used to end "-- the two implementation
+    # crates default to table-only, `native` is what costs nvcc." There is no
+    # CUDA pair left to be the floor under, and nothing on this side costs
+    # nvcc.
+    #
+    # What let the archive go was inverting the edge between the two while
+    # both paths still had to run: the rows moved HERE, and the archive took
+    # them back through a `default-features = false` dependency, re-exporting
+    # them under the paths it used to own. The arrow pointed at this crate,
+    # so nothing here had to move when the other end went. A symbol still has
+    # exactly one contract; the crate that authors it is the one a row is
+    # written for.
+    "crates/kernels-cuda",
+    "crates/kernels-metal",
+    # The Vulkan tree. Its table is `kernels-metal`'s coverage, row for row, so
+    # the two are comparable rather than merely parallel; what differs is the
+    # launch ABI (buffers to descriptor bindings, scalars to one push-constant
+    # block), which is the API's shape and not any kernel's. `native` is what
+    # costs `glslc` -- Vulkan has no runtime shader compiler, so GLSL -> SPIR-V
+    # is a BUILD-time hop where Metal's is a run-time one.
+    "crates/kernels-vulkan",
+    # The WebGPU tree. Its table is `kernels-metal`'s coverage, row for row, so
+    # all three are comparable rather than merely parallel. What differs is that
+    # this one costs NO TOOLCHAIN: WGSL is compiled by `naga`, which is Rust and
+    # ships inside `wgpu`, so a module is built by the process that dispatches
+    # it. There is no `native` feature here because there is no build product to
+    # gate -- the table, the shaders and every structural test are reachable on
+    # any machine that can build Rust, which is why this one is a
+    # `default-member` where its two siblings' device halves are not.
+    "crates/kernels-wgpu",
+
+    # -- tensor-*: the guest-program toolchain ------------------------------
+    # authoring eDSL -> PTIR -> planning -> CUDA/Metal codegen, plus the
+    # reference interpreter every backend diffs against.
+    "crates/tensor-ir",
+    "crates/tensor-dsl",
+    "crates/tensor-compiler",
+
+    # -- guest-target members (outside default-members, see below) ----------
+    # `inferlet` owns the canonical `pie:inferlet` WIT package (`wit/`) AND is
+    # the wit-bindgen site over it -- it has to be both, because `generate!`
+    # resolves its path on the filesystem and this crate is published. It is a
+    # guest crate because the generated import shims are wasm, even though the
+    # host reads its `wit/` directory by path.
+    "crates/inferlet",
+    "crates/inferlet-macros",
+
+    # -- Rust that lives outside crates/ on purpose -------------------------
+    # The python SDK's backend: pyo3/maturin want the Rust half beside its
+    # product, not in the workspace tree.
+    "sdk/server/python",
+    # The engine's on-device end-to-end suite. No code of its own; it exists so
+    # that `cargo test -p pie` means the CLI's own tests rather than
+    # "compile thirty GPU test binaries". Almost everything in it is `#[ignore]`d
+    # and asks for a real device.
+    "tests/gpu",
+]
+# Host sweeps (`cargo check`, `cargo test` with no `-p`/`--workspace`) run this
+# set. It is every member except the wasm32-wasip2 guest crate, which has no
+# host target and would fail the sweep it is not part of.
+default-members = [
+    "crates/bootstrap",
+    "crates/engine",
+    "crates/controller",
+    "crates/gateway",
+    "crates/worker",
+    "crates/client",
+    "crates/transport",
+    "crates/tokenizer",
+    "crates/grammar",
+    "crates/waker",
+    "crates/ids",
+    "crates/client-api",
+    "crates/controller-api",
+    "crates/worker-api",
+    "crates/driver-api",
+    "crates/driver",
+    # See the member comment: no SDK, no vendor driver, no adapter needed to
+    # build it or to run the tests that are not gated on `native`, so a sweep
+    # should carry it where it does not carry `driver-vulkan` or `driver-metal`.
+    "crates/driver-wgpu",
+    "crates/model",
+    "crates/model-ir",
+    "crates/model-dsl",
+    "crates/model-compiler",
+    "crates/model-loader",
+    "crates/kernels",
+    "crates/kernels-cuda",
+    "crates/kernels-metal",
+    "crates/kernels-vulkan",
+    "crates/kernels-wgpu",
+    "crates/tensor-ir",
+    "crates/tensor-dsl",
+    "crates/tensor-compiler",
+    "crates/inferlet-macros",
+    "sdk/server/python",
+    "tests/gpu",
 ]
 exclude = [
-    "inferlets",
-    "sdk/rust",
+    "tests/inferlets",
+    # Worktree checkouts under .claude/worktrees/ must never be captured by
+    # THIS manifest when cargo walks up from a worktree's excluded package
+    # (e.g. .claude/worktrees/<x>/tests/inferlets/<name> — the worktree's own root
+    # excludes it, so the walk continues up to here).
+    ".claude",
 ]
 
-# Distribution profile for `pie-server`. Use
-# `cargo build --profile release-min -p pie-server`. The regular
+# Shared package metadata. Opt in per field with `<field>.workspace = true`;
+# today only the `compiler/*` crates do.
+# ── The `pie` package ────────────────────────────────────────────────
+#
+# The root is a package as well as the workspace (the wasmtime pattern):
+# `cargo run` here boots the standalone. It used to be `bin/pie`, one of four
+# thin bin shells; the other three ride this same package as `src/bin/*`.
+#
+# That costs nothing, because `pie` already depended on all three role libs --
+# it is the composition root, the one crate that deps controller AND gateway
+# AND worker. Four packages whose union of dependencies equals one of them is
+# four manifests to keep in step for no boundary.
+[package]
+name = "pie"
+version = "0.1.0"
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The pie standalone: multi-call CLI (local/serve + ops) composing the bootstrap skeleton and the controller/gateway/worker role libs in-proc, plus the three role daemons."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "pie"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pie"
+path = "src/main.rs"
+
+# The three role daemons. `src/bin/<name>.rs` names the binary, which is why
+# the files are hyphenated: the user-facing commands are unchanged.
+[[bin]]
+name = "pie-controller"
+path = "src/bin/pie-controller.rs"
+
+[[bin]]
+name = "pie-gateway"
+path = "src/bin/pie-gateway.rs"
+
+[[bin]]
+name = "pie-worker"
+path = "src/bin/pie-worker.rs"
+
+[features]
+# This package selects the driver backend; it forwards the flavors to the
+# embedded worker. Default = none (dummy fallback); enable driver-cuda or
+# driver-metal for real inference.
+default = []
+driver-cuda = ["worker/driver-cuda"]
+# macOS/Apple Silicon. Without this the `pie` binary has no way to reach the
+# Metal driver at all: `worker`'s `driver-metal` is what links the archive,
+# and this is the only package that builds a binary.
+driver-metal = ["worker/driver-metal"]
+# Vulkan, anywhere there is a loader and an ICD. No vendor or platform
+# condition on it: `worker`'s `driver-vulkan` is what puts the driver in the
+# graph, and this is the only package that builds a binary.
+driver-vulkan = ["worker/driver-vulkan"]
+# The WebGPU shell, which needs neither. Vulkan builds anywhere and RUNS where
+# an ICD is installed; this one carries its own way to every API -- Vulkan,
+# Metal, D3D12 and WebGPU through one pure-Rust binary, shaders included. Same
+# forwarding, and the same reason it lives here: this is the only package that
+# builds a binary.
+driver-wgpu = ["worker/driver-wgpu"]
+# Probe passthroughs to the embedded worker (→ runtime).
+profile-fire = ["worker/profile-fire"]
+
+[dependencies]
+# Shared process skeleton (imports as `bootstrap`): CLI flags, paths, tracing,
+# signals, /metrics, banner.
+bootstrap = { path = "crates/bootstrap" }
+# The three role libs — this is the ONE package that deps all three (Seam 4).
+controller = { path = "crates/controller" }
+gateway = { path = "crates/gateway" }
+worker = { path = "crates/worker", default-features = false }
+engine = { path = "crates/engine" }  # program/manifest types for `pie inferlet`
+# `pie model convert` — the host-side load-plan executor and checkpoint
+# writer. Pure Rust; needs no driver and no GPU.
+model-loader = { path = "crates/model-loader" }
+# The tokenizer compiler — `pie model convert` runs it once at import and
+# serializes the result into the artifact (`pie.tokenizer/1`), so the runtime
+# never parses `tokenizer.json` again.
+tokenizer = { path = "crates/tokenizer" }
+# The HF `config.json` normalizer — `pie model convert` runs it once and
+# writes the result as the `pie.model/1` descriptor, so the runtime and the
+# driver stop re-deriving it from HF quirks at every boot.
+# Client edge for `pie config tune`: the sweep generates load through
+# the same websocket path a deployment is reached by, because measuring an
+# in-process shortcut would measure something nobody runs.
+client = { path = "crates/client" }
+model = { path = "crates/model", features = ["contract"] }
+# Wire vocabulary — compose.rs names control-plane types (RoutingTable, Ack,
+# GatewayInfo, WorkerInfo, Neighbors, WorkerStatus) from pie-controller-rpc and
+# the id atoms (WorkerId/GatewayId/NodeId) from pie-ids.
+ids = { path = "crates/ids" }
+controller-api = { path = "crates/controller-api" }
+
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+toml = "1.1"
+tokio = { version = "1.53", features = ["full"] }
+tracing = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# R3 weight/runtime provisioning downloaders — these live ONLY here (the worker
+# lib links zero provisioning machinery). `reqwest` carries `blocking` because
+# the CLI `runtime install` download is synchronous; the HF snapshot fetch in
+# `local::hf::download` is async and streams.
+#
+# `rustls-no-provider`, not `rustls`: reqwest's `rustls` feature hard-selects
+# the aws-lc backend (`rustls = ["__rustls-aws-lc-rs", ...]`), whose build
+# script was the single most expensive unit in a cold build and a second crypto
+# backend beside the `ring` the client crate and wasmtime-wasi-http already
+# link. `bootstrap::install_crypto_provider` picks ring at process boot.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "blocking", "stream"] }
+tar = "0.4"
+xz2 = "0.1"
+toml_edit = "0.25.13"
+
+[dev-dependencies]
+tempfile = "3"
+# `boot_smoke` drives the one public composition seam (`run_standalone`) the
+# way a client does; that is the reason this package has a `[lib]` at all.
+client = { path = "crates/client" }
+
+# The same `model`, with the one row that is not a model. `model_artifact`
+# writes a checkpoint and runs it through `pie model build`, which identifies
+# it against the catalog -- so the test needs a row small enough to write.
+#
+# Cargo unifies this with the `[dependencies]` entry above, which is why the
+# guarantee cannot be "the binary does not enable it": it is
+# `a_shipped_catalog_has_no_test_rows`, in `model` itself.
+model = { path = "crates/model", features = ["contract", "test-rows"] }
+
+# SIGPIPE disposition — see `die_quietly_on_closed_pipe` in main.rs.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[workspace.package]
+# The floor is verified, not assumed: `cargo +1.91.1 check --all-targets` builds
+# all six compiler crates. `rust-toolchain.toml` pins 1.97.1 because that is the
+# version CI's `-D warnings` gate is calibrated against, but pinning a toolchain
+# is not the same claim as requiring one — a consumer of `tensor-ir` needs only
+# what the source actually uses.
+#
+# Lowering this further needs a toolchain to check it against; raising it needs
+# a reason in the diff. Either way the number is a measurement, so re-measure
+# rather than edit it to match whatever is installed.
+rust-version = "1.91"
+
+# The checkpoint readers, in one place because releasing them is a two-repo
+# dance: `ztensor` owns the container format and its validation,
+# `ztensor-compat` owns the foreign-format projections.
+#
+# An ordinary version requirement. It was a revision-pinned git dependency
+# while the two were developed together, which `Cargo.lock` not being tracked
+# here made necessary: a branch would have resolved to whatever v2's tip was at
+# clone time, and v2 moved under us.
+#
+# The patch is named, not just `"2.1"`, because 2.1.1 broke the API on purpose
+# and says so in its changelog. This is still a caret range — it does not pin —
+# but it puts the floor above the break, so no resolution can land on 2.1.0 and
+# fail to compile. `Cargo.lock` is not tracked here, which is what makes the
+# floor the only thing deciding that.
+#
+# 2.1.0 put the modules on the spec's layers (`format` is L0+L1 and opens no
+# file, `provide` is the projection face) and scoped the object builders. 2.1.1
+# narrowed what is left: bytes are reached through `Tensor::data`, since the
+# nine shorthands for it addressed one part while `verify` on the same receiver
+# covered them all, and `Part::bytes` hands back a `Cow` rather than a
+# lookalike of one.
+[workspace.dependencies]
+ztensor = "2.1.1"
+ztensor-compat = "2.1.1"
+
+# Shared lint table. Opt in per crate with `[lints] workspace = true`; today
+# only the `compiler/*` crates do, because they are the only ones at zero
+# clippy warnings and therefore the only ones CI can gate with `-D warnings`
+# (`.github/workflows/ci.yml`). The rest of the workspace still carries ~240
+# warnings; wire a crate in here once it is clean rather than all at once.
+#
+# Everything below is at zero occurrences across the compiler crates as of this
+# commit, so each is a ratchet that costs nothing today and blocks a
+# regression tomorrow. Lints that would need a cleanup first are deliberately
+# absent — notably `clippy::wildcard_enum_match_arm`, the lint that would have
+# caught the catch-all `_ =>` arms that silently absorbed new ops. Down from 38
+# sites to 26; the survivors were each read and are fail-safe (`_ => None`,
+# `_ => {}`, "skip this optimization") or delegate to a match that *is*
+# exhaustive, so a new variant inherits a conservative answer rather than a
+# confident wrong one. Turning the lint on would now mean 26 `#[allow]`s or 26
+# hand-written variant lists that drift, which buys less than it costs.
+[workspace.lints.rust]
+# Promoted from `tensor-dsl`, which was the only crate carrying it. There is no
+# `unsafe` anywhere in the tensor toolchain, so this extends that crate's
+# existing guarantee to `tensor-ir` and `tensor-compiler` at zero cost.
+unsafe_code = "forbid"
+# Every public item in the tensor toolchain is documented, and this keeps it
+# that way. These crates are read far more often than they are written -- the op
+# table, the wire layout and the type rules are all consulted from other
+# crates and from generated backend sources -- so an undocumented public item
+# is a rule someone has to reconstruct from the implementation, and the
+# reconstruction is what silently disagrees with it later.
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+# A compiler crate that writes to a stream is either debugging scaffolding left
+# behind or a diagnostic that belongs behind an explicit, annotated `allow`.
+print_stdout = "deny"
+print_stderr = "deny"
+# `cast_possible_truncation` is deliberately NOT set here. It fires on ~130
+# `usize as u32` sites that are all bounded -- by the container ceilings, by
+# the `u32` value-id space, or by `usize` being 64 bits on the only targets
+# `tensor-compiler` and `tensor-compiler` build for -- so denying it workspace-wide buys
+# ~130 `#[allow]` and no guarantee.
+#
+# It is denied at the top of `compiler/ir/src/lib.rs` instead, which is where
+# it earns its keep: that crate narrows counts that came from bytes it did not
+# write. Anywhere else, a narrowing cast still deserves the same question --
+# what is the bound, and who enforces it -- the lint just cannot ask it
+# usefully.
+
+# Distribution profile for `worker`. Use
+# `cargo build --profile release-min -p pie-worker`. The regular
 # `release` profile stays as the default dev/bench path (no LTO).
 #
 # Thin LTO over fat: ~10× faster link than fat with most of the size
@@ -31,8 +500,23 @@ exclude = [
 # (CUDA kernel compile + Rust+C++ link grew from ~1h to many hours)
 # without measurably better artifacts. Thin LTO parallelizes across
 # codegen units, so we leave codegen-units at the default (16) too.
+#
+# NO `panic = "abort"`. It was here, and it was quietly deleting behaviour
+# this tree goes to some length to provide: three `catch_unwind` barriers
+# turn a panic into an answer rather than a dead process -- the driver lane
+# in `engine::scheduler::worker` (which drains and fails the requests behind
+# a poisoned lane instead of leaving a frame in flight, after one was
+# measured stalled for 7030s), and the two C ABI seams in
+# `driver_cuda::serve::guard` and `pie_wake`, whose whole documented purpose
+# is that an operator gets a message naming the entry point "instead of a
+# bare SIGABRT". Under `abort` every one of them is dead code and the
+# shipped binary does exactly what those comments say it must not.
+#
+# Each of the three now fails the build under `cfg(panic = "abort")`, so
+# this is not a line anyone can put back by accident. It cost ~8 MiB of
+# binary, which is not a currency this project trades in.
 [profile.release-min]
 inherits = "release"
 lto = "thin"
-panic = "abort"
 strip = "symbols"
+

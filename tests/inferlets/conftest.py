@@ -11,8 +11,8 @@ Each ``test_<name>.py`` file defines one or more async test functions and a
 
 Usage from project root::
 
-    uv run python tests/inferlets/test_watermarking.py --dummy
-    uv run python tests/inferlets/test_watermarking.py --model Qwen/Qwen3-0.6B
+    uv run python tests/inferlets/test_curated.py --dummy
+    uv run python tests/inferlets/test_curated.py --model Qwen/Qwen3-0.6B
 """
 
 from __future__ import annotations
@@ -31,8 +31,7 @@ from pie_client import Event
 # Paths
 # ---------------------------------------------------------------------------
 
-ROOT = Path(__file__).resolve().parent.parent.parent
-INFERLETS_DIR = ROOT / "inferlets"
+INFERLETS_DIR = Path(__file__).resolve().parent
 
 
 # ---------------------------------------------------------------------------
@@ -43,12 +42,29 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
     parser = argparse.ArgumentParser(description=description)
     parser.addoption = parser.add_argument  # convenience alias
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B", help="HuggingFace model ID")
-    parser.add_argument("--device", default="cuda:0", help="Device(s), comma-separated")
+    parser.add_argument("--device", default=None,
+                        help="Device(s), comma-separated. Default: 'metal:0' for --driver metal, "
+                             "'gpu:0' for --driver wgpu or vulkan, else 'cuda:0'")
     parser.add_argument("--timeout", type=int, default=120, help="Timeout per inferlet (seconds)")
+    # A SMALL number here is a stress rather than a tuning knob: `driver-vulkan`
+    # and `driver-wgpu` both open their KV pool at 1024 pages, which almost no
+    # curated inferlet ever fills, so the pool's growth path is barely entered
+    # by a default run. Two real defects have been found in that path, both by
+    # this sweep and both only because thirty-nine programs share one server.
+    # `--kv-pages 8` puts every request in it.
+    parser.add_argument("--kv-pages", type=int, default=None,
+                        help="KV pages the backend opens with (default: the backend's own)")
     parser.add_argument("--verbose", action="store_true", help="Show stdout on failure")
     driver_group = parser.add_mutually_exclusive_group()
-    driver_group.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "tensorrt_llm", "dummy", "cuda_native", "portable"],
-                              help="Inference driver: 'dev', 'vllm', 'sglang', 'tensorrt_llm', 'dummy', 'cuda_native', or 'portable'")
+    # `wgpu` and `vulkan` are the two pure-Rust backends. They were missing
+    # here for as long as the embedded wheel could not host them -- it pinned
+    # `worker/driver-cuda` -- so naming one produced a server with no driver.
+    # The wheel takes a feature now (`maturin build --no-default-features
+    # --features driver-wgpu`), and a build that did not select the named
+    # backend fails at boot saying so, which is a better answer than a choice
+    # list that pretends the option does not exist.
+    driver_group.add_argument("--driver", default="dev", choices=["dev", "vllm", "sglang", "tensorrt_llm", "dummy", "cuda_native", "metal", "vulkan", "wgpu"],
+                              help="Inference driver: 'dev', 'vllm', 'sglang', 'tensorrt_llm', 'dummy', 'cuda_native', 'metal', 'vulkan' or 'wgpu'")
     driver_group.add_argument("--dummy", action="store_true",
                               help="Alias for --driver dummy")
     parser.add_argument("--vllm-attention-backend", default=None,
@@ -67,9 +83,6 @@ def make_parser(description: str = "Inferlet E2E Test") -> argparse.ArgumentPars
                         help="If set, write each test's captured inferlet output to "
                              "<dir>/<test-name>.txt (one file per test, multiple "
                              "run_inferlet calls concatenated with separators).")
-    parser.add_argument("--portable-n-gpu-layers", type=int, default=None,
-                        help="(--driver portable only) Override n_gpu_layers; "
-                             "-1 = all layers on GPU, 0 = CPU only, N = first N.")
     return parser
 
 
@@ -108,6 +121,40 @@ def _clear_wasmtime_cache():
         shutil.rmtree(cache_dir, ignore_errors=True)
 
 
+def _build_guests():
+    """Build every curated guest from source before anything is installed.
+
+    The harness installs prebuilt `.wasm` files. Without this, a guest whose
+    SOURCE was fixed is still tested in its OLD shape, and the failure is
+    read as the SERVER's -- which is exactly what happened to
+    `prefix-tree-kv-cache`, whose one-pipeline-per-leaf fix sat unbuilt while
+    the run kept failing with `pipeline is closed` and the blame went to the
+    driver for two sessions.
+
+    Skipped when `PIE_INFERLETS_NO_BUILD` is set, for runs against artifacts
+    that were built elsewhere (a cross-compiled or vendored guest).
+    """
+    import os
+    import subprocess
+
+    if os.environ.get("PIE_INFERLETS_NO_BUILD"):
+        print("Guests: not built (PIE_INFERLETS_NO_BUILD)")
+        return
+    result = subprocess.run(
+        ["cargo", "build", "--workspace", "--target", "wasm32-wasip2"],
+        cwd=INFERLETS_DIR,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        # Loud, and NOT fatal: a workspace that cannot build here may still
+        # have usable artifacts, and a stale run says more than no run.
+        print("Guests: BUILD FAILED -- testing whatever artifacts exist")
+        print(result.stderr.strip()[-2000:])
+        return
+    print("Guests: built from source")
+
+
 async def run_inferlet(
     client,
     name: str,
@@ -124,15 +171,34 @@ async def run_inferlet(
     if extra_args is None:
         extra_args = []
     wasm_name = name.replace("-", "_")
-    # Rust: cargo emits to target/wasm32-wasip2/{release,debug}/<name>.wasm
+    # Rust workspace artifacts live under this directory's target/. Keep the member
+    # paths as fallbacks for inferlets built outside the curated workspace.
     # JS (bakery build) / Python (componentize-py): flat target/<name>.wasm
     inferlet_dir = INFERLETS_DIR / name
     candidates = [
+        INFERLETS_DIR / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
+        INFERLETS_DIR / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / "wasm32-wasip2" / "release" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / "wasm32-wasip2" / "debug" / f"{wasm_name}.wasm",
         inferlet_dir / "target" / f"{wasm_name}.wasm",
     ]
-    wasm_path = next((p for p in candidates if p.exists()), None)
+    # The NEWEST of the ones that exist, not the first.
+    #
+    # The list is a preference order and was read as one, which is wrong here
+    # for a reason that cost real time: `_build_guests` above builds DEBUG --
+    # no `--release` -- while this list prefers release. So a release artifact
+    # built once, by hand or by an older harness, shadows every rebuild this
+    # harness does afterwards, silently and for good. The failure mode is a
+    # source edit that appears to have no effect, which is indistinguishable
+    # from a correct program, and it is how a mutation test came back "the
+    # mutation survived" against a guest that had never been rebuilt.
+    #
+    # Newest-wins keeps every path working -- a vendored or cross-built guest
+    # is still found, and a deliberate release build is still preferred right
+    # after it is made -- while making the thing just built the thing that
+    # runs.
+    present = [p for p in candidates if p.exists()]
+    wasm_path = max(present, key=lambda p: p.stat().st_mtime, default=None)
     manifest_path = inferlet_dir / "Pie.toml"
 
     if wasm_path is None:
@@ -183,16 +249,28 @@ TestFn = Callable[..., Coroutine]
 async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     from pie.server import Server
     from pie.config import (
-        Config, ModelConfig, ServerConfig, AuthConfig, TelemetryConfig,
+        Config, ModelConfig, ServerConfig, TelemetryConfig,
         DriverConfig,
     )
 
-    device = [d.strip() for d in args.device.split(",")] if "," in args.device else args.device
+    raw_device = args.device
+    if raw_device is None:
+        # `gpu:0` for the two portable backends: neither reads it as a
+        # selector -- wgpu asks the platform for an adapter and vulkan
+        # enumerates -- but `device` is required of every driver, so it has to
+        # say something and `cuda:0` would be a lie about the hardware.
+        raw_device = {
+            "metal": "metal:0",
+            "wgpu": "gpu:0",
+            "vulkan": "gpu:0",
+        }.get(args.driver, "cuda:0")
+    device = [d.strip() for d in raw_device.split(",")] if "," in raw_device else raw_device
     if isinstance(device, str):
         device = [device]
 
     # Clear stale wasmtime module cache to avoid linker mismatches
     # between recompiled WASM components and cached compiled modules.
+    _build_guests()
     _clear_wasmtime_cache()
 
     print(f"Model:  {args.model}")
@@ -211,24 +289,20 @@ async def _run(tests: list[TestFn], args: argparse.Namespace) -> int:
     if args.driver in ("sglang", "vllm") and args.spec_ngram:
         driver_subsection["spec_ngram_enabled"] = True
         driver_subsection["spec_ngram_num_drafts"] = args.spec_num_drafts
-    if args.driver == "portable" and args.portable_n_gpu_layers is not None:
-        driver_subsection["n_gpu_layers"] = args.portable_n_gpu_layers
 
     cfg = Config(
         server=ServerConfig(port=0),
-        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
-        models=[
-            ModelConfig(
-                name="default",
-                hf_repo=args.model,
-                driver=DriverConfig(
-                    type=args.driver,
-                    device=device,
-                    options=driver_subsection,
-                ),
+        model=ModelConfig(
+            name="default",
+            hf_repo=args.model,
+            kv_pages=args.kv_pages,
+            driver=DriverConfig(
+                type=args.driver,
+                device=device,
+                options=driver_subsection,
             ),
-        ],
+        ),
     )
     out_dir = Path(args.output_dir) if args.output_dir else None
     if out_dir is not None:

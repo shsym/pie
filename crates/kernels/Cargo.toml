@@ -1,0 +1,33 @@
+[package]
+name = "kernels"
+version = "0.4.0"
+edition = "2024"
+authors = ["In Gim <in.gim@yale.edu>"]
+description = "The vocabulary a kernel signature is written in: KernelSig, the capabilities a kernel may lack, the host plan it obligates, and the kernel! macro that declares one."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "kernels"
+path = "src/lib.rs"
+
+# No dependencies, and none is wanted: a row in a backend's table must be
+# writable next to the .cu it describes without dragging a graph along.
+[dependencies]
+
+# The three shader backends' tables, so ONE test can compare them.
+#
+# `.wiki/kernel-x/refactor-bigplan.md` §1.1: the three are one table written
+# down three times -- 100/100 identical `launch`, 100/100 identical `axes`,
+# 94/100 `operands` -- and *nothing in the workspace compares them*, which is
+# why seven statements had drifted and nobody had noticed. This is that
+# comparison.
+#
+# A dev-dependency, so the cycle is legal: each of these depends on `kernels`,
+# and cargo permits a dev-dependency to point back. Nothing in `src` gains an
+# edge, so the shared crate stays the floor it is.
+[dev-dependencies]
+kernels-metal = { path = "../kernels-metal" }
+kernels-vulkan = { path = "../kernels-vulkan" }
+kernels-wgpu = { path = "../kernels-wgpu" }
