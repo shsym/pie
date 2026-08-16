@@ -91,36 +91,8 @@ fn dirname_to_repo_id(dir: &str) -> Option<String> {
 // Pie-compatibility check
 // -----------------------------------------------------------------------------
 
-/// HuggingFace `model_type` → PIE arch name. Kept in sync with
-/// the model_type strings the C++ drivers (`crates/driver-cuda/csrc/src/loader/`,
-/// `crates/driver-metal/csrc/src/`) recognise. Architectures supported by *any*
-/// of the standalone-linked drivers belong here.
-const HF_TO_PIE_ARCH: &[(&str, &str)] = &[
-    ("llama", "llama3"),
-    ("qwen2", "qwen2"),
-    ("qwen3", "qwen3"),
-    ("qwen3_5", "qwen3_5"),
-    ("qwen3_moe", "qwen3_moe"),
-    ("qwen3_5_moe", "qwen3_5_moe"),
-    ("qwen3_5_moe_text", "qwen3_5_moe"),
-    ("qwen3_vl", "qwen3_vl"),
-    ("qwen3_vl_text", "qwen3_vl"),
-    ("phi3", "phi3"),
-    ("mixtral", "mixtral"),
-    ("gemma2", "gemma2"),
-    ("gemma3_text", "gemma3"),
-    ("gemma4_text", "gemma4"),
-    ("gemma4", "gemma4"),
-    ("mistral3", "mistral3"),
-    ("olmo3", "olmo3"),
-    ("gptoss", "gptoss"),
-    ("gpt_oss", "gptoss"),
-    ("nemotron_h", "nemotron_h"),
-    ("kimi_k3", "kimi_k3"),
-];
-
 /// Read `<repo_dir>/snapshots/<latest>/config.json` and look up its
-/// `model_type` against [`HF_TO_PIE_ARCH`]. Returns
+/// `model_type` against [`model::ingest::arch_for_model_type`]. Returns
 /// `(true, arch_name)` when supported, `(false, "unsupported type:
 /// <model_type>")` when not, or `(false, "no config")` when the
 /// snapshot is missing or unreadable.
@@ -153,12 +125,16 @@ fn check_pie_compatibility(repo_dir: &Path) -> (bool, String) {
     if model_type.is_empty() {
         return (false, "no config".to_string());
     }
-    for (hf, pie) in HF_TO_PIE_ARCH {
-        if *hf == model_type {
-            return (true, pie.to_string());
-        }
+    // The table used to live here, "kept in sync with the model_type strings
+    // the C++ drivers recognise" by hand -- and it had drifted, naming three
+    // architectures no row in this build advertises. It now sits beside the
+    // rows it is a fact about, in `model::ingest`, where the import passes
+    // that turn a `model_type` into a naming table read the same entries and
+    // a test refuses an entry no generation answers to.
+    match model::ingest::arch_for_model_type(model_type) {
+        Some(pie) => (true, pie.to_string()),
+        None => (false, format!("unsupported type: {model_type}")),
     }
-    (false, format!("unsupported type: {model_type}"))
 }
 
 // -----------------------------------------------------------------------------
@@ -186,6 +162,18 @@ struct Artifact {
     tensors: usize,
     written_by: Option<String>,
     source: Option<String>,
+    /// Per-target builds derived from this archive. Reported so that the store
+    /// size a listing shows is the store size on disk: a runtime artifact is
+    /// as large as the archive it came from, and a model with three of them
+    /// occupies four times what the archive line alone would suggest.
+    runtimes: Vec<RuntimeBuild>,
+}
+
+#[derive(serde::Serialize)]
+struct RuntimeBuild {
+    key: String,
+    bytes: u64,
+    runtime_quant: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -243,6 +231,25 @@ impl crate::ui::Report for ModelList {
                     format!("{from}{by}"),
                 ],
             ));
+            // Indented under the archive they came from, because that is the
+            // relationship: a build is derived and deleting it costs a
+            // rebuild, where deleting the archive costs a re-import.
+            for runtime in &artifact.runtimes {
+                let quant = runtime
+                    .runtime_quant
+                    .as_deref()
+                    .map(|q| format!(", {q}"))
+                    .unwrap_or_default();
+                table.push(Row::new(
+                    Mark::Plain,
+                    [
+                        format!("  runtime/{}", runtime.key),
+                        crate::ui::bytes(runtime.bytes),
+                        String::new(),
+                        format!("built{quant}"),
+                    ],
+                ));
+            }
         }
         table.print(palette);
 
@@ -306,6 +313,15 @@ fn list() -> Result<Answer> {
             .into_iter()
             .map(|e| Artifact {
                 shards: e.shards(),
+                runtimes: e
+                    .runtimes
+                    .iter()
+                    .map(|r| RuntimeBuild {
+                        key: r.key.clone(),
+                        bytes: r.bytes,
+                        runtime_quant: r.runtime_quant.clone(),
+                    })
+                    .collect(),
                 name: e.name,
                 root: e.root,
                 bytes: e.bytes,
@@ -333,6 +349,15 @@ fn info(name: String) -> Result<Answer> {
     };
     Ok(Answer::report(ModelInfo {
         shards: entry.shards(),
+        runtimes: entry
+            .runtimes
+            .iter()
+            .map(|r| RuntimeBuild {
+                key: r.key.clone(),
+                bytes: r.bytes,
+                runtime_quant: r.runtime_quant.clone(),
+            })
+            .collect(),
         name: entry.name,
         root: entry.root,
         files: entry.files,
@@ -354,6 +379,7 @@ pub struct ModelInfo {
     tensors: usize,
     written_by: Option<String>,
     source: Option<String>,
+    runtimes: Vec<RuntimeBuild>,
 }
 
 impl crate::ui::Report for ModelInfo {
@@ -377,6 +403,24 @@ impl crate::ui::Report for ModelInfo {
             row("written by", format!("pie {written_by}"));
         }
         row("path", crate::ui::short_path(&self.root));
+        // What has been built from it, and for what. `pie model build` is the
+        // only thing that writes these, and `pie model rm` takes them with the
+        // archive because they are derived from it.
+        for runtime in &self.runtimes {
+            let quant = runtime
+                .runtime_quant
+                .as_deref()
+                .map(|q| format!(" ({q})"))
+                .unwrap_or_default();
+            row(
+                "runtime",
+                format!(
+                    "{} — {}{quant}",
+                    runtime.key,
+                    crate::ui::bytes(runtime.bytes)
+                ),
+            );
+        }
         table.print(palette);
         println!(
             "\n{}",
@@ -588,11 +632,18 @@ fn remove(name: String, skip_confirm: bool) -> Result<Answer> {
         );
     };
 
-    let bytes = entry.bytes;
+    // The archive AND the builds derived from it, because that is what the
+    // removal takes. Reporting the archive alone understated a three-artifact
+    // model as one file, in a confirmation prompt whose whole job is to say
+    // what is about to be lost.
+    let files = entry.files.len() + entry.runtimes.iter().map(|r| r.files.len()).sum::<usize>();
+    let derived = match entry.runtimes.len() {
+        0 => String::new(),
+        n => format!(", {n} build(s)"),
+    };
     let what = format!(
-        "artifact {name} ({}, {} file(s))",
-        crate::ui::bytes(bytes),
-        entry.files.len()
+        "artifact {name} ({}, {files} file(s){derived})",
+        crate::ui::bytes(entry.total_bytes()),
     );
 
     if !skip_confirm

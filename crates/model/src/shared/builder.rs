@@ -945,6 +945,16 @@ impl<'a> Builder<'a> {
                     self.push_runtime_quant(raw, raw.name.clone(), scheme)?;
                 }
                 _ => {
+                    // A scale the checkpoint shipped beside a weight this run
+                    // re-quantizes is an INPUT to that dequant, not an output.
+                    // The plan finds it by name off the raw table
+                    // (`with_block_scale_source`), never through the contract,
+                    // and then writes its own scale under the same
+                    // `_scale_inv` name. Publishing the shipped one here put
+                    // two tensors at that name and the plan refused the pair.
+                    if self.requant_consumes_shipped_scale(raw, scheme) {
+                        continue;
+                    }
                     let axis = self.shard_axis(&raw.name)?;
                     let defined = self.push_direct(raw, self.output_name(&raw.name), axis)?;
                     self.state_shipped_block_scales(raw, defined, scheme);
@@ -952,6 +962,33 @@ impl<'a> Builder<'a> {
             }
         }
         Ok(())
+    }
+
+    /// True for a shipped scale whose weight this run re-quantizes, which
+    /// makes the scale an input the plan reads off the checkpoint rather than
+    /// a tensor the contract publishes.
+    ///
+    /// The conditions are `state_shipped_block_scales`' own, asked one pass
+    /// earlier. That function could only decline to *pair* the scale, by
+    /// which time `push_direct` had already published it under the name the
+    /// loader's generated scale takes — so `--quant fp8` over any checkpoint
+    /// shipping FP8 weights with `_scale_inv` siblings died at plan compile
+    /// with "duplicate runtime tensor", whatever the scale's shape. That is
+    /// the whole DeepSeek/GLM re-encode path `push_runtime_quant` documents.
+    fn requant_consumes_shipped_scale(&self, raw: &RawTensor, scheme: Option<QuantScheme>) -> bool {
+        let Some(scheme) = scheme else {
+            return false;
+        };
+        let Some(weight) = probe::companion_weight_name(&raw.name) else {
+            return false;
+        };
+        let Some(companion) = self.find(&weight) else {
+            return false;
+        };
+        is_raw(&companion.encoding, DType::F8E4M3)
+            && !self.consumed.contains(&companion.id)
+            && self.source_name_allowed(&companion.name)
+            && runtime_quantizable_name(&companion.name, scheme)
     }
 
     /// State the pairing for a scale the checkpoint shipped beside an FP8
@@ -983,7 +1020,10 @@ impl<'a> Builder<'a> {
             return;
         }
         // A weight the loader re-quantizes gets the scales the loader itself
-        // writes, and states that pairing when it creates them.
+        // writes, and states that pairing when it creates them. Such a scale
+        // no longer reaches this function at all — `publish_remaining` drops
+        // it before publishing, via `requant_consumes_shipped_scale` — so
+        // this is a second line, not the first one.
         if scheme.is_some_and(|scheme| runtime_quantizable_name(&companion.name, scheme)) {
             return;
         }
@@ -1005,9 +1045,51 @@ impl<'a> Builder<'a> {
         });
     }
 
+    /// Decode every bound tensor whose scales live inside its payload.
+    ///
+    /// A GGUF block is self-contained — the scales are in the payload, not in
+    /// a companion tensor — and no device kernel pie ships reads one.
+    /// `model_loader`'s `validate_bound_encodings` refuses a plan that hands a
+    /// device one; this is the other half, and the reason the refusal is
+    /// reachable rather than fatal.
+    ///
+    /// **Why here and not at [`Self::define`].** `define` is the one
+    /// chokepoint every publish goes through, which makes it the obvious
+    /// place, and it is the wrong one: visibility is not settled there.
+    /// `define` publishes `Public` and [`Self::mark_internal`] demotes
+    /// afterwards, so a decode applied at `define` would also rewrite an
+    /// operand the contract itself consumes — which is exactly what a decode
+    /// READS FROM. Here, the family is finished and every visibility is final.
+    ///
+    /// **Why here and not in each family.** Ten family arms carry
+    /// `raw.encoding.clone()` through to a publish, and a rule spelled ten
+    /// times is a rule that holds nine times. This one is not a fact about a
+    /// family at all: it is a fact about what a device can read.
+    ///
+    /// The shape does not change and neither do the scales — a blocked scheme
+    /// has no companion to pair — so this is the encoding and the expression,
+    /// and nothing else.
+    fn decode_bound_blocks(&mut self) {
+        for tensor in &mut self.contract.tensors {
+            if tensor.visibility != Visibility::Public {
+                continue;
+            }
+            let Encoding::Quant(spec) = &tensor.encoding else {
+                continue;
+            };
+            if !spec.scheme.is_self_contained() {
+                continue;
+            }
+            let decoded = Encoding::Raw(spec.logical_dtype);
+            let expr = std::mem::replace(&mut tensor.expr, Expr::Src(String::new()));
+            tensor.expr = expr.cast(decoded.clone());
+            tensor.encoding = decoded;
+        }
+    }
+
     /// Check what only the whole contract can answer, after the family is
     /// done, and hand it over.
-    pub fn finish(self) -> Result<ModelContract, Error> {
+    pub fn finish(mut self) -> Result<ModelContract, Error> {
         if self.policy.component == Component::Encode && !self.encode_scope_allowed {
             return fail(format!(
                 "encode-scoped loading is not supported for '{}'",
@@ -1021,6 +1103,7 @@ impl<'a> Builder<'a> {
                 self.id
             ));
         }
+        self.decode_bound_blocks();
         Ok(self.contract)
     }
 
@@ -1045,12 +1128,31 @@ impl<'a> Builder<'a> {
             RuntimeQuant::Mxfp4 => QuantScheme::Mxfp4E2M1E8M0,
             RuntimeQuant::Int4 => QuantScheme::MlxAffineU4,
         };
-        // For FP4 a pre-quantized checkpoint is accepted (GLM-5.1 ships FP8
-        // experts). For FP8/INT8 only BF16 weights are re-quantized, never an
-        // already-quantized checkpoint.
-        if !self.encoding.is_none() && scheme != QuantScheme::Mxfp4E2M1E8M0 {
-            return Ok(None);
-        }
+        // **There is deliberately no "is the source already quantized" test
+        // here, and there used to be.** It read `self.encoding` -- the
+        // checkpoint's own `config.json` -- and returned `Ok(None)`, silently
+        // authoring an unquantized model for an operator who had asked for a
+        // quantized one. Three things were wrong with it and only the third
+        // is the reason it is gone.
+        //
+        // It could not see the case it was written for: FP8 arrives as
+        // `Raw(F8E4M3)` with the declaration in a sibling scale, so
+        // `is_none()` is true and it passed. It refused a case it never
+        // claimed: `scheme != Mxfp4` also catches INT4, which the comment
+        // above it did not mention. And a checkpoint's declaration is the
+        // wrong fact to ask anyway -- the question is about PROVENANCE, which
+        // is a property of the file rather than of the model, and which this
+        // author neither carries nor should.
+        //
+        // That question is answered once, at the CLI boundary, by
+        // `build::resolve_quant`, which is the only place holding all three
+        // deciding facts at once: what was requested, what the backend can
+        // bind, and what `pie_source_encoding` says the bytes are. It refuses
+        // where the backend could serve the model without a second rounding
+        // and warns where requantizing is the only way to serve it. A second
+        // line here bought nothing on top of that and cost the silence: when
+        // the two disagreed, this one won by doing nothing at all, and an
+        // artifact came out the size of the request nobody honored.
         let allowed = if scheme == QuantScheme::Mxfp4E2M1E8M0 {
             self.allow_mxfp4_rq
         } else {
@@ -1327,6 +1429,67 @@ mod tests {
     /// forgot would panic on an out-of-range index the moment an
     /// encode-scoped load reached it. The decision belongs here, where it
     /// is one statement and one test rather than eleven of each.
+    /// A bound tensor never leaves here holding a self-contained block.
+    ///
+    /// The author's half of the rule `model_loader`'s
+    /// `validate_bound_encodings` enforces. Without it, an archive that kept
+    /// its GGUF packing compiles a plan that hands the device Q4_0 and no
+    /// `TileMap` to object to — measured, before this existed: `pie model
+    /// build --backend cuda` wrote a runtime holding 169 `GgufQ4_0` tensors.
+    ///
+    /// The two controls are what keep it from being a blunt instrument. An
+    /// `Internal` tensor is left alone because that is what a decode reads
+    /// FROM, and the visibility that decides it is only final here — which is
+    /// the whole reason this runs at `finish` and not at `define`. And a
+    /// scheme whose scales are a separate tensor is left alone too: MXFP4
+    /// answers `None` to `block_layout`, and gpt-oss is bound that way.
+    #[test]
+    fn a_bound_tensor_does_not_leave_holding_a_self_contained_block() {
+        fn blocked() -> Encoding {
+            Encoding::Quant(
+                model_loader::types::QuantSpec {
+                    scheme: QuantScheme::GgufQ4_0,
+                    logical_dtype: DType::BF16,
+                    bits_per_element: 0,
+                    group_size: 0,
+                    channel_axis: None,
+                }
+                .normalized(),
+            )
+        }
+        let meta = checkpoint(&[("w", vec![4, 32], blocked())]);
+        let enc = StoredEncoding::dense();
+        let target = target();
+        let shape = LoadShape::dense(1, 32, false);
+        let policy = Policy::default();
+
+        let mut b = Builder::new(&meta, "x", shape, &enc, &target, &policy);
+        b.define("w".into(), Expr::src("w"), blocked(), Some(vec![4, 32]));
+        let contract = b.finish().expect("a contract was authored");
+        assert_eq!(contract.tensors[0].encoding, Encoding::Raw(DType::BF16));
+        assert_eq!(
+            contract.tensors[0].expr,
+            Expr::src("w").cast(Encoding::Raw(DType::BF16)),
+            "the declaration changed but nothing was told to produce it"
+        );
+
+        // An operand the contract consumes itself is left packed.
+        let mut b = Builder::new(&meta, "x", shape, &enc, &target, &policy);
+        let index = b.define("w".into(), Expr::src("w"), blocked(), Some(vec![4, 32]));
+        b.mark_internal(index);
+        let contract = b.finish().unwrap();
+        assert_eq!(contract.tensors[0].encoding, blocked());
+
+        // And a scheme whose scales are a tensor of their own is not this
+        // rule's business.
+        let mxfp4 = mxfp4_encoding(0);
+        let meta = checkpoint(&[("w", vec![4, 32], mxfp4.clone())]);
+        let mut b = Builder::new(&meta, "x", shape, &enc, &target, &policy);
+        b.define("w".into(), Expr::src("w"), mxfp4.clone(), Some(vec![4, 32]));
+        let contract = b.finish().unwrap();
+        assert_eq!(contract.tensors[0].encoding, mxfp4);
+    }
+
     #[test]
     fn marking_or_pairing_what_was_never_published_is_nothing() {
         let meta = checkpoint(&[("w", vec![4, 8], Encoding::Raw(DType::BF16))]);
@@ -2060,15 +2223,21 @@ mod tests {
         );
     }
 
-    /// An already-quantized checkpoint is re-quantized to FP4 and to nothing
-    /// else.
+    /// An already-quantized checkpoint is re-quantized to whatever it is
+    /// asked for, because declining is no longer this level's job.
     ///
-    /// GLM-5.1 ships FP8 experts and is still asked for FP4. The same
-    /// checkpoint asked for FP8 must fall through to the ordinary path
-    /// rather than re-encoding what is already encoded -- and `Ok(None)`,
-    /// not an error, because there is nothing wrong with the request.
+    /// GLM-5.1 ships FP8 experts and is still asked for FP4, which is why
+    /// `Mxfp4` was always allowed through. The FP8-over-FP8 case used to be
+    /// declined *here*, silently, with `Ok(None)` -- and the silence was the
+    /// problem: an operator who asked for a rounding got an artifact that had
+    /// not been rounded and no line saying so. It is refused earlier now, by
+    /// `build::resolve_quant`, which reads `pie_source_encoding` -- and which
+    /// sees this case only because `import::source_encoding` files an FP8
+    /// dtype under `quant:` rather than `raw:`. That tagging and this test
+    /// are two halves of one change; if the tagging regresses, the second
+    /// rounding comes back and nothing below this line will object.
     #[test]
-    fn a_prequantized_checkpoint_admits_only_the_fp4_request() {
+    fn a_prequantized_checkpoint_is_requantized_by_whatever_asks() {
         let rows = [(
             "model.layers.0.mlp.experts.0.up_proj.weight",
             vec![64, 128],
@@ -2083,10 +2252,10 @@ mod tests {
         let c = publish(&rows, &quantized, &rq(RuntimeQuant::Fp8), |b| {
             b.allow_bf16_runtime_quant();
         })
-        .expect("an FP8 request over a quantized checkpoint is declined, not refused");
+        .expect("nothing here objects to the request");
         assert!(
-            !matches!(&c.tensors[0].encoding, Encoding::Quant(s) if s.scheme == QuantScheme::Fp8E4M3),
-            "it must not re-encode an already-encoded checkpoint"
+            matches!(&c.tensors[0].encoding, Encoding::Quant(s) if s.scheme == QuantScheme::Fp8E4M3),
+            "the declaration is not a fact this author acts on any more"
         );
 
         let c = publish(&rows, &quantized, &rq(RuntimeQuant::Mxfp4), |b| {
@@ -2374,6 +2543,149 @@ mod tests {
         }
     }
 
+    /// An already-quantized weight is re-quantized, and nothing at this level
+    /// can tell that it should not be.
+    ///
+    /// This test used to be evidence against a guard: `runtime_quant_scheme`
+    /// refused an already-quantized checkpoint by asking `self.encoding`, and
+    /// FP8 walked past it because FP8 arrives as `Raw(F8E4M3)` with its
+    /// declaration in a sibling scale, so `is_none()` was true. The guard is
+    /// gone -- `build::resolve_quant` decides this once, where provenance is
+    /// actually known -- and the behaviour it failed to prevent is unchanged,
+    /// which is what this test now pins.
+    ///
+    /// What comes out is a weight at `Fp8E4M3, group_size 1` -- rounded onto
+    /// a per-output-channel grid from values that were already quantized --
+    /// and the source's own scale dropped, because for a re-quantized weight
+    /// the plan writes its own. For a checkpoint that ships blocked FP8 that
+    /// is the intended re-encode. For pie's own FP8 output it is a second
+    /// rounding nobody asked for. Nothing here can tell the two apart: both
+    /// are `Raw(F8E4M3)` at `[N, K]` with an `_scale_inv` beside them, and
+    /// they differ only in where they came from. That is the argument for
+    /// provenance, and this test is what makes the argument checkable.
+    #[test]
+    fn requantizing_an_fp8_weight_is_a_second_rounding_nothing_here_can_see() {
+        let rows = [
+            (
+                "model.layers.0.mlp.down_proj.weight",
+                vec![64, 256],
+                Encoding::Raw(DType::F8E4M3),
+            ),
+            (
+                "model.layers.0.mlp.down_proj.weight_scale_inv",
+                vec![64, 2],
+                Encoding::Raw(DType::F32),
+            ),
+        ];
+        let c = publish(
+            &rows,
+            &StoredEncoding::dense(),
+            &rq(RuntimeQuant::Fp8),
+            |b| {
+                b.allow_bf16_runtime_quant();
+            },
+        )
+        .expect("no refusal: provenance is not a fact this author holds");
+        let w = c
+            .tensors
+            .iter()
+            .find(|t| t.name.ends_with("down_proj.weight"))
+            .expect("the weight is published");
+        let Encoding::Quant(spec) = &w.encoding else {
+            panic!("expected a re-quantized weight, got {:?}", w.encoding);
+        };
+        assert_eq!(spec.scheme, QuantScheme::Fp8E4M3);
+        assert_eq!(
+            spec.group_size, 1,
+            "re-quantized per-output-channel, not left at the source's 128"
+        );
+        assert!(
+            !c.tensors.iter().any(|t| t.name.ends_with("_scale_inv")),
+            "the shipped scale is an input to the dequant, so the contract \
+             does not publish it; the plan writes the one that ships"
+        );
+    }
+
+    /// `--quant fp8` over a checkpoint that ships FP8 weights works at all.
+    ///
+    /// It did not. `push_runtime_quant` documents the path — "those weights
+    /// ship quantized, the executor dequants them to bf16 with a sibling
+    /// `_scale_inv` at materialize time, then re-encodes to the target
+    /// scheme" — and every route through it died at plan compile with
+    /// "duplicate runtime tensor '…weight_scale_inv'". The weight went to
+    /// `push_runtime_quant`; the scale beside it did not match
+    /// `runtime_quantizable_name`, so it fell to `push_direct` and was
+    /// published; then `quant_metadata_outputs` generated the loader's own
+    /// scale, whose suffix for FP8 is also `_scale_inv`. Two tensors, one
+    /// name.
+    ///
+    /// Both shapes are covered because neither is the deciding factor and
+    /// the first reading of this bug assumed one was: DeepSeek ships
+    /// `[N, K/128]` and pie's own FP8 output is per-output-channel, and the
+    /// collision was identical for both. The shipped scale is an input the
+    /// plan reads off the raw checkpoint table by name in
+    /// `with_block_scale_source`, never through the contract, so dropping it
+    /// from the contract costs the dequant nothing.
+    #[test]
+    fn requantizing_an_fp8_checkpoint_leaves_exactly_one_scale_at_each_name() {
+        for (label, scale_shape) in [
+            ("a shipped block scale", vec![64i64, 2i64]),
+            ("a per-output-channel scale", vec![64i64, 1i64]),
+        ] {
+            let rows = [
+                (
+                    "model.layers.0.mlp.down_proj.weight",
+                    vec![64, 256],
+                    Encoding::Raw(DType::F8E4M3),
+                ),
+                (
+                    "model.layers.0.mlp.down_proj.weight_scale_inv",
+                    scale_shape,
+                    Encoding::Raw(DType::F32),
+                ),
+            ];
+            let meta = {
+                let mut m = checkpoint(&rows);
+                for t in &mut m.tensors {
+                    let elems: i64 = t.shape.iter().product();
+                    let width = match t.encoding {
+                        Encoding::Raw(DType::F32) => 4,
+                        _ => 1,
+                    };
+                    t.span_bytes = (elems * width) as u64;
+                }
+                m
+            };
+            let c = publish(
+                &rows,
+                &StoredEncoding::dense(),
+                &rq(RuntimeQuant::Fp8),
+                |b| {
+                    b.allow_bf16_runtime_quant();
+                },
+            )
+            .expect("author");
+            let tgt = StorageTarget {
+                backend: BackendKind::Cuda,
+                tile_map_mask: model_loader::plan::passes::tile::CUDA_TILE_MAP_MASK,
+                ..target()
+            };
+            let got = model_loader::plan::compile(&meta, &c, tgt);
+            let plan = got.unwrap_or_else(|err| panic!("{label}: {err}"));
+            let scales: Vec<&str> = plan
+                .tensors
+                .iter()
+                .map(|t| t.name.as_str())
+                .filter(|n| n.ends_with("_scale_inv"))
+                .collect();
+            assert_eq!(
+                scales,
+                vec!["model.layers.0.mlp.down_proj.weight_scale_inv"],
+                "{label}: one scale, the one the loader wrote"
+            );
+        }
+    }
+
     /// A scale beside a weight that is not FP8 is left unpaired.
     ///
     /// "A companion that is not really FP8 is left alone rather than
@@ -2456,10 +2768,18 @@ mod tests {
     }
 
     /// A weight the loader is about to re-quantize gets the loader's own
-    /// scales, not the checkpoint's.
+    /// scales, not the checkpoint's — and the checkpoint's is not published.
     ///
     /// Both would otherwise be stated, and the shipped pairing would
     /// describe a block layout the re-quantized tensor no longer has.
+    ///
+    /// This test used to stop at the pairing: it asserted `scales` came back
+    /// `None` and let the shipped tensor stay in the contract. That is the
+    /// half-measure the bug was made of. Dropping the pairing frees nothing;
+    /// the loader's generated scale takes the same `_scale_inv` name, so the
+    /// two collided and plan compile refused every FP8 re-encode with
+    /// "duplicate runtime tensor". Asserting the name is *free* is the check
+    /// that would have caught it.
     #[test]
     fn a_requantized_weight_keeps_the_loaders_scales_not_the_shipped_ones() {
         let rows = [
@@ -2494,14 +2814,10 @@ mod tests {
             },
         )
         .unwrap();
-        let scale = c
-            .tensors
-            .iter()
-            .find(|t| t.name.ends_with("_scale_inv"))
-            .unwrap();
         assert!(
-            scale.scales.is_none(),
-            "the loader writes its own scales for a weight it re-encodes"
+            !c.tensors.iter().any(|t| t.name.ends_with("_scale_inv")),
+            "the loader writes its own scales for a weight it re-encodes, so \
+             the shipped one is not published at all"
         );
     }
 

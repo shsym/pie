@@ -57,7 +57,7 @@ use model::catalog::Override;
 use model::encoding::CONFIG_OBJECT;
 use model::manifest::Observed;
 use model_loader::checkpoint::Attributes;
-use model_loader::checkpoint::meta::{SOURCE_KEY, VERSION_KEY, meta_name};
+use model_loader::checkpoint::meta::{SOURCE_ENCODING_KEY, SOURCE_KEY, VERSION_KEY, meta_name};
 use std::collections::HashMap;
 
 /// Parses a human-written byte size: `16GiB`, `5GB`, `512MiB`, `1000000`.
@@ -178,6 +178,32 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         None => store_path(&source.name),
     };
 
+    // AN IMPORT MAY NOT WRITE OVER WHAT IT IS READING.
+    //
+    // A store archive is `<name>/archive.zt` and is named for its directory,
+    // so re-importing one resolves the destination to the source itself. The
+    // `.zt`-in, `.zt`-out early return below catches the ordinary case, but
+    // `--force` exists precisely to skip it, and the writer would then publish
+    // over the file the executor is streaming out of. `--delete-source` would
+    // finish by deleting the result.
+    //
+    // Compared against the checkpoint's own file list rather than against
+    // `source.path`, so a shard is caught as well as a root.
+    let clobbered: Vec<&str> = metadata
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .filter(|path| same_file(Path::new(path), &out_file))
+        .collect();
+    if !clobbered.is_empty() {
+        bail!(
+            "{} is both the source and the destination; an import that overwrote \
+             its own input would destroy the weights it was reading. Pass \
+             `--out <path>` to write it somewhere else.",
+            crate::ui::short_path(&out_file),
+        );
+    }
+
     // A checkpoint that is already an artifact is the one thing left alone —
     // converting `.zt` to `.zt` would rewrite bytes to reproduce them.
     if metadata
@@ -237,7 +263,7 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     // refused, because import is the family-blind half of the pair and
     // converting a model pie cannot serve is still a conversion.
     let attributes = gguf_attributes(&source, &metadata);
-    let ingest = gguf_ingest(attributes.as_ref(), &metadata);
+    let ingest = ingest_map(attributes.as_ref(), &metadata, &declared_model_type(&source));
     let rename = ingest.as_ref().map(|map| {
         map.iter()
             .filter_map(|(src, what)| Some((src.clone(), what.name()?.to_string())))
@@ -257,11 +283,20 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
             .collect::<HashMap<String, String>>()
     });
     if let Some(map) = &ingest {
-        let applied = apply_gguf_ingest(&mut materialization, &metadata, map)?;
-        println!(
-            "convert: renaming {} tensor(s) out of llama.cpp's vocabulary",
-            map.len() - applied.dropped.len()
-        );
+        let applied = apply_ingest(&mut materialization, &metadata, map)?;
+        // Counted off names that actually CHANGED, not off the map's size.
+        // The map now covers a safetensors import too, where every entry is a
+        // rename to the name it already has -- reporting that as "renaming
+        // 310 tensor(s) out of llama.cpp's vocabulary" would be two lies in
+        // one line. For a GGUF the two counts agree: every tensor it keeps is
+        // spelled differently.
+        let renamed = map
+            .iter()
+            .filter(|(src, what)| what.name().is_some_and(|dst| dst != src.as_str()))
+            .count();
+        if renamed > 0 {
+            println!("convert: renaming {renamed} tensor(s) out of llama.cpp's vocabulary");
+        }
         if applied.regrouped > 0 {
             println!(
                 "convert: regrouping the rows of {} attention projection(s) — \
@@ -318,16 +353,40 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
         for name in &dropped {
             println!(
                 "convert: dropping `{name}` — this file states no tie, because \
-                 GGUF has no key for one, but it is the only tensor standing \
-                 between this checkpoint and exactly one catalog row, and that \
-                 row says the head IS the embedding"
+                 GGUF has no key for one, but the row this checkpoint \
+                 identifies as says the head IS the embedding, so the tensor \
+                 is a copy of a tensor the artifact already carries"
             );
         }
     }
+    // Three counts and not two, because the middle one used to be folded into
+    // the first and stopped being true.
+    //
+    // `Materialization::decoded` once held both kinds of rewrite a conversion
+    // performs: unpacking a self-contained block, and narrowing an F16 or F32
+    // tensor to the BF16 every kernel reads. Calling the whole set "blocked"
+    // was loose but harmless while blocks dominated it. Since an archive keeps
+    // its source packing, the set holds narrowings ONLY -- so the old line
+    // reported "decode 65 blocked tensor(s)" for a Q3_K_M import that decoded
+    // no block at all, and the blocks it did keep were invisible inside a
+    // "copy through" count that also covers plain BF16.
+    //
+    // The counts are read by an operator deciding whether the import did what
+    // they meant, so they are named for what they are. `packed` is counted off
+    // the source rather than tracked through the materialization, because that
+    // is where the fact is: a tensor is kept packed exactly when its scheme
+    // carries its scales inside it.
+    let packed = metadata
+        .weights()
+        .filter(|tensor| {
+            matches!(&tensor.encoding, Encoding::Quant(spec) if spec.scheme.is_self_contained())
+        })
+        .count();
     println!(
-        "convert: decode {} blocked tensor(s) to plain dtypes, copy {} through",
+        "convert: narrow {} tensor(s) to bf16, keep {} packed as stored, copy {} through",
         materialization.decoded.len(),
-        materialization.passthrough.len()
+        packed,
+        materialization.passthrough.len().saturating_sub(packed)
     );
     report_servability(
         &source,
@@ -523,6 +582,14 @@ pub fn run(args: ImportArgs) -> Result<crate::ui::Answer> {
     let provenance = BTreeMap::from([
         (VERSION_KEY.to_string(), pie_version().to_string()),
         (SOURCE_KEY.to_string(), source.origin.clone()),
+        // HOW THE SOURCE STORED THESE NUMBERS, BEFORE THIS COMMAND DID.
+        //
+        // The one fact the artifact cannot state about itself: everything
+        // below keeps a self-contained block packed, so the tensors do say
+        // what they are — but only to a reader that walks all of them, and a
+        // build should not have to open the model to learn whether a second
+        // rounding is on the table. See `SOURCE_ENCODING_KEY`.
+        (SOURCE_ENCODING_KEY.to_string(), source_encoding(&metadata)),
     ]);
     let mut writer = match args.max_shard_size {
         Some(max) => CheckpointWriter::create_sharded(&out_file, &provenance, max),
@@ -625,25 +692,44 @@ fn gguf_attributes(source: &Source, metadata: &CheckpointMetadata) -> Option<Att
     parse_checkpoint_attributes(&source.path).ok()
 }
 
-/// The artifact's names for a source that speaks a vocabulary of its own.
+/// The artifact's names for this source, whatever vocabulary it speaks.
 ///
-/// `None` three ways, and only one of them is a problem: the source is not a
-/// GGUF, or it is one whose architecture this build has no pass for, or it
-/// names no architecture at all. All three continue -- import is the
+/// Every import comes through here, and both vocabularies are dispatched on
+/// a string the file states about ITSELF: a GGUF's `general.architecture`,
+/// and a checkpoint's `model_type` from `config.json`. The second used to be
+/// nothing at all -- safetensors was answered by one identity for every
+/// family at once, on the grounds that pie's names are HuggingFace's. They
+/// are, and now each family says so in its own `import.rs` rather than the
+/// fact being a property of the format.
+///
+/// `None` still means "apply nothing", and now only for the two cases that
+/// have a reason: a GGUF whose architecture this build has no pass for, and
+/// one that names no architecture at all. Both continue -- import is the
 /// family-blind half of the pair, and `report_servability` is what says which
-/// of the three happened and what it will cost.
+/// happened and what it will cost.
 ///
 /// Keyed on the SOURCE name, because that is what every caller here already
 /// holds: `materialize_contract` names its outputs after its inputs, and the
 /// passthrough set is source tensors by definition.
-fn gguf_ingest(
+fn ingest_map(
     attributes: Option<&Attributes>,
     metadata: &CheckpointMetadata,
+    model_type: &str,
 ) -> Option<HashMap<String, model::ingest::Ingest>> {
-    let attributes = attributes?;
-    let architecture = attributes.architecture()?;
     let names: Vec<&str> = metadata.tensors.iter().map(|t| t.name.as_str()).collect();
-    match model::ingest::gguf_ingest(attributes, &names) {
+    let Some(attributes) = attributes else {
+        return model::ingest::ingest(&model::ingest::Vocabulary::HuggingFace(model_type), &names)
+            .ok()
+            .map(|ingested| {
+                names
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .zip(ingested)
+                    .collect()
+            });
+    };
+    let architecture = attributes.architecture()?;
+    match model::ingest::ingest(&model::ingest::Vocabulary::Gguf(attributes), &names) {
         Ok(ingested) => Some(
             names
                 .iter()
@@ -668,7 +754,7 @@ fn gguf_ingest(
     }
 }
 
-/// What [`apply_gguf_ingest`] did, for the caller to report.
+/// What [`apply_ingest`] did, for the caller to report.
 struct Applied {
     /// Tensors whose rows were put back in pie's order.
     regrouped: usize,
@@ -688,10 +774,17 @@ struct Applied {
 /// stores Q and K at a width no cast improves, so `materialize_contract` puts
 /// them in `passthrough` and plans a byte copy. A byte copy cannot reorder
 /// rows, so such a tensor is PROMOTED here -- moved out of the passthrough set
-/// and given a contract entry of its own. A quantized GGUF needs no promotion
-/// because its Q and K are already decoded, but it takes the same expression;
-/// the regrouping moves whole rows, and a GGUF block lives inside a row.
-fn apply_gguf_ingest(
+/// and given a contract entry of its own.
+///
+/// A quantized GGUF used to need no promotion, its Q and K having been decoded
+/// on the way in; since an archive keeps the packing its source shipped they
+/// land in `passthrough` like everything else and are promoted the same way,
+/// keeping their blocked encoding. The expression is the one it always was:
+/// the regrouping moves whole rows, and a GGUF block lives inside a row, so
+/// the permutation never addresses into one. `infer::blocked_axis` is what
+/// holds that -- it refuses a regroup that would cut a block, and a row
+/// permutation is not one.
+fn apply_ingest(
     materialization: &mut Materialization,
     metadata: &CheckpointMetadata,
     map: &HashMap<String, model::ingest::Ingest>,
@@ -1235,6 +1328,69 @@ impl ProgressLine {
     }
 }
 
+/// The distinct encodings a source checkpoint stored its weights in.
+///
+/// Sorted and comma-separated, so it reads as one fact and compares as one
+/// string: `raw:bf16`, `quant:q4_0`, `quant:q4_k,quant:q6_k`. Each part says
+/// which KIND it is, for the reason below. Mixed is the normal case for a GGUF —
+/// llama.cpp keeps the attention output and the embeddings at a wider scheme
+/// than the bulk — and the whole set is kept rather than a "dominant" one,
+/// because which tensors were coarse is exactly what a later requantization
+/// would compound.
+///
+/// Metadata objects are excluded: a tokenizer vocabulary is `u8` and saying so
+/// would make every artifact claim a `u8` source.
+///
+/// # Why each part says which kind it is
+///
+/// The only question anyone asks of this string is "was any of it already
+/// quantized" — `pie model build` asks it to warn about rounding twice. That is
+/// decided HERE, where the `Encoding` is in hand and the answer is simply which
+/// match arm ran.
+///
+/// It was written without the prefix first, and the reader then carried a list
+/// of the raw spellings and treated everything else as quantized. That list is
+/// a copy of `DType`'s variants, maintained by hand and by eye: add or rename
+/// one and it is silently classified as *quantized*, and every import of a
+/// plain checkpoint starts advising the operator about a second rounding that
+/// is not happening. Nothing would have failed, which is the problem.
+///
+/// The scheme *name* is still `Debug`-derived, and that is fine — it is a
+/// label, read by operators and never branched on. What must not depend on a
+/// `Debug` impl is the classification, and now it does not.
+fn source_encoding(metadata: &model_loader::checkpoint::CheckpointMetadata) -> String {
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for tensor in metadata.weights() {
+        seen.insert(match &tensor.encoding {
+            // FP8 is stored as a *dtype*, not as a `Quant` scheme -- the
+            // checkpoint ships 8-bit floats with a sibling `_scale_inv` -- so
+            // reading the variant alone would file an already-rounded
+            // checkpoint under `raw:` and tell every later reader it was
+            // never quantized. It was rounded once, which is the only thing
+            // this string is asked. `build::quantized_source` holds no table
+            // by design; this is where the `Encoding` is in hand, so this is
+            // where the judgement goes.
+            model_loader::types::Encoding::Raw(dtype) if dtype.is_block_scaled() => {
+                format!("quant:{}", format!("{dtype:?}").to_lowercase())
+            }
+            model_loader::types::Encoding::Raw(dtype) => {
+                format!("raw:{}", format!("{dtype:?}").to_lowercase())
+            }
+            // The variant name lowercased, minus the `Gguf` family prefix:
+            // `GgufQ4_0` is the scheme llama.cpp and every model card call
+            // `Q4_0`, and this string is read by operators, not by Rust.
+            model_loader::types::Encoding::Quant(spec) => {
+                let name = format!("{:?}", spec.scheme);
+                format!(
+                    "quant:{}",
+                    name.strip_prefix("Gguf").unwrap_or(&name).to_lowercase()
+                )
+            }
+        });
+    }
+    seen.into_iter().collect::<Vec<_>>().join(",")
+}
+
 /// What `convert` was pointed at, once the pointing is resolved.
 pub(crate) struct Source {
     /// The path the loader reads — a snapshot directory or a single file.
@@ -1283,10 +1439,17 @@ pub(crate) fn resolve_source(source: &str) -> Result<Source> {
     let path = Path::new(source);
     if path.exists() {
         let name = if path.is_file() {
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("model")
-                .to_string()
+            // A store archive is named for its directory, not its file. Every
+            // one of them is `archive.zt`, so the stem alone would call every
+            // model in the store `archive` — and `pie model build` would write
+            // its output under `models/archive/runtime/`, one shared directory
+            // for every model on the machine.
+            store_archive_name(path).unwrap_or_else(|| {
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("model")
+                    .to_string()
+            })
         } else {
             path.file_name()
                 .and_then(|name| name.to_str())
@@ -1350,18 +1513,43 @@ fn resolve_snapshot(repo_id: &str) -> Result<(PathBuf, bool)> {
 
 /// A repo ID as one filesystem name: `qwen/qwen3-0.6b` → `qwen--qwen3-0.6b`.
 ///
-/// The store is a flat directory, so the separator has to survive as something
-/// legal in a filename. `--` rather than a single `-` because model names
-/// contain single hyphens freely and the mapping has to stay reversible.
+/// The store gives each model a directory, so the separator has to survive as
+/// something legal in a single path component. `--` rather than a single `-`
+/// because model names contain single hyphens freely and the mapping has to
+/// stay reversible.
 fn store_name(repo_id: &str) -> String {
     repo_id.replace('/', "--")
 }
 
-/// `$PIE_HOME/models/<name>.zt` — one model, one file, one flat directory.
+/// Whether two paths name the same file on disk.
+///
+/// Canonicalized, so a symlink or a `..` cannot spell one file two ways. A
+/// path that does not exist canonicalizes to itself, which is the right answer
+/// here: a destination that is not there yet cannot be the source.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
+}
+
+/// The model name a path names, when it is a store archive.///
+/// `.../models/<name>/archive.zt` → `<name>`. Decided by the filename and the
+/// parent, not by whether the path is under `$PIE_HOME`: a store copied
+/// somewhere else is still a store, and the directory is still what says which
+/// model this is.
+fn store_archive_name(path: &Path) -> Option<String> {
+    if path.file_name()? != crate::local::store::ARCHIVE_FILE {
+        return None;
+    }
+    Some(path.parent()?.file_name()?.to_str()?.to_string())
+}
+
+/// `$PIE_HOME/models/<name>/archive.zt` — the general-form artifact.
+///
+/// One layer of the store, not the whole of it: builds for particular targets
+/// land under `<name>/runtime/` and are derived from this. See
+/// [`crate::local::store`].
 pub(crate) fn store_path(name: &str) -> PathBuf {
-    bootstrap::paths::pie_home()
-        .join("models")
-        .join(format!("{name}.zt"))
+    crate::local::store::archive_path(name)
 }
 
 /// Where `--out` puts the artifact: a `.zt` path names the file, anything else
@@ -1438,6 +1626,36 @@ fn tokenizer_path(source: &Source) -> Option<PathBuf> {
 /// checkpoint declares the head tied then the forward uses the embedding,
 /// whatever those bytes happen to hold. A checkpoint that meant them to differ
 /// would be one that did not declare the tie.
+/// What this checkpoint says it is, from `config.json`'s `model_type`.
+///
+/// The HuggingFace half of `general.architecture`: a string the file states
+/// about itself, which `model::ingest` turns into the family's naming table.
+/// Empty when there is no config to read -- a lone `.gguf`, or a directory
+/// shipped without one -- and empty is an answer rather than a missing
+/// argument, because it is exactly the case where no family can be named.
+///
+/// `text_config` is read as a fallback for the same reason
+/// [`declares_tied_head`] reads it: a multimodal release states the text
+/// tower's type there and the composite's at the top level, and it is the
+/// text tower whose tensors this import is renaming.
+fn declared_model_type(source: &Source) -> String {
+    if source.path.is_file() {
+        return String::new();
+    }
+    let Ok(raw) = std::fs::read(source.path.join("config.json")) else {
+        return String::new();
+    };
+    serde_json::from_slice::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            v.get("model_type")
+                .or_else(|| v.get("text_config")?.get("model_type"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 fn declares_tied_head(source: &Source) -> bool {
     if source.path.is_file() {
         return false;
@@ -1527,10 +1745,9 @@ fn tied_head_sources(
 /// What is left is pie's catalog, and it is a legitimate authority rather
 /// than a fallback -- a row stating `tied_embeddings` is a measured fact
 /// about the model, which is what the table is for. So the question is put to
-/// it directly: does dropping the head turn a checkpoint that matches NO row
-/// into one that matches exactly one? A yes is the catalog naming the model
-/// and saying it has no head. Anything else -- it already identified, it
-/// still does not, the drop made it ambiguous -- leaves the tensor alone.
+/// it directly: does the row this checkpoint identifies as spell its head as
+/// a tie, and does this checkpoint carry one anyway? Both, and the tensor is
+/// a copy of the embedding. Either alone leaves it where it is.
 ///
 /// Measured on `Qwen2.5-0.5B-Instruct-Q4_0.gguf`, whose `output.weight` is
 /// Q8_0 while the `token_embd.weight` it duplicates is Q4_0: dequantized,
@@ -1538,14 +1755,44 @@ fn tied_head_sources(
 /// against a signal of rms 0.0157 -- which is Q4_0's own error and nothing
 /// else. The head is the embedding, stored more precisely because llama.cpp
 /// quantizes the output projection more precisely.
+///
+/// **It asks the row, and it used to ask a refusal.** The question was put
+/// as a difference -- does dropping the head turn a checkpoint that matches
+/// NO row into one that matches exactly one -- which read the tie out of the
+/// catalog's *intolerance* of a head a tied row does not want. That was true
+/// until [`TensorSpec::tied_copy`] landed: a tied row now accepts a
+/// redundant head at the embedding's own extents, because a stock HF export
+/// writes the module tree and ships one. The difference collapsed to `false`
+/// for every row it was written for, silently -- the drop simply stopped
+/// happening, and the artifact grew a duplicate of its own embedding that
+/// still identified fine. So the question is now put to the row directly,
+/// which is what it always meant.
+///
+/// [`TensorSpec::tied_copy`]: model::manifest::TensorSpec::tied_copy
 fn head_is_a_materialized_tie(published: &Observed) -> bool {
-    // By the ARTIFACT name, because `published` has already been renamed and
-    // `without` lowers what it is given through the same rule the keys went
-    // through. Handing it the GGUF's `output.weight` would look right and
-    // remove nothing, which is a check that silently always answers no.
-    let headless = published.clone().without(TIED_HEAD_NAMES);
-    model::catalog::identify_observed(published, &Override::None).is_err()
-        && model::catalog::identify_observed(&headless, &Override::None).is_ok()
+    let Ok(row) = model::catalog::identify_observed(published, &Override::None) else {
+        return false;
+    };
+    // Two halves, and both are load-bearing. The row has to SPELL the head
+    // as a tied copy, and this checkpoint has to actually CARRY one -- a
+    // model with no head is not improved by dropping the head it does not
+    // have, and asking only the row answers yes for every tied model on
+    // earth. The caller happens to guard the second half as well; this
+    // function is not honest without it.
+    //
+    // `TIED_HEAD_NAMES` are ARTIFACT names -- `published` has already been
+    // renamed, so a GGUF's `output.weight` is `lm_head.weight` here -- while
+    // a manifest names the tensor and not its planes. `Observed::logical` is
+    // the same lowering identification just used, so the two are compared
+    // through it rather than by trimming suffixes here.
+    row.manifest().tensors.iter().any(|spec| {
+        !spec.tied_copy.is_empty()
+            && TIED_HEAD_NAMES
+                .iter()
+                .any(|artifact| Observed::logical(artifact) == spec.name)
+    }) && TIED_HEAD_NAMES
+        .iter()
+        .any(|artifact| published.has(&Observed::logical(artifact)))
 }
 
 /// What the artifact will publish, which after a rename is not what was read.
@@ -2107,7 +2354,8 @@ impl Decoded<'_> {
                     std::cmp::Ordering::Equal => break Ok(bytes),
                     std::cmp::Ordering::Greater => {
                         break Err(anyhow!(
-                            "the decode produced '{produced}' where the artifact wants '{name}',                          so its schedule is not ascending"
+                            "the decode produced '{produced}' where the artifact wants '{name}', \
+                             so its schedule is not ascending"
                         ));
                     }
                 }
@@ -2203,6 +2451,12 @@ mod tests {
     /// The GGUF case with the GGUF taken out of it: `qwen2.5-0.5b` is
     /// `tied_embeddings: true`, and llama.cpp ships `output.weight` anyway
     /// because its own reader has no other way to store a head.
+    ///
+    /// This test is why the detector was rewritten rather than quietly
+    /// returning `false` forever: `tied_copy` made the checkpoint-with-head
+    /// identify, which is exactly what the old formulation took as proof
+    /// that the head was NOT a tie.
+
     #[test]
     fn a_head_a_tied_row_does_not_want_is_read_as_the_tie() {
         assert!(head_is_a_materialized_tie(&published("qwen2.5-0.5b", true)));
@@ -2235,6 +2489,16 @@ mod tests {
     /// Losing a tensor is the one outcome that cannot be undone by importing
     /// again with a newer build, so a model this build does not know keeps
     /// every byte it came with.
+    ///
+    /// This is the case a real file lands in, and it was checked against one:
+    /// `llama-2-7b.Q4_0.gguf` publishes a genuine untied `output.weight`, and
+    /// pie has no Llama 2 row. A dry run renames all 291 tensors, prints no
+    /// drop, and reports the near misses BY the head -- `lm_head is
+    /// [32000, 4096], this variant implies [128256, 4096]` -- so the tensor
+    /// is still there to be wrong about. The head survives here because the
+    /// SECOND condition fails rather than the first: removing it does not
+    /// turn no match into one match. That is the weaker of the two guards, so
+    /// it is the one worth having a checkpoint behind.
     #[test]
     fn an_unrecognized_checkpoint_keeps_its_head() {
         let observed = model::manifest::Observed::from_pairs([
@@ -2258,6 +2522,50 @@ mod tests {
         );
         // A bare name has no separator to translate.
         assert_eq!(store_name("mymodel"), "mymodel");
+    }
+
+    /// A store archive is named for its directory, not for its file.
+    ///
+    /// Every archive in the store is called `archive.zt`, so the file-stem
+    /// rule would have called every model on the machine `archive` — and
+    /// `pie model build` would then have written every build into one shared
+    /// `models/archive/runtime/` directory.
+    #[test]
+    fn a_store_archive_takes_its_name_from_its_directory() {
+        assert_eq!(
+            store_archive_name(Path::new("/home/u/.pie/models/Qwen--Qwen3-0.6B/archive.zt"))
+                .as_deref(),
+            Some("Qwen--Qwen3-0.6B")
+        );
+        // Anything else keeps the ordinary stem rule.
+        assert_eq!(store_archive_name(Path::new("/data/qwen.zt")), None);
+        assert_eq!(store_archive_name(Path::new("archive.gguf")), None);
+        // A bare `archive.zt` has no directory to be named for.
+        assert_eq!(store_archive_name(Path::new("archive.zt")), None);
+    }
+
+    /// The destination is compared to the source by identity, not by spelling.
+    ///
+    /// Re-importing a store archive resolves the destination to the source
+    /// itself, and `--force` skips the "already pie's own format" return that
+    /// otherwise covers it. The writer would then publish over the file the
+    /// executor is reading, and `--delete-source` would finish by deleting the
+    /// result — so the two are compared canonically, where a symlink or a `..`
+    /// cannot spell one file two ways.
+    #[test]
+    fn a_destination_that_is_the_source_is_recognized_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("archive.zt");
+        std::fs::write(&real, b"weights").unwrap();
+        let link = dir.path().join("alias.zt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(same_file(&real, &real));
+        assert!(same_file(&link, &real), "a symlink is not a second file");
+        assert!(same_file(&dir.path().join("./archive.zt"), &real));
+        assert!(!same_file(&dir.path().join("other.zt"), &real));
+        // A destination that does not exist yet cannot be the source.
+        assert!(!same_file(&dir.path().join("nowhere.zt"), &real));
     }
 
     #[test]
@@ -2388,6 +2696,108 @@ mod tests {
             origin: "x".into(),
             fetched: false,
         }));
+    }
+
+    /// An unstacked mixture leaves the contract out of the artifact's order.
+    ///
+    /// `apply_ingest` had no test. This one exists for the unstack, and
+    /// for a consequence of it that is invisible at this layer: the loop cuts
+    /// a stack into `0..count` and appends in NUMERIC order, while everything
+    /// downstream -- the artifact's canonical form, and `run`'s `ordered`
+    /// check that decides whether a spool is needed -- compares names as
+    /// STRINGS. Those two agree up to nine experts and part company at ten,
+    /// which is why this fixture has twelve and not three.
+    ///
+    /// The cost is not small. A schedule that is not ascending gets the
+    /// spool, and the spool writes the decoded set to disk once before the
+    /// artifact writes it again -- measured at 13.0 s against 8.9 s on a
+    /// 12.6 GiB F16 checkpoint, and a routed mixture's expert banks are most
+    /// of the model.
+    ///
+    /// Asserted rather than fixed here, because the fix is not a sort at this
+    /// layer: these names are the SOURCE's until the rename lands, so sorting
+    /// them would order the wrong strings. Whoever changes it should re-read
+    /// `ordered` in `run` first, and measure a real mixture -- the point of
+    /// this test is that the premise is checkable rather than remembered.
+    #[test]
+    fn an_unstacked_mixture_appends_its_experts_in_a_numeric_order() {
+        use model_loader::checkpoint::{CheckpointFile, CheckpointMetadata, RawTensor};
+        use model_loader::contract::ModelContract;
+        use model_loader::types::{CheckpointFormat, FileId, TensorId};
+
+        const EXPERTS: i64 = 12;
+        let stack = "blk.0.ffn_gate_exps.weight";
+        let metadata = CheckpointMetadata {
+            files: vec![CheckpointFile {
+                id: FileId(0),
+                path: "model.gguf".into(),
+                size_bytes: 0,
+                format: CheckpointFormat::Gguf,
+            }],
+            tensors: vec![RawTensor {
+                id: TensorId(0),
+                name: stack.into(),
+                file_id: FileId(0),
+                file_offset: 0,
+                span_bytes: 0,
+                shape: vec![EXPERTS, 4, 2],
+                encoding: Encoding::Raw(DType::BF16),
+            }],
+        };
+        let mut m = Materialization {
+            contract: ModelContract {
+                alignment: 1,
+                tensors: Vec::new(),
+                groups: Vec::new(),
+            },
+            decoded: Vec::new(),
+            // BF16, so `materialize_contract` planned a copy and not a decode.
+            passthrough: vec![stack.into()],
+            meta: Vec::new(),
+        };
+        let map = HashMap::from([(
+            stack.to_string(),
+            model::ingest::Ingest::Unstack {
+                each: "model.layers.0.mlp.experts.{}.gate_proj.weight".into(),
+            },
+        )]);
+
+        let applied = apply_ingest(&mut m, &metadata, &map).unwrap();
+
+        assert_eq!(applied.unstacked, EXPERTS as usize);
+        assert!(
+            m.passthrough.is_empty(),
+            "the stack itself is not published"
+        );
+        assert_eq!(
+            m.decoded,
+            [stack],
+            "the cut rides the executor, which is what puts it in the spool's set"
+        );
+        let names: Vec<&str> = m.contract.tensors.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names.len(), EXPERTS as usize);
+        assert!(
+            names[0].ends_with("experts.0.gate_proj.weight"),
+            "{names:?}"
+        );
+
+        // Ten sorts below two as a string. This is the whole finding.
+        let ascending = names.windows(2).all(|pair| pair[0] <= pair[1]);
+        assert!(
+            !ascending,
+            "the experts now come out in artifact order; if that was deliberate, \
+             `run`'s spool for this checkpoint is no longer needed: {names:?}"
+        );
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted[2], names[10],
+            "and the string order really is the numeric one interleaved: \
+             experts 0, 1 and TEN are the first three names"
+        );
+
+        // Each expert is one slab of the stack, at the shape left over.
+        assert_eq!(m.contract.tensors[0].shape, Some(vec![4, 2]));
     }
 
     /// The head is dropped from every set that would write it, at either width.
