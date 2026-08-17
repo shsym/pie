@@ -80,6 +80,31 @@ namespace {
 
 constexpr int kQwen35GdnWarpTiledMaxTokens = 64;
 
+// The escape hatch the STOPGAP comments below have named since they were
+// written. Both fast GDN prefill paths refuse `write_state=true` because the
+// warp-tiled fold was observed to corrupt persisted state, and the comments
+// point at PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST=1 as the way back -- but no
+// such knob was ever added, so the claim could not be tested without editing
+// and rebuilding the driver.
+//
+// It exists now, and it defaults OFF: absent or "0" reproduces today's routing
+// exactly, so this is inert until someone opts in. That matters because the
+// stopgap may already be obsolete -- the MoE forward carries no equivalent
+// guard, and the defect commit that motivated this one measured a POINTER bug
+// that has since been fixed. Deciding that needs an A/B on one prefill, which
+// is what this makes possible.
+//
+// Cost of the stopgap, in its own words: "0.1 tok/s". Measured downstream, it
+// is the sequential per-token kernel on 48 of 64 layers for every turn.
+bool qwen35_gdn_warp_tiled_state_persist_enabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST");
+        if (v == nullptr || v[0] == '\0') return false;
+        return v[0] != '0';
+    }();
+    return enabled;
+}
+
 void qwen35_dense_mlp_block(
     const Qwen3_5LayerWeights& Lw,
     const HfConfig& cfg,
@@ -881,7 +906,8 @@ void linear_attn_layer_body(
         // The commit-advance threads commit_len only through the FLA path.
         commit_len == nullptr &&
         // STOPGAP: skip warp-tiled when it must PERSIST state (the buggy fold).
-        !write_state;
+        // PIE_QWEN35_GDN_WARP_TILED_STATE_PERSIST=1 lifts it for an A/B.
+        (!write_state || qwen35_gdn_warp_tiled_state_persist_enabled());
     // V_h == K_h is the repeat=1 case, not a separate shape: the GQA kernel
     // computes h_k = h/1 = h and indexes q at (r*K_h + h)*K_d, which is the
     // non-GQA kernel's (r*V_h + h)*K_d exactly. The two branches also hand it
@@ -912,8 +938,12 @@ void linear_attn_layer_body(
     // its state-persisting prefills down the proven chunk path fixes it at a
     // cost of 0.1 tok/s. Frozen verify (write_state=false) persists nothing,
     // so the fold cannot manifest there and keeps the faster kernel.
+    // Same knob as above: this path is the warp-tiled kernel's GQA twin and
+    // carries the identical stopgap, so lifting one without the other would
+    // leave every GQA model -- Qwen3.6-27B included -- on the slow path and
+    // make the A/B read as "no effect".
     const bool use_batched_fla_gqa =
-        !write_state &&
+        (!write_state || qwen35_gdn_warp_tiled_state_persist_enabled()) &&
         !linear_decode &&
         slot_ids_d != nullptr &&
         qo_indptr_d != nullptr &&
