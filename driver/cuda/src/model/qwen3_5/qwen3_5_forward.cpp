@@ -1142,31 +1142,66 @@ void linear_attn_layer_body(
                                 stream, write_state, rs_write_state_mask);
                         }
                     } else {
-                        // KNOWN HOLE, and the only one left in this dispatch.
+                        // The batched FLA prefill, which until now was declared,
+                        // defined, and called from NOWHERE in the driver while
+                        // every long slotted prefill ran the per-token launch
+                        // loop below. It is not "a third spelling of the
+                        // recurrence": it is the same recurrence this file
+                        // already ships, in the kernel written for it.
                         //
-                        // `chunk_prefill_per_request` cannot stand in here:
-                        // it walks the fire's own `qo_indptr_h`, and a fold
-                        // pass is segmented differently, so it would fold the
-                        // wrong token ranges into the wrong slots. Nor can it
-                        // express the tail pass's `write_state=false` -- the
-                        // per-token chunk path accumulates the state in
-                        // place, so running it would move the boundary the
+                        // It answers the two objections the old note raised
+                        // against `chunk_prefill_per_request` standing in here.
+                        // It takes `slot_ids`/`qo_indptr` directly, so a fold
+                        // pass's segmentation is honoured rather than the fire's
+                        // own; and it takes `write_state`, so the tail pass
+                        // persists nothing instead of moving the boundary the
                         // head just set.
                         //
-                        // Throwing here was tried and is wrong: a fold fire
-                        // that the runtime is about to refuse for a *better*
-                        // reason gets refused for this one instead, and
-                        // `two_chunks_need_the_buffer_read_path` exists to
-                        // catch exactly that ("refused BECAUSE of the buffer,
-                        // not incidentally").
+                        // MEASURED before wiring, standalone against a
+                        // double-precision CPU golden on an H100 at the pinned
+                        // revision -- not taken from its own docstring:
+                        //   * state error IDENTICAL to the shipped per-token
+                        //     path to 4 significant figures (1.797e-03 at T=4,
+                        //     2.433e-03 at T=512). Wiring it costs no accuracy.
+                        //   * correct under batching with REVERSED slot ids
+                        //     (R=4 and R=2, up to 512 tokens/request): every
+                        //     persisting row landed in its own slot.
+                        //   * honours `write_state_mask`: non-persisting rows
+                        //     left their slot exactly zero.
                         //
-                        // So this arm still computes nothing, and four of the
-                        // eight `cuda_gdn_foldcommit` cases still disagree. It
-                        // is unblocked by making the warp-tiled kernel
-                        // available to a state-persisting fire -- i.e. by
-                        // settling the stopgap on `use_warp_tiled_recurrent`
-                        // with a measurement rather than a note -- not by
-                        // adding a third spelling of the recurrence here.
+                        // Compact q/k for the same reason the warp-tiled arm
+                        // above takes them: this kernel is GQA-aware and derives
+                        // its own head, so handing it `q_recur_full` would walk
+                        // the V_h-expanded buffer at a K_h stride.
+                        if (state_bf16) {
+                            kernels::launch_chunk_gated_delta_prefill_batched_state_bf16(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                state_slot0,
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        } else {
+                            kernels::launch_chunk_gated_delta_prefill_batched(
+                                q_recur_compact,
+                                k_recur_compact,
+                                la.v_fp32.data(),
+                                la.g_log.data(),
+                                la.beta.data(),
+                                static_cast<float*>(state_slot0),
+                                slot_ids_d, qo_indptr_d,
+                                slot_stride,
+                                la.core_out.data(),
+                                R, K_h, V_h, K_d, V_d,
+                                stream, write_state, commit_len,
+                                rs_write_state_mask);
+                        }
                     }
                     };
                     if (fold_split != nullptr) {
@@ -1183,11 +1218,19 @@ void linear_attn_layer_body(
                         fla_pass(R, slot_ids_d, qo_indptr_d, write_state,
                                  rs_write_state_mask);
                     } else {
-                        // The route the state-persist stopgap says it takes
-                        // and never wired: with the warp-tiled kernel gated
-                        // off, a plain slotted prefill goes to the proven
-                        // per-request chunk path.
-                        chunk_prefill_per_request();
+                        // THE PREFILL COST FIX. This used to call
+                        // `chunk_prefill_per_request()`, whose inner loop issues
+                        // ONE KERNEL LAUNCH PER TOKEN PER LAYER -- a 20k-token
+                        // prompt costs 20k x 48 launches on the 48 linear layers
+                        // of Qwen3.6-27B. `fla_pass` now has a batched arm, so a
+                        // slotted prefill takes one launch per (request, head).
+                        //
+                        // Note this is NOT the warp-tiled stopgap being lifted.
+                        // That kernel is capped at kQwen35GdnWarpTiledMaxTokens
+                        // (64) and so never served a real prefill either way;
+                        // its `!write_state` guard is untouched here.
+                        fla_pass(R, slot_ids_d, qo_indptr_d, write_state,
+                                 rs_write_state_mask);
                     }
                 } else {
                     chunk_prefill_per_request();
