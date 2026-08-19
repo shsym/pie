@@ -118,6 +118,60 @@ impl pie::inferlet::working_set::HostRsWorkingSet for ProcessCtx {
         Ok(out)
     }
 
+    async fn update_index(
+        &mut self,
+        this: Resource<RsWorkingSet>,
+        key: Vec<u8>,
+        committed_tokens: u32,
+    ) -> Result<Result<(), String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let ws = self.ctx().table.get(&this)?.clone();
+        let stores = store_registry::get(ws.model, ws.driver as usize);
+        let mut rs = stores.rs.lock().unwrap();
+        let out = rs
+            .update_index(key, ws.id, committed_tokens)
+            .map_err(|e| e.to_string());
+        // Replacing a key may have released the previous snapshot's slot.
+        rs.retire_idle();
+        Ok(out)
+    }
+
+    async fn from_index(
+        &mut self,
+        key: Vec<u8>,
+        committed_tokens: u32,
+    ) -> Result<Result<Option<Resource<RsWorkingSet>>, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        // Single-model runtime: the snapshot store is model 0, driver 0 (the
+        // same resolution `new` uses).
+        let model = 0;
+        let stores = store_registry::get(model, 0);
+        let restored = {
+            let mut rs = stores.rs.lock().unwrap();
+            rs.from_index(&key, committed_tokens)
+                .map(|id| id.map(|id| (id, rs.geometry(id))))
+        };
+        match restored {
+            Ok(Some((id, geom))) => {
+                let geom = geom.map_err(anyhow::Error::from)?;
+                let ws = RsWorkingSet::new(model, 0, id, geom);
+                self.register_rs_working_set(model, 0, id);
+                Ok(Ok(Some(self.ctx().table.push(ws)?)))
+            }
+            Ok(None) => Ok(Ok(None)),
+            Err(error) => Ok(Err(error.to_string())),
+        }
+    }
+
+    async fn remove_index(&mut self, key: Vec<u8>) -> Result<Result<bool, String>> {
+        crate::inferlet::process::gate::residency_gate(self).await?;
+        let stores = store_registry::get(0, 0);
+        let mut rs = stores.rs.lock().unwrap();
+        let out = rs.remove_index(&key).map_err(|e| e.to_string());
+        rs.retire_idle();
+        Ok(out)
+    }
+
     async fn fork(
         &mut self,
         this: Resource<RsWorkingSet>,

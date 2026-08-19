@@ -149,6 +149,29 @@ pub enum RsError {
     /// A reserved-path prepare was handed fewer slots than it needs.
     #[error("rs slot grant mismatch: required {required}, granted {granted}")]
     GrantMismatch { required: usize, granted: usize },
+    #[error("rs snapshot: invalid index key: {reason}")]
+    SnapshotBadKey { reason: &'static str },
+    /// Only a FOLDED state can be snapshotted; a working set that never
+    /// folded has nothing to save.
+    #[error("rs snapshot: the working set holds no folded state")]
+    SnapshotNoFold,
+    /// A snapshot carries only the folded boundary. Buffered (unfolded)
+    /// tokens cannot ride along: a fold cannot be rewound, so what was never
+    /// folded would be silently lost on resume.
+    #[error(
+        "rs snapshot: {buffered} buffered token(s) are not folded; fold or discard them before \
+         saving"
+    )]
+    SnapshotBufferedTokens { buffered: u32 },
+    /// The named non-boundary-resume refusal: a fold is irreversible, so a
+    /// saved recurrent state is only valid at the exact committed length it
+    /// was folded through.
+    #[error(
+        "rs snapshot boundary mismatch: the recurrent state was saved at {saved} committed \
+         token(s) but resume requested {requested}; a fold cannot be rewound or replayed, so a \
+         saved context resumes only at its exact boundary"
+    )]
+    SnapshotBoundaryMismatch { saved: u32, requested: u32 },
 }
 
 /// A buffer page that is reserved but has no physical slot behind it yet.
@@ -273,11 +296,25 @@ struct RsEntry {
     buffer_head: u32,
 }
 
+/// A saved recurrent state: the folded slot, structurally retained (one ref
+/// in [`RsStore::refs`]) so it outlives every working set, tagged with the
+/// committed token length at the fold boundary. The RS twin of the KV
+/// store's `KvIndexEntry` — together they are what a saved context carries.
+#[derive(Debug, Clone, Copy)]
+struct RsSnapshot {
+    slot: RsSlotId,
+    geom: RsGeometry,
+    committed: u32,
+}
+
 /// The RS store: WorkingSets + the typed backing pool.
 pub struct RsStore {
     pool: Pool<RsSlotId>,
     refs: HashMap<RsSlotId, u32>,
     working_sets: GenMap<RsWsMarker, RsEntry>,
+    /// Saved folded states by opaque key (the same key space the KV index
+    /// uses, so one context name saves both halves).
+    snapshots: HashMap<Vec<u8>, RsSnapshot>,
     /// See `KvStore::seq`: submission sequence for epoch retirement.
     seq: u64,
     /// Submission sequences prepared but not yet settled or cancelled.
@@ -294,6 +331,7 @@ impl RsStore {
             pool: Pool::new(capacity),
             refs: HashMap::new(),
             working_sets: GenMap::new(),
+            snapshots: HashMap::new(),
             seq: 0,
             outstanding: BTreeSet::new(),
         }
@@ -391,6 +429,116 @@ impl RsStore {
         for id in entry.buffer.into_iter().flatten() {
             self.decref(id, epoch);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Snapshot index (saved contexts)
+    // ------------------------------------------------------------------
+
+    fn validate_index_key(key: &[u8]) -> Result<(), RsError> {
+        if key.is_empty() {
+            return Err(RsError::SnapshotBadKey {
+                reason: "key must not be empty",
+            });
+        }
+        if key.len() > crate::store::kv::MAX_INDEX_KEY_BYTES {
+            return Err(RsError::SnapshotBadKey {
+                reason: "key exceeds 256 bytes",
+            });
+        }
+        Ok(())
+    }
+
+    /// Atomically insert or replace `key` with a snapshot of `ws`'s folded
+    /// state, tagged with the committed token length at the boundary.
+    ///
+    /// The state stays device-resident: the snapshot retains the folded slot
+    /// by reference (like a fork's shared parent), so the next write from ANY
+    /// holder — the saving working set included — classifies as CoW and the
+    /// saved bytes are never mutated. The working set must be fully folded:
+    /// buffered tokens are refused, because a snapshot carries only the
+    /// boundary and a fold cannot be rewound to recover an unfolded tail.
+    ///
+    /// Content ordering rides the pipeline stream exactly as `fork` does: the
+    /// mapping published at prepare already carries every fire submitted
+    /// before this call, and a later CoW copy is issued behind the fires that
+    /// wrote the slot.
+    pub fn update_index(
+        &mut self,
+        key: Vec<u8>,
+        ws: RsWorkingSetId,
+        committed: u32,
+    ) -> Result<(), RsError> {
+        Self::validate_index_key(&key)?;
+        let (geom, folded, buffered) = {
+            let entry = self.entry(ws)?;
+            (entry.geom, entry.folded, entry.occupancy.bound())
+        };
+        let slot = folded.ok_or(RsError::SnapshotNoFold)?;
+        if buffered != 0 {
+            return Err(RsError::SnapshotBufferedTokens { buffered });
+        }
+        *self.refs.entry(slot).or_insert(1) += 1;
+        let replaced = self.snapshots.insert(
+            key,
+            RsSnapshot {
+                slot,
+                geom,
+                committed,
+            },
+        );
+        if let Some(old) = replaced {
+            let epoch = self.current_epoch();
+            self.decref(old.slot, epoch);
+        }
+        Ok(())
+    }
+
+    /// Exact lookup of a saved recurrent state. A missing key returns
+    /// `Ok(None)`. `committed` must equal the tag the snapshot was saved
+    /// with; any other boundary is refused (`SnapshotBoundaryMismatch`) — a
+    /// fold is irreversible, so the state is only meaningful at the exact
+    /// committed length it was folded through.
+    ///
+    /// The returned working set shares the snapshot's folded slot
+    /// copy-on-write with an empty buffer; its first state write privatizes
+    /// the slot and the snapshot stays intact.
+    pub fn from_index(
+        &mut self,
+        key: &[u8],
+        committed: u32,
+    ) -> Result<Option<RsWorkingSetId>, RsError> {
+        Self::validate_index_key(key)?;
+        let Some(snapshot) = self.snapshots.get(key).copied() else {
+            return Ok(None);
+        };
+        if snapshot.committed != committed {
+            return Err(RsError::SnapshotBoundaryMismatch {
+                saved: snapshot.committed,
+                requested: committed,
+            });
+        }
+        *self.refs.entry(snapshot.slot).or_insert(1) += 1;
+        Ok(Some(self.working_sets.insert(RsEntry {
+            geom: snapshot.geom,
+            folded: Some(snapshot.slot),
+            buffer: Vec::new(),
+            occupancy: Occupancy::EMPTY,
+            buffer_head: 0,
+        })))
+    }
+
+    /// Remove only the named snapshot. Working sets already returned by
+    /// [`Self::from_index`] remain valid. Returns `false` when the key is
+    /// absent.
+    pub fn remove_index(&mut self, key: &[u8]) -> Result<bool, RsError> {
+        Self::validate_index_key(key)?;
+        let Some(snapshot) = self.snapshots.remove(key) else {
+            return Ok(false);
+        };
+        let epoch = self.current_epoch();
+        self.decref(snapshot.slot, epoch);
+        Ok(true)
     }
 
     // ------------------------------------------------------------------

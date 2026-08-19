@@ -13,6 +13,7 @@ members = [
     "rs-buffer-bench",
     "generate-gdn-frame",
     "gdn-foldcommit",
+    "gdn-save-resume",
     "grammar",
     "grammar-late",
     "grammar-wit-bench",

@@ -53,7 +53,12 @@ static STATE: OnceLock<TestState> = OnceLock::new();
 /// `OnceLock`: `add_and_install` shells out to `cargo build` and mutates the
 /// shared program registry, so two tests installing the same program in
 /// parallel race ("Component not found").
-const PROGRAMS: [&str; 3] = ["generate-gdn", "generate-gdn-frame", "gdn-foldcommit"];
+const PROGRAMS: [&str; 4] = [
+    "generate-gdn",
+    "generate-gdn-frame",
+    "gdn-foldcommit",
+    "gdn-save-resume",
+];
 
 fn state() -> &'static TestState {
     STATE.get_or_init(|| {
@@ -173,6 +178,28 @@ fn fold_commit_buffers_then_folds_the_accepted_prefix() {
         out.contains("buffered=4") && out.contains("committed=2") && out.contains("abandoned=2"),
         "{out}"
     );
+}
+
+/// Saved-context resume end to end: a hybrid context saves its KV pages AND
+/// its folded recurrent state under one key, resumes both at the exact
+/// committed boundary and decodes on — while resuming at any OTHER length
+/// takes the named boundary refusal, a missing key is a typed None, and the
+/// saver itself keeps decoding off the now-shared (CoW) fold. This is the
+/// engine half of the contract whose absence made hybrid guests refuse every
+/// saved-context reopen ("the saved context does not yet carry its recurrent
+/// state").
+#[test]
+fn saved_context_resumes_with_its_folded_recurrent_state() {
+    let out = run("gdn-save-resume", "").unwrap_or_else(|e| panic!("gdn-save-resume failed: {e}"));
+    for expected in [
+        "resumed=1",
+        "original=1",
+        "refusals=2",
+        "missing=none",
+        "removed=true",
+    ] {
+        assert!(out.contains(expected), "missing `{expected}`: {out}");
+    }
 }
 
 /// Accepting nothing must still be legal: the buffered chunk is abandoned

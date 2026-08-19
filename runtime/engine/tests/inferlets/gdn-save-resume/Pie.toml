@@ -1,0 +1,4 @@
+[package]
+name = "gdn-save-resume"
+version = "0.1.0"
+description = "Test inferlet: save a hybrid context's folded recurrent state alongside its KV pages, resume it at the exact boundary, and take the named refusal everywhere else"

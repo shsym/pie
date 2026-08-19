@@ -1030,3 +1030,159 @@ fn discarding_buffered_tokens_releases_content_but_not_capacity() {
     assert_eq!(s.buffer_tokens(ws).unwrap(), 0);
     assert_eq!(s.buffer_size(ws).unwrap(), 3);
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot index (saved contexts): the folded state a saved ChatContext
+// carries, tagged with the committed length at its fold boundary.
+// ---------------------------------------------------------------------------
+
+/// Save-with-fold roundtrip: the snapshot retains the folded slot past the
+/// saving working set's death, `from_index` at the exact boundary hands back
+/// a working set sharing it CoW, and the next state write on the resumed set
+/// privatizes a copy — the saved bytes are never written again.
+#[test]
+fn snapshot_roundtrip_retains_and_restores_the_fold_cow() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    write_state(&mut s, ws);
+    let saved_slot = s.folded_slot(ws).unwrap().unwrap();
+
+    s.update_index(b"ctx".to_vec(), ws, 7).unwrap();
+
+    // The saver keeps decoding: its own next write must now CoW, because the
+    // snapshot holds the slot.
+    let prepared = s.prepare_write(ws, true, None).unwrap();
+    let state = prepared.state().unwrap();
+    assert_eq!(
+        state.copy_from,
+        Some(saved_slot),
+        "saver CoWs off the snapshot"
+    );
+    s.cancel_prepared(prepared);
+
+    // The snapshot outlives every working set.
+    let epoch = s.current_epoch();
+    s.release_working_set(ws, epoch);
+
+    // Wrong boundary first (see the dedicated test), then the exact one.
+    let resumed = s.from_index(b"ctx", 7).unwrap().expect("saved key resumes");
+    assert_eq!(
+        s.folded_slot(resumed).unwrap(),
+        Some(saved_slot),
+        "the resumed working set starts from the saved fold"
+    );
+    assert_eq!(s.buffer_size(resumed).unwrap(), 0);
+    assert_eq!(s.buffer_tokens(resumed).unwrap(), 0);
+
+    // The resumed set's first state write is a CoW copy FROM the saved slot,
+    // never a reset and never an in-place write.
+    let prepared = s.prepare_write(resumed, true, None).unwrap();
+    let state = prepared.state().unwrap();
+    assert!(!state.reset);
+    assert_eq!(state.copy_from, Some(saved_slot));
+    settled(&mut s, prepared);
+    assert_ne!(s.folded_slot(resumed).unwrap(), Some(saved_slot));
+
+    // A second resume still starts from the pristine saved state.
+    let again = s.from_index(b"ctx", 7).unwrap().expect("snapshot intact");
+    assert_eq!(s.folded_slot(again).unwrap(), Some(saved_slot));
+}
+
+/// Non-boundary refusal: a fold cannot be rewound, so resuming behind or past
+/// the saved committed length fails with the named diagnostic; a missing key
+/// is a typed None, not an error.
+#[test]
+fn snapshot_refuses_any_boundary_but_the_saved_one() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    write_state(&mut s, ws);
+    s.update_index(b"ctx".to_vec(), ws, 12).unwrap();
+
+    for requested in [0, 11, 13] {
+        assert_eq!(
+            s.from_index(b"ctx", requested),
+            Err(RsError::SnapshotBoundaryMismatch {
+                saved: 12,
+                requested
+            })
+        );
+    }
+    assert_eq!(s.from_index(b"other", 12), Ok(None));
+}
+
+/// What refuses to SAVE: a working set that never folded (the shape a
+/// pure-attention context is in — its RS never exists) and one holding
+/// buffered (unfolded) tokens. Both are named refusals, not silent drops.
+#[test]
+fn snapshot_refuses_unfolded_and_buffered_states() {
+    let mut s = store();
+    let ws = s.create_working_set(geom());
+    assert_eq!(
+        s.update_index(b"ctx".to_vec(), ws, 0),
+        Err(RsError::SnapshotNoFold)
+    );
+
+    write_state(&mut s, ws);
+    s.alloc_buffer(ws, 1).unwrap();
+    let prepared = s.prepare_write(ws, false, Some((0, 3))).unwrap();
+    settled(&mut s, prepared);
+    assert_eq!(
+        s.update_index(b"ctx".to_vec(), ws, 4),
+        Err(RsError::SnapshotBufferedTokens { buffered: 3 })
+    );
+}
+
+/// Slot accounting: replacing a key releases the displaced snapshot's retain,
+/// removing a key releases its retain, and a slot pinned only by a snapshot
+/// returns to the pool when the snapshot goes. `remove_index` on an absent
+/// key is `false`.
+#[test]
+fn snapshot_replace_and_remove_release_their_retains() {
+    let mut s = store();
+    let first = s.create_working_set(geom());
+    write_state(&mut s, first);
+    let first_slot = s.folded_slot(first).unwrap().unwrap();
+    s.update_index(b"ctx".to_vec(), first, 3).unwrap();
+    let epoch = s.current_epoch();
+    s.release_working_set(first, epoch);
+    s.retire_idle();
+    let held = s.available_slots();
+
+    // Replace: the displaced snapshot's slot (its only remaining owner)
+    // becomes reclaimable. The second working set's own fold took one slot,
+    // so the pool coming back to `held` means exactly one slot was freed.
+    let second = s.create_working_set(geom());
+    write_state(&mut s, second);
+    assert_eq!(s.available_slots(), held - 1);
+    s.update_index(b"ctx".to_vec(), second, 5).unwrap();
+    s.retire_idle();
+    assert_eq!(s.available_slots(), held, "first snapshot's slot freed");
+    assert_eq!(
+        s.from_index(b"ctx", 3),
+        Err(RsError::SnapshotBoundaryMismatch {
+            saved: 5,
+            requested: 3
+        }),
+        "the replacement's tag is authoritative"
+    );
+    let _ = first_slot;
+
+    // Remove: false on a missing key, true (and the retain released) on a
+    // live one — after which the key is gone but an already-resumed working
+    // set keeps the slot alive. The saver is released first so the resumed
+    // set becomes the slot's sole owner once the snapshot goes.
+    assert_eq!(s.remove_index(b"missing"), Ok(false));
+    let epoch = s.current_epoch();
+    s.release_working_set(second, epoch);
+    let resumed = s.from_index(b"ctx", 5).unwrap().unwrap();
+    assert_eq!(s.remove_index(b"ctx"), Ok(true));
+    assert_eq!(s.from_index(b"ctx", 5), Ok(None));
+    let resumed_slot = s.folded_slot(resumed).unwrap().unwrap();
+    let prepared = s.prepare_write(resumed, true, None).unwrap();
+    assert_eq!(
+        prepared.state().unwrap().slot,
+        resumed_slot,
+        "sole owner writes in place after the snapshot is gone"
+    );
+    s.cancel_prepared(prepared);
+}

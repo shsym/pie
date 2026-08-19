@@ -744,6 +744,32 @@ impl RsWorkingSet {
             rs: Rc::new(self.rs.fork(&on.wit)?),
         })
     }
+
+    /// Insert or atomically replace an opaque, model-scoped snapshot of this
+    /// working set's FOLDED state, tagged with the committed token length at
+    /// the boundary. The working set must be fully folded (no buffered
+    /// tokens). The RS half of a saved context: pair it with
+    /// [`WorkingSet::update_index`] under the same key.
+    pub fn update_index(&self, key: &[u8], committed_tokens: u32) -> Result<(), String> {
+        self.rs.update_index(key, committed_tokens)
+    }
+
+    /// Exact best-effort lookup of a saved recurrent state. `Ok(None)` means
+    /// nothing is saved under `key`. `committed_tokens` must equal the tag
+    /// the snapshot was saved with: a fold cannot be rewound, so resuming at
+    /// any other boundary is refused with a named diagnostic.
+    pub fn from_index(key: &[u8], committed_tokens: u32) -> Result<Option<RsWorkingSet>, String> {
+        Ok(
+            crate::working_set::RsWorkingSet::from_index(key, committed_tokens)?
+                .map(|rs| RsWorkingSet { rs: Rc::new(rs) }),
+        )
+    }
+
+    /// Remove only a saved snapshot. Working sets returned by an earlier
+    /// lookup remain valid.
+    pub fn remove_index(key: &[u8]) -> Result<bool, String> {
+        crate::working_set::RsWorkingSet::remove_index(key)
+    }
 }
 
 impl Default for RsWorkingSet {

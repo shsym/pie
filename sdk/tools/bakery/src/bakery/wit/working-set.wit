@@ -153,6 +153,32 @@ interface working-set {
         // Reorder the buffered slots by the full bijection `perm`.
         reorder-buffer: func(perm: list<u32>) -> result<_, error>;
 
+        // Atomically insert or replace `key` with a snapshot of this working
+        // set's FOLDED state, tagged with `committed-tokens` — the committed
+        // token length at the fold boundary. Keys are opaque bytes scoped to
+        // the active model/driver store, the same key space a saved context's
+        // KV pages live in (`kv-working-set.update-index`); the state stays
+        // device-resident and structurally retained, exactly as indexed KV
+        // pages do. The working set must be fully folded: it must hold a
+        // folded state, and any buffered (unfolded) tokens are refused —
+        // a snapshot carries only the boundary, and a fold cannot be rewound
+        // to reconstruct what was never folded.
+        update-index: func(key: list<u8>, committed-tokens: u32) -> result<_, error>;
+
+        // Exact best-effort lookup. A missing or removed key returns none.
+        // The returned working set shares the snapshot's folded state
+        // copy-on-write (like `fork`) with an empty buffer, positioned at the
+        // saved boundary. `committed-tokens` must equal the tag the snapshot
+        // was saved with: a fold is irreversible, so resuming at any other
+        // committed length — behind the boundary or past it — is refused with
+        // a named diagnostic rather than silently pairing the state with a
+        // different sequence length.
+        from-index: static func(key: list<u8>, committed-tokens: u32) -> result<option<rs-working-set>, error>;
+
+        // Remove only the named snapshot. Working sets already returned by
+        // from-index remain valid. Returns false when the key is absent.
+        remove-index: static func(key: list<u8>) -> result<bool, error>;
+
         // Copy-on-write child sharing the folded state and buffered slabs,
         // ordered on `on`.
         fork: func(on: borrow<pipeline>) -> result<rs-working-set, error>;
