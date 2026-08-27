@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Pie multimodal (image) latency/throughput benchmark.
 
-The Pie-side counterpart to `vllm_mm_bench.py`. Starts the embedded server with
-the `cuda_native` driver, installs the `image-qa-bench` inferlet, and drives it
-with a fixed local image + question per request. The inferlet returns exact
-prompt and output token counts (prompt = text tokens + image soft-token rows),
-so the accounting matches vLLM's.
+The Pie-side counterpart to `vllm_mm_bench.py`. Launches `pie serve` with the
+`cuda_native` driver, installs the `image-qa-bench` inferlet, and drives it with
+a fixed local image + question per request. The inferlet returns exact prompt
+and output token counts (prompt = text tokens + image soft-token rows), so the
+accounting matches vLLM's.
 
 Timed path mirrors vLLM's: host-side decode/resize/patchify + vision encode +
 text prefill + decode. The image arrives base64 in the launch input — no network
@@ -17,8 +17,7 @@ Modes (from common.add_mode_subcommands):
 
 Run:
   python pie_mm_bench.py latency --model Qwen/Qwen3-VL-2B-Instruct \
-      --image assets/bench_image.png --inferlet-dir /path/to/image-qa-bench \
-      --requests 16 --max-tokens 128 \
+      --image assets/bench_image.png --requests 16 --max-tokens 128 \
       --json-out out/pie_latency.json
 """
 from __future__ import annotations
@@ -26,8 +25,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import inspect
+import contextlib
 import json
+import os
+import socket
 import sys
 import time
 from pathlib import Path
@@ -42,17 +43,18 @@ from common import (
     summarize,
 )
 
-SERVER_SDK = ROOT / "sdk" / "server" / "python" / "python"
+SERVER_SDK = ROOT / "sdk" / "python-server" / "python"
 if str(SERVER_SDK) not in sys.path:
     sys.path.insert(0, str(SERVER_SDK))
 
+BENCH_INFERLET = "image-qa-bench"
 WASM_NAME = "image_qa_bench.wasm"
 
 
-def bench_inferlet_paths(inferlet_dir: str) -> tuple[Path, Path, str]:
+def bench_inferlet_paths() -> tuple[Path, Path, str]:
     import tomllib
 
-    d = Path(inferlet_dir).expanduser().resolve()
+    d = ROOT / "inferlets" / BENCH_INFERLET
     wasm = d / "target" / "wasm32-wasip2" / "release" / WASM_NAME
     manifest = d / "Pie.toml"
     if not wasm.exists():
@@ -64,8 +66,15 @@ def bench_inferlet_paths(inferlet_dir: str) -> tuple[Path, Path, str]:
     return wasm, manifest, f"{pkg['name']}@{pkg['version']}"
 
 
+def find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
 def build_config(args: argparse.Namespace, port: int):
     from pie.config import (
+        AuthConfig,
         Config,
         DriverConfig,
         ModelConfig,
@@ -78,24 +87,14 @@ def build_config(args: argparse.Namespace, port: int):
     device = [d.strip() for d in args.device.split(",")]
     if args.mode == "latency":
         max_concurrent: int | None = 1
+        batch_policy = "greedy"
     else:
         max_concurrent = None if args.concurrency == 0 else args.concurrency
+        batch_policy = "adaptive"
 
     driver_options = {
         "gpu_mem_utilization": args.gpu_mem_util,
-        "ready_timeout": f"{int(args.server_startup_timeout)}s",
-    }
-    requested_scheduler_kwargs = {
-        "default_token_limit": args.default_token_limit,
-        "default_endowment_pages": args.endowment_pages,
-        "admission_oversubscription_factor": args.admission_oversubscription_factor,
-        "speculation_depth": args.speculation_depth,
-    }
-    scheduler_parameters = inspect.signature(SchedulerConfig).parameters
-    scheduler_kwargs = {
-        key: value
-        for key, value in requested_scheduler_kwargs.items()
-        if value is not None and key in scheduler_parameters
+        "ready_timeout_s": float(args.server_startup_timeout),
     }
     cfg = Config(
         server=ServerConfig(
@@ -104,31 +103,38 @@ def build_config(args: argparse.Namespace, port: int):
             verbose=True,
             max_concurrent_processes=max_concurrent,
         ),
+        auth=AuthConfig(enabled=False),
         telemetry=TelemetryConfig(),
         runtime=RuntimeConfig(
-            # See pie_bench.py: a pooling slot costs ~4 GiB of virtual address
-            # space, so this must track the admission cap, not the total
-            # request count, or the reservation exceeds the 128 TiB user VA
-            # limit and the engine panics inside mmap.
-            wasm_max_instances=max(4096, (max_concurrent or 0) * 4),
+            wasm_max_instances=max(4096, (args.num_requests + args.warmup) * 4),
         ),
-        model=ModelConfig(
-            name="default",
-            hf_repo=args.model,
-            scheduler=SchedulerConfig(**scheduler_kwargs),
-            driver=DriverConfig(
-                type=args.driver,
-                device=device,
-                tensor_parallel_size=args.tp_size,
-                activation_dtype=args.activation_dtype,
-                options=driver_options,
-            ),
-        ),
+        models=[
+            ModelConfig(
+                name="default",
+                hf_repo=args.model,
+                scheduler=SchedulerConfig(
+                    batch_policy=batch_policy,
+                    default_token_limit=args.default_token_limit,
+                    default_endowment_pages=args.endowment_pages,
+                    admission_oversubscription_factor=args.admission_oversubscription_factor,
+                    **({"speculation_depth": args.speculation_depth}
+                       if args.speculation_depth is not None else {}),
+                ),
+                driver=DriverConfig(
+                    type=args.driver,
+                    device=device,
+                    tensor_parallel_size=args.tp_size,
+                    activation_dtype=args.activation_dtype,
+                    options=driver_options,
+                ),
+            )
+        ],
     )
     config_blob = {
         "modality": "image",
         "image": args.image,
         "driver": args.driver,
+        "scheduler": batch_policy,
         "endowment_pages": args.endowment_pages,
         "gpu_mem_utilization": args.gpu_mem_util,
         "max_concurrent_processes": max_concurrent,
@@ -140,9 +146,83 @@ def build_config(args: argparse.Namespace, port: int):
     return cfg, config_blob
 
 
+async def launch_server(args: argparse.Namespace):
+    """Start `pie serve`, return (proc, port, token, drain_task, lines)."""
+    port = find_free_port()
+    cfg, config_blob = build_config(args, port)
+    cfg_path = ROOT / ".tmp" / "benches" / f"pie-mm-{port}.toml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(cfg.to_toml())
+
+    pie_bin = Path(args.pie_bin)
+    if not pie_bin.exists():
+        raise FileNotFoundError(
+            f"missing {pie_bin}; build with: cargo build -p pie-server --release "
+            "--no-default-features --features driver-cuda"
+        )
+
+    # Force flashinfer split-KV (flash-decoding) on for small-batch decode: the
+    # driver's default heuristic disables it for batch<=512 on sm>=8, which makes
+    # long-KV (multimodal) single-stream decode scale linearly with context. With
+    # split-KV the long-KV decode stays flat, matching vLLM/SGLang.
+    serve_env = {**os.environ, "PIE_FLASHINFER_FORCE_SPLIT_KV_SMALL": "1"}
+    proc = await asyncio.create_subprocess_exec(
+        str(pie_bin), "serve", "--config", str(cfg_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        env=serve_env,
+    )
+    lines: list[str] = []
+
+    def surface(txt: str) -> bool:
+        return (" WARN " in txt or " ERROR " in txt or "panic" in txt
+                or "[vtim]" in txt or "[fire]" in txt)
+
+    # Read startup until the auth token line appears.
+    token: str | None = None
+    deadline = time.perf_counter() + args.server_startup_timeout
+    assert proc.stdout is not None
+    while time.perf_counter() < deadline:
+        try:
+            line = await asyncio.wait_for(
+                proc.stdout.readline(), timeout=max(0.1, deadline - time.perf_counter())
+            )
+        except asyncio.TimeoutError:
+            break
+        if not line:
+            raise RuntimeError("pie serve exited before startup:\n" + "".join(lines[-60:]))
+        txt = line.decode("utf-8", errors="replace")
+        lines.append(txt)
+        if surface(txt):
+            sys.stderr.write(txt)
+            sys.stderr.flush()
+        if "internal token: " in txt:
+            token = txt.split("internal token: ", 1)[1].strip()
+            break
+        if proc.returncode is not None:
+            raise RuntimeError(f"pie serve exited {proc.returncode}:\n" + "".join(lines[-60:]))
+    if token is None:
+        raise TimeoutError("timed out waiting for pie serve startup:\n" + "".join(lines[-60:]))
+
+    async def drain() -> None:
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                return
+            txt = line.decode("utf-8", errors="replace")
+            lines.append(txt)
+            del lines[:-200]
+            if surface(txt):
+                sys.stderr.write(txt)
+                sys.stderr.flush()
+
+    drain_task = asyncio.create_task(drain())
+    return proc, port, token, drain_task, config_blob
+
+
 async def run(args: argparse.Namespace):
-    from pie.server import Server
-    from pie_client import Event
+    from pie_client import Event, PieClient
 
     image_b64 = base64.b64encode(Path(args.image).read_bytes()).decode("ascii")
     n = args.requests if args.mode == "latency" else args.num_requests
@@ -163,13 +243,15 @@ async def run(args: argparse.Namespace):
             "return_text": args.dump_first_text,
         }
 
-    wasm, manifest, pkg = bench_inferlet_paths(args.inferlet_dir)
-    cfg, config_blob = build_config(args, 0)
+    wasm, manifest, pkg = bench_inferlet_paths()
+    proc, port, token, drain_task, config_blob = await launch_server(args)
     first_text: list[str | None] = [None]
     sem = asyncio.Semaphore(args.concurrency) if (args.mode == "tput" and args.concurrency > 0) else None
 
-    async with Server(cfg) as server:
-        client = await server.connect()
+    try:
+        client = PieClient(f"ws://127.0.0.1:{port}")
+        await client.connect()
+        await client.auth_by_token(token)
         try:
             await client.install_program(wasm, manifest, force_overwrite=True)
 
@@ -178,6 +260,7 @@ async def run(args: argparse.Namespace):
                 try:
                     p = await client.launch_process(
                         pkg, input=make_input(i, max_tokens=max_tokens),
+                        token_budget=args.token_budget,
                     )
                     while True:
                         ev, msg = await asyncio.wait_for(p.recv(), timeout=args.request_timeout)
@@ -258,13 +341,24 @@ async def run(args: argparse.Namespace):
                 sys.stderr.write(f"[stat] model_status failed: {e}\n")
         finally:
             await client.close()
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        drain_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await drain_task
 
     if args.dump_first_text and first_text[0]:
         print("\n--- first output ---\n" + first_text[0].strip() + "\n--------------------")
 
     summary = summarize(
         mode=args.mode, engine="pie", model=args.model,
-        results=results, wall_s=wall, config=config_blob,
+        results=results, wall_s=wall, config={**config_blob, "pie_bin": str(args.pie_bin)},
     )
     return summary, results
 
@@ -275,8 +369,6 @@ def main() -> None:
     for sp in parser._subparsers._group_actions[0].choices.values():
         sp.add_argument("--image", default="assets/bench_image.png",
                         help="Local image fed (base64) to every request.")
-        sp.add_argument("--inferlet-dir", required=True,
-                        help="Path to a built image-qa-bench inferlet project.")
         sp.add_argument("--question",
                         default="What is in this image? Answer in one sentence.")
         sp.add_argument("--driver", default="cuda_native")
@@ -290,6 +382,9 @@ def main() -> None:
                         help="Scheduler admission oversubscription (match pie_bench).")
         sp.add_argument("--speculation-depth", type=int, default=None,
                         help="Pass-level chain-firing depth (hides guest<->host per-step round-trip).")
+        sp.add_argument("--token-budget", type=int, default=2048,
+                        help="Per-process admission token budget.")
+        sp.add_argument("--pie-bin", default=str(ROOT / "target" / "release" / "pie"))
         sp.add_argument("--server-startup-timeout", type=float, default=300.0)
         sp.add_argument("--dump-first-text", action="store_true",
                         help="Decode + print the first request's output (spot-check).")

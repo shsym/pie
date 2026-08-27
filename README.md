@@ -48,81 +48,26 @@ Then configure and run:
 
 ```bash
 pie config init
-pie model import Qwen/Qwen3-0.6B
-pie serve
+pie run text-completion -- --prompt "The capital of France is"
 ```
-
-`pie serve` boots the engine and holds the terminal. From another shell, submit an
-inferlet to it with the Python client (`pip install pie-client`):
-
-```bash
-pie-client submit text-completion -- --prompt "The capital of France is"
-```
-
-### Backends
-
-CUDA is the plane that serves today, and it is a compile-time feature — the
-number in it is the CUDA runtime ABI the binary will load, which is why there
-is no version-less spelling to guess at:
-
-```bash
-cargo build --release -p pie --bin pie --features driver-cuda-13
-```
-
-A binary built with no driver feature has nothing true to put in `[driver]`,
-so `pie config init` says so instead of writing a config that will not parse.
-
-The Metal, Vulkan and WGPU planes are mid-migration. Their kernel tables are
-in the workspace and green; their drivers are not, and a config naming one is
-told what happened at boot rather than falling back to something slower. They
-return when each has an executor for the compiled forward pass (P5).
 
 ## Project Layout
 
 | Directory | Description |
 |---|---|
-| `src/` | The `pie` CLI and the three role daemons — the invariant entry point |
-| `crates/engine/` | Inferlet runtime |
-| `crates/tensor-*/` | Tensor-program toolchain: authoring eDSL → PTIR → planning → CUDA/Metal codegen (+ the reference interpreter) |
-| `crates/model*/` | What a model is: the catalog, the authoring eDSL and its traced IR, the forward compiler, the checkpoint loader |
-| `crates/controller/` | Cluster-coordination control plane (pairing · roles · health) |
-| `crates/transport/` | Worker↔worker P2P KV-tensor data plane |
-| `crates/driver*/` | Backend drivers: the CUDA shell + the shared execution-shell substrate (the three shader shells are out of the workspace until P5) |
-| `crates/*-api` | Boundary contracts (`client` · `controller` · `worker` · `driver`) — the dependency floor |
-| `tests/inferlets/` | Curated inferlet E2E fixtures |
-| `sdk/inferlet/` | SDKs for programs that run ON pie (Python · JavaScript · tools) |
-| `sdk/client/` | SDKs for programs that CALL pie (Python · JavaScript) |
-
-Every Rust crate lives under `crates/`; the repo root is the workspace and the
-`pie` package both. The [pie-project.org](https://pie-project.org) docs site
-has its own repo, [pie-project/website](https://github.com/pie-project/website).
-
-## Building inferlets
-
-Inferlets compile to the `wasm32-wasip2` component target. Install the target
-once after cloning:
-
-```bash
-rustup target add wasm32-wasip2
-```
-
-Build an inferlet with:
-
-```bash
-cargo build --target wasm32-wasip2
-```
+| `runtime/` | Inferlet runtime |
+| `server/` | CLI |
+| `inferlets/` | Example inferlets |
+| `sdk/` | Inferlet SDKs (Rust · Python · JavaScript) |
+| `client/` | Client libraries (Rust · Python · JavaScript) |
+| `driver/` | Pie drivers (portable / CUDA / vLLM / SGLang) |
+| `website/` | [pie-project.org](https://pie-project.org) docs site |
 
 ## Getting Help
 
 Questions and bug reports are welcome on
 [GitHub Issues](https://github.com/pie-project/pie/issues) and
 [GitHub Discussions](https://github.com/pie-project/pie/discussions).
-
-## Acknowledgements
-
-The constrained-decoding engine in `crates/grammar` is a Rust rewrite derived
-in part from [XGrammar](https://github.com/mlc-ai/xgrammar), licensed under
-Apache License 2.0. See [NOTICE](NOTICE) for attribution.
 
 ## License
 
