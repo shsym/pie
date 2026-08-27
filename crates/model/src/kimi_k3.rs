@@ -1,0 +1,36 @@
+pub mod forward;
+pub mod import;
+pub mod model;
+pub mod template;
+
+use model::Model;
+use model_dsl::Dtype;
+
+pub const CATALOG: &[crate::Row] = model_dsl::catalog![
+    (
+        "kimik3-bf16-mxfp4-kv-bf16",
+        1,
+        model_dsl::trace_hybrid,
+        Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, 1)
+    ),
+    (
+        "kimik3-bf16-mxfp4-kv-bf16-tp2",
+        2,
+        model_dsl::trace_hybrid,
+        Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, 2)
+    ),
+];
+
+pub const IMPORTS: &[crate::ImportRow] = &[
+    ("kimik3-bf16-mxfp4-kv-bf16", |src| {
+        Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, 1).import(src)
+    }),
+    ("kimik3-bf16-mxfp4-kv-bf16-tp2", |src| {
+        Model::k3(Dtype::Bf16, Dtype::Mxfp4, Dtype::Bf16, 1).import(src)
+    }),
+];
+
+pub const TEMPLATES: &[crate::template::TemplateRow] = &[
+    ("kimik3-bf16-mxfp4-kv-bf16", template::instruct),
+    ("kimik3-bf16-mxfp4-kv-bf16-tp2", template::instruct),
+];
