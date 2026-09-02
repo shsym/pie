@@ -60,6 +60,18 @@ pub struct BandPlan {
 /// One streamed group: a router, and every expert-indexed param read
 /// against the vector it writes — the unit of residency, since one
 /// rewrite of `routes` re-indexes every band in the group at once.
+/// A run being walked in expert-major passes (`Tier::pass_at`).
+#[derive(Clone, Debug)]
+struct Passing {
+    row_offset: u32,
+    rows: u32,
+    /// The routing vector as the router wrote it: expert ids.
+    ids: Vec<i32>,
+    /// The distinct experts, in first-appearance order, cut into groups of
+    /// at most the slab's seats — one per pass.
+    groups: Vec<Vec<u32>>,
+}
+
 #[derive(Debug, Clone)]
 pub struct GroupPlan {
     /// The routing vector this group's bands are indexed by, rewritten at the segment cut.
@@ -320,6 +332,7 @@ fn found(
 
     // Expert-indexed reads, joined to the router that wrote their routing vector.
     let mut of_group: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    let mut routers_of: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
     for node in &trace.nodes {
         let Operation::Linear(op) = &node.op else {
             continue;
@@ -349,13 +362,25 @@ fn found(
             if !seats.contains(&at) {
                 seats.push(at);
             }
+            routers_of.entry(at).or_default().insert(routes.0);
             for &plane in planes.get(&at).into_iter().flatten() {
                 if !seats.contains(&plane) {
                     seats.push(plane);
                 }
+                routers_of.entry(plane).or_default().insert(routes.0);
             }
         }
     }
+    // **A BANK TWO ROUTERS INDEX STAYS RESIDENT.** A seat number means one
+    // group's seat, and a band shared between two groups would be re-indexed
+    // twice — so such a band (a draft head's experts, routed once per chain
+    // step) is not a streamed band at all: it is held whole, as a dense plane
+    // is, and costs the budget its full size.
+    let shared: BTreeSet<usize> = routers_of
+        .iter()
+        .filter(|(_, routers)| routers.len() > 1)
+        .map(|(&at, _)| at)
+        .collect();
 
     let mut bands: Vec<BandPlan> = Vec::new();
     let mut groups: Vec<GroupPlan> = Vec::new();
@@ -366,6 +391,10 @@ fn found(
             // A router nothing expert-indexed reads isn't a group.
             continue;
         };
+        params.retain(|at| !shared.contains(at));
+        if params.is_empty() {
+            continue;
+        }
         params.sort_unstable();
         let experts = arity[&routes.0];
         // Every group in a plan states the same expert count.
@@ -433,6 +462,25 @@ fn found(
     Ok((bands, groups))
 }
 
+/// How many experts one row of the router writing `routes` picks — the
+/// bound on distinct experts `rows` rows can name, which is what sizes a
+/// streamed segment's sub-batch (`slots / fan_out` rows fit the slab).
+#[must_use]
+pub fn fan_out(trace: &Trace, routes: ValueId) -> Option<u32> {
+    trace.nodes.iter().find_map(|node| match &node.op {
+        Operation::Linear(Linear::MoeTopkSoftmax { routes: r, top_k, .. })
+        | Operation::Linear(Linear::MoeTopkSoftmaxScaled { routes: r, top_k, .. })
+        | Operation::Linear(Linear::MoeTopkSigmoid { routes: r, top_k, .. })
+        | Operation::Linear(Linear::MoeTopkSqrtSoftplus { routes: r, top_k, .. })
+        | Operation::Linear(Linear::MoeHashRoute { routes: r, top_k, .. })
+            if *r == routes =>
+        {
+            Some(*top_k)
+        }
+        _ => None,
+    })
+}
+
 /// The `Trace::params` row a value id names, or a refusal.
 fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
     match trace.values.get(id.0 as usize).map(|decl| &decl.def) {
@@ -449,15 +497,23 @@ fn weight_of(trace: &Trace, id: ValueId) -> Result<usize> {
 /// the routing vector the router in that region writes, or `None`. The cut
 /// falls after the deciding node and before the nodes that read.
 ///
+/// Only a router whose bands `plan` STREAMS cuts anything: a mixture over a
+/// resident bank (a draft head's experts, held whole because two routers
+/// index them) needs no seat swapped, and a cut is a blocking commit — two
+/// of them a fire, for nothing, on every plain decode.
+///
 /// # Errors
 ///
-/// [`Fault::Residency`] when `streams` and a region holds two routers: the
-/// cut would fall after both, encoding the first mixture against un-swapped seats.
+/// [`Fault::Residency`] when the plan streams and a region holds two
+/// streamed routers: the cut would fall after both, encoding the first
+/// mixture against un-swapped seats.
 pub fn cuts(
     trace: &Trace,
     compiled: &CompiledModel,
-    streams: bool,
+    plan: &Plan,
 ) -> Result<Vec<Option<ValueId>>> {
+    let streams = plan.streams();
+    let streamed: BTreeSet<u32> = plan.groups.iter().map(|group| group.routes.0).collect();
     let mut out = Vec::with_capacity(compiled.template().len());
     for (at, region) in compiled.template().iter().enumerate() {
         let mut here: Option<ValueId> = None;
@@ -478,6 +534,9 @@ pub fn cuts(
                 | Linear::MoeHashRoute { routes, .. } => *routes,
                 _ => continue,
             };
+            if !streamed.contains(&routes.0) {
+                continue;
+            }
             if let Some(first) = here {
                 if first != routes && streams {
                     return Err(Fault::Residency(format!(
@@ -692,6 +751,9 @@ pub struct Tier {
     /// Per slab: the prediction read at the previous group's cut for this
     /// one, or `None`.
     predicted: Vec<Option<Vec<Vec<u32>>>>,
+    /// Per slab: the run an expert-major walk is in the middle of — its
+    /// original routing vector and the expert groups its passes seat.
+    passing: Vec<Option<Passing>>,
     /// The route prefetch in flight: the next group's predicted experts
     /// being read on another thread. Joined at the next cut.
     inflight: Option<std::thread::JoinHandle<Result<()>>>,
@@ -765,6 +827,7 @@ impl Tier {
                 .filter_map(|group| group.hint.map(|hint| (group.routes.0, hint)))
                 .collect(),
             predicted: vec![None; plan.groups.len()],
+            passing: vec![None; plan.groups.len()],
             prediction: Prediction::default(),
             inflight: None,
             file: None,
@@ -858,12 +921,13 @@ impl Tier {
         rect: Tensor,
         hint: Option<Tensor>,
         span: MaskSpan,
+        pass: (u32, u32),
     ) -> Result<()> {
         let Some(&at) = self.of_routes.get(&routes.0) else {
             return Ok(());
         };
         let started = std::time::Instant::now();
-        let out = self.segment_at(at, arena, handles, routes, rect, hint, span);
+        let out = self.segment_at(at, arena, handles, routes, rect, hint, span, pass);
         self.cut_ns += started.elapsed().as_nanos() as u64;
         out
     }
@@ -962,10 +1026,14 @@ impl Tier {
         rect: Tensor,
         hint: Option<Tensor>,
         span: MaskSpan,
+        pass: (u32, u32),
     ) -> Result<()> {
         // ── Whatever the prefetch was still reading into the seats this
         //    segment is about to name has to have landed first.
         self.join_inflight()?;
+        if pass.1 > 1 {
+            return self.pass_at(at, arena, handles, routes, rect, span, pass);
+        }
         if span.rows > 0 && (hint.is_some() || self.predicted[at].is_some()) {
             self.predict(at, arena, handles, routes, rect, hint, span)?;
         }
@@ -1033,6 +1101,117 @@ impl Tier {
                 self.prefetch(at + 1, &rows)?;
             }
         }
+        Ok(())
+    }
+
+    /// One expert-major pass over a whole run (`compose::pass_spans`): pass
+    /// 0 reads the run's routing vector and cuts its distinct experts into
+    /// groups of at most the slab's seats; pass `p` seats group `p` and
+    /// writes the vector as seat indices for that group's experts and `-1`
+    /// for every other entry, which the routed kernels skip (`route_sort`
+    /// drops a negative pair, `route_scatter` leaves its row, the matvec
+    /// returns). Each expert is copied once per run, not once per piece.
+    #[allow(clippy::too_many_arguments)]
+    fn pass_at(
+        &mut self,
+        at: usize,
+        arena: &mut Buffer,
+        handles: &Handles,
+        routes: ValueId,
+        rect: Tensor,
+        span: MaskSpan,
+        (pass, passes): (u32, u32),
+    ) -> Result<()> {
+        for seat in &mut self.slabs[at].pinned {
+            *seat = false;
+        }
+        self.segments += 1;
+        if span.rows == 0 {
+            return Ok(());
+        }
+        let width = u64::from(rect.width);
+        let base = handles
+            .get(rect.buf)
+            .ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "handle {}, the routing vector of value {}, which this fire minted no \
+                     row for",
+                    rect.buf, routes.0
+                ),
+            })?
+            .offset();
+        let first = base + u64::from(span.row_offset) * width * 4;
+        let count = usize::try_from(u64::from(span.rows) * width).unwrap_or(usize::MAX);
+        let fresh = pass == 0
+            || self.passing[at]
+                .as_ref()
+                .is_none_or(|p| p.row_offset != span.row_offset || p.rows != span.rows);
+        if fresh {
+            let mut raw = vec![0u8; count * 4];
+            arena.read(first, &mut raw)?;
+            let ids: Vec<i32> = raw
+                .chunks_exact(4)
+                .map(|e| i32::from_le_bytes([e[0], e[1], e[2], e[3]]))
+                .collect();
+            if let Some(dump) = &mut self.dump {
+                use std::io::Write;
+                for row in ids.chunks_exact(width as usize) {
+                    let ids: Vec<String> = row.iter().map(ToString::to_string).collect();
+                    let _ = writeln!(dump, "{at}\t{}", ids.join(" "));
+                }
+            }
+            let mut order: Vec<u32> = Vec::new();
+            for &id in &ids {
+                if id < 0 {
+                    continue;
+                }
+                let expert = id as u32;
+                if expert >= self.slabs[at].experts {
+                    return Err(Fault::Residency(format!(
+                        "a routing vector names expert {expert} and `{}` declares {} of them; \
+                         a seat cannot be found for an expert the router does not have.",
+                        self.slabs[at].bands[0].name, self.slabs[at].experts
+                    )));
+                }
+                if !order.contains(&expert) {
+                    order.push(expert);
+                }
+            }
+            let seats = self.slabs[at].pinned.len().max(1);
+            let groups = order.chunks(seats).map(<[u32]>::to_vec).collect();
+            self.passing[at] = Some(Passing {
+                row_offset: span.row_offset,
+                rows: span.rows,
+                ids,
+                groups,
+            });
+        }
+        let (ids, group) = {
+            let state = self.passing[at].as_ref().expect("stated just above");
+            (
+                state.ids.clone(),
+                state.groups.get(pass as usize).cloned().unwrap_or_default(),
+            )
+        };
+        let _ = passes;
+        // Seat this pass's group, then write the vector: seats for the
+        // group, `-1` for the rest.
+        let mut seat_of: BTreeMap<u32, i32> = BTreeMap::new();
+        for &expert in &group {
+            let seat = self.seat(at, expert)?;
+            seat_of.insert(expert, seat as i32);
+        }
+        let mut raw = Vec::with_capacity(count * 4);
+        for id in ids {
+            let entry = if id < 0 {
+                -1
+            } else {
+                seat_of.get(&(id as u32)).copied().unwrap_or(-1)
+            };
+            raw.extend_from_slice(&entry.to_le_bytes());
+        }
+        self.flush()?;
+        arena.write(first, &raw)?;
         Ok(())
     }
 

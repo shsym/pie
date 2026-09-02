@@ -14,7 +14,8 @@
 
 use std::cell::RefCell;
 
-use kernels_metal::{ArgValue, Encode, Error, Fire};
+use kernels_metal::{ArgValue, Encode, Error, Fire, Tensor};
+use model_exec::fire::MaskSpan;
 use model_ir::ValueId;
 
 use crate::device::ctx::Frame;
@@ -29,6 +30,7 @@ use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
 #[cfg(target_vendor = "apple")]
 /// The shader file every routing decision is made in.
+#[allow(dead_code, reason = "the router's dispatch no longer cuts; kept as the name of the seam")]
 const ROUTER_FILE: &str = "linear/moe_route.metal";
 
 #[cfg(target_vendor = "apple")]
@@ -43,6 +45,7 @@ const ROUTER_FILE: &str = "linear/moe_route.metal";
 ///
 /// `route_sort` (same file) is deliberately excluded: it runs after the ids
 /// have already been rewritten.
+#[allow(dead_code, reason = "see ROUTER_FILE")]
 const ROUTER_POINTS: [&str; 2] = ["router_topk", "hash_route_gather"];
 
 #[cfg(target_vendor = "apple")]
@@ -116,6 +119,10 @@ pub struct Cuts<'a> {
     /// tables are resident. Both this and `tier` may be `Some`: a capped
     /// load can stream experts and gather its n-gram table independently.
     rows: Option<&'a RefCell<crate::gather::Slab>>,
+    /// The `(region, run)` whose first dispatch has been seen — the cut for
+    /// a routed segment happens once per run of the region that reads the
+    /// router's seats, before that run's first dispatch.
+    seen: std::cell::Cell<(u32, u32)>,
 }
 
 impl<'a> Cuts<'a> {
@@ -141,6 +148,7 @@ impl<'a> Cuts<'a> {
             arena: RefCell::new(arena),
             tier,
             rows,
+            seen: std::cell::Cell::new((u32::MAX, u32::MAX)),
         }
     }
 }
@@ -222,8 +230,15 @@ impl<'a> Sink<'a> {
         let Some(tier) = cuts.tier else {
             return Ok(());
         };
+        // The router is the last node of ITS region (`model_compiler::region`
+        // breaks after every router), so the region whose run is beginning
+        // reads the routes the region before it wrote — and the cut's span is
+        // this run's, which is what lets a routed segment run in pieces.
         let region = cuts.place.region.get();
-        let Some(routes) = cuts.at.get(region as usize).copied().flatten() else {
+        let Some(routes) = region
+            .checked_sub(1)
+            .and_then(|router| cuts.at.get(router as usize).copied().flatten())
+        else {
             return Ok(());
         };
         // The prediction the router carries, where the carve put it — read
@@ -232,9 +247,9 @@ impl<'a> Sink<'a> {
             .borrow()
             .hint_for(routes)
             .and_then(|hint| cuts.slots.0.get(hint.0 as usize).copied().flatten());
-        self.across(fire, cuts, routes, "a routing vector", |rect, span, arena| {
+        self.across(fire, cuts, routes, "a routing vector", |rect, span, pass, arena| {
             tier.borrow_mut()
-                .segment(arena, self.handles, routes, rect, hint, span)
+                .segment(arena, self.handles, routes, rect, hint, span, pass)
         })
     }
 
@@ -251,7 +266,7 @@ impl<'a> Sink<'a> {
         let Some(ids) = cuts.ngram.get(region as usize).copied().flatten() else {
             return Ok(());
         };
-        self.across(fire, cuts, ids, "an n-gram id vector", |rect, span, arena| {
+        self.across(fire, cuts, ids, "an n-gram id vector", |rect, span, _pass, arena| {
             rows.borrow_mut()
                 .segment(arena, self.handles, ids, rect, span)
         })
@@ -268,7 +283,7 @@ impl<'a> Sink<'a> {
         cuts: &Cuts<'_>,
         vector: ValueId,
         what: &str,
-        seat: impl FnOnce(Tensor, MaskSpan, &mut Buffer) -> crate::error::Result<()>,
+        seat: impl FnOnce(Tensor, MaskSpan, (u32, u32), &mut Buffer) -> crate::error::Result<()>,
     ) -> Result<(), Error> {
         let Held::Owned(cell) = &self.frame else {
             return Ok(());
@@ -297,11 +312,23 @@ impl<'a> Sink<'a> {
                     what: format!("value {}, {what} the carve gave no rectangle", vector.0),
                 })
             })?;
-        let span = cuts
-            .windows
-            .at(region, cuts.place.run.get())
-            .span;
-        seat(rect, span, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
+        let window = cuts.windows.at(region, cuts.place.run.get());
+        let span = window.span;
+        let pass = (window.pass, window.passes);
+        if std::env::var_os("PIE_CUT_TRACE").is_some() {
+            eprintln!(
+                "cut: region {region} run {}: rows {}..{} of value {} ({what}; rect {} x {}; pass {} of {})",
+                cuts.place.run.get(),
+                span.row_offset,
+                span.row_offset + span.rows,
+                vector.0,
+                rect.rows,
+                rect.width,
+                pass.0,
+                pass.1
+            );
+        }
+        seat(rect, span, pass, &mut cuts.arena.borrow_mut()).map_err(refuse)?;
 
         *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);
         Ok(())
@@ -318,11 +345,12 @@ impl<'a> Sink<'a> {
     }
 }
 
-/// **THE KERNEL PROFILE** — `PIE_KERNEL_PROFILE=1`, streamed loads only.
+/// **THE KERNEL PROFILE** — `PIE_KERNEL_PROFILE=1`.
 ///
-/// With it set, every dispatch of an owned (segment) frame is committed in
-/// its own command buffer and timed on the device (`GPUEndTime -
-/// GPUStartTime`), and the time is summed here by entrypoint. It is a
+/// With it set, every dispatch is committed in its own command buffer and
+/// timed on the device (`GPUEndTime - GPUStartTime`), and the time is
+/// summed here by entrypoint — an owned (segment) frame's dispatches in
+/// place, a borrowed frame's each in a buffer of its own. It is a
 /// measurement mode, not a serving one: a command buffer per kernel costs
 /// submission latency the sums do not include, so what the profile answers is
 /// "where does the DEVICE time of a token go", kernel by kernel — the
@@ -373,10 +401,59 @@ impl Encode for Sink<'_> {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         #[cfg(target_vendor = "apple")]
         {
+            // Segment boundary: a streamed load ends its command buffer at the
+            // first dispatch of every run of a region that reads a router's
+            // seats — after the router decided (its region ended) and before
+            // the matmuls read. Once per `(region, run)`; a run of many
+            // pieces is many cuts, each seating its own rows' experts.
+            if let Some(cuts) = &self.cuts {
+                let here = (cuts.place.region.get(), cuts.place.run.get());
+                if cuts.seen.get() != here {
+                    cuts.seen.set(here);
+                    self.cut(fire, cuts)?;
+                }
+            }
             let pipeline = self
                 .pipelines
                 .at(self.device.device(), fire)
                 .map_err(|fault| Sink::refuse(fire, fault))?;
+            // ── The kernel profile on a BORROWED frame (a full-residency
+            // load): the caller's command buffer cannot be committed per
+            // dispatch, so each dispatch goes into a buffer of its own,
+            // committed and waited for here, in order. The caller's own
+            // encodings (the readout blit, the epilogues) land after every
+            // one of these has completed.
+            if profiling() {
+                if let Held::Borrowed(_) = &self.frame {
+                    let refuse = |fault: Fault| Sink::refuse(fire, fault);
+                    let own = self.device.frame().map_err(refuse)?;
+                    {
+                        let encoder = own.encoder();
+                        encoder.setComputePipelineState(&pipeline);
+                        for (at, arg) in args.iter().enumerate() {
+                            self.bind(encoder, fire, at, *arg)?;
+                        }
+                        let lanes = MTLSize {
+                            width: fire.lanes[0].max(1) as usize,
+                            height: fire.lanes[1].max(1) as usize,
+                            depth: fire.lanes[2].max(1) as usize,
+                        };
+                        let group = if fire.group == [0, 0, 0] {
+                            crate::device::ctx::threadgroup(&pipeline, fire.lanes)
+                        } else {
+                            MTLSize {
+                                width: fire.group[0].max(1) as usize,
+                                height: fire.group[1].max(1) as usize,
+                                depth: fire.group[2].max(1) as usize,
+                            }
+                        };
+                        encoder.dispatchThreads_threadsPerThreadgroup(lanes, group);
+                    }
+                    let seconds = own.commit_timed().map_err(refuse)?;
+                    record_kernel(fire.entrypoint, seconds);
+                    return Ok(());
+                }
+            }
             self.with_frame(|frame| {
                 let encoder = frame.encoder();
                 encoder.setComputePipelineState(&pipeline);
@@ -413,19 +490,11 @@ impl Encode for Sink<'_> {
                     *cell.borrow_mut() = Some(self.device.frame().map_err(refuse)?);
                 }
             }
-            // Segment boundary: a streamed load ends its command buffer here,
-            // after the router decided and before the matmuls read. A
-            // full-residency load has no `cuts`.
+            // The gathered class's cut stays at the hasher's own dispatch: its
+            // vector is the table rows to seat, read the instant it is written.
+            // A full-residency load has no `cuts`.
             if let Some(cuts) = &self.cuts {
-                if fire.file == ROUTER_FILE
-                    && ROUTER_POINTS
-                        .iter()
-                        .any(|point| fire.entrypoint.starts_with(point))
-                {
-                    self.cut(fire, cuts)?;
-                } else if fire.file == HASHER_FILE
-                    && fire.entrypoint.starts_with(HASHER_POINT)
-                {
+                if fire.file == HASHER_FILE && fire.entrypoint.starts_with(HASHER_POINT) {
                     self.cut_rows(fire, cuts)?;
                 }
             }

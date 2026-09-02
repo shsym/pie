@@ -78,6 +78,61 @@ pub struct ClassWindow {
 /// shape as [`ClassWindow`], over a mask's classes rather than one.
 pub type MaskSpan = ClassWindow;
 
+/// Cut every span of `spans` longer than `cap` rows into consecutive pieces
+/// of at most `cap` rows, in place and in order. A piece keeps its span's
+/// lane interval: the ops of a capped region are row-local (a routed
+/// mixture's matmuls and their combine), and read no lane-shaped value. `0`
+/// caps nothing.
+/// **EXPERT-MAJOR PASSES** over a routed segment: instead of cutting a run
+/// into row pieces (`chunk_spans`), every span is walked whole `passes`
+/// times, and at each pass's cut the tier seats ONE GROUP of the distinct
+/// experts the run routes to and masks the routing vector to it (`-1`
+/// elsewhere), so each expert is copied once per run rather than once per
+/// piece it appears in. The pass count is what `cap` would have cut the
+/// widest span into, bounded by `max_passes` (the groups the whole expert
+/// set fills). Returns the passes; `1` leaves the spans alone.
+pub fn pass_spans(spans: &mut Vec<MaskSpan>, cap: u32, max_passes: u32) -> u32 {
+    if cap == 0 || max_passes <= 1 {
+        return 1;
+    }
+    let widest = spans.iter().map(|span| span.rows).max().unwrap_or(0);
+    let passes = widest.div_ceil(cap).clamp(1, max_passes);
+    if passes <= 1 {
+        return 1;
+    }
+    let whole = std::mem::take(spans);
+    for span in whole {
+        for _ in 0..passes {
+            spans.push(span);
+        }
+    }
+    passes
+}
+
+pub fn chunk_spans(spans: &mut Vec<MaskSpan>, cap: u32) {
+    if cap == 0 || spans.iter().all(|span| span.rows <= cap) {
+        return;
+    }
+    let whole = std::mem::take(spans);
+    for span in whole {
+        if span.rows <= cap {
+            spans.push(span);
+            continue;
+        }
+        let mut done = 0;
+        while done < span.rows {
+            let take = (span.rows - done).min(cap);
+            spans.push(MaskSpan {
+                row_offset: span.row_offset + done,
+                rows: take,
+                lane_offset: span.lane_offset,
+                lanes: span.lanes,
+            });
+            done += take;
+        }
+    }
+}
+
 /// The window table: one [`ClassWindow`] per class, indexed by class
 /// position. [`walk()`](fn@crate::fire::walk) checks the width first, or a
 /// wrong-width table finds the wrong class.

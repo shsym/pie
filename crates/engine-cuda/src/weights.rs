@@ -289,8 +289,11 @@ fn restore_from_checkpoint(
             continue;
         }
         let id = u32::try_from(param).unwrap_or(u32::MAX);
-        let len = place.bytes.min(place.reserved);
-        let Some(src) = serving.plane_padded(id, len) else {
+        let len = place.bytes;
+        let Some(src) = serving
+            .plane(id)
+            .filter(|src| src.len() as u64 == len && len <= place.reserved)
+        else {
             let plane = serving
                 .name(id)
                 .map_or_else(|| format!("param {param}"), |name| format!("`{name}`"));
@@ -449,7 +452,10 @@ fn arm_refill(tier: &mut crate::experts::Tier) {
         }
     };
     let (send, filled) = std::sync::mpsc::channel();
-    let planes = refill.planes.len();
+    // Logged even though every other line here is a refusal: until the fill
+    // lands, every T1 read is an NVMe page fault over HMM, and a log that
+    // never says the road was taken cannot show it.
+    let objects = refill.landings.len();
     let path = refill.path.clone();
     match std::thread::Builder::new()
         .name("pie-tier-refill".to_string())
@@ -457,7 +463,7 @@ fn arm_refill(tier: &mut crate::experts::Tier) {
     {
         Ok(filling) => {
             eprintln!(
-                "engine-cuda: the tier is DEFERRED — {planes} plane(s) of {bytes} byte(s) \
+                "engine-cuda: the tier is DEFERRED — {objects} object(s) of {bytes} byte(s) \
                  served out of {path:?} where they lie while a background thread builds \
                  the page-locked copy; until it lands, a T1 read is a page fault"
             );
@@ -474,7 +480,7 @@ fn arm_refill(tier: &mut crate::experts::Tier) {
 /// Page-lock runs last since `cudaHostAlloc` holds the memory-manager lock
 /// while it runs. A failure sends nothing; the seat keeps serving what it had.
 fn refill_from(
-    refill: &crate::checkpoint_serving::Refill,
+    refill: &crate::checkpoint_serving::Landings,
     bytes: usize,
     ordinal: i32,
     out: &std::sync::mpsc::Sender<crate::device::Pinned>,
@@ -1045,6 +1051,15 @@ impl Weights {
         self.rotor.is_some()
     }
 
+    /// Whether routed experts are served off the host (T1/T2): such a fire
+    /// stages its routed experts on the eager path, which a body cannot bake.
+    #[must_use]
+    pub fn hosts_experts(&self) -> bool {
+        self.experts
+            .as_ref()
+            .is_some_and(|tier| tier.plan().host_image() > 0)
+    }
+
     /// The routed-expert tier this load opened, or `None` for a load whose
     /// banks are resident.
     #[must_use]
@@ -1228,6 +1243,8 @@ fn packed(
         Dtype::Mxfp4 => place.width,
         // Two codes to a byte; `plane_bytes` rounds the total up.
         Dtype::U4g64 | Dtype::U4g32 | Dtype::U4g64tiled => place.width.div_ceil(2),
+        // Four codes to a byte.
+        Dtype::U2g32 | Dtype::U2g64 | Dtype::U2g128 => place.width.div_ceil(4),
         Dtype::U8g64 => place.width,
         other => model_compiler::arena::elem_bytes(other)
             .and_then(|element| u32::try_from(element).ok())

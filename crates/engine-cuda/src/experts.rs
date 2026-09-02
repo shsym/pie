@@ -202,6 +202,11 @@ pub fn count_promoted(window_ms: u64) {
 /// Can this device dereference an ordinary host mapping (HMM, `cudaDevAttrPageableMemoryAccess`)? This is the mechanism T2 stands on. Read from the current device; `false` without a runtime.
 #[must_use]
 pub fn pageable_access() -> bool {
+    // `PIE_CUDA_DEFERRED_TIER=0` forces the eager page-locked image: a seat
+    // served out of a pageable mapping page-faults on every device read.
+    if std::env::var_os("PIE_CUDA_DEFERRED_TIER").is_some_and(|v| v == "0") {
+        return false;
+    }
     #[cfg(feature = "cuda")]
     {
         use cudarc::runtime::sys as rt;
@@ -1249,8 +1254,10 @@ impl Tier {
                 None => host.device().saturating_add(host_at),
                 Some(artifact) => {
                     let id = u32::try_from(param).unwrap_or(u32::MAX);
-                    // The reserved extent, not the published one — a seat hands out a pointer treated as `reserved` bytes wide.
-                    let Some(bytes) = artifact.plane_padded(id, reserved) else {
+                    // A seat hands out a pointer treated as `reserved` bytes
+                    // wide, so the mapping must run that far past the plane;
+                    // it may, because no kernel reads past `bytes`.
+                    let Some(bytes) = artifact.plane_reserved(id, reserved) else {
                         let plane = artifact
                             .name(id)
                             .map_or_else(|| format!("param {param}"), |name| format!("`{name}`"));

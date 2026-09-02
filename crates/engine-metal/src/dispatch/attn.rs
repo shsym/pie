@@ -623,8 +623,11 @@ impl Run<'_> {
                 let Some(hash) = self.ple_hash(mults, primes, offsets) else {
                     return Err(kernels_metal::Error::Unsupported { op: op.name() });
                 };
+                // The ids run extended; the hashed rows land in the op's own
+                // rectangle — the gathered-table cut reads them the instant
+                // this dispatch is enqueued (`Sink::fire`'s hasher point), so
+                // nothing may stand between the kernel and the arena.
                 let ext_ids = self.rs_extend(OP, &seat, *ids)?;
-                let ext_out = self.rs_out(OP, &seat, *ngram_ids)?;
                 attn::ple::ngram_ids_committed(
                     self.ctx(),
                     ext_ids,
@@ -637,9 +640,8 @@ impl Run<'_> {
                     primes,
                     offsets,
                     *heads_per_ngram,
-                    ext_out,
-                )?;
-                self.rs_land(OP, &seat, ext_out, *ngram_ids)
+                    self.tensor(*ngram_ids),
+                )
             }
             Attention::SsmCausalConv1d {
                 x,
@@ -892,6 +894,60 @@ impl Run<'_> {
                 heads,
                 head_dim,
                 norm_eps,
+                gate_floor,
+                y,
+            }
+            | Attention::SsmKdaChunked {
+                mixed,
+                f,
+                b,
+                dt_bias,
+                a_log,
+                state,
+                heads,
+                head_dim,
+                norm_eps,
+                gate_floor,
+                y,
+            } if self.rs_seat().is_some() => {
+                const OP: &str = "attention.ssm_kda_committed";
+                let seat = self.rs_seat().expect("guarded");
+                // The conv's EXTENDED output, landed by its arm above in this
+                // window; the two projections extended off the buffer here.
+                let ext_mixed = self.rs_ext_of(OP, &seat, *mixed)?;
+                let ext_f = self.rs_extend(OP, &seat, *f)?;
+                let ext_b = self.rs_extend(OP, &seat, *b)?;
+                let ext_y = self.rs_out(OP, &seat, *y)?;
+                attn::ssm::kda_committed(
+                    self.ctx(),
+                    ext_mixed,
+                    self.qo_indptr(),
+                    &self.rs_committed(&seat),
+                    ext_f,
+                    ext_b,
+                    self.tensor(*dt_bias),
+                    self.tensor(*a_log),
+                    &self.recurrent(*state),
+                    seat.work,
+                    *heads,
+                    *head_dim,
+                    *norm_eps,
+                    *gate_floor,
+                    ext_y,
+                )?;
+                self.rs_land(OP, &seat, ext_y, *y)
+            }
+            Attention::SsmKdaStep {
+                mixed,
+                f,
+                b,
+                dt_bias,
+                a_log,
+                state,
+                heads,
+                head_dim,
+                norm_eps,
+                gate_floor,
                 y,
             } => attn::ssm::kda_step(
                 self.ctx(),
@@ -904,6 +960,7 @@ impl Run<'_> {
                 *heads,
                 *head_dim,
                 *norm_eps,
+                *gate_floor,
                 self.tensor(*y),
             ),
             Attention::SsmKdaChunked {
@@ -916,6 +973,7 @@ impl Run<'_> {
                 heads,
                 head_dim,
                 norm_eps,
+                gate_floor,
                 y,
             } => attn::ssm::kda_chunked(
                 self.ctx(),
@@ -928,6 +986,7 @@ impl Run<'_> {
                 *heads,
                 *head_dim,
                 *norm_eps,
+                *gate_floor,
                 self.tensor(*y),
             ),
 
