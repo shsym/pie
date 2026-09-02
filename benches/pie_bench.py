@@ -310,15 +310,24 @@ def build_config(args: argparse.Namespace):
         if getattr(args, "total_pages", 0):
             engine_options["total_pages"] = args.total_pages
         # `--max-model-len` is the cross-engine context knob (llama.cpp takes
-        # it as `--ctx-size`, vLLM as `max_model_len`), and on every other
-        # engine it means ONE REQUEST's context. The Metal engine's knob is
-        # the whole fleet's ring -- it is one shared linear ring, not a
-        # per-request allocation -- so the fair translation multiplies by the
-        # fleet the client will actually offer. Sending the per-request number
-        # straight through would hand a 16-way run 128 tokens per request and
-        # measure a starved engine against unstarved ones.
-        fleet = max(1, args.concurrency) if args.mode != "latency" else 1
-        engine_options["max_model_len"] = args.max_model_len * fleet
+        # it as `--ctx-size`, vLLM as `max_model_len`), ONE REQUEST's context
+        # on every engine — the Metal engine included: its fleet is derived
+        # as `total_pages * page_size / max_model_len` lanes, so a value
+        # multiplied by the fleet (which this once did) hands an 8-way run
+        # one lane. Size `--total-pages` to `fleet * max_model_len / 16`.
+        engine_options["max_model_len"] = args.max_model_len
+        # A recurrent model's state pool is sized by `max_state_slots` (default
+        # 256 seats: ~30 GiB of delta state for a qwen3.8-class trunk); one seat
+        # per lane is what a bench needs.
+        engine_options["max_state_slots"] = max(1, args.max_forward_requests)
+        for raw in getattr(args, "engine_option", []) or []:
+            key, sep, value = raw.partition("=")
+            if not sep:
+                raise SystemExit(f"--engine-option wants KEY=VALUE, got {raw!r}")
+            try:
+                engine_options[key] = int(value)
+            except ValueError:
+                engine_options[key] = value
     elif args.engine == "vllm":
         engine_options = {
             "gpu_memory_utilization": args.gpu_mem_util,
