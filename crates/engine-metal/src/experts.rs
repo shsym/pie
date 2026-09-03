@@ -1209,6 +1209,18 @@ impl Tier {
                     order.push(expert);
                 }
             }
+            // The experts already in a seat lead — what the last fire left
+            // in this slab — so pass 0 copies as little as it can. (Reading
+            // the next slab's PREDICTED first group ahead on a layer's last
+            // pass was tried here and evicted more of that than it seated:
+            // copies 40.5k → 47.4k on a 182-row GLM prefill.) Groups are a
+            // partition the tail sums slot by slot, so their order moves
+            // no bits.
+            let seat_of = &self.slabs[at].seat_of;
+            let (mut leading, trailing): (Vec<u32>, Vec<u32>) =
+                order.into_iter().partition(|&e| seat_of[e as usize].is_some());
+            leading.extend(trailing);
+            let order = leading;
             let seats = pass_group(self.slabs[at].slots) as usize;
             let groups = order.chunks(seats).map(<[u32]>::to_vec).collect();
             self.passing[at] = Some(Passing {
