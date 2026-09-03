@@ -384,6 +384,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mtp-speculative-bench"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "mtp-speculative-decoding"
 version = "0.1.0"
 dependencies = [
@@ -459,6 +467,14 @@ dependencies = [
 
 [[package]]
 name = "repetition-penalty"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "rs-mtp-speculative-bench"
 version = "0.1.0"
 dependencies = [
  "inferlet",
