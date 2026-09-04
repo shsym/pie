@@ -1013,6 +1013,17 @@ impl Model {
         let dflash = d.draft.filter(|r| matches!(r, Recipe::DFlash)).map(|recipe| {
             let p = recipe.prefix();
             let n = |s: &str| format!("{p}.{s}");
+            // **THE DRAFTER IS QUANTIZED LIKE THE TRUNK, AND IT COSTS
+            // NOTHING TO BE.** The shipped head is bf16 and only 1.75 G
+            // parameters against the trunk's 27, so carrying it unquantized is
+            // affordable — the obvious place to look for acceptance. It was
+            // tried, on this text with the projections at `dense`: the
+            // artifact went 15.0 -> 17.3 GiB, a draft fire went 17.8 -> 27.8
+            // ms, and the accepted prefix DID NOT MOVE — 13.500 / 10.000 /
+            // 4.375 of fifteen on counting / code / recall against 13.500 /
+            // 10.125 / 5.250 at four bits, the one differing round being noise
+            // over eight. What a block drafter accepts is a property of the
+            // HEAD, not of the precision it is carried at.
             let (dq, dkv, dhd) = (DFLASH_Q_HEADS / tp, DFLASH_KV_HEADS / tp, DFLASH_HEAD_DIM);
             let hd = dhd as u64;
             let inter = DFLASH_INTER / tp;
@@ -1102,10 +1113,12 @@ const DFLASH_HEAD_DIM: u32 = 128;
 const DFLASH_INTER: u32 = 17_408;
 const DFLASH_THETA: f32 = 10_000_000.0;
 const DFLASH_WINDOW: u32 = 2_048;
-const DFLASH_BLOCK: u32 = 16;
+pub const DFLASH_BLOCK: u32 = 16;
 /// `dflash_config.mask_token_id` — the id every block row but the first
-/// carries into the draft pass.
-const DFLASH_MASK_TOKEN: u32 = 248_070;
+/// carries into the draft pass. Public with [`DFLASH_BLOCK`] because a guest
+/// seeding a draft block needs both; they belong on the load's own
+/// advertisement (beside `mtp_depth`) once there is a guest asking.
+pub const DFLASH_MASK_TOKEN: u32 = 248_070;
 
 /// Adapter ceiling for every SKU of this family. Not a checkpoint fact (no
 /// pretrained artifact states it) — a deployment setting baked in at trace

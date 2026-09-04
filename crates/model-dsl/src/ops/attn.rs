@@ -134,6 +134,8 @@ pub fn masked(
     pages: ValueId,
     window: Option<u32>,
     head_dim: u32,
+    kv_heads: u32,
+    causal: bool,
     sm_scale: f32,
 ) -> Value {
     let r = q.rec();
@@ -146,6 +148,8 @@ pub fn masked(
             cache: pages,
             window,
             head_dim,
+            kv_heads,
+            causal,
             sm_scale,
             o: o.id(),
         },

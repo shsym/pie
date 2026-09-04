@@ -209,6 +209,11 @@ impl Run<'_> {
                 self.tensor(*o),
             ),
             Attention::Masked {
+                // The head split is the store's to read off this op
+                // (`store::kv::probe`); the dispatch takes its geometry from
+                // the pool the store already shaped.
+                kv_heads: _,
+                causal,
                 q,
                 plan,
                 mask,
@@ -228,6 +233,7 @@ impl Run<'_> {
                 self.cut_rows(self.tensor(*mask)),
                 self.pool(*cache),
                 *window,
+                *causal,
                 *head_dim,
                 *sm_scale,
                 self.tensor(*o),

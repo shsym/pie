@@ -204,7 +204,14 @@ impl ForwardHybrid for Model {
 
         // The trunk hidden states the drafter was trained against, kept in
         // tap order as the loop passes them.
-        let mut taps: Vec<Value> = Vec::new();
+        // **THE TAPS ARE FUSED WHERE THEY ARE TAKEN, NOT COLLECTED.** A residual
+    // add ALIASES its output onto the stream it folds into
+    // (`Elementwise::aliases`), so the trunk's hidden state is ONE buffer and
+    // a handle held across a later layer reads that layer's value, not the
+    // tapped one. The fusion's `[hidden, taps·hidden]` bank is its column
+    // slices summed, and a slice's matmul allocates — so taking the tap's
+    // product here is both the fusion and the snapshot, at no extra cost.
+    let mut fused: Option<Value> = None;
         let routes = inputs.adapter_routes();
         for (l, w) in inputs.walk_layers(&m.layers) {
             let x = ops::elemwise::rmsnorm_plus_one(&y, &w.mixer_norm, w.mixer_norm_eps);
@@ -289,8 +296,17 @@ impl ForwardHybrid for Model {
                 f
             };
             y = ops::elemwise::residual_add(&f, &y);
-            if m.dflash.as_ref().is_some_and(|d| d.taps.contains(&l)) {
-                taps.push(y.clone());
+            if let Some(at) = m
+                .dflash
+                .as_ref()
+                .and_then(|d| d.taps.iter().position(|t| *t == l))
+            {
+                let d = m.dflash.as_ref().expect("a tap index came from it");
+                let part = ops::linear::matmul(&y, &d.fc[at]);
+                fused = Some(match fused {
+                    Some(sum) => ops::elemwise::residual_add(&part, &sum),
+                    None => part,
+                });
             }
         }
 
@@ -305,7 +321,8 @@ impl ForwardHybrid for Model {
         // is what sharing the head means. Merge order is the split's.
         let x = match (&m.dflash, h_block) {
             (Some(d), Some(block)) => {
-                let hb = dflash_arm(d, &inputs, &taps, &block, &mask);
+                let fused = fused.as_ref().expect("a block drafter tapped the trunk");
+                let hb = dflash_arm(d, &inputs, fused, &block, &mask);
                 Value::merge(vec![hb, x])
             }
             _ => x,
@@ -437,37 +454,34 @@ impl ForwardHybrid for Model {
 /// the drafter's kv rows over the TRUNK's own rows, and the draft pass reads
 /// it back out of the cache in a later fire.
 ///
-/// `taps` are the trunk's hidden states at the layers the drafter was
-/// trained against, in tap order. Returns the block rows' final hidden for
+/// `fused` is the trunk's tapped hidden states already summed through their
+/// slices of the fusion bank — taken at the tap sites, because the residual
+/// stream is one aliased buffer. Returns the block rows' final hidden for
 /// the caller to merge before the shared readout.
+
 fn dflash_arm(
     d: &DFlash,
     inputs: &Input<Facts>,
-    taps: &[Value],
+    fused: &Value,
     h_block: &Value,
     mask: &Value,
 ) -> Value {
     // ── THE CONTEXT, WHICH IS THE CACHE ──────────────────────────────────
-    // Guarded on `drafts`, not on `block_draft`: it is the SPECULATING
-    // lane's own rows that become the drafter's context, and those are the
-    // trunk's rows. The IR has no concat, so the `[hidden, taps·hidden]`
-    // fusion is its column slices summed — the trick the chained heads use
-    // on their two-wide bank.
-    let fused = taps
-        .iter()
-        .zip(&d.fc)
-        .map(|(tap, bank)| {
-            let (dt, _) = tap.split(&Facts::drafts());
-            ops::linear::matmul(&dt, bank)
-        })
-        .reduce(|a, b| ops::elemwise::residual_add(&a, &b))
-        .expect("a block drafter fuses at least one tap");
-    let h_ctx = ops::elemwise::rmsnorm_plus_one(&fused, &d.hidden_norm, d.hidden_norm_eps);
-    // Split off the trunk's arm first and the drafting lanes' out of that,
-    // so these positions are spelled the way the keys beside them are — the
-    // taps they came from are already inside the trunk's arm.
-    let (_, trunk_positions) = inputs.positions().split(&Facts::block_draft());
-    let (ctx_positions, _) = trunk_positions.split(&Facts::drafts());
+    // **ON EVERY TRUNK FIRE, NOT ONLY A DRAFTING ONE.** The taps carry the
+    // trunk's own arm and that is the whole guard this wants: a fire whose
+    // rows the trunk ran must leave the drafter's context behind, or the
+    // drafter attends over a sequence with holes in it the next time it
+    // drafts. (The chained heads guard their work on `Facts::drafts`, but
+    // that fact is INFERRED from a program reading the draft seam, and a
+    // block drafter plants that seam on its block rows alone — so a verify
+    // fire could never set it, and the context would never be written.)
+    // It costs a five-way fusion and ten projections a fire, under a percent
+    // of a decode.
+    //
+    let h_ctx = ops::elemwise::rmsnorm_plus_one(fused, &d.hidden_norm, d.hidden_norm_eps);
+    // Spelled the way the keys beside them are: the taps these positions go
+    // with are already inside the trunk's arm.
+    let (_, ctx_positions) = inputs.positions().split(&Facts::block_draft());
     for b in &d.blocks {
         let a = &b.attn;
         let hd = a.head_dim;
@@ -526,7 +540,23 @@ fn dflash_arm(
                 a.kv_heads,
                 a.sm_scale,
             ),
-            None => ops::attn::masked(&q, &plan, mask, inputs.kv(&a.kv), None, hd, a.sm_scale),
+            // **NOT CAUSAL.** The drafter's last layer is full attention:
+            // the reference skips `create_causal_mask` outright when
+            // `is_causal` is false, so a mask row sees the whole block, its
+            // own future included. Stated here because a mask alone cannot
+            // say it — pie's masked read is causal AND mask unless the op
+            // says otherwise.
+            None => ops::attn::masked(
+                &q,
+                &plan,
+                mask,
+                inputs.kv(&a.kv),
+                None,
+                hd,
+                a.kv_heads,
+                false,
+                a.sm_scale,
+            ),
         };
         h = ops::elemwise::residual_add(&ops::linear::matmul(&o, &a.o_proj), &h);
 
@@ -684,7 +714,7 @@ fn attn_mixer(
     let (so, lse) = ops::attn::prefill_lse(&sq, plan_s, pages, None, d, m.kv_heads, a.sm_scale);
     seam::at(seam::SCORES, &[&lse]);
     let o = Value::merge(vec![
-        ops::attn::masked(&mq, plan_m, mask, pages, None, d, a.sm_scale),
+        ops::attn::masked(&mq, plan_m, mask, pages, None, d, m.kv_heads, true, a.sm_scale),
         so,
         ops::attn::decode(&dq, plan_d, pages, None, d, a.sm_scale),
         ops::attn::prefill(&p, plan_p, pages, None, d, m.kv_heads, a.sm_scale),
