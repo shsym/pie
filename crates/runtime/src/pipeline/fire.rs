@@ -909,6 +909,7 @@ fn stamp_lane_words(
             lane.drafts,
             lane.captures_scores,
             carries_media,
+            lane.block_draft,
         );
     }
 }
@@ -1292,6 +1293,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if p_reads_mtp_logits {
             for lane in &mut req.lanes {
                 lane.drafts = true;
+            }
+        }
+        // A pass the guest marked `set-drafting-block` carries a block
+        // drafter's proposal rows, which a plan guards its trunk against.
+        // Stated, not inferred: what makes a fire a draft is the anchor the
+        // guest chose from the accepted prefix, and no intrinsic shows it.
+        if ctx.resources().get(&fwd)?.block_draft {
+            for lane in &mut req.lanes {
+                lane.block_draft = true;
             }
         }
         // A class, not a bool: `fire_device_geometry` stamps the third class

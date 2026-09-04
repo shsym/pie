@@ -3,7 +3,7 @@ use model_dsl::{
     Request, Value, Weight, ops, seam,
 };
 
-use super::model::{Attn, Gdn, Head, Mixer, Mlp, Model, Tower};
+use super::model::{Attn, DFlash, DRAFT_DEPTH, Gdn, Head, Mixer, Mlp, Model, Tower};
 
 /// The trunk's mrope section split; both qwen SKUs share `[11, 11, 10]`,
 /// summing to half `rotary_dim`.
@@ -16,6 +16,8 @@ pub struct Facts {
     pub captures_scores: bool,
     pub masked: bool,
     pub media: bool,
+    /// The rows are a block drafter's proposal — see [`Facts::block_draft`].
+    pub block_draft: bool,
 }
 
 impl Facts {
@@ -62,6 +64,15 @@ impl Facts {
     pub fn media() -> Predicate {
         Predicate::fact(5)
     }
+
+    /// Lanes whose rows are a block drafter's proposal rather than the
+    /// sequence's own — `[anchor, MASK x block-1]`, which the trunk must not
+    /// run over. Declared ahead of the arm that reads it, so the fact a lane
+    /// carries and the plan that guards on it land in one place.
+    #[must_use]
+    pub fn block_draft() -> Predicate {
+        Predicate::fact(6)
+    }
 }
 
 impl Classify for Facts {
@@ -73,6 +84,7 @@ impl Classify for Facts {
             captures_scores: r.captures_scores(),
             masked: r.has_custom_mask(),
             media: r.has_media(),
+            block_draft: r.drafts_a_block(),
         }
     }
 
@@ -83,6 +95,7 @@ impl Classify for Facts {
             | (u64::from(self.captures_scores) << 3)
             | (u64::from(self.masked) << 4)
             | (u64::from(self.media) << 5)
+            | (u64::from(self.block_draft) << 6)
     }
 }
 
@@ -116,6 +129,17 @@ impl ForwardHybrid for Model {
             let a = &mtp.attn;
             c.kv(kv, a.kv.clone(), [plane, plane]);
         }
+        // The block drafter brings five layers, so five rows — in the same
+        // page-id space for the same reason, and at the same plane width,
+        // which its own geometry happens to land on (8 kv heads x 128
+        // against the trunk's 4 x 256; see `DFlash`).
+        if let Some(dflash) = &self.dflash {
+            for b in &dflash.blocks {
+                let a = &b.attn;
+                let dplane = a.kv_heads as u64 * a.head_dim as u64;
+                c.kv(kv, a.kv.clone(), [dplane, dplane]);
+            }
+        }
         c
     }
 
@@ -131,7 +155,16 @@ impl ForwardHybrid for Model {
             Facts::qo_one(),
             Predicate::rest(),
         ];
-        let [input_m, input_s, input_d, input_p] = inputs.split(classes);
+        // A plan is CONSUMED inside the trunk's own arm, so it must be built
+        // there too: `compatible` lets `Always` meet anything, but two
+        // stated guards must be equal, and a plan spelled `captures` cannot
+        // meet a query spelled `block-draft AND captures`. Splitting the
+        // drafter's rows off first makes both sides say the same thing.
+        let (_, trunk_inputs) = match &m.dflash {
+            Some(_) => inputs.split(&Facts::block_draft()),
+            None => (inputs.clone(), inputs.clone()),
+        };
+        let [input_m, input_s, input_d, input_p] = trunk_inputs.split(classes);
         let plan_m = ops::attn::plan_prefill(&input_m, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_d = ops::attn::plan_decode(&input_d, m.q_heads, m.kv_heads, m.head_dim, None);
         let plan_p = ops::attn::plan_prefill(&input_p, m.q_heads, m.kv_heads, m.head_dim, None);
@@ -153,8 +186,27 @@ impl ForwardHybrid for Model {
             y = ops::layout::scatter_live_rows(t, &inputs.patch_routes(), &imaged).everywhere();
         }
 
+        // **THE BLOCK DRAFTER'S ROWS LEAVE HERE.** They carry
+        // `[anchor, MASK x block-1]`, which is not this sequence — the 64
+        // layers below must not run over them. Every trunk node downstream
+        // is guarded by this split, so a fire of nothing but draft rows
+        // leaves each of their classes empty, and an empty class is not
+        // walked at all (`engine_metal::window`): a draft fire pays for no
+        // trunk layer. `h_block` is already the drafter's input, since the
+        // drafter shares the target's embedding.
+        let (h_block, mut y) = match &m.dflash {
+            Some(_) => {
+                let (block, rest) = y.split(&Facts::block_draft());
+                (Some(block), rest)
+            }
+            None => (None, y),
+        };
+
+        // The trunk hidden states the drafter was trained against, kept in
+        // tap order as the loop passes them.
+        let mut taps: Vec<Value> = Vec::new();
         let routes = inputs.adapter_routes();
-        for (_, w) in inputs.walk_layers(&m.layers) {
+        for (l, w) in inputs.walk_layers(&m.layers) {
             let x = ops::elemwise::rmsnorm_plus_one(&y, &w.mixer_norm, w.mixer_norm_eps);
             let o = match &w.mixer {
                 Mixer::Attn(a) => {
@@ -237,6 +289,9 @@ impl ForwardHybrid for Model {
                 f
             };
             y = ops::elemwise::residual_add(&f, &y);
+            if m.dflash.as_ref().is_some_and(|d| d.taps.contains(&l)) {
+                taps.push(y.clone());
+            }
         }
 
         let x = ops::elemwise::rmsnorm_plus_one(&y, &m.final_norm, m.final_norm_eps);
@@ -245,7 +300,26 @@ impl ForwardHybrid for Model {
             Head::Bank(bank) => bank,
         };
 
+        // The drafter reads out through the TARGET's head, so its rows join
+        // the trunk's before the one `lm_head` rather than after it — which
+        // is what sharing the head means. Merge order is the split's.
+        let x = match (&m.dflash, h_block) {
+            (Some(d), Some(block)) => {
+                let hb = dflash_arm(d, &inputs, &taps, &block, &mask);
+                Value::merge(vec![hb, x])
+            }
+            _ => x,
+        };
+
         let logits = ops::linear::lm_head(&x, head);
+
+        // The block's proposals: one draft a block row, the same
+        // `[rows, depth]` seam shape the chained heads plant at depth one.
+        if m.dflash.is_some() {
+            let (dlogits, _) = logits.split(&Facts::block_draft());
+            seam::at(seam::MTP, &[&dlogits]);
+            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&[&dlogits])]);
+        }
 
         // Stated after the trunk's readout, so a draft column doesn't share
         // address space with the trunk's `lm_head` output.
@@ -263,70 +337,85 @@ impl ForwardHybrid for Model {
             // and qwen4 arms read it). Row r's own id pairs it one position
             // early and the head drafts nothing the trunk accepts.
             let (dlogits, _) = logits.split(&Facts::drafts());
-            let chosen = ops::layout::argmax(&[&dlogits]);
+            let mut chosen = ops::layout::argmax(&[&dlogits]);
+            let mut hidden = dx;
+            // The chain: `DRAFT_DEPTH` passes of the one shipped block, each
+            // fed the previous pass's argmax and residual — the shape the
+            // qwen4 head runs. The checkpoint trains one step; every step
+            // past it is the head run past its training, and pays only if
+            // its acceptance clears the round's extra row (model.rs).
+            let mut chain: Vec<Value> = Vec::with_capacity(DRAFT_DEPTH as usize);
+            for step in 0..DRAFT_DEPTH {
+                // `[a|b]*[We|Wh]^T = a*We^T + b*Wh^T`, as two matmuls and one
+                // add since the IR has no concatenation. The pre-norms are the
+                // recipe's: MTP normalizes each stream first, EAGLE fuses the
+                // raw pair (`None` here is a recipe with no norm, not a skip).
+                let e = ops::layout::embed(&chosen, &m.embed, m.vocab);
+                let (e, h) = match &mtp.pre_fc {
+                    Some(pre) => (
+                        ops::elemwise::rmsnorm_plus_one(&e, &pre.embedding, pre.eps),
+                        ops::elemwise::rmsnorm_plus_one(&hidden, &pre.hidden, pre.eps),
+                    ),
+                    None => (e, hidden.clone()),
+                };
+                let mut dy = ops::elemwise::residual_add(
+                    &ops::linear::matmul(&e, &mtp.fc_embed),
+                    &ops::linear::matmul(&h, &mtp.fc_hidden),
+                );
 
-            // `[a|b]*[We|Wh]^T = a*We^T + b*Wh^T`, as two matmuls and one add
-            // since the IR has no concatenation. The pre-norms are the
-            // recipe's: MTP normalizes each stream first, EAGLE fuses the
-            // raw pair (`None` here is a recipe with no norm, not a skip).
-            let e = ops::layout::embed(&chosen, &m.embed, m.vocab);
-            let (e, h) = match &mtp.pre_fc {
-                Some(pre) => (
-                    ops::elemwise::rmsnorm_plus_one(&e, &pre.embedding, pre.eps),
-                    ops::elemwise::rmsnorm_plus_one(&dx, &pre.hidden, pre.eps),
-                ),
-                None => (e, dx.clone()),
-            };
-            let mut dy = ops::elemwise::residual_add(
-                &ops::linear::matmul(&e, &mtp.fc_embed),
-                &ops::linear::matmul(&h, &mtp.fc_hidden),
-            );
+                // One attention arm, not a decode/prefill split: the head only
+                // ever runs small speculative forwards, where a batched-prefill
+                // read is the same numbers as a decode read. A chained step
+                // reads the kv the first step appended and appends nothing.
+                let a = &mtp.attn;
+                let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mixer_norm, mtp.mixer_norm_eps);
+                let o = mtp_attn(&nx, &inputs, m, &plan_mtp, a, step > 0);
+                let o = if m.tp > 1 {
+                    ops::collective::all_reduce(&o)
+                } else {
+                    o
+                };
+                dy = ops::elemwise::residual_add(&o, &dy);
 
-            // One attention arm, not a decode/prefill split: the head only
-            // ever runs small speculative forwards, where a batched-prefill
-            // read is the same numbers as a decode read.
-            let a = &mtp.attn;
-            let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mixer_norm, mtp.mixer_norm_eps);
-            let o = mtp_attn(&nx, &inputs, m, &plan_mtp, a);
-            let o = if m.tp > 1 {
-                ops::collective::all_reduce(&o)
-            } else {
-                o
-            };
-            dy = ops::elemwise::residual_add(&o, &dy);
+                let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mlp_norm, mtp.mlp_norm_eps);
+                let Mlp::Dense {
+                    gate_up,
+                    down,
+                    inter,
+                } = &mtp.mlp
+                else {
+                    panic!("a draft head is one block and routes to no experts");
+                };
+                let f = ops::linear::matmul(
+                    &ops::linear::mlp_swiglu(&ops::linear::matmul(&nx, gate_up), *inter),
+                    down,
+                );
+                let f = if m.tp > 1 {
+                    ops::collective::all_reduce(&f)
+                } else {
+                    f
+                };
+                dy = ops::elemwise::residual_add(&f, &dy);
 
-            let nx = ops::elemwise::rmsnorm_plus_one(&dy, &mtp.mlp_norm, mtp.mlp_norm_eps);
-            let Mlp::Dense {
-                gate_up,
-                down,
-                inter,
-            } = &mtp.mlp
-            else {
-                panic!("a draft head is one block and routes to no experts");
-            };
-            let f = ops::linear::matmul(
-                &ops::linear::mlp_swiglu(&ops::linear::matmul(&nx, gate_up), *inter),
-                down,
-            );
-            let f = if m.tp > 1 {
-                ops::collective::all_reduce(&f)
-            } else {
-                f
-            };
-            dy = ops::elemwise::residual_add(&f, &dy);
-
-            // Readout through the base head (no dedicated mtp.lm_head), past
-            // this recipe's own final norm when it has one; EAGLE has none.
-            let read = match &mtp.norm {
-                Some(norm) => ops::elemwise::rmsnorm_plus_one(&dy, norm, mtp.norm_eps),
-                None => dy,
-            };
-            let draft = ops::linear::lm_head(&read, head);
-            seam::at(seam::MTP, &[&draft]);
+                // Readout through the base head (no dedicated mtp.lm_head), past
+                // this recipe's own final norm when it has one; EAGLE has none.
+                let read = match &mtp.norm {
+                    Some(norm) => ops::elemwise::rmsnorm_plus_one(&dy, norm, mtp.norm_eps),
+                    None => dy.clone(),
+                };
+                let draft = ops::linear::lm_head(&read, head);
+                if step == 0 {
+                    seam::at(seam::MTP, &[&draft]);
+                }
+                chosen = ops::layout::argmax(&[&draft]);
+                hidden = dy;
+                chain.push(draft);
+            }
             // The token plane the device-resident loop reads
-            // (`intrinsics::mtp_drafts`): depth one, the head's argmax at
-            // every drafting row — what `mtp_depth` advertises.
-            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&[&draft])]);
+            // (`intrinsics::mtp_drafts`): every step's argmax side by side,
+            // `[rows, DRAFT_DEPTH]` — what `mtp_depth` advertises.
+            let steps: Vec<&Value> = chain.iter().collect();
+            seam::at(seam::MTP_DRAFTS, &[&ops::layout::argmax(&steps)]);
         }
 
         logits
@@ -336,6 +425,129 @@ impl ForwardHybrid for Model {
 /// Picks the rotation by whether the model has a tower, not by a per-lane
 /// fact bit: a text-only model keeps the scalar `rope_partial`; a tower model
 /// always uses mrope, since an image-free row's position is just `(p, p, p)`.
+/// **THE BLOCK DRAFTER'S TWO ARMS** — the context it caches, and the block
+/// it proposes.
+///
+/// The reference (`z-lab/dflash`'s `model_mlx.py`) runs
+/// `h = layer(h, h_ctx, rope, cache)` over five layers, where `h_ctx` is
+/// **passed to every layer and updated by none**, and all a layer does with
+/// it is `cache.update_and_fetch(k_proj(h_ctx), v_proj(h_ctx))`. A fixed row
+/// set that contributes keys and values at every layer, cached, IS a kv row
+/// — so there is no second stream to carry here. The context is written into
+/// the drafter's kv rows over the TRUNK's own rows, and the draft pass reads
+/// it back out of the cache in a later fire.
+///
+/// `taps` are the trunk's hidden states at the layers the drafter was
+/// trained against, in tap order. Returns the block rows' final hidden for
+/// the caller to merge before the shared readout.
+fn dflash_arm(
+    d: &DFlash,
+    inputs: &Input<Facts>,
+    taps: &[Value],
+    h_block: &Value,
+    mask: &Value,
+) -> Value {
+    // ── THE CONTEXT, WHICH IS THE CACHE ──────────────────────────────────
+    // Guarded on `drafts`, not on `block_draft`: it is the SPECULATING
+    // lane's own rows that become the drafter's context, and those are the
+    // trunk's rows. The IR has no concat, so the `[hidden, taps·hidden]`
+    // fusion is its column slices summed — the trick the chained heads use
+    // on their two-wide bank.
+    let fused = taps
+        .iter()
+        .zip(&d.fc)
+        .map(|(tap, bank)| {
+            let (dt, _) = tap.split(&Facts::drafts());
+            ops::linear::matmul(&dt, bank)
+        })
+        .reduce(|a, b| ops::elemwise::residual_add(&a, &b))
+        .expect("a block drafter fuses at least one tap");
+    let h_ctx = ops::elemwise::rmsnorm_plus_one(&fused, &d.hidden_norm, d.hidden_norm_eps);
+    // Split off the trunk's arm first and the drafting lanes' out of that,
+    // so these positions are spelled the way the keys beside them are — the
+    // taps they came from are already inside the trunk's arm.
+    let (_, trunk_positions) = inputs.positions().split(&Facts::block_draft());
+    let (ctx_positions, _) = trunk_positions.split(&Facts::drafts());
+    for b in &d.blocks {
+        let a = &b.attn;
+        let hd = a.head_dim;
+        let k = ops::linear::matmul(&h_ctx, &a.k_proj);
+        let v = ops::linear::matmul(&h_ctx, &a.v_proj);
+        let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, hd, a.k_norm_eps);
+        // One tensor, not a q/k pair: there is no query here, only the
+        // context's keys on their way into the row.
+        let k = ops::elemwise::rope_partial_q(&k, &ctx_positions, a.rotary_dim, hd, a.theta);
+        ops::attn::kv_append(
+            &k,
+            &v,
+            inputs.kv(&a.kv),
+            &inputs.write_page(&a.kv),
+            &inputs.write_offset(&a.kv),
+        );
+    }
+
+    // ── THE BLOCK ────────────────────────────────────────────────────────
+    let (input_block, _) = inputs.split(&Facts::block_draft());
+    let (block_positions, _) = inputs.positions().split(&Facts::block_draft());
+    let mut h = h_block.clone();
+    for b in &d.blocks {
+        let a = &b.attn;
+        let hd = a.head_dim;
+        let plan = ops::attn::plan_prefill(&input_block, a.q_heads, a.kv_heads, hd, None);
+        let x = ops::elemwise::rmsnorm_plus_one(&h, &b.mixer_norm, b.mixer_norm_eps);
+        let q = ops::linear::matmul(&x, &a.q_proj);
+        let k = ops::linear::matmul(&x, &a.k_proj);
+        let v = ops::linear::matmul(&x, &a.v_proj);
+        let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, hd, a.q_norm_eps);
+        let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, hd, a.k_norm_eps);
+        let (q, k) =
+            ops::elemwise::rope_partial(&q, &k, &block_positions, a.rotary_dim, hd, a.theta);
+        // The block's own kv joins the row the context is already in, and
+        // the guest rolls it back with `kv_len` next round — the transient
+        // half of `keys = concat(cache.fetch(ctx), prop)`.
+        ops::attn::kv_append(
+            &k,
+            &v,
+            inputs.kv(&a.kv),
+            &inputs.write_page(&a.kv),
+            &inputs.write_offset(&a.kv),
+        );
+        // A sliding layer is causal within the block and windowed over the
+        // context, which is what a windowed prefill IS. The last layer is
+        // full attention and BIDIRECTIONAL over the block — only a stated
+        // mask says that, and it is the guest's (`inputs.mask()`).
+        let o = match b.window {
+            Some(w) => ops::attn::prefill(
+                &q,
+                &plan,
+                inputs.kv(&a.kv),
+                Some(w),
+                hd,
+                a.kv_heads,
+                a.sm_scale,
+            ),
+            None => ops::attn::masked(&q, &plan, mask, inputs.kv(&a.kv), None, hd, a.sm_scale),
+        };
+        h = ops::elemwise::residual_add(&ops::linear::matmul(&o, &a.o_proj), &h);
+
+        let x = ops::elemwise::rmsnorm_plus_one(&h, &b.mlp_norm, b.mlp_norm_eps);
+        let Mlp::Dense {
+            gate_up,
+            down,
+            inter,
+        } = &b.mlp
+        else {
+            panic!("a draft block routes to no experts");
+        };
+        let f = ops::linear::matmul(
+            &ops::linear::mlp_swiglu(&ops::linear::matmul(&x, gate_up), *inter),
+            down,
+        );
+        h = ops::elemwise::residual_add(&f, &h);
+    }
+    ops::elemwise::rmsnorm_plus_one(&h, &d.norm, d.norm_eps)
+}
+
 fn rotate(
     q: &Value,
     k: &Value,
@@ -484,7 +696,9 @@ fn attn_mixer(
 /// The draft head's attention: the family's gated full-attention site, over
 /// the head's own kv row (in the trunk's page-id space), on one prefill
 /// schedule.
-fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn) -> Value {
+/// `chain`: a step past the first, which reads the kv the first step wrote
+/// for this row and appends none of its own (as the qwen4 head chains).
+fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn, chain: bool) -> Value {
     let pages = inputs.kv(&a.kv);
     let write_page = inputs.write_page(&a.kv);
     let write_offset = inputs.write_offset(&a.kv);
@@ -495,7 +709,9 @@ fn mtp_attn(x: &Value, inputs: &Input<Facts>, m: &Model, plan: &Value, a: &Attn)
     let q = ops::elemwise::rmsnorm_per_head_plus_one(&q, &a.q_norm, d, a.q_norm_eps);
     let k = ops::elemwise::rmsnorm_per_head_plus_one(&k, &a.k_norm, d, a.k_norm_eps);
     let (q, k) = rotate(&q, &k, inputs, m, a, d);
-    ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
+    if !chain {
+        ops::attn::kv_append(&k, &v, pages, &write_page, &write_offset);
+    }
     let o = ops::attn::prefill(&q, plan, pages, None, d, m.kv_heads, a.sm_scale);
     ops::linear::matmul(&ops::elemwise::gate_sigmoid_mul(&o, &gate), &a.o_proj)
 }
