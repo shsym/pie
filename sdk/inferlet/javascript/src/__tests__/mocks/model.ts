@@ -2,7 +2,8 @@
 export * from '../stubs.js';
 import { modelStub } from '../stubs.js';
 export const {
-  name, architecture, defaultSystemSpeculation, isLinear, passKind,
-  outputVocabSize, kvPageSize, frameSize, channelCapacity, maxEmbedLength,
+  name, architecture, defaultSystemSpeculation, passKind,
+  outputVocabSize, kvPageSize, frameSize, channelCapacity, maxEmbedLength, prefillChunkHint,
   rsStateSize, rsBufferPageSize, rsFoldGranularity, arenaBlockSize,
+  mtpDepth, submitDeadlineUs, runAheadWindow, draftBlock, canvas,
 } = modelStub;

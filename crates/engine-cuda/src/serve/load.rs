@@ -22,7 +22,7 @@ use super::{Boot, FireCost, Golden, Graphs, Shell};
 /// The cold prefix both doors run: bind the device, settle the compiler's
 /// inputs, bake the artifact. `boot` is widened in place (its lattice).
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
-    let device = Context::bind(boot.ordinal)?;
+    let device = Context::bind(boot.ordinal, boot.comm)?;
 
     // One-shot: whichever load arrives first states the kernel cache root.
     kernels_cuda::disk::install(boot.cache_dir);
@@ -55,6 +55,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         tokens: boot.budget.clone(),
         patches: boot.patches.clone(),
     };
+    // The peepholes (`model_ir::fuse`) run on the trace this load keeps, so
+    // the compile and every node index taken off `boot.trace` below share
+    // one numbering; see the Metal shell's `load` for the argument.
+    boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     Ok(Baked {
         device,
@@ -163,6 +167,11 @@ impl Shell {
             boot.checkpoint,
             boot.residency.clone(),
             device.stream(),
+            checkpoint::plan::StorageTarget::for_backend(
+                checkpoint::types::BackendKind::Cuda,
+                boot.world.rank,
+                boot.world.size,
+            ),
         )?;
         weights.rotate(&boot.trace, &compiled)?;
         let arena = Arena::reserve(&compiled.arena)?;
@@ -217,6 +226,12 @@ impl Shell {
                 })
             })
         });
+        // The self-conditioning gather's width, when the plan reads one.
+        let self_cond_taps = u32::try_from(declared_width(
+            &boot.trace,
+            model_ir::RuntimeInput::SelfCondRows,
+        ))
+        .unwrap_or(u32::MAX);
         let mrope_seat = boot.trace.values.iter().any(|decl| {
             matches!(
                 decl.def,
@@ -243,6 +258,7 @@ impl Shell {
             boot.runahead,
             patch_seat,
             mrope_seat,
+            u64::from(self_cond_taps),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -287,6 +303,7 @@ impl Shell {
             budgets,
             patch_seat,
             mrope_seat,
+            self_cond_taps,
             drops_patch_rows,
             towered: compiled_towered,
             patch_fold,
@@ -377,6 +394,13 @@ impl Shell {
         }
         // The arming pass is the last thing the load does; only the golden can fail it.
         shell.arm_bodies()?;
+        // A tensor-parallel follower runs the guest as a shadow of rank 0's:
+        // it fires the same boundaries (so its device-only `tok_in` handoff
+        // feeds its own pipelined decode step), but its host-ended rings are
+        // rank 0's, read and never written. See `program::Session`.
+        if boot.world.rank != 0 {
+            shell.programs.set_shadow(true);
+        }
         Ok(shell)
     }
 }
@@ -428,29 +452,8 @@ fn patch_fold(trace: &model_ir::Trace) -> u32 {
 /// Which bit of a fact word decides the correction window, or `None` when no
 /// single bit does (none qualifies, or two do).
 fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) -> Option<u32> {
-    if corrected.is_empty() {
-        return None;
-    }
-    let mut found = None;
-    for bit in 0..u64::BITS {
-        if classes.mask & (1u64 << bit) == 0 {
-            continue;
-        }
-        let decides = classes.classes.iter().enumerate().all(|(at, class)| {
-            let runs = corrected.contains(at);
-            class
-                .words
-                .iter()
-                .all(|word| ((word >> bit) & 1 == 1) == runs)
-        });
-        if decides {
-            if found.is_some() {
-                return None;
-            }
-            found = Some(bit);
-        }
-    }
-    found
+    // One derivation for every shell: `model_ir::ClassTable::adapter_fact`.
+    classes.adapter_fact(corrected)
 }
 
 /// What [`bake`] answers.

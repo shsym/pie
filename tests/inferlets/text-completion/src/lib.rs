@@ -86,6 +86,9 @@ async fn main(input: Input) -> Result<Output> {
         model::ForwardKind::Recurrent => {
             return Err("this program has no recurrent-only path (it needs a KV cache)".into());
         }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
     };
     let page_size = kv_page_size();
 
@@ -97,7 +100,10 @@ async fn main(input: Input) -> Result<Output> {
         });
     }
 
-    let mut prompt = model::encode(&input.prompt);
+    // The model's opening (`<bos>` where it has one) before the raw text: a
+    // gemma without it answers noise.
+    let mut prompt = inferlet::chat::prefix();
+    prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }

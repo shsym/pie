@@ -912,6 +912,58 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     }
 }
 
+/// A denoise pass's lanes read bidirectionally. The causal bound is lifted
+/// on the engine's custom-mask arm, so a lane the guest gave no mask gets
+/// the all-keeping one; either way `Lane::mask` is `Some`, which is what
+/// makes the lane's `masked` fact true when the words are stamped next.
+/// The staged self-conditioning payload, when there is one, is cut onto
+/// the lanes by their rows; a payload that does not cover the fire's rows
+/// exactly is refused rather than truncated.
+fn stamp_denoise(
+    req: &mut crate::engine::FireRequest,
+    payload: Option<crate::pipeline::instance::SelfCondPayload>,
+) -> Result<(), String> {
+    let wanted: usize = req.lanes.iter().map(|lane| lane.tokens.len()).sum();
+    let mut cursor = 0usize;
+    for lane in &mut req.lanes {
+        lane.bidirectional = true;
+        if lane.mask.is_none() {
+            // Alternating runs, masked-out first: none dropped, everything
+            // kept. `total` is a ceiling the expansion clips to the extent.
+            lane.mask = Some(::engine::Masking::Extent(::engine::Mask::new(
+                vec![0, u32::MAX],
+                u64::from(u32::MAX),
+            )));
+        }
+        if let Some(payload) = &payload {
+            let cells = lane.tokens.len() * payload.taps as usize;
+            let end = cursor + cells;
+            if end > payload.rows.len() {
+                return Err(format!(
+                    "the staged payload holds {} taps and this fire's {wanted} rows want {}",
+                    payload.rows.len(),
+                    wanted * payload.taps as usize
+                ));
+            }
+            lane.self_cond = Some(::engine::fire::SelfCondInput::new(
+                payload.taps,
+                payload.rows[cursor..end].to_vec(),
+                &payload.weights[cursor..end],
+            ));
+            cursor = end;
+        }
+    }
+    if let Some(payload) = &payload
+        && cursor != payload.rows.len()
+    {
+        return Err(format!(
+            "the staged payload holds {} taps and this fire's {wanted} rows want {cursor}",
+            payload.rows.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Stamp each lane's fact word, which `engine::fire::compose` turns into a
 /// class and therefore the row window every guarded node runs over. Called
 /// here because a lane's mask is only known once the fire's mask has
@@ -937,6 +989,9 @@ fn stamp_lane_words(
             lane.captures_scores,
             carries_media,
             lane.block_draft,
+            // The denoise reading and the bidirectional lane are one fact
+            // stated twice: the model's class and the engine's mask bits.
+            lane.bidirectional,
         );
     }
 }
@@ -954,17 +1009,67 @@ pub(crate) fn stamp_lane_slots(
     req: &mut crate::engine::FireRequest,
     stores: &crate::store::registry::Stores,
     ws: crate::store::kv::page_table::WorkingSetId,
-) -> Result<(), String> {
-    let seats = stores
-        .seats
-        .lock()
-        .unwrap()
-        .seats(ws, req.lanes.len())
-        .map_err(|error| format!("pipeline: seating this fire's lanes: {error}"))?;
+) -> Result<(), crate::store::seat::SeatError> {
+    let seats = stores.seats.lock().unwrap().seats(ws, req.lanes.len())?;
     for (lane, &seat) in req.lanes.iter_mut().zip(&seats) {
         lane.slot = seat;
     }
     Ok(())
+}
+
+/// How long a fire waits for a peer to give seats back before its exhaustion
+/// is a refusal. Admission caps processes, not sequences, so a process that
+/// opens many (a beam, a consensus fan-out) can find the book full while every
+/// seat is legitimately held; the holders finish in decode time, not in
+/// minutes. Past this bound the seats are held by fires that are themselves
+/// waiting, and refusing one is what breaks the cycle.
+const SEAT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// [`stamp_lane_slots`], waiting for seats when the book is full. An ask
+/// wider than the whole book is refused at once — no release can seat it.
+/// An ask that fits is parked until a working set releases its seats
+/// (`Stores::seats_freed`), re-asked, and refused only past [`SEAT_WAIT`].
+///
+/// # Errors
+///
+/// The seat book's refusal, with how long the fire waited when it did.
+pub(crate) async fn seat_lane_slots(
+    req: &mut crate::engine::FireRequest,
+    stores: &crate::store::registry::Stores,
+    ws: crate::store::kv::page_table::WorkingSetId,
+) -> Result<(), String> {
+    use crate::store::seat::SeatError;
+    let deadline = tokio::time::Instant::now() + SEAT_WAIT;
+    loop {
+        // Registered before the ask, so a release between the ask and the
+        // wait is not missed: `notify_waiters` wakes only futures already
+        // enabled.
+        let mut freed = Box::pin(stores.seats_freed.notified());
+        freed.as_mut().enable();
+        let refusal = match stamp_lane_slots(req, stores, ws) {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+        let fits = match refusal {
+            SeatError::Exhausted { need, capacity, .. } => capacity != 0 && need <= capacity,
+        };
+        if !fits {
+            return Err(format!(
+                "pipeline: seating this fire's lanes: {refusal}; no release can seat it"
+            ));
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err(format!(
+                "pipeline: seating this fire's lanes: {refusal}; waited {:?} for a peer to \
+                 release seats and none did",
+                SEAT_WAIT
+            ));
+        }
+        // A timeout here is not a refusal: the loop re-asks and settles at
+        // the deadline check above.
+        let _ = tokio::time::timeout(deadline - now, freed).await;
+    }
 }
 
 /// Rewrite each lane's page list from working-set-relative indexes to pool
@@ -1376,6 +1481,15 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let Err(error) = attn_mask.apply_to(&mut req) {
             return Ok(Err(format!("pipeline: fire attention mask: {error}")));
         }
+        {
+            let pass = ctx.resources().get_mut(&fwd)?;
+            if pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise) {
+                let payload = pass.bindings.self_cond.take();
+                if let Err(error) = stamp_denoise(&mut req, payload) {
+                    return Ok(Err(format!("pipeline: self-conditioning: {error}")));
+                }
+            }
+        }
         stamp_lane_words(&mut req, fire_wide_mask, carries_media);
         // `engine::fire::StepMedia` is the parallel slice keyed by lane;
         // `scheduler::batch` rebases each row's lane onto its co-batched
@@ -1400,7 +1514,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
         let ws = ctx.resources().get(&ws_res)?.clone();
         let stores = crate::store::registry::get(ws.model, ws.engine);
-        if let Err(refusal) = stamp_lane_slots(&mut req, &stores, ws.id) {
+        if let Err(refusal) = seat_lane_slots(&mut req, &stores, ws.id).await {
             return Ok(Err(refusal));
         }
         let (readable_pages, writable_pages) =
@@ -2797,6 +2911,18 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
+    {
+        let pass = ctx.resources().get_mut(&fwd)?;
+        if pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise) {
+            let payload = pass.bindings.self_cond.take();
+            if let Err(error) = stamp_denoise(&mut req, payload) {
+                reclaim_pending_device_grant(ctx, &fwd);
+                let reason = format!("pipeline: self-conditioning: {error}");
+                record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
+                return Ok(Err(reason));
+            }
+        }
+    }
     // The program's facts ride every lane here as they do on the host path:
     // a program that materializes a draft-head rectangle is a drafting lane
     // (the draft arm runs and rewrites its plane every fire — a window that
@@ -2816,7 +2942,7 @@ async fn fire_device_geometry<C: FireContext>(
     stamp_lane_words(&mut req, fire_wide_mask, false);
     // A device-geometry fire resolves its row split on the device but its
     // seats here: a seat is which sequence each row group is.
-    if let Err(refusal) = stamp_lane_slots(&mut req, &stores, ws.id) {
+    if let Err(refusal) = seat_lane_slots(&mut req, &stores, ws.id).await {
         reclaim_pending_device_grant(ctx, &fwd);
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));

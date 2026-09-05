@@ -64,8 +64,24 @@ interface model {
         recurrent,
         // Both attention and recurrent layers        -> `forward-hybrid`
         hybrid,
+        // Paged KV plus a canvas the model denoises in place, one trunk
+        // read causally or bidirectionally per pass -> `forward-diffusion`
+        diffusion,
     }
     pass-kind: func() -> forward-kind;
+
+    // The canvas a diffusion model denoises: how many tokens one block is,
+    // and the trunk's hidden width (the row width of a self-conditioning
+    // signal). `none` for every other kind — the same fact as
+    // `pass-kind() == diffusion`, stated once with its numbers.
+    record canvas-shape {
+        length: u32,
+        hidden: u32,
+        // How many `(id, weight)` taps per canvas row
+        // `forward-diffusion.self-conditioning` takes.
+        self-cond-taps: u32,
+    }
+    canvas: func() -> option<canvas-shape>;
 
     // Logits/output dimension (= hf_config.vocab_size). May EXCEED the
     // tokenizer's vocabs() token count due to padding. Use THIS for
@@ -159,6 +175,17 @@ interface model {
     // Guests split a prompt of L tokens into ceil(L / C) chunk passes;
     // chunking is guest-side, against this static constant.
     max-embed-length: func() -> u32;
+
+    // The prefill chunk the scheduler would like to see right now, in
+    // tokens: the per-forward token budget shared evenly among the live
+    // processes, rounded down to whole KV pages, never below one page and
+    // never above `max-embed-length`. A prefill fire that fills the whole
+    // budget holds every other lane's decode for as long as it runs; a fire
+    // of this size leaves the step room for them. A hint, not a limit: the
+    // runtime never splits a fire, and a guest may chunk larger or smaller
+    // — the SDK's `prefill_chunks` takes it as its default cap. Not static:
+    // it moves with the number of live processes.
+    prefill-chunk-hint: func() -> u32;
 
     // ── Working-set / arena capabilities (global, over the bound model) ──
     // Memory-shaping parameters of the bound model's engine, so an inferlet

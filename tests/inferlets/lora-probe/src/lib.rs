@@ -41,7 +41,8 @@
 //! rank 16 (`Adapters { slots: 8, rank: 16 }`). A different SKU passes its own
 //! numbers rather than editing this file, because a rank is TRACE-KNOWN: a
 //! different rank is a different traced program, which is exactly what a
-//! parameter that reaches the channel shape expresses.
+//! parameter that reaches the channel shape expresses. gemma-4-26b-a4b is
+//! `{"layers": 30, "hidden": 2816, "rank": 16}`.
 
 use inferlet::eta::adapter::{Site, mm};
 use inferlet::eta::hybrid::prelude::*;
@@ -276,6 +277,9 @@ async fn main(input: Input) -> Result<Output> {
                         an attention trunk's mixer output)"
                     .into(),
             );
+        }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
         }
     };
     let page_size = kv_page_size();

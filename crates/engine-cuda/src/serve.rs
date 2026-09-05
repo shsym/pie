@@ -79,6 +79,9 @@ pub struct Shell {
     patch_seat: Option<crate::inputs::PatchSeat>,
     /// Whether the plan declares `RuntimeInput::MropePositions`.
     mrope_seat: bool,
+    /// Taps per row of `RuntimeInput::SelfCondRows`, or zero for a plan that
+    /// declares none.
+    self_cond_taps: u32,
     /// Whether the plan declares `layout.scatter_live_rows`.
     drops_patch_rows: bool,
     /// Whether the artifact states a patch axis at all.
@@ -270,13 +273,9 @@ impl Shell {
     /// `word` with the correction window's bit set, or `None` when this bake cannot carry the lane.
     #[must_use]
     pub fn adapted_word(&self, word: u64) -> Option<u64> {
+        // One rule for every shell: `model_ir::ClassTable::adapted_word`.
         let bit = self.adapter_fact?;
-        let adapted = word | (1u64 << bit);
-        let class = self
-            .compiled
-            .classes
-            .class_of(adapted & self.compiled.classes.mask)?;
-        self.corrected.contains(class).then_some(adapted)
+        self.compiled.classes.adapted_word(&self.corrected, bit, word)
     }
 
     /// The shared-adapter store.
@@ -383,6 +382,13 @@ impl Shell {
     pub fn program_instance(&mut self, instance_id: u64) -> Result<Option<&mut ProgramSession>> {
         self.reap_guests()?;
         Ok(self.programs.instance_mut(instance_id))
+    }
+
+    /// Every bound instance's predicted channel cursors, for the ranks of a
+    /// tensor-parallel group to compare.
+    #[must_use]
+    pub fn channel_predictions(&self) -> Vec<(u64, Vec<crate::program::Cursor>)> {
+        self.programs.predictions()
     }
 
     /// Tear down one bound instance and free its rings, reaped first.
@@ -559,6 +565,10 @@ pub struct Prepared<'a> {
     patch_embed_weights: Vec<f32>,
     /// The trunk's rotation stream; empty unless the plan declares it.
     mrope_positions: Vec<i32>,
+    /// The denoiser's self-conditioning taps, `[rows, taps]` each; empty
+    /// unless the plan declares them.
+    self_cond_rows: Vec<i32>,
+    self_cond_weights: Vec<f32>,
     /// Every region's rows and lanes, bound to a device address only in `enqueue`.
     windows: Windows,
     /// One per lane, in fire (seriated) order.

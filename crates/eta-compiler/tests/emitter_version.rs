@@ -16,16 +16,10 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 /// fingerprint change that doesn't move the version fails
 /// `the_pinned_versions_are_the_compiled_ones` until someone updates it here.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 26, 0xa9ff_c409_891c_d517),
-    // The metal row's hash was mis-transcribed when 42 -> 43 was made
-    // (566667983, which bumped both backends and got cuda's right). The
-    // emitter has not changed a byte since that commit -- `crates/eta-compiler`
-    // and `crates/eta-ir` are identical between it and here -- so the pin was
-    // wrong when written rather than the output having moved under it, and the
-    // gate has been red ever since. Corrected to what the emitter emits,
-    // WITHOUT touching the version: 43 is what the engines have cached, and
-    // bumping it would discard every one of those caches for nothing.
-    ("metal", 43, 0x6e9f_cbfa_60f7_04da),
+    ("cuda", 28, 0x7c99_21ae_b678_f7ec),
+    // 44 -> 45: `ptir_m1_runtime.metal` (spliced into every emitted kernel)
+    // grew the threadgroup-partitioned op walk, so every emitted byte moved.
+    ("metal", 45, 0x2d2b_20af_8aba_05a5),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the

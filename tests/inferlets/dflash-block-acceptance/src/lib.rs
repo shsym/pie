@@ -78,6 +78,7 @@
 //! decoding it, which is the loop `rs-mtp-speculative-decoding` runs for the
 //! chained heads.
 
+use inferlet::eta::adapter::{Site, mm};
 use inferlet::eta::hybrid::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -128,6 +129,58 @@ struct Input {
     /// load does not advertise it yet, so the caller states it; absent, v1's.
     #[serde(default)]
     block: Option<u32>,
+    /// Diagnostic: bind a zero-`B` adapter (`lora-probe`'s shape) on every
+    /// pass, the draft fire included. The correction is exactly zero, so the
+    /// proposals must not move; what is under test is that a lane which bound
+    /// an adapter may FIRE a draft block at all — its rows run no trunk
+    /// layer, so there is nothing to correct and nothing to refuse.
+    #[serde(default)]
+    adapter: bool,
+    /// The adapter bank's geometry, the trunk's `[layers, rank, hidden]`;
+    /// `lora-probe`'s defaults (qwen35-d0.8b) when absent.
+    #[serde(default)]
+    adapter_layers: Option<u32>,
+    #[serde(default)]
+    adapter_hidden: Option<u32>,
+    #[serde(default)]
+    adapter_rank: Option<u32>,
+}
+
+/// A zero-`B` adapter in `lora-probe`'s orientations: `A` `[layers, rank,
+/// hidden]` with a deterministic pattern, `B` `[layers, hidden, rank]` all
+/// zero, so `B(Ax)` is exactly zero and the pass's answer is the base model's.
+struct ZeroAdapter {
+    a: Vec<f32>,
+    b: Vec<f32>,
+    layers: u32,
+    hidden: u32,
+    rank: u32,
+}
+
+impl ZeroAdapter {
+    fn build(layers: u32, hidden: u32, rank: u32) -> ZeroAdapter {
+        let a = (0..layers * rank * hidden)
+            .map(|i| {
+                let mut h = i ^ 0x0a0a_a0a0;
+                h ^= h >> 16;
+                h = h.wrapping_mul(0x7feb_352d);
+                h ^= h >> 15;
+                ((h % 10_000) as f32 / 10_000.0 - 0.5) * 0.1
+            })
+            .collect();
+        let b = vec![0.0f32; (layers * hidden * rank) as usize];
+        ZeroAdapter { a, b, layers, hidden, rank }
+    }
+
+    /// Fresh channels a fire: a channel's seed is put once, so one bound to an
+    /// earlier fire cannot be re-stated on the next (`lora-probe` rebuilds its
+    /// weights a phase for the same reason).
+    fn attach(&self, fwd: &ForwardPass) -> Result<()> {
+        let a = Channel::from_shaped([self.layers, self.rank, self.hidden], self.a.clone()).named("lora_a");
+        let b = Channel::from_shaped([self.layers, self.hidden, self.rank], self.b.clone()).named("lora_b");
+        fwd.adapter(Site::O, move |x, y| y + mm(&b, mm(&a, x)))
+            .map_err(|e| e.into())
+    }
 }
 
 fn no_hide() -> i32 {
@@ -190,7 +243,10 @@ async fn main(input: Input) -> Result<Output> {
     let from = advertised.map_or(1, |d| d.proposals_from) as usize;
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
-    let mut prompt = model::encode(&input.prompt);
+    // The model's opening (`<bos>` where it has one) before the raw text: a
+    // gemma without it answers noise.
+    let mut prompt = inferlet::chat::prefix();
+    prompt.extend(model::encode(&input.prompt));
     if prompt.is_empty() {
         prompt.push(0);
     }
@@ -211,6 +267,9 @@ async fn main(input: Input) -> Result<Output> {
         model::ForwardKind::Recurrent => {
             return Err("a block drafter reads attention kv; a recurrent-only text has none".into());
         }
+        model::ForwardKind::Diffusion => {
+            return Err("this program decodes a token at a time; a diffusion model wants a canvas loop".into());
+        }
         model::ForwardKind::Hybrid => {
             let rs = RsWorkingSet::new();
             rs.alloc_buffer(2 * block.div_ceil(rs_page).max(1))
@@ -219,6 +278,13 @@ async fn main(input: Input) -> Result<Output> {
         }
     };
     let pipe = Pipeline::new();
+    let adapter = input.adapter.then(|| {
+        ZeroAdapter::build(
+            input.adapter_layers.unwrap_or(24),
+            input.adapter_hidden.unwrap_or(1024),
+            input.adapter_rank.unwrap_or(16),
+        )
+    });
 
     // ── PREFILL: the prompt, chunked. Every chunk leaves the drafter's
     //    context behind it, because the context arm rides every trunk fire.
@@ -247,6 +313,9 @@ async fn main(input: Input) -> Result<Output> {
         let next = Channel::new([out_rows], dtype::i32).named("next_p");
 
         let fwd = ForwardPass::new();
+        if let Some(adapter) = &adapter {
+            adapter.attach(&fwd)?;
+        }
         fwd.embed(&toks, &indptr)?;
         fwd.readout(&readout)?;
         fwd.attention(
@@ -336,6 +405,9 @@ async fn main(input: Input) -> Result<Output> {
         let out = Channel::new([block], dtype::i32).named("drafts_d");
 
         let fwd = ForwardPass::new();
+        if let Some(adapter) = &adapter {
+            adapter.attach(&fwd)?;
+        }
         fwd.set_drafting_block(true)
             .map_err(|why| format!("stating the draft block: {why}"))?;
         fwd.embed(&toks, &indptr)?;
@@ -392,6 +464,9 @@ async fn main(input: Input) -> Result<Output> {
             let next = Channel::new([1], dtype::i32).named("next_t");
 
             let fwd = ForwardPass::new();
+        if let Some(adapter) = &adapter {
+            adapter.attach(&fwd)?;
+        }
             fwd.embed(&toks, &indptr)?;
             fwd.attention(
                 Some(KvBinding {

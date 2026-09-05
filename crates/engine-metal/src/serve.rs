@@ -446,28 +446,8 @@ fn patch_fold(trace: &Trace) -> u32 {
 /// must move a lane into the same word or a control plane's submission would
 /// mean two different things on two backends.
 fn adapter_fact(classes: &model_ir::ClassTable, corrected: &model_ir::ClassSet) -> Option<u32> {
-    if corrected.is_empty() {
-        return None;
-    }
-    let mut found = None;
-    for bit in 0..u64::BITS {
-        if classes.mask & (1u64 << bit) == 0 {
-            continue;
-        }
-        let decides = classes.classes.iter().enumerate().all(|(at, class)| {
-            let runs = corrected.contains(at);
-            class.words.iter().all(|word| ((word >> bit) & 1 == 1) == runs)
-        });
-        if decides {
-            if found.is_some() {
-                // Two facts that no class tells apart. Answering either would
-                // be answering by coin toss, so this answers neither.
-                return None;
-            }
-            found = Some(bit);
-        }
-    }
-    found
+    // One derivation for every shell: `model_ir::ClassTable::adapter_fact`.
+    classes.adapter_fact(corrected)
 }
 
 fn place_routes(
@@ -1071,6 +1051,18 @@ impl Shell {
     /// residency, [`Fault::Unbound`] for a plan naming a seat this shell does
     /// not bind.
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        // **THE PEEPHOLES RUN HERE, ON THE TRACE THE SHELL KEEPS.** Every
+        // node index this shell holds (`gather`, `experts`, the readout map)
+        // is taken off `boot.trace` below, and the compile is too, so fusing
+        // first keeps them one numbering; a value's id survives fusion, and
+        // values are all the runtime ever names across the boundary. A
+        // pre-norm block's residual fold and the norm that reads it become
+        // one launch (`residual_add_rms_single_row`): 128 fewer a token on a
+        // 64-layer trunk, at the two launches' bits.
+        let boot = Boot {
+            trace: model_ir::fuse::residual_norm(boot.trace),
+            ..boot
+        };
         let device = Context::bind()?;
         let keepalive = if crate::keepalive::KeepAlive::wanted() {
             Some(crate::keepalive::KeepAlive::start(&device)?)
@@ -1366,6 +1358,17 @@ impl Shell {
         // alone: a plan declaring it stages one stream every fire, image or
         // no image, because `(p, p, p)` is what a text row rotates by.
         let states_mrope = declared_width(&boot.trace, RuntimeInput::MropePositions) > 0;
+        // A block-diffusion text's denoiser input: this shell stages no seat
+        // for it (and lifts no causal bound), so the plan is refused here
+        // rather than at its first denoise fire.
+        if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
+            return Err(Fault::Program {
+                at: "serve::load",
+                why: "this plan reads a self-conditioning input (a block-diffusion text), \
+                      which this shell stages no seat for"
+                    .to_string(),
+            });
+        }
         // **HOW MANY PATCH ROWS ONE OUTPUT ROW COSTS**, read off the folds the
         // plan states. `1` for a plan that folds nothing, which is every
         // pre-campaign plan and every tower whose pooler is the identity.
@@ -2379,13 +2382,9 @@ impl Shell {
     /// wrong answer this axis must never give.
     #[must_use]
     pub fn adapted_word(&self, word: u64) -> Option<u64> {
+        // One rule for every shell: `model_ir::ClassTable::adapted_word`.
         let bit = self.adapter_fact?;
-        let adapted = word | (1u64 << bit);
-        let class = self
-            .compiled
-            .classes
-            .class_of(adapted & self.compiled.classes.mask)?;
-        self.corrected.contains(class).then_some(adapted)
+        self.compiled.classes.adapted_word(&self.corrected, bit, word)
     }
 
     /// **Does this load hold its whole weight table on the device?**
@@ -4164,7 +4163,13 @@ impl Shell {
                 // nowhere for a correction to run, whatever the word says.
                 return Err(Fault::Adapterless { lane: row.source });
             }
-            if seated.adapter.is_some() != runs_correction {
+            // A block drafter's draft fire carries an adapted lane's id and no
+            // trunk row: the correction cannot reach its class, so nothing is
+            // owed and nothing is refused (`ClassTable::correction_reaches`).
+            let unreachable = seated.adapter.is_some()
+                && !runs_correction
+                && !self.compiled.classes.correction_reaches(&self.corrected, lane.word);
+            if seated.adapter.is_some() != runs_correction && !unreachable {
                 return Err(Fault::AdapterWord {
                     lane: row.source,
                     word: lane.word,
