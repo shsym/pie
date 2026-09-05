@@ -1,14 +1,15 @@
 //! The operator's TOML schema — every key `pie serve` reads.
 //!
-//! Engine kinds with no build host ([`EngineKind::Vulkan`] / [`EngineKind::Wgpu`])
-//! stay named so a config asking for one is refused by name, not as malformed.
+//! Every [`EngineKind`] now has a build that hosts it — the two portable
+//! shells landed — so a config asking for one is refused by a missing feature
+//! flag rather than by the name being unhostable.
 //!
 //! [`Config`] is the user-facing TOML schema; conversion to the runtime's own
 //! config happens in [`crate::translate`].
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, ensure};
+use anyhow::{Result, bail, ensure};
 use controller_api::Role;
 // Run-ahead depths come from the engine contract's own module.
 pub use engine::runahead::Runahead;
@@ -23,7 +24,9 @@ pub mod schema;
 /// The unit-carrying value types (`"50ms"`, `"4GiB"`): [`Duration`], [`ByteSize`].
 pub mod units;
 
-pub use backend::{CudaNativeEngineOptions, MetalEngineOptions};
+pub use backend::{
+    CudaNativeEngineOptions, MetalEngineOptions, VulkanEngineOptions, WgpuEngineOptions,
+};
 pub use units::{ByteSize, Duration};
 
 // -----------------------------------------------------------------------------
@@ -80,7 +83,7 @@ impl Config {
         })?;
         let reshaped = crate::config::layout::reshape(file)?;
         let s = &toml::to_string(&reshaped).map_err(|e| anyhow::anyhow!("reshape config: {e}"))?;
-        let cfg: Config = toml::from_str(s).map_err(|e| {
+        let mut cfg: Config = toml::from_str(s).map_err(|e| {
             if s.contains("[[model]]") {
                 anyhow::anyhow!(
                     "parse config: {e}\n\
@@ -91,6 +94,7 @@ impl Config {
                 anyhow::anyhow!("parse config: {e}")
             }
         })?;
+        cfg.model.resolve_drafter()?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -368,9 +372,10 @@ pub struct SandboxConfig {
     /// setting -- it is the only one that also stops `wasi:http`.
     #[serde(default = "default_true")]
     pub allow_network: bool,
-    /// Hosts an inferlet may reach, `["*"]` for any. Filters `wasi:sockets`
-    /// only; `wasi:http` bypasses it, so use `allow_network = false` instead
-    /// when that matters.
+    /// Hosts an inferlet may reach, `["*"]` for any.
+    ///
+    /// Filters `wasi:sockets` only; `wasi:http` bypasses it, so use
+    /// `allow_network = false` instead when that matters.
     #[serde(default = "default_network_allowed_hosts")]
     pub network_allowed_hosts: Vec<String>,
     /// Instances the wasmtime pooling allocator may hold. A ceiling on
@@ -461,6 +466,16 @@ pub struct ModelConfig {
     /// one — the cheapest row whose contract and plan fit the checkpoint.
     #[serde(default)]
     pub sku: Option<String>,
+    /// Which published draft head to serve `model` with, by its short name
+    /// (`dflash`, `dflash2`): `sku` looked up in the catalog's table of
+    /// published heads (`models::drafter::PUBLISHED`) for the target `model`
+    /// names, so a deployment says which drafter it wants rather than which
+    /// row spells it. The artifact must already carry the head — `pie model
+    /// import <target> --drafter <name>` is what puts it there. Refused when
+    /// `model` is a path (the table keys on repository ids) or names a target
+    /// the table lacks; `sku` beside it must agree.
+    #[serde(default)]
+    pub drafter: Option<String>,
     /// Which backend runs the model, on what devices.
     pub engine: EngineConfig,
     /// Where this model's materialized-weight artifacts are kept between runs.
@@ -613,6 +628,47 @@ impl ModelConfig {
     #[must_use]
     pub fn patch_ceilings(&self) -> (Option<u32>, Option<u32>) {
         (self.max_patches, self.max_images)
+    }
+
+    /// Resolve `[model] drafter` into `[model] sku` through the published
+    /// heads table. Called once at load, before validation.
+    ///
+    /// # Errors
+    ///
+    /// A `model` the table cannot key (a path), a name it does not know for
+    /// this target, or a `sku` that names another row.
+    pub fn resolve_drafter(&mut self) -> Result<()> {
+        let Some(drafter) = self.drafter.as_deref() else {
+            return Ok(());
+        };
+        let target = self.model.trim();
+        ensure!(
+            !target.contains('/') || !target.ends_with(".zt"),
+            "model.drafter = {drafter:?} needs model.model to name the target repository \
+             (as `pie model list` prints it), not an artifact path {target:?}; name the row \
+             with model.sku instead"
+        );
+        let Some(published) = models::drafter::published(target, drafter) else {
+            let known: Vec<&str> = models::drafter::published_for(target).map(|p| p.drafter).collect();
+            bail!(
+                "model.drafter = {drafter:?}: no published head of that name for {target:?} in this \
+                 build{}",
+                if known.is_empty() {
+                    "; it knows none for that target — name the row with model.sku".to_string()
+                } else {
+                    format!("; it knows {known:?}")
+                }
+            );
+        };
+        match &self.sku {
+            Some(sku) if sku != published.sku => bail!(
+                "model.sku = {sku:?} and model.drafter = {drafter:?} name different rows (the \
+                 drafter's is {:?}); state one of them",
+                published.sku
+            ),
+            _ => self.sku = Some(published.sku.to_string()),
+        }
+        Ok(())
     }
 
     fn validate(&self) -> Result<()> {
@@ -858,9 +914,34 @@ impl EngineConfig {
                     );
                 }
             }
-            // Nothing to check: these kinds are refused by name at
-            // `flavor::Flavor::from_kind`.
-            EngineKind::Vulkan | EngineKind::Wgpu => {}
+            // Typed, like the CUDA arm and unlike Metal's: this table is
+            // parsed with `deny_unknown_fields`, so a key the shell never
+            // reads is refused here rather than ignored at boot.
+            EngineKind::Vulkan => {
+                let opts: VulkanEngineOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "invalid [engine] options for engine type {:?}: {e}",
+                            self.kind,
+                        )
+                    })?;
+                opts.validate()?;
+            }
+            // Typed too, and for the same reason: `deny_unknown_fields`
+            // makes a key the shell never reads a refusal here rather than a
+            // line quietly ignored at boot.
+            EngineKind::Wgpu => {
+                let opts: WgpuEngineOptions = toml::Value::Table(self.options.clone())
+                    .try_into()
+                    .map_err(|e| {
+                    anyhow::anyhow!(
+                        "invalid [engine] options for engine type {:?}: {e}",
+                        self.kind,
+                    )
+                })?;
+                opts.validate()?;
+            }
         }
         Ok(())
     }
@@ -868,9 +949,8 @@ impl EngineConfig {
 
 /// Which engine a `[model.engine] type` names.
 ///
-/// `Vulkan` and `Wgpu` are named, not offered: no build of pie hosts them.
-/// The names stay so a deployment asking for one is refused by name rather
-/// than told its config is malformed.
+/// Every name here is now offered: `Vulkan` and `Wgpu` were named-not-hosted
+/// until their shells landed, and each is one `--features` flag away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EngineKind {
@@ -1121,5 +1201,4 @@ device = ["cpu"]
     // -------------------------------------------------------------------------
     // [model] device_weight_budget / host_weight_budget
     // -------------------------------------------------------------------------
-
 }

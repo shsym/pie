@@ -145,6 +145,10 @@ pub struct EngineConfig {
     pub rs_cache_slot_bytes: u64,
     pub has_mtp_logits: bool,
     pub mtp_depth: u32,
+    pub draft_block: u32,
+    pub draft_mask_token: u32,
+    pub draft_bidirectional: bool,
+    pub draft_proposals_from: u32,
     pub has_value_head: bool,
     pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
@@ -329,6 +333,15 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             Some(depth) if engine_configs.iter().all(|d| d.mtp_depth == depth) => depth,
             _ => 0,
         },
+        // Likewise one block drafter for the deployment, or none.
+        draft_block: match engine_configs.first().map(|d| d.draft_block) {
+            Some(rows) if engine_configs.iter().all(|d| d.draft_block == rows) => rows,
+            _ => 0,
+        },
+        draft_mask_token: engine_configs.first().map_or(0, |d| d.draft_mask_token),
+        draft_bidirectional: !engine_configs.is_empty()
+            && engine_configs.iter().all(|d| d.draft_bidirectional),
+        draft_proposals_from: engine_configs.first().map_or(1, |d| d.draft_proposals_from),
         has_value_head: !engine_configs.is_empty()
             && engine_configs.iter().all(|d| d.has_value_head),
         has_kv_envelopes: !engine_configs.is_empty()
@@ -351,6 +364,8 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     let arena_kv_pages: Vec<usize> = engine_configs.iter().map(|d| d.total_pages).collect();
     let arena_cpu_pages: Vec<usize> = engine_configs.iter().map(|d| d.cpu_pages).collect();
     let arena_rs_slots: Vec<usize> = engine_configs.iter().map(|d| d.rs_cache_slots).collect();
+    let arena_max_context: Vec<usize> =
+        engine_configs.iter().map(|d| d.limits.max_context).collect();
     // Whether engine 0 can physically move KV bytes to/from host swap —
     // arms the suspend rung.
     let kv_swap_capable = engine_configs
@@ -382,6 +397,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         &arena_kv_pages,
         &arena_cpu_pages,
         &arena_rs_slots,
+        &arena_max_context,
     );
 
     // Residency planner: always installed. KV pool exhaustion is FCFS

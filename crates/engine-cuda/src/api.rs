@@ -421,6 +421,10 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // `MtpDrafts` is `[k]` i32 token ids, an argmax the guest can take
         // for itself off `MtpLogits`; no device path here produces it.
         mtp_depth: 0,
+        draft_block: 0,
+        draft_mask_token: 0,
+        draft_bidirectional: false,
+        draft_proposals_from: 1,
         has_value_head: false,
         // Does this load export a capture column, and did the slab that
         // observes it get carved.
@@ -642,7 +646,10 @@ intended for diagnostics, not serving",
                 kv_pages: u32::try_from(paging.pages()).unwrap_or(u32::MAX),
                 kv_page_size: paging.page_size,
                 state_slots: if state_rows { paging.slots } else { 0 },
-                state_slot_bytes: 0,
+                // What one recurrent slot costs across the plan's state rows.
+                // Zero for a plan with none, which is how the runtime tells a
+                // hybrid model from a pure-attention one (`RsCaps::state_size`).
+                state_slot_bytes: shell.state_slot_bytes(),
                 // What the load actually seats, read off the plan: the
                 // smallest capacity any one bank declares, since an id must
                 // fit every site it is written into. Zero for a model whose
@@ -667,13 +674,18 @@ intended for diagnostics, not serving",
                 max_context: paging.context(),
             },
             profile,
-            // The whole fire geometry, plus the mask: `crate::program::ports`
-            // reads every port in this set off the attached instance's own
-            // rings at fire time. The page family and write descriptor are
-            // claimed because `geometry_with` already takes a caller-stated
-            // page table per lane; the mask because a fire whose ancestry is
-            // device data has nowhere else to state it.
-            ports: PortMask::DEVICE_GEOMETRY.with(Port::AttnMask),
+            // The whole fire geometry, plus the mask and the fold length:
+            // `crate::program::ports` reads every port in this set off the
+            // attached instance's own rings at fire time. The page family and
+            // write descriptor are claimed because `geometry_with` already
+            // takes a caller-stated page table per lane; the mask because a
+            // fire whose ancestry is device data has nowhere else to state it;
+            // the fold length because it belongs to no class at all
+            // (`ports::resolves` answers it for both) and a recurrent guest
+            // that cannot state it falls back to a host-serialized pass.
+            ports: PortMask::DEVICE_GEOMETRY
+                .with(Port::AttnMask)
+                .with(Port::RsFoldLen),
             geometry: GeometryClass::DeviceGeometry,
             // `copy_kv` moves cells device-to-device inside this load's own
             // pools; the other three directions need a pool or mapping this
@@ -1500,6 +1512,7 @@ mod tests {
             }],
             nodes: Vec::new(),
             seams: Vec::new(),
+            drafter: None,
         }
     }
 

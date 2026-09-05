@@ -36,6 +36,18 @@ impl Platform {
     /// `Metal`/`Wgpu`/`Vulkan` have no fragment-order point for it. The
     /// match is per placed variant, and the tail `debug_assert` below fires
     /// if a new placed variant is added without a row here.
+    ///
+    /// **`Vulkan` stays out even though it now has a matrix-unit tier**, and
+    /// that is a property of the API rather than a gap. CUDA can pre-arrange
+    /// a plane because `mma.sync`'s m16n8k16 fragment layout is architected:
+    /// a host repack knows which lane will hold which element.
+    /// `VK_KHR_cooperative_matrix` deliberately does not say — a load states
+    /// only `RowMajor`/`ColumnMajor` and a stride, and the implementation
+    /// chooses the lane mapping — so a plane written in fragment order would
+    /// be read as if it were row-major, which is not a slower answer but a
+    /// wrong one. `kernels-vulkan`'s coopmat tier also loads its fragments
+    /// out of a shared tile it dequantized into, not out of the stored
+    /// plane, so a repack would not reach the matrix load at all.
     #[must_use]
     pub fn reads_placement(self, dtype: Dtype) -> bool {
         match dtype {
@@ -107,10 +119,19 @@ pub enum CacheRow {
     /// shared as both, `[kv_lora_rank, rope_dim]` a latent page. `dtype` is
     /// declared by the model, not chosen by the engine. `space` is the
     /// geometry group this cache's rows belong to.
-    Kv { name: String, planes: Vec<u64>, dtype: Dtype, space: u32 },
+    Kv {
+        name: String,
+        planes: Vec<u64>,
+        dtype: Dtype,
+        space: u32,
+    },
     /// Recurrent state: per-lane slab shape. `dtype` is declared by the
     /// model since some state (e.g. qwen4's PLE token ids) can't fit bf16.
-    State { name: String, slab: Vec<u64>, dtype: Dtype },
+    State {
+        name: String,
+        slab: Vec<u64>,
+        dtype: Dtype,
+    },
 }
 
 /// A named seam a declaration states, carried through for the tools that read
@@ -142,4 +163,36 @@ pub struct Trace {
     pub values: Vec<ValueDecl>,
     pub nodes: Vec<Node>,
     pub seams: Vec<Seam>,
+    /// The block drafter this text carries, if any — facts a guest seeding a
+    /// draft block needs and cannot read off the plan's shapes (the block is a
+    /// split of the token axis, symbolic in the plan). Stated by the text
+    /// that plants the `mtp.drafts` seam; advertised by the load.
+    #[serde(default)]
+    pub drafter: Option<BlockDrafter>,
+}
+
+/// **WHAT A GUEST NEEDS TO SEED A DRAFT BLOCK**, stated by the model text.
+/// Not policy: the head was trained at these numbers, and a guest that shows
+/// it another block is out of distribution. Which rows to verify, and whether
+/// to draft at all, stay the guest's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockDrafter {
+    /// Rows one draft pass carries: the anchor and `rows - 1` mask slots.
+    pub rows: u32,
+    /// The id every block row but the first carries in.
+    pub mask_token: u32,
+    /// Whether the block sees itself (a full-attention layer over the block),
+    /// in which case the guest must state the mask that says so; a head whose
+    /// layers are all causal inside the block wants none.
+    pub bidirectional: bool,
+    /// The first block row whose readout is a proposal: 1 for a head whose
+    /// row `i` predicts position `i` (DFlash: the anchor row proposes
+    /// nothing), 0 for a head whose row `i` predicts position `i + 1`
+    /// (DSpark: the anchor row proposes the next token too).
+    #[serde(default = "one")]
+    pub proposals_from: u32,
+}
+
+fn one() -> u32 {
+    1
 }

@@ -1,3 +1,4 @@
+use crate::drafter::dflash::{self, DFlash};
 use model_dsl::{Dtype, Weight};
 
 
@@ -35,7 +36,9 @@ pub struct Model {
     /// a second checkpoint; both share this same declaration.
     pub mtp: Option<Mtp>,
 
-    /// The block drafter, when this SKU's recipe is [`Recipe::DFlash`].
+    /// The block drafter, when this SKU's recipe is [`Recipe::DFlash`] or
+    /// [`Recipe::DFlash2`] — declared in [`crate::drafter::dflash`], since it
+    /// brings its own architecture and nothing of this trunk's.
     /// Exclusive with [`mtp`](Model::mtp): a plan carries one draft head or
     /// none, and the two shapes share no declaration.
     pub dflash: Option<DFlash>,
@@ -97,92 +100,6 @@ pub struct Mtp {
     pub norm_eps: f32,
 }
 
-/// **A DFlash block drafter** — the shape `z-lab/Qwen3.6-27B-DFlash` ships.
-///
-/// Where [`Mtp`] fuses one hidden state with one token embedding and runs a
-/// single block chained a token at a time, this fuses [`taps`](DFlash::taps)
-/// TRUNK HIDDEN STATES and runs [`blocks`](DFlash::blocks) layers ONCE over a
-/// whole block of rows whose tail is the mask token, so a single pass
-/// proposes [`block`](DFlash::block) tokens:
-///
-/// ```text
-/// h  = rms(Σᵢ tapᵢ · fcᵢ)                       the five taps, fused
-/// for each block:  h += attn(rms(h));  h += mlp(rms(h))
-/// draft = lm_head(rms(h))                       through the TARGET's head
-/// ```
-///
-/// Three things differ from every other head this family carries, and each
-/// is why this is its own declaration rather than a flag on [`Mtp`]:
-///
-/// * **The fusion is five-wide.** The stored `fc.weight` is one
-///   `[hidden, 5·hidden]` bank; the IR has no concat, so it is sliced into
-///   five `[hidden, hidden]` banks summed with `residual_add`, the same way
-///   [`Mtp`] splits its two-wide bank.
-/// * **The attention is NOT the family's gated site.** Its `q_proj` is
-///   `[q_heads·head_dim, hidden]`, not the trunk's `2·q_heads·head_dim` — no
-///   gate to split off — and its geometry is its own (32 q heads, 8 kv, head
-///   dim 128 against the trunk's 24/4/256). Only the plane width coincides
-///   (8·128 = 4·256 = 1024), which is what lets its kv rows share the
-///   trunk's page-id space.
-/// * **The pass is bidirectional over the block.** Four of five layers are
-///   sliding-window; the mask that makes the block see itself is the
-///   guest's (`inputs.mask()`), not the model's.
-pub struct DFlash {
-    /// Which trunk layers feed the fusion, in the order their banks are
-    /// sliced out of `fc` — `[1, 16, 31, 46, 61]` for the shipped head.
-    pub taps: Vec<u32>,
-    /// One `[hidden, hidden]` column slice of the stored `fc.weight` per tap.
-    pub fc: Vec<Weight>,
-    /// Scales the fused stream before the first block.
-    pub hidden_norm: Weight,
-    pub hidden_norm_eps: f32,
-    pub blocks: Vec<DFlashBlock>,
-    /// The final norm before the readout through the target's `lm_head`.
-    pub norm: Weight,
-    pub norm_eps: f32,
-    /// Rows one draft pass proposes — the width of the `mtp.drafts` seam.
-    pub block: u32,
-    /// The token every block row but the first carries on the way in.
-    pub mask_token: u32,
-}
-
-/// One layer of a [`DFlash`] drafter: the standard pre-norm decoder block,
-/// with its own ungated attention and a sliding window on all but the last.
-pub struct DFlashBlock {
-    pub mixer_norm: Weight,
-    pub mixer_norm_eps: f32,
-    pub attn: DraftAttn,
-    pub mlp_norm: Weight,
-    pub mlp_norm_eps: f32,
-    pub mlp: Mlp,
-    /// Keys older than this many positions are not attended; `None` on the
-    /// one full-attention layer the shipped head ends with.
-    pub window: Option<u32>,
-}
-
-/// A [`DFlash`] layer's attention site. [`Attn`]'s twin without the q-gate
-/// and with its own head geometry; the two cannot share a struct because
-/// `Attn::qg_proj` is declared at twice the q width and every reader of it
-/// splits a gate off.
-pub struct DraftAttn {
-    pub q_heads: u32,
-    pub kv_heads: u32,
-    pub head_dim: u32,
-    pub rotary_dim: u32,
-    pub theta: f32,
-    pub sm_scale: f32,
-    pub q_proj: Weight,
-    pub k_proj: Weight,
-    pub v_proj: Weight,
-    pub o_proj: Weight,
-    pub q_norm: Weight,
-    pub q_norm_eps: f32,
-    pub k_norm: Weight,
-    pub k_norm_eps: f32,
-    /// This layer's kv row, in the trunk's page-id space.
-    pub kv: String,
-}
-
 /// The two pre-fusion norms, when the recipe has them. One shared epsilon,
 /// since `rms_norm_eps` is a single config value for this family.
 pub struct PreFc {
@@ -211,6 +128,16 @@ pub enum Recipe {
     /// pass proposes [`DFlash::block`] tokens. Declared as [`DFlash`], not
     /// [`Mtp`] — it shares neither the fusion shape nor the attention shape.
     DFlash,
+    /// DFlash2 (`z-lab/Qwen3.8-27B-DFlash2`): the same fusion and the same
+    /// five blocks, at a block of eight, every layer sliding and causal
+    /// inside the block, with a two-tap dynamic convolution around each
+    /// sublayer ([`DynConv`]). The candidate selector the head also ships is
+    /// not declared yet — the readout is the per-slot argmax, as v1's.
+    DFlash2,
+    /// DSpark (`DimInfer/Qwen3.8-27B-Dspark-v1`): the v1 backbone, all
+    /// layers full, a block of fifteen whose every row proposes, a markov
+    /// bigram readout. See [`crate::drafter::dflash::QWEN38_27B_DSPARK`].
+    DSpark,
 }
 
 impl Recipe {
@@ -219,8 +146,15 @@ impl Recipe {
     pub fn prefix(self) -> &'static str {
         match self {
             Recipe::Mtp => "mtp",
-            Recipe::Eagle | Recipe::DFlash => "aux",
+            Recipe::Eagle | Recipe::DFlash | Recipe::DFlash2 | Recipe::DSpark => "aux",
         }
+    }
+
+    /// Whether this recipe is a block drafter ([`DFlash`]) rather than a
+    /// chained head ([`Mtp`]).
+    #[must_use]
+    pub fn drafts_a_block(self) -> bool {
+        matches!(self, Recipe::DFlash | Recipe::DFlash2 | Recipe::DSpark)
     }
 }
 
@@ -491,6 +425,9 @@ struct Dims {
     /// layer count: every shipped draft head (either recipe) is exactly one
     /// decoder layer.
     draft: Option<Recipe>,
+    /// The published block drafter a block-drafting recipe reads — its own
+    /// numbers, one descriptor a checkpoint (`drafter::dflash`).
+    dflash_head: Option<&'static dflash::Head>,
 }
 
 impl Model {
@@ -503,6 +440,15 @@ impl Model {
     pub fn a3b_mtp(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a3b_dims();
         d.draft = Some(Recipe::Mtp);
+        Model::new(w, kv, tp, d)
+    }
+
+    /// The A3B with z-lab's block drafter (`Qwen3.6-35B-A3B-DFlash`)
+    /// overlaid: the same four hooks the 27B spells, a second mixture.
+    pub fn a3b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        let mut d = Model::a3b_dims();
+        d.draft = Some(Recipe::DFlash);
+        d.dflash_head = Some(&dflash::QWEN36_35B_A3B_DFLASH);
         Model::new(w, kv, tp, d)
     }
 
@@ -534,6 +480,7 @@ impl Model {
             norm_eps: 1e-6,
             tower: None,
             draft: None,
+            dflash_head: None,
         }
     }
 
@@ -602,6 +549,7 @@ impl Model {
                 norm_eps: 1e-6,
                 tower: None,
                 draft: None,
+                dflash_head: None,
             },
         )
     }
@@ -664,6 +612,7 @@ impl Model {
             norm_eps: 1e-6,
             tower,
             draft,
+            dflash_head: None,
         }
     }
 
@@ -692,6 +641,7 @@ impl Model {
                 norm_eps: 1e-6,
                 tower: None,
                 draft: None,
+                dflash_head: None,
             },
         )
     }
@@ -712,6 +662,19 @@ impl Model {
     /// the drafter brings its own layers rather than sharing one.
     pub fn d27b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
         Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash)))
+    }
+
+    /// The 27B with the DFlash2 drafter overlaid by `--aux`
+    /// (`z-lab/Qwen3.8-27B-DFlash2`): the same trunk, [`Recipe::DFlash2`]'s
+    /// head. The Qwen3.8-27B trunk reads with `d27b`'s dims.
+    pub fn d27b_dflash2(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DFlash2)))
+    }
+
+    /// The 27B with the DSpark drafter overlaid by `--aux`
+    /// (`DimInfer/Qwen3.8-27B-Dspark-v1`).
+    pub fn d27b_dspark(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(w, kv, tp, Model::d27b_dims(None, Some(Recipe::DSpark)))
     }
 
     /// Same 64 layers without the draft head. Used for 4-bit conversions:
@@ -764,6 +727,14 @@ impl Model {
             norm_eps: 1e-6,
             tower,
             draft,
+            // The 27B heads: which one is the recipe's, since three are
+            // published for this trunk.
+            dflash_head: draft.and_then(|r| match r {
+                Recipe::DFlash => Some(&dflash::QWEN36_27B_DFLASH),
+                Recipe::DFlash2 => Some(&dflash::QWEN38_27B_DFLASH2),
+                Recipe::DSpark => Some(&dflash::QWEN38_27B_DSPARK),
+                Recipe::Mtp | Recipe::Eagle => None,
+            }),
         }
     }
 
@@ -977,7 +948,7 @@ impl Model {
         // kv row stays `kv.mtp` under either recipe — a fact about this
         // plan's page-id space, not about which checkpoint the bytes came
         // from.
-        let mtp = d.draft.filter(|r| !matches!(r, Recipe::DFlash)).map(|recipe| {
+        let mtp = d.draft.filter(|r| !r.drafts_a_block()).map(|recipe| {
             let inter = match &d.mlp {
                 MlpDims::Dense { inter } => *inter,
                 MlpDims::Routed(m) => m.inter,
@@ -1007,72 +978,22 @@ impl Model {
             }
         });
 
-        // The block drafter's geometry is its OWN (see `DFlash`), so nothing
-        // here is read off `Dims` but the trunk's hidden width and the
-        // element types.
-        let dflash = d.draft.filter(|r| matches!(r, Recipe::DFlash)).map(|recipe| {
-            let p = recipe.prefix();
-            let n = |s: &str| format!("{p}.{s}");
-            // **THE DRAFTER IS QUANTIZED LIKE THE TRUNK, AND IT COSTS
-            // NOTHING TO BE.** The shipped head is bf16 and only 1.75 G
-            // parameters against the trunk's 27, so carrying it unquantized is
-            // affordable — the obvious place to look for acceptance. It was
-            // tried, on this text with the projections at `dense`: the
-            // artifact went 15.0 -> 17.3 GiB, a draft fire went 17.8 -> 27.8
-            // ms, and the accepted prefix DID NOT MOVE — 13.500 / 10.000 /
-            // 4.375 of fifteen on counting / code / recall against 13.500 /
-            // 10.125 / 5.250 at four bits, the one differing round being noise
-            // over eight. What a block drafter accepts is a property of the
-            // HEAD, not of the precision it is carried at.
-            let (dq, dkv, dhd) = (DFLASH_Q_HEADS / tp, DFLASH_KV_HEADS / tp, DFLASH_HEAD_DIM);
-            let hd = dhd as u64;
-            let inter = DFLASH_INTER / tp;
-            DFlash {
-                taps: DFLASH_TAPS.to_vec(),
-                // One column slice of the stored `[hidden, 5·hidden]` bank
-                // per tap; replicated, since a trunk hidden state is.
-                fc: (0..DFLASH_TAPS.len())
-                    .map(|i| Weight::sym(n(&format!("fc_tap{i}")), [hidden, hidden], w))
-                    .collect(),
-                hidden_norm: Weight::sym(n("hidden_norm"), [hidden], dense),
-                hidden_norm_eps: d.norm_eps,
-                blocks: (0..DFLASH_LAYERS)
-                    .map(|l| {
-                        let b = |s: &str| format!("{p}.layers.{l}.{s}");
-                        DFlashBlock {
-                            mixer_norm: Weight::sym(b("mixer_norm"), [hidden], dense),
-                            mixer_norm_eps: d.norm_eps,
-                            attn: DraftAttn {
-                                q_heads: dq,
-                                kv_heads: dkv,
-                                head_dim: dhd,
-                                rotary_dim: dhd,
-                                theta: DFLASH_THETA,
-                                sm_scale: (dhd as f32).sqrt().recip(),
-                                q_proj: Weight::sym(b("q_proj"), [dq as u64 * hd, hidden], w).columns(),
-                                k_proj: Weight::sym(b("k_proj"), [dkv as u64 * hd, hidden], w).columns(),
-                                v_proj: Weight::sym(b("v_proj"), [dkv as u64 * hd, hidden], w).columns(),
-                                o_proj: Weight::sym(b("o_proj"), [hidden, dq as u64 * hd], w).rows(),
-                                q_norm: Weight::sym(b("q_norm"), [hd], dense),
-                                q_norm_eps: d.norm_eps,
-                                k_norm: Weight::sym(b("k_norm"), [hd], dense),
-                                k_norm_eps: d.norm_eps,
-                                kv: format!("kv.dflash.{l}"),
-                            },
-                            mlp_norm: Weight::sym(b("mlp_norm"), [hidden], dense),
-                            mlp_norm_eps: d.norm_eps,
-                            mlp: dense_mlp(w, hidden, inter, &format!("{p}.layers.{l}")),
-                            // The shipped head is four sliding layers then
-                            // one full; `layer_types` in its config.
-                            window: (l + 1 < DFLASH_LAYERS).then_some(DFLASH_WINDOW),
-                        }
-                    })
-                    .collect(),
-                norm: Weight::sym(n("norm"), [hidden], dense),
-                norm_eps: d.norm_eps,
-                block: DFLASH_BLOCK,
-                mask_token: DFLASH_MASK_TOKEN,
-            }
+        // The block drafter's geometry is its OWN (`drafter::dflash`), so it
+        // reads nothing off `Dims` but the trunk's widths and element types.
+        let dflash = d.draft.filter(|r| r.drafts_a_block()).map(|recipe| {
+            let head = d.dflash_head.expect("a block-drafting recipe names its published head");
+            DFlash::declare(
+                head,
+                recipe.prefix(),
+                &dflash::Trunk {
+                    hidden,
+                    vocab: d.vocab as u64,
+                    norm_eps: d.norm_eps,
+                    weights: w,
+                    dense,
+                    tp,
+                },
+            )
         });
 
         Model {
@@ -1099,26 +1020,6 @@ impl Model {
         }
     }
 }
-
-/// **The shipped DFlash drafter's geometry** (`z-lab/Qwen3.6-27B-DFlash`'s
-/// `config.json`), which is the head's own and not the trunk's — see
-/// [`DFlash`]. Constants rather than [`Dims`] fields because exactly one SKU
-/// carries this head and every number below is a fact about that published
-/// checkpoint, not a knob.
-const DFLASH_TAPS: [u32; 5] = [1, 16, 31, 46, 61];
-const DFLASH_LAYERS: u32 = 5;
-const DFLASH_Q_HEADS: u32 = 32;
-const DFLASH_KV_HEADS: u32 = 8;
-const DFLASH_HEAD_DIM: u32 = 128;
-const DFLASH_INTER: u32 = 17_408;
-const DFLASH_THETA: f32 = 10_000_000.0;
-const DFLASH_WINDOW: u32 = 2_048;
-pub const DFLASH_BLOCK: u32 = 16;
-/// `dflash_config.mask_token_id` — the id every block row but the first
-/// carries into the draft pass. Public with [`DFLASH_BLOCK`] because a guest
-/// seeding a draft block needs both; they belong on the load's own
-/// advertisement (beside `mtp_depth`) once there is a guest asking.
-pub const DFLASH_MASK_TOKEN: u32 = 248_070;
 
 /// Adapter ceiling for every SKU of this family. Not a checkpoint fact (no
 /// pretrained artifact states it) — a deployment setting baked in at trace

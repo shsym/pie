@@ -145,3 +145,129 @@ fn the_block_drafters_plan_is_whole() {
         );
     }
 }
+
+/// **THE DFLASH2 TEXT TRACES, AND CONVOLVES.** The v2 row builds the same
+/// two-armed plan with the dynamic convolution around every sublayer of the
+/// drafter — four `attention.block_dyn_conv` nodes a block, twenty in all —
+/// and no masked read: every v2 layer is sliding and causal inside the block.
+#[test]
+fn the_dflash2_plan_is_whole_and_convolves() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "qwen38-27b-dflash2")
+        .expect("this build ships the DFlash2 row");
+    for platform in [Platform::Metal, Platform::Cuda] {
+        let trace = (row.trace)(platform);
+        let convs = trace
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, model_dsl::Operation::Attention(model_dsl::Attention::BlockDynConv { .. })))
+            .count();
+        assert_eq!(convs, 20, "{platform:?}: five blocks x two sublayers x two sides");
+        let walks = trace
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, model_dsl::Operation::Attention(model_dsl::Attention::SelectorWalk { .. })))
+            .count();
+        let topks = trace
+            .nodes
+            .iter()
+            .filter(|n| matches!(&n.op, model_dsl::Operation::Layout(model_dsl::Layout::TopK { .. })))
+            .count();
+        assert_eq!((topks, walks), (1, 1), "{platform:?}: the selector reads the block out once");
+        let seams: Vec<&str> = trace.seams.iter().map(|s| s.seam.as_str()).collect();
+        assert!(seams.iter().any(|s| s.contains("mtp")), "{platform:?}: no draft seam; {seams:?}");
+        // The facts a guest seeds the block from ride on the trace.
+        let facts = trace.drafter.expect("the v2 text states its block drafter");
+        assert_eq!((facts.rows, facts.mask_token, facts.bidirectional), (8, 248_070, false));
+    }
+}
+
+/// **THE V1 TEXT STATES ITS BLOCK TOO**, and says it is bidirectional — its
+/// last layer is full attention over the block, so a guest must bind a mask.
+#[test]
+fn the_v1_text_states_a_bidirectional_block_of_sixteen() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "qwen36-27b-dflash")
+        .expect("this build ships the block-drafter row");
+    let trace = (row.trace)(Platform::Metal);
+    let facts = trace.drafter.expect("the v1 text states its block drafter");
+    assert_eq!((facts.rows, facts.mask_token, facts.bidirectional), (16, 248_070, true));
+    // The A3B mixture carries the same shape with eight taps and its own mask id.
+    let a3b = models::skus()
+        .find(|row| row.recipe.text == "qwen36-35b-a3b-dflash")
+        .expect("this build ships the A3B block-drafter row");
+    let facts = (a3b.trace)(Platform::Metal).drafter.expect("the A3B text states its block drafter");
+    assert_eq!((facts.rows, facts.mask_token, facts.bidirectional, facts.proposals_from), (16, 248_077, true, 1));
+    // And an undrafted text states none.
+    let plain = models::skus()
+        .find(|row| row.recipe.text == "qwen38-27b" && row.recipe.weights.contains(&model_dsl::Dtype::U4g64))
+        .expect("the plain row");
+    assert!((plain.trace)(Platform::Metal).drafter.is_none());
+}
+
+/// **THE DSPARK TEXT**: v1's backbone with no convolution, a top-k and a
+/// bigram walk for its readout, and a block of fifteen whose every row
+/// proposes — the anchor row included.
+#[test]
+fn the_dspark_plan_is_whole_and_walks_a_bigram() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "qwen38-27b-dspark")
+        .expect("this build ships the DSpark row");
+    let trace = (row.trace)(Platform::Metal);
+    let count = |pred: &dyn Fn(&model_dsl::Operation) -> bool| trace.nodes.iter().filter(|n| pred(&n.op)).count();
+    assert_eq!(count(&|op| matches!(op, model_dsl::Operation::Attention(model_dsl::Attention::BlockDynConv { .. }))), 0);
+    assert_eq!(count(&|op| matches!(op, model_dsl::Operation::Layout(model_dsl::Layout::TopK { .. }))), 1);
+    let walks: Vec<_> = trace
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.op {
+            model_dsl::Operation::Attention(model_dsl::Attention::SelectorWalk { hp, first, .. }) => Some((*hp, *first)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(walks.len(), 1);
+    assert_eq!(walks[0], (None, 0), "a bigram lattice walked from the anchor row");
+    let facts = trace.drafter.expect("the DSpark text states its block drafter");
+    assert_eq!(
+        (facts.rows, facts.mask_token, facts.bidirectional, facts.proposals_from),
+        (15, 248_200, true, 0)
+    );
+}
+
+
+/// **THE SAME FOUR HOOKS IN A SECOND FAMILY.** gemma's text carries z-lab's
+/// head for its mixture: six taps (six `fc` slices into the fusion), the v1
+/// shape's one bidirectional layer (one non-causal masked read), a block of
+/// sixteen whose mask id is 4, and no trunk plan guarded on anything but the
+/// trunk's own rows.
+#[test]
+fn gemma_carries_the_block_drafter_too() {
+    use model_dsl::Platform;
+    let row = models::skus()
+        .find(|row| row.recipe.text == "gemma4-26b-a4b-dflash")
+        .expect("this build ships gemma's DFlash row");
+    let trace = (row.trace)(Platform::Metal);
+    let facts = trace.drafter.expect("gemma's text states its block drafter");
+    assert_eq!(
+        (facts.rows, facts.mask_token, facts.bidirectional, facts.proposals_from),
+        (16, 4, true, 1)
+    );
+    let bidirectional = trace
+        .nodes
+        .iter()
+        .filter(|n| {
+            matches!(
+                &n.op,
+                model_dsl::Operation::Attention(model_dsl::Attention::Masked { causal: false, .. })
+            )
+        })
+        .count();
+    assert_eq!(bidirectional, 1, "the head's full layer is the one non-causal read");
+    let plain = models::skus()
+        .find(|row| row.recipe.text == "gemma4-26b-a4b")
+        .expect("the plain row");
+    assert!((plain.trace)(Platform::Metal).drafter.is_none());
+}

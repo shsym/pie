@@ -1,4 +1,4 @@
-use checkpoint::contract::{Expr, ModelContract, TensorType};
+use checkpoint::contract::{Expr, ModelContract, TensorType, UnaryOp};
 
 use super::model::{Head, Mixer, Mlp, Model};
 use model_dsl::Platform;
@@ -353,56 +353,10 @@ impl Model {
         }
 
         // The block drafter, always `--aux`-imported (it is published on its
-        // own), so always under `aux.`. Its layers are the standard pre-norm
-        // decoder spelling — `input_layernorm`, `self_attn.*`,
-        // `post_attention_layernorm`, `mlp.*` — and its `q_proj` is the
-        // plain one, NOT the trunk's `[2·q, hidden]` gate-packed bank.
+        // own); its planes and their spelling are the drafter's
+        // (`drafter::dflash`), and the norm fold is this layout's.
         if let Some(dflash) = &self.dflash {
-            // **THE DRAFTER'S NORMS ARE FOLDED LIKE THE TRUNK'S**, measured
-            // rather than assumed. Whether an `--aux` checkpoint carries
-            // mlx_lm's `+1` fold is a question about its publisher, not about
-            // the target, so it was A/B'd on the artifact with everything else
-            // fixed: folded, the drafter keeps 0.33 / 0.33 / 0.67 of a block on
-            // counting / code / recall; unfolded, 0.33 / 0.00 / 0.33. The
-            // chained-head arm above reads its norms raw and is left alone —
-            // its own numbers are measured and good.
-            b.read_expr(&dflash.hidden_norm, norm("aux.hidden_norm.weight".to_string()))?;
-            // `fc.weight` is one `[hidden, taps·hidden]` bank; tap `i` is
-            // columns `i·hidden .. (i+1)·hidden`, sliced as the MTP head's
-            // two-wide bank is.
-            let span = extents(&dflash.fc[0])[1];
-            for (i, bank) in dflash.fc.iter().enumerate() {
-                let at = span * i as i64;
-                b.read_expr(bank, Expr::src("aux.fc.weight".to_string()).slice(1, at, span))?;
-            }
-            for (l, block) in dflash.blocks.iter().enumerate() {
-                let n = |s: &str| format!("aux.layers.{l}.{s}");
-                let a = &block.attn;
-                b.read_expr(&block.mixer_norm, norm(n("input_layernorm.weight")))?;
-                b.read(&a.q_proj, n("self_attn.q_proj.weight"))?;
-                b.read(&a.k_proj, n("self_attn.k_proj.weight"))?;
-                b.read(&a.v_proj, n("self_attn.v_proj.weight"))?;
-                b.read(&a.o_proj, n("self_attn.o_proj.weight"))?;
-                b.read_expr(&a.q_norm, norm(n("self_attn.q_norm.weight")))?;
-                b.read_expr(&a.k_norm, norm(n("self_attn.k_norm.weight")))?;
-                b.read_expr(&block.mlp_norm, norm(n("post_attention_layernorm.weight")))?;
-                match &block.mlp {
-                    Mlp::Dense { gate_up, down, .. } => {
-                        b.read_concat(
-                            gate_up,
-                            [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")],
-                        )?;
-                        b.read(down, n("mlp.down_proj.weight"))?;
-                    }
-                    Mlp::Routed { .. } => {
-                        return Err(Error::Illegible {
-                            name: n("mlp"),
-                            detail: "a draft block routes to no experts".to_string(),
-                        });
-                    }
-                }
-            }
-            b.read_expr(&dflash.norm, norm("aux.norm.weight".to_string()))?;
+            dflash.bind_aux(&mut b, src, &norm)?;
         }
 
         Ok(b.build())
@@ -430,19 +384,51 @@ impl Model {
                     .to_string(),
             });
         }
+        // Undoes llama.cpp's RMSNorm +1 fold, for the same reason
+        // [`Layout::folds_the_norm_one`] undoes `mlx_lm`'s: this family's
+        // norm computes `x_norm * (1 + w)`, ggml's `rms_norm` has no such
+        // constant, so the converter stores what its own kernel multiplies
+        // by. Measured against this model's safetensors artifact, every
+        // plane read through a `*_plus_one` norm is greater by exactly one
+        // — `output_norm`, `attn_norm`, the MLP norm and the per-head q/k
+        // norms — and `Qwen3_5RMSNormGated`'s `ssm_norm`, which has no
+        // constant, is identical in both. Read verbatim these are fluent
+        // nonsense, not a failure anyone would notice.
+        // Stated with `read_over`, so the subtraction happens at the f32
+        // width the GGUF stores and the narrowing to this family's dtype
+        // happens above it: `1 + w` and `1` are near-equal numbers, and
+        // subtracting them in bf16 cancels the residual the model reads.
+        let minus_one = |read: Expr| -> Expr { read.bias(-1.0) };
+
         let mut b = Builder::new(src, self.tp, platform);
         b.read(&self.embed, "token_embd.weight")?;
-        b.read(&self.final_norm, "output_norm.weight")?;
+        b.read_over(&self.final_norm, "output_norm.weight", minus_one)?;
 
         if let Head::Bank(head) = &self.head {
-            b.read(head, "output.weight")?;
+            // llama.cpp omits `output.weight` where the head is tied to the
+            // embedding and lets `token_embd.weight` serve both, so a row that
+            // declares a head bank reads the embedding when the file ties.
+            b.read(
+                head,
+                spelled(
+                    src,
+                    ["output.weight".to_string(), "token_embd.weight".to_string()],
+                )?,
+            )?;
         }
 
         for (l, w) in self.layers.iter().enumerate() {
             let n = |s: &str| format!("blk.{l}.{s}");
 
-            b.read(&w.mixer_norm, n("attn_norm.weight"))?;
-            b.read(&w.mlp_norm, n("ffn_norm.weight"))?;
+            b.read_over(&w.mixer_norm, n("attn_norm.weight"), minus_one)?;
+            // `qwen3` names the MLP's norm `ffn_norm`; `qwen35` names the same
+            // plane `post_attention_norm`. Neither is more correct, so the one
+            // the file holds is the one read.
+            b.read_over(
+                &w.mlp_norm,
+                spelled(src, [n("ffn_norm.weight"), n("post_attention_norm.weight")])?,
+                minus_one,
+            )?;
 
             match &w.mixer {
                 Mixer::Attn(a) => {
@@ -450,15 +436,49 @@ impl Model {
                     b.read(&a.k_proj, n("attn_k.weight"))?;
                     b.read(&a.v_proj, n("attn_v.weight"))?;
                     b.read(&a.o_proj, n("attn_output.weight"))?;
-                    b.read(&a.q_norm, n("attn_q_norm.weight"))?;
-                    b.read(&a.k_norm, n("attn_k_norm.weight"))?;
+                    b.read_over(&a.q_norm, n("attn_q_norm.weight"), minus_one)?;
+                    b.read_over(&a.k_norm, n("attn_k_norm.weight"), minus_one)?;
                 }
                 Mixer::Gdn(g) => {
-                    b.read(&g.in_qkvz, n("ssm_in.weight"))?;
-                    b.read(&g.in_ba, n("ssm_beta_alpha.weight"))?;
+                    // `qwen35` publishes the mixer's input projections split
+                    // the way the safetensors checkpoint does — qkv beside its
+                    // gate, beta beside alpha — under attention's own names,
+                    // and joins them nowhere. A file that ships them already
+                    // fused keeps the single-name spelling.
+                    match spelled(src, [n("ssm_in.weight")]) {
+                        Ok(fused) => b.read(&g.in_qkvz, fused)?,
+                        Err(_) => b.read_concat(
+                            &g.in_qkvz,
+                            [n("attn_qkv.weight"), n("attn_gate.weight")],
+                        )?,
+                    }
+                    match spelled(src, [n("ssm_beta_alpha.weight")]) {
+                        Ok(fused) => b.read(&g.in_ba, fused)?,
+                        Err(_) => {
+                            b.read_concat(&g.in_ba, [n("ssm_beta.weight"), n("ssm_alpha.weight")])?
+                        }
+                    }
                     b.read(&g.conv, n("ssm_conv1d.weight"))?;
                     b.read(&g.dt_bias, n("ssm_dt.bias"))?;
-                    b.read(&g.a_log, n("ssm_a"))?;
+                    // `ssm_a` is NOT `A_log`. llama.cpp's converter writes the
+                    // decay itself, `-exp(A_log)`, and this model reads the
+                    // logarithm: layer 0 of a `Qwen3.5-0.8B-Q4_K_M` holds
+                    // `-1.2941, -0.1312, -0.1194, ...` where the safetensors
+                    // `A_log` holds `0.2578, -2.031, -2.125, ...`, and
+                    // `ln(-x)` carries the first onto the second exactly.
+                    //
+                    // Read verbatim it leaves every decay gate in the mixer
+                    // wrong, which is fluent nonsense rather than a failure
+                    // anyone would notice, so the logarithm is taken here —
+                    // once, at import, into the artifact. A file that spells
+                    // the logarithm outright is read as it stands.
+                    match spelled(src, [n("ssm_a_log")]) {
+                        Ok(logarithm) => b.read(&g.a_log, logarithm)?,
+                        Err(_) if src.get(&n("ssm_a")).is_some() => {
+                            b.read_expr(&g.a_log, Expr::Src(n("ssm_a")).unary(UnaryOp::NegLn))?;
+                        }
+                        Err(missing) => return Err(missing),
+                    }
                     b.read(&g.norm, n("ssm_norm.weight"))?;
                     b.read(&g.out_proj, n("ssm_out.weight"))?;
                 }
@@ -493,6 +513,24 @@ impl Model {
         }
 
         Ok(b.build())
+    }
+}
+
+/// Whichever of `names` the checkpoint holds, in the order given.
+///
+/// One plane, spelled differently by two GGUF architectures (`qwen3`'s
+/// `ffn_norm` against `qwen35`'s `post_attention_norm`) or present in one and
+/// tied away in the other (`output.weight`). Choosing by what the file HOLDS
+/// rather than by what its metadata CLAIMS keeps the reading honest: a file
+/// that holds neither is refused naming both, so the miss says what was
+/// looked for.
+pub(crate) fn spelled<const N: usize>(
+    src: &ztensor::Source,
+    names: [String; N],
+) -> Result<String, Error> {
+    match names.iter().find(|name| src.get(name).is_some()) {
+        Some(found) => Ok(found.clone()),
+        None => Err(Error::Missing(names.join("` or `"))),
     }
 }
 

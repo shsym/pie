@@ -34,32 +34,35 @@
 //!
 //! ```text
 //!          block   counting        code        recall       prose        json     mean
-//! DFlash     16  4.24 w8 2.21  6.66 w8 2.82  2.95 w3 1.97  3.34 w4 1.96  6.09 w8 2.70  2.33
-//! DFlash2     8  6.62 w8 3.32  5.08 w8 2.72  3.78 w8 2.22  2.85 w3 1.90  5.19 w8 2.75  2.58
-//! DSpark     16  8.29 w16 2.94 5.18 w8 2.44  2.98 w3 1.88  2.37 w3 1.86  5.05 w8 2.36  2.29
+//! DFlash     16  4.24 w8 1.80  6.66 w8 2.53  2.95 w3 1.64  3.34 w3 1.63  6.09 w8 2.38  1.99
+//! DFlash2     8  6.62 w8 3.15  5.08 w8 2.42  3.78 w8 1.80  2.85 w3 1.50  5.19 w8 2.47  2.27
+//! DSpark     16  8.29 w16 2.72 5.18 w8 2.05  2.98 w3 1.48  2.37 w3 1.36  5.05 w8 2.01  1.92
 //! ```
+//!
+//! (Corrected 2026-09-05: the reference's `accept_lengths` is `len(committed)`,
+//! the accepted prefix plus the bonus — already tokens a round — and an earlier
+//! table here added one more, reading 2.33 / 2.58 / 2.29. Order unchanged.)
 //!
 //! **THE EARLIER TABLE HERE PINNED THE WIDTH, AND THAT DECIDED IT.** It read
 //! DFlash 2.69 against DFlash2 2.76 — a tie — by pricing DFlash at sixteen
 //! rows and DFlash2 at its native eight, which hands one head the cheaper
 //! rung; and it reported DFlash2's prose as 0.93, "a round that loses to
-//! plain decode". Neither survives. `E[min(kept + 1, w)]` is not a function
-//! of `E[kept]`, so a mean cannot be re-priced at another width — the
+//! plain decode". Neither survives. `E[min(kept, w)]` is not a function of
+//! `E[kept]`, so a mean cannot be re-priced at another width — the
 //! distribution has to be kept, and once it is, **no head loses on any
-//! workload**: the smallest cell above is 1.86.
+//! workload**: the smallest cell above is 1.36.
 //!
-//! **DFlash2 leads, by 11% on the mean**, and DSpark is NOT the outlier the
+//! **DFlash2 leads, by 14% on the mean**, and DSpark is NOT the outlier the
 //! old note made it (it read "an index of about 1.4" from published means at
-//! width-sixteen prices; measured here it is 2.29, within 2% of DFlash).
+//! width-sixteen prices; measured here it is 1.92, within 4% of DFlash).
 //! What the old note got right is the shape: DFlash2's shorter block is
-//! stronger where prefixes are short (counting 3.32, recall 2.22) and DFlash
-//! is stronger on code (2.82).
+//! stronger where prefixes are short (counting 3.15, recall 1.80) and DFlash
+//! is stronger on code (2.53).
 //!
-//! **But the width matters more than the head.** DFlash pinned at sixteen
-//! means 1.84 and at its per-prompt best 2.33 — 27% — where the whole spread
-//! between the three heads is 2.29 to 2.58, 12%. Pinned means for the record:
-//! DFlash w4 2.06 / w8 2.29 / w16 1.84, DFlash2 w4 2.10 / w8 2.56, DSpark
-//! w4 1.99 / w8 2.19.
+//! **The head matters about as much as the width.** The spread between heads
+//! is 18% (1.92 to 2.27); between a pinned width and the per-prompt best it is
+//! 13% (DFlash w4 1.76 against 1.99). Pinned means for the record: DFlash w4
+//! 1.76 / w8 1.90, DFlash2 w4 1.85 / w8 2.24, DSpark w4 1.65 / w8 1.81.
 //!
 //! **The confound that cannot be removed**: DFlash runs on Qwen3.6-27B and
 //! the other two on Qwen3.8-27B, because that is what each was trained
@@ -75,7 +78,6 @@
 //! decoding it, which is the loop `rs-mtp-speculative-decoding` runs for the
 //! chained heads.
 
-use inferlet::chat;
 use inferlet::eta::hybrid::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -121,6 +123,11 @@ struct Input {
     /// Diagnostic: read the prefill out at every row, not only the last.
     #[serde(default)]
     readout_all: bool,
+    /// The block the head was trained at: sixteen for the v1 head
+    /// (`qwen36-27b-dflash`), eight for DFlash2 (`qwen38-27b-dflash2`). The
+    /// load does not advertise it yet, so the caller states it; absent, v1's.
+    #[serde(default)]
+    block: Option<u32>,
 }
 
 fn no_hide() -> i32 {
@@ -167,13 +174,20 @@ const MASK_TOKEN: i32 = 248_070;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Hybrid {
-        return Err("this inferlet drives a hybrid model's recurrent state".into());
-    }
     if model::mtp_depth() == 0 {
         return Err("this SKU ships no draft head".into());
     }
-    let block = BLOCK_ROWS;
+    // The head's facts off the load (`model::draft_block`); the inputs
+    // override for a diagnostic, the constants are the last resort.
+    let advertised = model::draft_block();
+    let block = input
+        .block
+        .or(advertised.map(|d| d.rows))
+        .unwrap_or(BLOCK_ROWS)
+        .max(2);
+    let mask_token = advertised.map_or(MASK_TOKEN, |d| d.mask_token as i32);
+    let no_mask = input.no_mask || advertised.is_some_and(|d| !d.bidirectional);
+    let from = advertised.map_or(1, |d| d.proposals_from) as usize;
     let page_size = kv_page_size();
     let rs_page = model::rs_buffer_page_size().max(1);
     let mut prompt = model::encode(&input.prompt);
@@ -190,10 +204,20 @@ async fn main(input: Input) -> Result<Output> {
     let max_pages = max_extent.div_ceil(page_size);
     ws.reserve(max_pages).context("reserve KV")?;
     let pool = max_pages * page_size;
-    let rs = RsWorkingSet::new();
-    rs.alloc_buffer(2 * block.div_ceil(rs_page).max(1))
-        .map_err(|why| format!("alloc rs runs: {why}"))?;
-    let rs_set = vec![rs];
+    // A hybrid text (qwen's GDN layers) needs its recurrent state bound; an
+    // attention-only one (gemma) binds none — the drafter is the same either way.
+    let rs_set = match model::pass_kind() {
+        model::ForwardKind::Attention => Vec::new(),
+        model::ForwardKind::Recurrent => {
+            return Err("a block drafter reads attention kv; a recurrent-only text has none".into());
+        }
+        model::ForwardKind::Hybrid => {
+            let rs = RsWorkingSet::new();
+            rs.alloc_buffer(2 * block.div_ceil(rs_page).max(1))
+                .map_err(|why| format!("alloc rs runs: {why}"))?;
+            vec![rs]
+        }
+    };
     let pipe = Pipeline::new();
 
     // ── PREFILL: the prompt, chunked. Every chunk leaves the drafter's
@@ -263,13 +287,13 @@ async fn main(input: Input) -> Result<Output> {
     let mut kept = Vec::new();
     let mut drafts_all = Vec::new();
     let mut truth_all = Vec::new();
-    let mut hits_by_position = vec![0u32; block as usize - 1];
+    let mut hits_by_position = vec![0u32; block as usize - from];
 
     for round in 0..input.rounds {
         // ── the draft: ONE pass over `[anchor, MASK x block-1]`, the trunk
         //    guarded away from its rows, the whole extent visible (the
         //    drafter's last layer is full attention with no causality).
-        let mut ids = vec![MASK_TOKEN; block as usize];
+        let mut ids = vec![mask_token; block as usize];
         ids[0] = anchor;
         let toks = Channel::from(ids.as_slice()).named("toks_d");
         let indptr = Channel::from([0u32, block]).named("embed_indptr_d");
@@ -303,7 +327,7 @@ async fn main(input: Input) -> Result<Output> {
             })
             .collect();
         let mask = Channel::from_shaped([block, pool], visible).named("mask_d");
-        let bound_mask = if input.no_mask { None } else { Some(&mask) };
+        let bound_mask = if no_mask { None } else { Some(&mask) };
         // **EVERY BLOCK ROW READS OUT.** The drafts plane is cut to the rows
         // the readout names, so a pass that leaves it at the default gets a
         // one-row plane and asking it for `block` values is a geometry
@@ -338,15 +362,11 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         fwd.epilogue(move || {
-            // **THE PROPOSALS ARE THE LOGITS, NOT THE DRAFTS SEAM.** A
-            // chained head's draft logits are a plane of their own, which is
-            // what `mtp.drafts` is for; a BLOCK drafter's rows go through
-            // the target's one `lm_head` beside the trunk's, so the fire's
-            // own readout over the block rows already IS the drafter's. The
-            // seam is bound one row wide at the readout row
-            // (`serve.rs::bind_intrinsic`), so asking it for `block` values
-            // is a geometry mismatch — which is how this was found.
-            out.put(&reshape(reduce_argmax(intrinsics::logits()), [block]));
+            // **THE PROPOSALS ARE THE HEAD'S READOUT, OFF THE `mtp.drafts`
+            // SEAM**, one id per readout row: a v1 head plants its per-slot
+            // argmax there and DFlash2 its selector's walk, so this measures
+            // whichever head the load carries without re-deriving either.
+            out.put(&reshape(intrinsics::mtp_drafts(block), [block]));
         });
         fwd.submit(&pipe)
             .with_context(|| format!("draft submit @round {round}"))?;
@@ -411,7 +431,9 @@ async fn main(input: Input) -> Result<Output> {
         // The drafts are rows `1..block`, which is why the checkpoint's
         // README runs it at `num_speculative_tokens: 15` against a block of
         // sixteen.
-        let proposals: Vec<i32> = proposals[1..].to_vec();
+        // DSpark's rows all propose (row `i` predicts `held + i + 1`), which
+        // the load says with `proposals_from == 0`.
+        let proposals: Vec<i32> = proposals[from..].to_vec();
         let mut prefix = 0u32;
         for (at, (p, t)) in proposals.iter().zip(&truth).enumerate() {
             if p == t {

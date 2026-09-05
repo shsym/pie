@@ -58,6 +58,16 @@ pub fn skus() -> Vec<crate::Sku> {
             |tp: u32| Model::d0_8b(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
+            "qwen36-35b-a3b-dflash",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml,
+            &tokenizer::CONTRACT,
+            |tp: u32| Model::a3b_dflash(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
             "qwen36-35b-a3b-mtp",
             1,
             [Dtype::U4g64],
@@ -116,6 +126,28 @@ pub fn skus() -> Vec<crate::Sku> {
             template::chatml_interleaved,
             &tokenizer::CONTRACT_38,
             |tp: u32| Model::d27b(Dtype::Bf16, Dtype::Bf16, tp),
+        ),
+        // The DFlash2 block drafter overlaid by `--aux`; asks before the
+        // plain rows for the reason the v1 row does.
+        (
+            "qwen38-27b-dflash2",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml_interleaved,
+            &tokenizer::CONTRACT_38,
+            |tp: u32| Model::d27b_dflash2(Dtype::U4g64, Dtype::Bf16, tp),
+        ),
+        (
+            "qwen38-27b-dspark",
+            1,
+            [Dtype::U4g64],
+            Dtype::Bf16,
+            model_dsl::trace_hybrid,
+            template::chatml_interleaved,
+            &tokenizer::CONTRACT_38,
+            |tp: u32| Model::d27b_dspark(Dtype::U4g64, Dtype::Bf16, tp),
         ),
         (
             "qwen38-27b-mtp",

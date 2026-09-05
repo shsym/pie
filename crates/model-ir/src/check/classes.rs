@@ -595,6 +595,8 @@ fn writes_cache(op: &Operation) -> bool {
             | Attention::MlaDecodeSelected { .. }
             | Attention::MlaPrefillSelected { .. }
             | Attention::SsmGdnPrep { .. }
+            | Attention::BlockDynConv { .. }
+            | Attention::SelectorWalk { .. }
             | Attention::IndexLayernormRope { .. }
             | Attention::IndexRope { .. }
             | Attention::IndexTopk { .. }
@@ -654,6 +656,7 @@ mod tests {
                     values: Vec::new(),
                     nodes: Vec::new(),
                     seams: Vec::new(),
+                    drafter: None,
                 },
                 inputs: 0,
             }
