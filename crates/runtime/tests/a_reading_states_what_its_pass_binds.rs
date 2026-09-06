@@ -2,13 +2,16 @@
 //! and `input` resolve against, so the runtime refuses at registration any
 //! statement it could not resolve by name: readings must sit at their own
 //! index, names and port names must be unique, a token-less reading must
-//! carry a latents port (its lane's row count), positions carry at most
+//! carry a ROW-SHAPED port (latents, context or voxels: its lane's row
+//! count), positions carry at most
 //! four axes, and one velocity width serves the whole eta profile — which
 //! `velocity_facts` reads off the first velocity reading.
 //!
 //! `cargo test -p runtime --test a_reading_states_what_its_pass_binds`
 
-use models::{Generative, PortFact, PortKind, ReadingFact, ReadoutKind, Stream};
+use models::{
+    AxisRole, Generative, PortFact, PortKind, PositionConvention, ReadingFact, ReadoutKind, Stream,
+};
 use runtime::model::{validate_generative, velocity_facts};
 
 fn text() -> ReadingFact {
@@ -19,6 +22,7 @@ fn text() -> ReadingFact {
         takes_tokens: true,
         streams: Vec::new(),
         ports: Vec::new(),
+        positions: None,
         readout: ReadoutKind::Hidden,
         readout_width: 512,
     }
@@ -36,25 +40,44 @@ fn denoise() -> ReadingFact {
                 name: "latents",
                 kind: PortKind::Latents,
                 width: 64,
+                streams: Vec::new(),
+                at: None,
             },
             PortFact {
                 name: "timestep",
                 kind: PortKind::LaneVector,
                 width: 1,
+                streams: Vec::new(),
+                at: None,
             },
             PortFact {
                 name: "positions",
                 kind: PortKind::AxisPositions,
                 width: 3,
+                streams: Vec::new(),
+                at: None,
             },
             PortFact {
                 name: "context",
                 kind: PortKind::Context,
                 width: 512,
+                streams: Vec::new(),
+                at: None,
             },
         ],
+        positions: Some(convention()),
         readout: ReadoutKind::Velocity,
         readout_width: 64,
+    }
+}
+
+/// A convention that fits [`denoise`]'s three-axis positions port.
+fn convention() -> PositionConvention {
+    PositionConvention {
+        axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+        text_axis: 0,
+        text_origin: 0,
+        image_follows_text: false,
     }
 }
 
@@ -90,6 +113,8 @@ fn a_reading_resolves_its_ports_by_name_to_kind_relative_indices() {
         name: "guidance",
         kind: PortKind::LaneVector,
         width: 1,
+        streams: Vec::new(),
+        at: None,
     });
     let (index, _) = two.port("guidance").expect("declared");
     assert_eq!(index, 1, "the second lane vector is lane-vector port 1");
@@ -130,17 +155,38 @@ fn duplicate_names_are_refused() {
         name: "latents",
         kind: PortKind::Latents,
         width: 64,
+        streams: Vec::new(),
+        at: None,
     });
     let why = validate_generative(&family(vec![text(), twice])).unwrap_err();
     assert!(why.contains("`latents`") && why.contains("twice"), "{why}");
 }
 
 #[test]
-fn a_token_less_reading_must_carry_a_latents_port() {
+fn a_token_less_reading_must_carry_a_row_shaped_port() {
     let mut rowless = denoise();
-    rowless.ports.retain(|port| port.kind != PortKind::Latents);
+    rowless.ports.retain(|port| {
+        !matches!(
+            port.kind,
+            PortKind::Latents | PortKind::Context | PortKind::Voxels
+        )
+    });
     let why = validate_generative(&family(vec![text(), rowless])).unwrap_err();
-    assert!(why.contains("no latents port"), "{why}");
+    assert!(why.contains("no latents, context or voxels port"), "{why}");
+
+    // A CONTEXT port is row-shaped and states the lane's rows on its own
+    // (`host::forward::port_rows` takes it when it is the lane's only row
+    // port): MiniMax H3's `refine` reading binds the encoder's rows and
+    // nothing else, and that is a whole statement.
+    let mut context_only = denoise();
+    context_only
+        .ports
+        .retain(|port| port.kind == PortKind::Context);
+    // Its rope table went with the other ports, and so does its
+    // convention.
+    context_only.positions = None;
+    validate_generative(&family(vec![text(), context_only]))
+        .expect("a context port states its lane's rows");
 }
 
 #[test]
@@ -159,4 +205,30 @@ fn readings_that_disagree_on_the_velocity_width_are_refused() {
     low.readout_width = 128;
     let why = validate_generative(&family(vec![text(), denoise(), low])).unwrap_err();
     assert!(why.contains("velocity"), "{why}");
+}
+
+/// A position convention is checked against the port it describes: one role
+/// per axis, and a text axis inside them. A family that states otherwise
+/// hands a family-blind guest a grid of the wrong width, and the failure
+/// would surface as a rope mismatch deep in a fire rather than here.
+#[test]
+fn a_position_convention_must_fit_its_positions_port() {
+    let mut wide = denoise();
+    let mut roles = convention();
+    roles.axes.push(AxisRole::Index);
+    wide.positions = Some(roles);
+    let why = validate_generative(&family(vec![text(), wide])).unwrap_err();
+    assert!(why.contains("4 axis roles for a 3-wide"), "{why}");
+
+    let mut off = denoise();
+    let mut roles = convention();
+    roles.text_axis = 3;
+    off.positions = Some(roles);
+    let why = validate_generative(&family(vec![text(), off])).unwrap_err();
+    assert!(why.contains("axis 3 of a 3-axis"), "{why}");
+
+    let mut portless = text();
+    portless.positions = Some(convention());
+    let why = validate_generative(&family(vec![portless, denoise()])).unwrap_err();
+    assert!(why.contains("declares no axis-positions port"), "{why}");
 }

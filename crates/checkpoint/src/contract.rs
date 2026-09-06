@@ -120,6 +120,14 @@ pub enum UnaryOp {
     /// which is how a decay rate is stored by a converter that keeps the
     /// rate itself where the model reads its logarithm.
     NegLn,
+    /// `out = sqrt(x)`, defined for `x >= 0`: a standard deviation from a
+    /// stored variance (a frozen BatchNorm's `running_var + eps`).
+    Sqrt,
+    /// `out = 1 / sqrt(x)`, defined for `x > 0`: the INVERSE deviation of
+    /// the same frozen BatchNorm — what normalises where [`Self::Sqrt`]
+    /// denormalises, and the one form the affine fragment cannot reach
+    /// (it multiplies and adds, it never divides).
+    Rsqrt,
 }
 
 impl UnaryOp {
@@ -128,6 +136,8 @@ impl UnaryOp {
     pub fn apply(self, x: f64) -> f64 {
         match self {
             Self::NegLn => (-x).ln(),
+            Self::Sqrt => x.sqrt(),
+            Self::Rsqrt => x.sqrt().recip(),
         }
     }
 
@@ -136,6 +146,8 @@ impl UnaryOp {
     pub fn defined_at(self, x: f64) -> bool {
         match self {
             Self::NegLn => x < 0.0,
+            Self::Sqrt => x >= 0.0,
+            Self::Rsqrt => x > 0.0,
         }
     }
 
@@ -144,6 +156,8 @@ impl UnaryOp {
     pub const fn domain(self) -> &'static str {
         match self {
             Self::NegLn => "strictly negative",
+            Self::Sqrt => "non-negative",
+            Self::Rsqrt => "strictly positive",
         }
     }
 }

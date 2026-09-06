@@ -18,6 +18,9 @@
 //!   PER REGION instead of per class: which regions hold nothing but ops that
 //!   address off the staged seat's start ([`crate::shifted`]), and can
 //!   therefore be replayed somewhere other than the fire's row zero.
+//! * [`regions_launching_schedules`] — which region LAUNCHES each attention
+//!   schedule, so a schedule is carved at the ceilings of the region that
+//!   reads it rather than the prepare region that built it.
 //! * [`regions_lane_shifting`] — the same reading one AXIS over
 //!   ([`crate::lane_shifted`]): which regions hold nothing but ops that find
 //!   their own LANE inside the fire, and can therefore be replayed somewhere
@@ -73,6 +76,8 @@ pub struct Export {
 /// This load's declared exports (design §9), resolved once at boot.
 #[derive(Debug, Clone)]
 pub(crate) struct Exports {
+    /// The classes whose window writes the `out` seam (empty without one).
+    pub(crate) out_classes: model_ir::ClassSet,
     /// The trunk's logits. `None` for a plan whose readout is a float seam
     /// (`velocity`, `hidden`) — a denoiser has no logits — and a plan with
     /// neither is refused at boot, since a fire would compute nothing a
@@ -97,9 +102,11 @@ pub(crate) struct Exports {
     /// planted in, in plan order. The LAST one is what a `hidden()`
     /// intrinsic and a `ReadoutSeam::Hidden` readback read.
     pub(crate) hidden: Vec<Export>,
-    /// The pixel plane and its `[Clips, 4]` grid (D8), for a plan whose
-    /// text plants `seam::PIXELS` on both; `None` otherwise.
-    pub(crate) pixels: Option<(ValueId, ValueId)>,
+    /// The pixel planes and their `[Clips, 4]` grids (D8), one per
+    /// planting of `seam::PIXELS` in plan order — a VAE plants one on its
+    /// decode arm and one on its encode arm — each with the classes whose
+    /// arm writes the plane; empty for a plan that plants none.
+    pub(crate) pixels: Vec<(Export, ValueId)>,
 }
 
 /// Which seam a fire's host readback mirrors, and the value it reads.
@@ -110,6 +117,84 @@ pub(crate) struct ReadoutSeam {
 }
 
 impl Exports {
+    /// The pixel plane and grid a lane of `class` reads back from: the
+    /// planting whose arm the class runs, else — for a plan with one
+    /// planting — that one.
+    #[must_use]
+    pub(crate) fn pixels_for(&self, class: Option<usize>) -> Option<(ValueId, ValueId)> {
+        class
+            .and_then(|class| {
+                self.pixels
+                    .iter()
+                    .find(|(export, _)| export.classes.contains(class))
+            })
+            .or_else(|| (self.pixels.len() == 1).then(|| &self.pixels[0]))
+            .map(|(export, grid)| (export.value, *grid))
+    }
+
+    /// Every pixels planting's row width, in plan order — one per
+    /// `seam::PIXELS` the text plants. A planting whose width is symbolic
+    /// is skipped rather than guessed, so a plan of only symbolic pixel
+    /// widths reads as planting none.
+    pub(crate) fn pixels_widths<'a>(&'a self, trace: &'a Trace) -> impl Iterator<Item = u32> + 'a {
+        self.pixels.iter().filter_map(move |(export, _)| {
+            crate::store::kv::width_of(trace, export.value)
+                .ok()
+                .and_then(|width| u32::try_from(width).ok())
+        })
+    }
+
+    /// The seam a lane of `class` reads back from — the export its OWN arm
+    /// writes (a multi-reading plan plants `hidden` on its encoder arm and
+    /// `velocity` on its denoise arm, design D1/D5): `out` when the class
+    /// writes it, else its `velocity`, else the last `hidden` its class
+    /// writes; a class that writes none falls back to the plan-wide
+    /// [`readout`](Exports::readout).
+    #[must_use]
+    pub(crate) fn readout_for(&self, class: usize) -> Option<ReadoutSeam> {
+        use engine::fire::ReadoutSeam as Seam;
+        if let Some(out) = self.out
+            && self.out_classes.contains(class)
+        {
+            return Some(ReadoutSeam {
+                seam: Seam::Logits,
+                value: out,
+            });
+        }
+        if let Some(velocity) = self.velocity_for(class) {
+            return Some(ReadoutSeam {
+                seam: Seam::Velocity,
+                value: velocity.value,
+            });
+        }
+        if let Some(hidden) = self.hidden_for(class) {
+            return Some(ReadoutSeam {
+                seam: Seam::Hidden,
+                value: hidden.value,
+            });
+        }
+        self.readout()
+    }
+
+    /// The velocity export a lane of `class` writes, else the plan's (for
+    /// a class writing none — the plan-wide answer keeps a text SKU's one
+    /// seam bound as before).
+    #[must_use]
+    pub(crate) fn velocity_for(&self, class: usize) -> Option<&Export> {
+        self.velocity
+            .as_ref()
+            .filter(|export| export.classes.contains(class))
+    }
+
+    /// The last hidden export a lane of `class` writes.
+    #[must_use]
+    pub(crate) fn hidden_for(&self, class: usize) -> Option<&Export> {
+        self.hidden
+            .iter()
+            .rev()
+            .find(|export| export.classes.contains(class))
+    }
+
     /// The seam a lane's rows are read back from: `out` when the plan has
     /// one, else `velocity`, else the last `hidden` — a plan with none was
     /// refused at [`Exports::of`].
@@ -148,10 +233,9 @@ impl Exports {
             .iter()
             .find(|seam| seam.seam == OUT_SEAM)
             .and_then(|seam| seam.values.first().copied());
-        let float_readout = trace
-            .seams
-            .iter()
-            .any(|seam| FLOAT_READOUT_SEAMS.contains(&seam.seam.as_str()) && !seam.values.is_empty());
+        let float_readout = trace.seams.iter().any(|seam| {
+            FLOAT_READOUT_SEAMS.contains(&seam.seam.as_str()) && !seam.values.is_empty()
+        });
         if out.is_none() && !float_readout {
             return Err(Fault::Unbound {
                 what: format!(
@@ -162,14 +246,13 @@ impl Exports {
             });
         }
         let named = |name: &str| -> Vec<Export> {
-            trace.seams
+            trace
+                .seams
                 .iter()
                 .filter(|seam| seam.seam == name)
                 .flat_map(|seam| {
                     let layer = seam.layer.unwrap_or(0);
-                    seam.values
-                        .iter()
-                        .map(move |value| (layer, *value))
+                    seam.values.iter().map(move |value| (layer, *value))
                 })
                 .map(|(layer, value)| Export {
                     value,
@@ -188,12 +271,23 @@ impl Exports {
         let pixels = trace
             .seams
             .iter()
-            .find(|seam| seam.seam == PIXELS_SEAM)
-            .and_then(|seam| match seam.values.as_slice() {
-                [plane, grid, ..] => Some((*plane, *grid)),
+            .filter(|seam| seam.seam == PIXELS_SEAM)
+            .filter_map(|seam| match seam.values.as_slice() {
+                [plane, grid, ..] => Some((
+                    Export {
+                        value: *plane,
+                        layer: seam.layer.unwrap_or(0),
+                        classes: writer_classes(trace, compiled, *plane),
+                    },
+                    *grid,
+                )),
                 _ => None,
-            });
+            })
+            .collect();
         Ok(Exports {
+            out_classes: out.map_or_else(model_ir::ClassSet::default, |out| {
+                writer_classes(trace, compiled, out)
+            }),
             out,
             mtp: named(MTP_SEAM).into_iter().next(),
             scores,
@@ -214,6 +308,19 @@ impl Exports {
 /// the writing node is the one reading that cannot be fooled by a model text
 /// reusing an op.
 fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> model_ir::ClassSet {
+    // A merged export is written by its arms: every class that writes any
+    // arm reads the seam back from the merged column.
+    if let Some(model_ir::Def::Merge(arms)) =
+        trace.values.get(value.0 as usize).map(|decl| &decl.def)
+    {
+        let mut classes = model_ir::ClassSet::default();
+        for (arm, _) in arms {
+            for class in writer_classes(trace, compiled, *arm).iter() {
+                classes.insert(class);
+            }
+        }
+        return classes;
+    }
     let mut outputs: Vec<ValueId> = Vec::new();
     let mut writers: Vec<u32> = Vec::new();
     for (at, node) in trace.nodes.iter().enumerate() {
@@ -234,7 +341,6 @@ fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> mo
     }
     classes
 }
-
 
 /// The classes whose window runs an `attention.masked` arm.
 ///
@@ -580,10 +686,27 @@ pub(crate) struct Feeds {
     /// Every row selection a packing table is keyed by, in first-seen order
     /// (the order the inputs store carves them in).
     pub(crate) selections: Vec<model_ir::Selection>,
-    /// The selections whose `ReferenceTag` table a `RaggedMask::ReferenceSelfOnly`
-    /// reads on its query side — the ones whose groups may hold at most one
-    /// reference lane on this shell (the kernel has one tail per group).
-    pub(crate) reference_masked: Vec<model_ir::Selection>,
+    /// Every float port merged STRAIGHT into a stream (`Value::merge` with
+    /// the port as an arm): the merged column has no node writing that arm's
+    /// rows, so the fire lands the port's rows in it before the walk — the
+    /// lanes the arm's guard selects, from the port rectangle the feed
+    /// filled (zeros for a lane nothing fed). The compiler keeps such a
+    /// column live from the fire's first instant.
+    pub(crate) merged: Vec<MergedPort>,
+    /// Merges with an input arm this shell cannot land: a non-port input, or
+    /// an arm guard that is not a conjunction of facts. Refused at load.
+    pub(crate) unlanded: Vec<ValueId>,
+}
+
+/// One float port that is a merge's arm.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MergedPort {
+    /// The merged value whose column the rows land in.
+    pub(crate) merge: ValueId,
+    /// Which port.
+    pub(crate) seat: crate::inputs::PortSeat,
+    /// The arm's lanes.
+    pub(crate) select: model_ir::Selection,
 }
 
 impl Feeds {
@@ -624,6 +747,17 @@ impl Feeds {
                     width: u32::from(axes),
                     dtype,
                 }),
+                // The voxel port (D8). It is a seat like any other for the
+                // purpose of "which class must feed this", but its rectangle
+                // is NOT in the inputs store: the payload lives in
+                // `voxels::Store`, below the fire's other inputs, so
+                // `seats()` keeps it out of the token-axis carve.
+                RuntimeInput::Voxels { port, channels } => Some(crate::inputs::PortSeat {
+                    kind: engine::fire::PortKind::Voxels,
+                    port,
+                    width: channels,
+                    dtype,
+                }),
                 RuntimeInput::RowPermutation { select }
                 | RuntimeInput::Geometry {
                     kind:
@@ -655,18 +789,65 @@ impl Feeds {
                 }
             }
         }
-        for node in &trace.nodes {
-            if let model_ir::Operation::Attention(model_ir::Attention::Ragged {
-                mask: model_ir::RaggedMask::ReferenceSelfOnly { q_tags, .. },
-                ..
-            }) = &node.op
-                && let Def::Input(RuntimeInput::Geometry {
-                    kind: GeomKind::ReferenceTag { select },
-                    ..
-                }) = &trace.values[q_tags.0 as usize].def
-                && !feeds.reference_masked.contains(select)
-            {
-                feeds.reference_masked.push(*select);
+        // The ports merged straight into a stream.
+        for (at, decl) in trace.values.iter().enumerate() {
+            let Def::Merge(arms) = &decl.def else {
+                continue;
+            };
+            for (arm, guard) in arms {
+                let Def::Input(input) = &trace.values[arm.0 as usize].def else {
+                    continue;
+                };
+                let seat = feeds
+                    .ports
+                    .iter()
+                    .find(|(seat, _)| {
+                        let (kind, port) = match *input {
+                            RuntimeInput::Latents { port, .. } => {
+                                (engine::fire::PortKind::Latents, port)
+                            }
+                            RuntimeInput::LaneVector { port, .. } => {
+                                (engine::fire::PortKind::LaneVector, port)
+                            }
+                            RuntimeInput::Context { port, .. } => {
+                                (engine::fire::PortKind::Context, port)
+                            }
+                            RuntimeInput::AxisPositions { port, .. } => {
+                                (engine::fire::PortKind::AxisPositions, port)
+                            }
+                            _ => return false,
+                        };
+                        seat.kind == kind && seat.port == port
+                    })
+                    .map(|(seat, _)| *seat);
+                let (Some(seat), Some(select)) = (seat, model_ir::Selection::of(guard)) else {
+                    // A non-port input merged, or an arm whose guard is no
+                    // conjunction: nothing lands it. Left to the load's
+                    // refusal (`Shell::load`), which names the value.
+                    feeds.unlanded.push(ValueId(at as u32));
+                    continue;
+                };
+                // The port is read through the merge: the classes whose
+                // window reads the MERGED column, among the arm's own lanes,
+                // are the classes that must feed it.
+                let readers = reader_classes(trace, compiled, ValueId(at as u32));
+                if let Some((_, classes)) = feeds
+                    .ports
+                    .iter_mut()
+                    .find(|(have, _)| have.kind == seat.kind && have.port == seat.port)
+                {
+                    for class in readers.iter() {
+                        let word = compiled.classes.classes[class].word();
+                        if select.holds(word) {
+                            classes.insert(class);
+                        }
+                    }
+                }
+                feeds.merged.push(MergedPort {
+                    merge: ValueId(at as u32),
+                    seat,
+                    select,
+                });
             }
         }
         feeds
@@ -674,8 +855,15 @@ impl Feeds {
 
     /// The port seats alone, in the store's order.
     #[must_use]
+    /// The port rectangles the INPUTS store carves — every seat but the
+    /// voxel one, whose payload the voxel store reserves at the ladder's
+    /// ceilings instead (design D8).
     pub(crate) fn seats(&self) -> Vec<crate::inputs::PortSeat> {
-        self.ports.iter().map(|(seat, _)| *seat).collect()
+        self.ports
+            .iter()
+            .map(|(seat, _)| *seat)
+            .filter(|seat| seat.kind != engine::fire::PortKind::Voxels)
+            .collect()
     }
 }
 
@@ -702,4 +890,76 @@ fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> mo
         }
     }
     classes
+}
+
+/// **WHICH TEMPLATE REGION LAUNCHES EACH ATTENTION SCHEDULE** — one entry per
+/// `Trace::values` id, holding the region of the node that READS that
+/// schedule. `None` for a value no launch reads, and `None` again when two
+/// regions read one: nothing can then speak for both, and the caller carves
+/// nothing rather than carve at the wrong region's ceilings.
+///
+/// **THIS IS [`regions_shifting`]'S CONSUMER SIDE, AND IT EXISTS BECAUSE THE
+/// TWO REGIONS ARE NEVER THE SAME ONE.** A schedule is BUILT in a
+/// `Phase::Prepare` region — a region holds one phase, so a planner op never
+/// shares a region with the launch that reads it — and such a region holds
+/// nothing but [`crate::PLANNED`] ops, so [`regions_shifting`] reads it as
+/// shifting for free: it names no kernel that could address the wrong row.
+/// The region that LAUNCHES the schedule answers for itself, and a trunk
+/// region carrying one `linear.matmul` (`Reads::Nothing`) does not shift.
+///
+/// So the ceilings a schedule is carved at — how many requests it names, and
+/// which lane it counts them from — must be the LAUNCHER's and not the
+/// builder's. It is the launch that is handed a boundary vector, and
+/// `Run::ragged_q` picks that vector off the launcher's own standing:
+/// carving at the builder's ceiling hands a 32-request schedule a one-lane
+/// vector, which `kernels_cuda::attn`'s `lanes_carry` refuses by name.
+///
+/// `model_exec::store::check::no_schedule_straddles_its_readers` pins the two
+/// regions to one MASK, so they see one window and one span; it does not pin
+/// them to one region, and the `shifted`/`lane_shifted` bits are per region.
+#[must_use]
+pub(crate) fn regions_launching_schedules(
+    trace: &Trace,
+    compiled: &CompiledModel,
+) -> Vec<Option<u32>> {
+    let mut out: Vec<Option<u32>> = vec![None; trace.values.len()];
+    let mut claimed: Vec<bool> = vec![false; trace.values.len()];
+    let mut inputs: Vec<ValueId> = Vec::new();
+    for (at, region) in compiled.template().iter().enumerate() {
+        let here = u32::try_from(at).unwrap_or(u32::MAX);
+        for node in region.nodes.clone() {
+            let Some(node) = trace.nodes.get(node as usize) else {
+                continue;
+            };
+            inputs.clear();
+            node.op.inputs(&mut inputs);
+            for id in &inputs {
+                let at = id.0 as usize;
+                // A host struct is the only thing a plan op defines and the
+                // only thing a launch reads it as; a rectangle operand says
+                // nothing about schedules.
+                if !trace
+                    .values
+                    .get(at)
+                    .is_some_and(|decl| matches!(decl.ty, model_ir::Ty::Struct(_)))
+                {
+                    continue;
+                }
+                let Some(slot) = out.get_mut(at) else {
+                    continue;
+                };
+                if claimed[at] {
+                    // A second region reading one schedule: neither can speak
+                    // for the other, so nobody does.
+                    if *slot != Some(here) {
+                        *slot = None;
+                    }
+                } else {
+                    claimed[at] = true;
+                    *slot = Some(here);
+                }
+            }
+        }
+    }
+    out
 }

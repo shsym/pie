@@ -81,6 +81,7 @@ impl Shell {
             airborne: &self.airborne,
             scores: self.scores.as_ref(),
             shifted: &self.shifted,
+            schedule_readers: &self.schedule_readers,
             decoding: &self.decoding,
             seq,
         };
@@ -126,6 +127,8 @@ struct FireCtx<'a> {
     airborne: &'a Airborne,
     scores: Option<&'a Scores>,
     shifted: &'a [bool],
+    /// Per `Trace::values` id: which region's launch reads that attention schedule — what [`crate::run::Ceilings::readers`] carries.
+    schedule_readers: &'a [Option<u32>],
     decoding: &'a model_ir::ClassSet,
     /// The step this fire settles at.
     seq: u64,
@@ -154,7 +157,13 @@ impl FireCtx<'_> {
         // A session may hold one airborne fire, so the deferred batch is reaped
         // only when a prologue is about to stage.
         if p.attachments.iter().any(|a| a.at == Boundary::Prologue) {
-            reap_guest_fires(self.programs, self.owed, self.airborne, self.guest_landed, "enqueue.prologue")?;
+            reap_guest_fires(
+                self.programs,
+                self.owed,
+                self.airborne,
+                self.guest_landed,
+                "enqueue.prologue",
+            )?;
         }
         for (at, attached) in p.attachments.iter().enumerate() {
             if attached.at != Boundary::Prologue {
@@ -265,6 +274,48 @@ impl FireCtx<'_> {
             })?;
             Some(store.stage(self.device.stream(), &p.voxel_tables)?)
         };
+        // The voxel port fed from a channel (D8): the tables above staged the
+        // grid and the slots and left the payload region as the load did, and
+        // each fed lane's rows land in it now — device to device from the
+        // cell the instance's own `take` would read this fire, at the lane's
+        // `voxel_offset`. Nothing crosses the host bus: a decode's latent and
+        // an encode's pixels are already on the card, on the ring the guest
+        // wrote them to.
+        if let Some(handles) = voxels {
+            for feed in &p.voxel_feeds {
+                let dest = handles.voxels.ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "lane {}'s voxel port payload, which this fire's tables reserved \
+                         no rectangle for",
+                        feed.lane
+                    ),
+                })?;
+                let row_bytes = feed.bytes / u64::from(feed.rows.max(1));
+                let at = dest.ptr + u64::from(feed.first) * row_bytes;
+                let (source, _) = self.programs.feed_cell(feed.instance, feed.channel)?;
+                if feed.cast {
+                    kernels_cuda::linear::quant::cast_fp32_to(
+                        self.device.ctx(),
+                        kernels_cuda::Tensor::new(source, feed.rows, feed.width, Dtype::F32),
+                        &mut kernels_cuda::Tensor::new(at, feed.rows, feed.width, Dtype::Bf16),
+                    )
+                    .map_err(Fault::from)?;
+                } else {
+                    crate::device::alloc::copy_any(
+                        self.device.stream(),
+                        at,
+                        source,
+                        usize::try_from(feed.bytes).unwrap_or(usize::MAX),
+                    )?;
+                }
+            }
+        } else if !p.voxel_feeds.is_empty() {
+            return Err(Fault::Unbound {
+                what: "a channel-fed voxel port on a fire that staged no voxel table; a \
+                       lane that feeds one submits its clips beside it (`Step::voxels`)"
+                    .to_string(),
+            });
+        }
         let self_cond = if p.self_cond_rows.is_empty() {
             None
         } else {
@@ -278,11 +329,25 @@ impl FireCtx<'_> {
             // `take` would read this fire.
             for &(first, cells, rows_channel, weights_channel, instance) in &p.self_cond_feeds {
                 let bytes = cells * 4;
-                let (rows_at, weights_at) =
-                    self.programs.self_cond_cells(instance, rows_channel, weights_channel, bytes as u64)?;
+                let (rows_at, weights_at) = self.programs.self_cond_cells(
+                    instance,
+                    rows_channel,
+                    weights_channel,
+                    bytes as u64,
+                )?;
                 let offset = (first * 4) as u64;
-                crate::device::alloc::copy_d2d(self.device.stream(), staged.0.ptr + offset, rows_at, bytes)?;
-                crate::device::alloc::copy_d2d(self.device.stream(), staged.1.ptr + offset, weights_at, bytes)?;
+                crate::device::alloc::copy_d2d(
+                    self.device.stream(),
+                    staged.0.ptr + offset,
+                    rows_at,
+                    bytes,
+                )?;
+                crate::device::alloc::copy_d2d(
+                    self.device.stream(),
+                    staged.1.ptr + offset,
+                    weights_at,
+                    bytes,
+                )?;
             }
             Some(staged)
         };
@@ -343,7 +408,11 @@ impl FireCtx<'_> {
                     carve_rows
                 };
                 self.inputs
-                    .port(seat.kind, seat.port, u32::try_from(rows).unwrap_or(u32::MAX))
+                    .port(
+                        seat.kind,
+                        seat.port,
+                        u32::try_from(rows).unwrap_or(u32::MAX),
+                    )
                     .map(|tensor| crate::run::PortBinding {
                         kind: seat.kind,
                         port: seat.port,
@@ -367,6 +436,42 @@ impl FireCtx<'_> {
                 clips: u64::from(p.composition.clips()),
             },
         );
+        // The ports merged straight into a stream land in their merged
+        // column now — after the feeds and the carve, before the walk: the
+        // arm's lanes' rows from the port rectangle, or zeros for a lane
+        // that fed nothing, so the column never reads the last fire's bytes.
+        for land in &p.merge_lands {
+            let Some(column) = slots.0[land.merge.0 as usize] else {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "value {}, a merge over a port, which the carve gave no rectangle",
+                        land.merge.0
+                    ),
+                });
+            };
+            let row_bytes = land.seat.row_bytes();
+            let at = column.ptr + u64::from(land.first) * row_bytes;
+            let bytes = usize::try_from(u64::from(land.rows) * row_bytes).unwrap_or(usize::MAX);
+            if land.fed {
+                let rectangle = self
+                    .inputs
+                    .port(land.seat.kind, land.seat.port, u32::MAX)
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "the {:?} port {} rectangle, which this load carved none of",
+                            land.seat.kind, land.seat.port
+                        ),
+                    })?;
+                crate::device::alloc::copy_any(
+                    self.device.stream(),
+                    at,
+                    rectangle.ptr + u64::from(land.first) * row_bytes,
+                    bytes,
+                )?;
+            } else {
+                crate::device::alloc::zero_span_on(self.device.stream(), at, bytes)?;
+            }
+        }
         // The three RS seats: a plain fire binds `Tensor::ABSENT` for all of them.
         let caches = self.pools.table(
             &self
@@ -562,6 +667,7 @@ impl FireCtx<'_> {
             bodied: p.bodied,
             shifted: self.shifted,
             admits: p.admits.as_ref(),
+            readers: self.schedule_readers,
             carve: p.bodied.then(|| record::Carve {
                 per_axis: model_ir::PerAxis::new([
                     Some(record::AxisCarve {
@@ -647,11 +753,10 @@ impl FireCtx<'_> {
         } else {
             // An eager walk under a recording mode is counted.
             if self.graphs.records() {
-                self.cache
-                    .eager_walk(
-                        self.weights.rotating() || self.weights.hosts_experts(),
-                        p.rs.buffered,
-                    );
+                self.cache.eager_walk(
+                    self.weights.rotating() || self.weights.hosts_experts(),
+                    p.rs.buffered,
+                );
             }
             // The rotation rides the eager cursor.
             let mut cursor = Cursor::new(&place);
@@ -699,8 +804,15 @@ impl FireCtx<'_> {
         }
         let slots = &staged.slots;
         // The pixels seam (D8): the plane and its output grid, resolved here
-        // whenever the fire carried clips.
-        let pixels = match self.exports.pixels {
+        // whenever the fire carried clips — the planting of the class the
+        // clips run in (M0: one voxel class a fire).
+        let voxel_class = p
+            .composition
+            .voxel_classes()
+            .present_in_order()
+            .next()
+            .map(|class| class as usize);
+        let pixels = match self.exports.pixels_for(voxel_class) {
             Some((plane, grid)) if p.composition.voxel_rows() > 0 => {
                 let rect = |id: model_ir::ValueId, what: &str| {
                     slots.0[id.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -722,92 +834,103 @@ impl FireCtx<'_> {
             }
             _ => None,
         };
-        // The readout seam: `out` (logits) when the plan has one, else the
-        // float readout it plants instead (`velocity`, then the last
-        // `hidden`) — design D3's "this kind's logits".
-        // A pixels-only plan (a VAE decoder, D8) has no row readout at all:
-        // its numbers come off the pixels seam below.
-        let readout = match self.exports.readout() {
-            Some(readout) => Some(readout),
-            None if pixels.is_some() => None,
-            None => {
-                return Err(Fault::Unbound {
-                    what: "a plan with no `out` seam and no float readout, which boot should \
-                           have refused"
-                        .to_string(),
-                });
-            }
-        };
-        let logits = match readout {
-            Some(readout) => {
-                let out = readout.value;
-                let logits = slots.0[out.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the {:?} readout seam, which the carve gave no rectangle",
-                        out.0, readout.seam
-                    ),
-                })?;
-                if !matches!(logits.dtype, Dtype::Bf16 | Dtype::F32) {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "the {:?} readout seam landed as {:?}, which this shell cannot \
-                             read back",
-                            readout.seam, logits.dtype
-                        ),
-                    });
+        // Where each lane's pixels BEGIN in that plane, on the host, before
+        // the walk that computes the device grid: the epilogue's `pixels()`
+        // intrinsic is a base address, so it cannot wait for the launch.
+        // `voxels::host_grid` replays the plan's `Spatial::Grid` chain with
+        // the rules' own host twins over this fire's port grid. A chain the
+        // twins cannot follow binds nothing rather than binding a wrong row.
+        let mut pixels_at: Vec<Option<(kernels_cuda::Tensor, u32, u32)>> =
+            vec![None; p.lanes.len()];
+        if let (Some(seat), Some((_, grid))) =
+            (pixels.as_ref(), self.exports.pixels_for(voxel_class))
+            && let Some(table) = crate::voxels::host_grid(self.trace, &p.voxel_tables.grid, grid)
+        {
+            for (lane, &(first, count)) in seat.lane_clips.iter().enumerate() {
+                if count == 0 {
+                    continue;
                 }
-                if readout.seam == engine::fire::ReadoutSeam::Logits && logits.dtype != Dtype::Bf16
-                {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "an out seam landed as {:?}, which this shell cannot read back",
-                            logits.dtype
-                        ),
-                    });
-                }
-                logits
+                let at = first as usize * 4;
+                let Some(&offset) = table.get(at + 3) else {
+                    continue;
+                };
+                let rows: i64 = (first..first + count)
+                    .filter_map(|clip| table.get(clip as usize * 4..clip as usize * 4 + 3))
+                    .map(|b| i64::from(b[0]) * i64::from(b[1]) * i64::from(b[2]))
+                    .sum();
+                pixels_at[lane] = Some((
+                    seat.plane,
+                    u32::try_from(offset).unwrap_or(0),
+                    u32::try_from(rows).unwrap_or(u32::MAX),
+                ));
             }
-            None => kernels_cuda::Tensor::new(0, 0, 0, Dtype::Bf16),
-        };
-        let readout_seam = readout.map_or(engine::fire::ReadoutSeam::Pixels, |readout| readout.seam);
-        // The float seams an epilogue may point an intrinsic at, whether or
-        // not they are the readout: the velocity plane and the last hidden
-        // plane, each as the carve placed it.
-        let float_plane = |export: Option<&crate::exports::Export>,
-                           seam: &str|
-         -> Result<Option<kernels_cuda::Tensor>> {
-            let Some(export) = export else {
-                return Ok(None);
-            };
-            let plane = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "value {}, the `{seam}` export, which the carve gave no rectangle",
-                    export.value.0
-                ),
-            })?;
-            if !matches!(plane.dtype, Dtype::Bf16 | Dtype::F32) {
-                return Err(Fault::Unbound {
-                    what: format!(
-                        "a `{seam}` export landed as {:?}, which this shell cannot point an \
-                         intrinsic at",
-                        plane.dtype
-                    ),
-                });
-            }
-            Ok(Some(plane))
-        };
-        let velocity = float_plane(self.exports.velocity.as_ref(), "velocity")?;
-        let hidden = float_plane(self.exports.hidden.last(), "hidden")?;
-        // Which rows of the arena's logits rectangle each submitted lane reads and owns.
+        }
+        // Which rows of the arena's readout rectangles each submitted lane
+        // reads and owns, and the class its word landed in.
         let lane_count = p.lanes.len();
         let mut last_row = vec![0u32; lane_count];
         let mut first_row = vec![0u32; lane_count];
         let mut lane_rows = vec![0u32; lane_count];
+        let mut lane_class = vec![0usize; lane_count];
         for row in p.composition.lanes() {
             let at = row.source as usize;
             last_row[at] = row.row_offset + row.rows - 1;
             first_row[at] = row.row_offset;
             lane_rows[at] = row.rows;
+            lane_class[at] = row.class as usize;
+        }
+        // One export rectangle, as the carve placed it, checked for an
+        // element this shell can read back or point an intrinsic at.
+        let plane_of = |value: model_ir::ValueId, what: &str| -> Result<kernels_cuda::Tensor> {
+            let plane = slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "value {}, the {what} export, which the carve gave no rectangle",
+                    value.0
+                ),
+            })?;
+            if !matches!(plane.dtype, Dtype::Bf16 | Dtype::F32) {
+                return Err(Fault::Unbound {
+                    what: format!(
+                        "the {what} export landed as {:?}, which this shell cannot read back",
+                        plane.dtype
+                    ),
+                });
+            }
+            Ok(plane)
+        };
+        // The readout seam, PER LANE, from the lane's class: `out` (logits)
+        // when its arm writes one, else the float readout its arm plants
+        // (`velocity`, then its last `hidden`) — design D3's "this kind's
+        // logits", and D5's several arms of one plan each reading back their
+        // own seam. A pixels-only plan (a VAE decoder, D8) has no row
+        // readout at all: its numbers come off the pixels seam below.
+        let mut lane_planes: Vec<Option<(engine::fire::ReadoutSeam, kernels_cuda::Tensor)>> =
+            vec![None; lane_count];
+        for lane in 0..lane_count {
+            match self.exports.readout_for(lane_class[lane]) {
+                Some(readout) => {
+                    let plane = plane_of(readout.value, &format!("{:?} readout", readout.seam))?;
+                    if readout.seam == engine::fire::ReadoutSeam::Logits
+                        && plane.dtype != Dtype::Bf16
+                    {
+                        return Err(Fault::Unbound {
+                            what: format!(
+                                "an out seam landed as {:?}, which this shell cannot read back",
+                                plane.dtype
+                            ),
+                        });
+                    }
+                    lane_planes[lane] = Some((readout.seam, plane));
+                }
+                None if pixels.is_some() => {}
+                None => {
+                    return Err(Fault::Unbound {
+                        what: "a plan with no `out` seam and no float readout, which boot should \
+                               have refused"
+                            .to_string(),
+                    });
+                }
+            }
         }
 
         // The capture columns' rectangles, one per exported attention layer.
@@ -835,7 +958,6 @@ impl FireCtx<'_> {
         }
 
         // The epilogue: intrinsics point at rows of the arena, read where they lie.
-        let vocab = u32::try_from(logits.width as usize).unwrap_or(u32::MAX);
         let storage_of = |plane: kernels_cuda::Tensor| {
             if plane.dtype == Dtype::F32 {
                 crate::program::launch::INTRINSIC_STORAGE_F32
@@ -865,7 +987,13 @@ impl FireCtx<'_> {
             None => None,
         };
         // The previous frame's epilogues are collected here, the latest point a lane must be free.
-        reap_guest_fires(self.programs, self.owed, self.airborne, self.guest_landed, "enqueue.epilogue")?;
+        reap_guest_fires(
+            self.programs,
+            self.owed,
+            self.airborne,
+            self.guest_landed,
+            "enqueue.epilogue",
+        )?;
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
             // The guest's own rows, by index within the lane.
@@ -902,6 +1030,19 @@ impl FireCtx<'_> {
             // denoiser's epilogue reads every latent row's velocity, and a
             // hidden readout every row's state (`Readout::Rows` narrows the
             // logits row list, never these).
+            // Each from the lane's OWN arm (a multi-reading plan's denoise
+            // arm plants velocity, its encoder arm hidden): a lane whose arm
+            // plants none binds none, and a program reading it is refused at
+            // its mint by name.
+            let class = lane_class[lane];
+            let velocity = match self.exports.velocity_for(class) {
+                Some(export) => Some(plane_of(export.value, "velocity")?),
+                None => None,
+            };
+            let hidden = match self.exports.hidden_for(class) {
+                Some(export) => Some(plane_of(export.value, "hidden")?),
+                None => None,
+            };
             if let Some(plane) = velocity {
                 self.programs.bind_intrinsic(
                     attached.instance,
@@ -924,11 +1065,30 @@ impl FireCtx<'_> {
                     first_row[lane],
                 )?;
             }
+            // The pixels plane (D8), at the lane's OWN first output voxel —
+            // not `first_row`, which is its TOKEN row: a VAE lane's rows are
+            // its clips' voxels, and the plane is the whole fire's.
+            if let Some((plane, first, _)) = pixels_at[lane] {
+                self.programs.bind_intrinsic(
+                    attached.instance,
+                    eta_ir::op::IntrinsicId::Pixels,
+                    plane.ptr,
+                    storage_of(plane),
+                    plane.width,
+                    plane.width,
+                    first,
+                )?;
+            }
             // The logits intrinsic is the out seam's alone: a plan whose
             // readout is a float seam binds none, and a program reading
             // `logits()` against it is refused at its mint by name.
-            if readout_seam != engine::fire::ReadoutSeam::Logits {
-                // Nothing to bind for `logits`.
+            let logits = match lane_planes[lane] {
+                Some((engine::fire::ReadoutSeam::Logits, plane)) => plane,
+                _ => kernels_cuda::Tensor::new(0, 0, 0, Dtype::Bf16),
+            };
+            let vocab = logits.width;
+            if logits.ptr == 0 {
+                // Nothing to bind for `logits`: this lane's arm plants none.
             } else if consecutive {
                 self.programs.bind_intrinsic(
                     attached.instance,
@@ -1039,8 +1199,9 @@ impl FireCtx<'_> {
         }
 
         // The sequences are longer — only the slots this shell counts for.
-        for (seat, table) in p.seats.iter().zip(&p.tables) {
+        for ((seat, table), kv_less) in p.seats.iter().zip(&p.tables).zip(&p.kv_less_seats) {
             if table.is_empty()
+                && !kv_less
                 && let Some(slot) = self.held.get_mut(seat.slot as usize)
             {
                 *slot = seat.have + seat.rows;
@@ -1048,8 +1209,7 @@ impl FireCtx<'_> {
         }
 
         Ok(Some(Readback {
-            logits,
-            seam: readout_seam,
+            lanes: lane_planes,
             columns,
             last_row,
             first_row,

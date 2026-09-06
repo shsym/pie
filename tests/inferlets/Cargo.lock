@@ -187,6 +187,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "flux2-klein-parity"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "flux2-parity"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -298,6 +314,14 @@ dependencies = [
 
 [[package]]
 name = "gumbel-watermark"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "h3-parity"
 version = "0.1.0"
 dependencies = [
  "inferlet",
@@ -728,6 +752,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "text-to-image"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "token-healing"
 version = "0.1.0"
 dependencies = [
@@ -772,6 +804,14 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "wan2-parity"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
 
 [[package]]
 name = "wasm-encoder"
@@ -901,6 +941,22 @@ dependencies = [
 
 [[package]]
 name = "xtc-sampling"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "zimage-parity"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
+name = "zimage-vae-parity"
 version = "0.1.0"
 dependencies = [
  "inferlet",

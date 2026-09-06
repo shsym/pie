@@ -55,6 +55,20 @@ CUDA agents replace the CUDA arms, the other shells stay refused this phase.
   kv_heads, sm_scale, mask, tags: Option<(Tensor, Tensor)>, &mut o)`, bf16 in/out, head_dim
   64/128/256 (the vendored FlashInfer ragged FA2 template); `seat::ENTRIES` `RowsAndLanes`
   and a rebind law like `attention.prefill`.
+- `RaggedMask::RelativeBias { table, max_len }` (M3): the segment pairing plus an additive
+  per-head bias on every logit, `s = q·k · sm_scale + table[h][clamp(kj − qi + max_len − 1)]`,
+  `table` a `[heads, 2·max_len − 1]` f32 value (`Dim::Const` rows — a plan constant, handed
+  whole; one row per QUERY head). The umT5 / T5 relative position bias and an ALiBi slope
+  table both fit. The table is `Elementwise::RelativeBucketBias { embedding: [num_buckets,
+  heads] weight (bf16/f32), max_len, num_buckets, max_distance, bidirectional } -> y`, HF's
+  `_relative_position_bucket` transcribed in torch's f32 steps (statement on the op). DSL:
+  `elemwise::relative_bucket_bias(inputs.recorder(), &weight, max_len, num_buckets,
+  max_distance, bidirectional)`, `attn::relative_bias(&table, max_len) -> RaggedMask`.
+  Kernels: `attn_ragged::RaggedMask::RelativeBias { table: Tensor, max_len }` (the FA2
+  `RelativeBias` variant, `MaskMode::kNone`, bias added on the logits hook, `sm_scale_log2 =
+  log2e`; a zero table is the plain arm bit for bit at a power-of-two `sm_scale`) and
+  `elemwise::relative_bucket_bias(ctx, embedding, max_len, num_buckets, max_distance,
+  bidirectional, &mut y)`, `seat::ENTRIES` `Reads::Nothing` (a constant launch).
 - `Guard::narrow(outer, inner)`: a value read under a narrower guard that implies its
   producer's is spelled as `inner` (so a joint attention's answer splits back onto its arms).
 
@@ -156,6 +170,18 @@ clip table below carries the offsets.
   `GridRule::out_extent`/`apply`/`growth` are the host twins.
 - **Ports and readouts.** `RuntimeInput::Voxels { port, channels }`
   `[Voxels, channels]` f32/bf16 (DSL `Input::voxels(port, channels, dtype)`);
+  a plan may read voxel ports of SEVERAL widths on several arms (Z-Image's
+  `vae.decode` reads 16 channels, its `vae.encode` 3): the CUDA shell reserves
+  the payload at the widest (`voxels::Seat.channels`) and reads a fire's
+  width off its payload (`Seat.widths`, `Tables.channels`, M0: one width a
+  fire), a `RuntimeInput::Voxels` bound at another width panics by name.
+  `models::PortKind::Voxels` / WIT `port-kind.voxels` name the port to a
+  guest: its channel is `[h, w, C]` (a still) or `[t, h, w, C]` (a clip), the
+  shape being the clip's box (`runtime::validate_port_channel`); the readout
+  is `models::ReadoutKind::Pixels` / WIT `readout-kind.pixels`. Every
+  planting of `seam::PIXELS` is its own export (`Exports.pixels`, one per arm
+  with its writer classes) and a fire reads back the planting of the class
+  its clips ran in (`Exports::pixels_for`);
   `Input::grid()`; `RuntimeInput::TokenGrid { p }` `[Clips, 4] i32`
   `{t/pt, h/ph, w/pw, token_row_offset}` (`Input::token_grid(p)`), the token
   side of the patchify pair — a clip's tokens are its lane's token rows, clips
@@ -165,10 +191,26 @@ clip table below carries the offsets.
   TWO values — `seam::at(seam::PIXELS, &[&y, &y_grid])` — so the reader
   slices the plane per clip through the output grid.
 - **Ops** (`model-ir/src/ops/spatial.rs`, DSL `ops::spatial`): `Conv3d { x,
-  grid, w, bias?, k, stride, pad, causal_t, time_pad: TimePad, cache?,
-  y_grid, y }` (bf16 in, fp32 accumulate, one rounding; `w` `[C_out,
-  taps·C_in]` tap-major channel-fastest); `GroupNorm { x, grid, groups,
-  weight, bias, eps, silu, y }` (fp32 Welford per clip per group);
+  grid, w, bias?, k, stride, pad, pad_back, causal_t, time_pad: TimePad,
+  cache?, y_grid, y }` (bf16 in, fp32 accumulate, one rounding; `w` `[C_out,
+  taps·C_in]` tap-major channel-fastest; `pad` is the zero padding IN FRONT
+  of each axis and `pad_back` BEHIND it — equal for a symmetric convolution,
+  `GridRule::Conv` carries both, and only the front pad shifts the kernel's
+  tap window, the back pad reaching it through the output box alone; DSL
+  `Conv::conv2d([3, 3], [2, 2], [0, 0]).pad_back([0, 1, 1])` is diffusers'
+  `Downsample2D`, `F.pad(x, (0, 1, 0, 1))` then a stride-2 3×3);
+  `GroupNorm { x, grid, groups, weight, bias, eps, silu, y }` (fp32 Welford
+  per clip per group); `Attention { q, k, v, grid, sm_scale, y }` — the conv
+  VAE's mid-block attention, ONE head as wide as the row, per clip over every
+  voxel of the clip, `q`/`k`/`v`/`y` all `[rows, C]` bf16 at one type (not
+  `attention.ragged`: that kernel is stamped at head widths 64/128/256 over
+  token-axis CSRs, and a VAE's head is its whole channel row); fp32 scores,
+  online softmax and accumulation, one rounding at the store; kernel
+  `spatial::attention(ctx, q, k, v, grid, sm_scale, &mut y)`
+  (`kernels/spatial/attn.cuh`, `C ∈ {256, 512, 1024}`, a warp-per-four-
+  queries online-softmax walk over the clip's keys, no flash tiling — a VAE
+  attends at its lowest resolution); DSL `spatial::attention(q, k, v, grid,
+  sm_scale)`;
   `UpsampleNearest { x, grid, factor, keep_first_frame, y_grid, y }`;
   `PixelShuffle`/`PixelUnshuffle { x, grid, r, y_grid, y }` (einops
   `'(c r1 r2 r3) t h w -> c (t r1) (h r2) (w r3)'`); `Patchify { x, grid, p,
@@ -227,17 +269,49 @@ clip table below carries the offsets.
   `dispatch/spatial.rs`. **M0 rules:** every spatial kernel takes the whole
   clip table and finds a row's lane itself (`seat::Reads::Nothing`), so a
   voxel launch runs over the fire's whole voxel rectangle and the shell
-  refuses a fire whose clips fall in two classes (`Fault::VoxelPayload`); a
-  voxel plan is served eagerly (`bodies` is downgraded at load, the arming
-  pass fires no clip). `Shell::fire_voxels(lanes, clips) -> Vec<Pixels>` is
-  the door; `Engine::submit` takes `Step.voxels: Vec<StepVoxels { lane, clips,
-  payload }>` (host-fed) and answers `LaneReadout { seam:
-  ReadoutSeam::Pixels, clips, values }`; `PortKind::Voxels` names the
-  channel-fed port (staging it is the port agent's, beside `Latents`).
+  refuses a fire whose clips fall in two classes (`Fault::VoxelPayload`).
+  **Arming is PER AXIS** (M1): `Windows::admit_axes` marks every region on
+  `RowAxis::Voxels` an `Admit::Island` — the arming pass fires no clip, so a
+  voxel window it sees has zero rows and would read as capturable, and a
+  spatial launch reads no seat that could retire a replay's padding — while
+  the TOKEN regions of the same plan are judged as ever, so a flagship
+  serves its DiT bodied with a VAE standing beside it in the artifact.
+  `Shell::fire_voxels(lanes, clips) -> Vec<Pixels>` is the door;
+  `Engine::submit` takes `Step.voxels: Vec<StepVoxels { lane, clips,
+  payload }>` and answers `LaneReadout { seam: ReadoutSeam::Pixels, clips,
+  values }`. **A voxel port has TWO feeds and a lane takes one**: the
+  `payload` beside its clips (host-fed, the shell's own door), or
+  `PortKind::Voxels` in `Lane::ports` (channel-fed) — the clips then carry
+  the box alone, and `enqueue` copies the committed cell into the voxel
+  payload at the lane's `voxel_offset`, device to device, casting an f32
+  cell into a bf16 port the way `Latents` does. A lane doing neither is
+  refused by name.
   Tests: `model-dsl/tests/a_conv_decoder_traces_on_the_voxel_axis`,
   `model-compiler/tests/the_third_row_axis_carves_its_own_arena`,
   `model-exec/tests/the_voxel_axis_seriates_its_own_clips`,
-  `engine-cuda/tests/a_conv_decoder_fires_over_a_voxel_port` (GPU).
+  `engine-cuda/tests/a_conv_decoder_fires_over_a_voxel_port` (GPU),
+  `engine-cuda/tests/a_channel_fed_voxel_port_lands_the_committed_cell` (GPU),
+  `engine-cuda/tests/a_two_axis_plan_arms_its_token_bodies` (GPU),
+  `kernels-cuda/tests/the_spatial_attention_answers_the_cpu_reference` (GPU).
+- **The first real VAE (M1).** `models::z_image::vae` states the FLUX
+  16-channel `AutoencoderKL` as the flagship's `vae.decode` (latent `[h·w, 16]`
+  → pixels `[8h·8w, 3]` in `[-1, 1]`, the `z/scaling + shift` denormalise
+  inside the plan) and `vae.encode` (pixels → the posterior MEAN `[h·w, 16]`,
+  raw; the guest applies `(mean − shift)·scaling`) readings, both on the
+  `pixels` seam; `models/tests/the_z_image_vae_bakes`, and the GPU parity gate
+  `engine-cuda/tests/the_z_image_vae_answers_the_reference` against
+  `scripts/imagegen/zimage_golden.py --vae` (decode cos 0.99998, mean |err|
+  0.0023; encode at the bf16 reference's own distance, cos 0.9997).
+  **FROM A GUEST** the same reading is `tests/inferlets/zimage-vae-parity`
+  driven by `scripts/imagegen/zimage_vae_parity.py`: the latent bound as the
+  port's channel (whose declared shape IS the clip's box, `[h, w, C]` or
+  `[t, h, w, C]`, which is what `runtime::validate_port_channel` accepts),
+  the answer read off `intrinsics::pixels(rows, 3)`, and the picture out
+  through `frames.from-channel` + `session.send-frames` — measured at cos
+  0.999981, mean |err| 0.00225, the host-fed gate's own distance.
+  `layout.split_rows` launches its rows on `grid.x` now (`grid.y` is capped
+  at 65 535 by every compute capability, which bit a 64k-row fire and a wide
+  voxel rectangle alike).
 
 ## 7. How the CUDA engine serves §1–§2 (M0 round 2)
 
@@ -264,9 +338,13 @@ a runtime or another shell must agree with. Tests: `engine-cuda/tests/a_double_b
   selection whose lanes' rows are not one contiguous run of the fire (classes seriated apart) is
   refused (`model_exec::fire::Fault::ScatteredSelection`) rather than packed over another class's
   rows.
-- **`ReferenceSelfOnly`** is served with the kernel's one-tail-per-group mask (reference lanes pack
-  last in their group; `packing::Packed::reference_start`). A group with two reference lanes is
-  refused by name at submit.
+- **`ReferenceSelfOnly`** is served in the contract's tag form: the two `ReferenceTag` tables,
+  fire-wide and indexed by the packed rows the CSRs name, reach the kernel whole
+  (`kernels_cuda::attn_ragged::RaggedMask::ReferenceTags { q_tags, kv_tags }`, a
+  `REGISTER_LOGITS_MASK` variant), so a group may hold ANY number of reference lanes, each
+  attending itself alone while every other row of the group sees them all (FLUX.2's KV layout,
+  HunyuanImage 3). The kernel's one-tail form (`ReferenceSelfOnly { ref_start }`) stays as a fast
+  case no engine arm uses.
 - **Ports.** Every `(kind, port)` a lane's CLASS reads must be fed (`Lane::ports`) from a channel the
   instance ATTACHED to that lane carries (the `SelfCondInput::channels` precedent): the feed reads
   the channel's committed cell at the consumer head — what the instance's own `take` would read
@@ -285,6 +363,13 @@ a runtime or another shell must agree with. Tests: `engine-cuda/tests/a_double_b
   attachment gets `IntrinsicId::Velocity` (the velocity plane) and `IntrinsicId::Hidden` (the last
   hidden plane) bound at the lane's first row, `width = plane.width`, storage raw-bf16 or f32 as
   the arena holds it; `Logits` is bound only when the readout seam is logits.
+  `IntrinsicId::Pixels` (D8, `[rows, C]` f32, gated by `ModelProfile { has_pixels, pixels_width }`
+  — `pixels_width` is `0` when a plan's plantings disagree, a VAE's decode RGB beside its
+  encode's 16-channel mean, and bind then checks rank and rows alone) is bound at the lane's
+  first OUTPUT VOXEL, not its token row: a VAE lane's rows are on the third axis. Every grid past
+  the port's is a device value, so the offset comes from `voxels::host_grid`, which replays the
+  plan's `Spatial::Grid` chain through `GridRule::apply`, the rules' own host twins. A program
+  reading an unbound `pixels` is refused at its mint by name.
 - **Lane-shaped values** (`[Lanes, ·]`: a lane vector's chain) are carved and computed at the
   fire's lane carve (the key's lane ceiling for a body) and launched without the staged seat
   (`Run::unseated`); an f32 lane activation's `linear.matmul` takes `linear::lane_gemm`.

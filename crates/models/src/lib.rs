@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod deepseek_v4;
 pub mod drafter;
+pub mod flux_2;
 pub mod gemma_4;
 pub mod gemma_4_diffusion;
 pub mod glm_5;
@@ -9,12 +10,14 @@ pub mod gpt_oss;
 pub mod kimi_k3;
 pub mod media;
 pub mod mini_dit;
+pub mod minimax_h3;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
 pub mod template;
-pub mod z_image;
 pub mod tokenizer;
+pub mod wan_2;
+pub mod z_image;
 
 use std::sync::LazyLock;
 
@@ -66,7 +69,8 @@ pub struct Sku {
     pub trace: model_dsl::TraceFn,
     pub classify: ClassifyFn,
     pub import: ImportFn,
-    pub template: fn(std::sync::Arc<::tokenizer::Tokenizer>) -> std::sync::Arc<dyn template::Instruct>,
+    pub template:
+        fn(std::sync::Arc<::tokenizer::Tokenizer>) -> std::sync::Arc<dyn template::Instruct>,
     pub tokenizer: &'static tokenizer::Contract,
     /// The canvas a block-diffusion text denoises; `None` for every
     /// autoregressive row. What `model.pass-kind()` reads `diffusion` off,
@@ -127,6 +131,10 @@ pub struct ReadingFact {
     /// The float input ports, in the order the trace numbers them within
     /// each kind: the `n`th `Latents` port here is `Input::latents(n, ..)`.
     pub ports: Vec<PortFact>,
+    /// Where this reading's lanes place their rows in the rotary space
+    /// (design D7/D12), when it declares an `AxisPositions` port and its
+    /// layout fits [`PositionConvention`]. `None` otherwise.
+    pub positions: Option<PositionConvention>,
     /// Which export seam the epilogue reads (`logits()`, `velocity()`,
     /// `hidden()`).
     pub readout: ReadoutKind,
@@ -152,16 +160,17 @@ impl ReadingFact {
 
     /// Every port with its kind-relative index, in declaration order.
     pub fn ports_indexed(&self) -> impl Iterator<Item = (u8, &PortFact)> + '_ {
-        let mut seen = [0u8; 4];
+        let mut seen = [0u8; 5];
         self.ports.iter().map(move |port| {
             let slot = match port.kind {
                 PortKind::Latents => 0,
                 PortKind::LaneVector => 1,
                 PortKind::Context => 2,
                 PortKind::AxisPositions => 3,
+                PortKind::Voxels => 4,
             };
-            let index = seen[slot];
-            seen[slot] = seen[slot].saturating_add(1);
+            let index = port.at.unwrap_or(seen[slot]);
+            seen[slot] = index.saturating_add(1);
             (index, port)
         })
     }
@@ -188,6 +197,16 @@ pub struct PortFact {
     /// reading. A pass on stream `s` must bind exactly the ports that list
     /// `s` (or list nothing).
     pub streams: Vec<Stream>,
+    /// The `RuntimeInput` index this port is read at, when it is not the
+    /// positional one. A port's index is normally its position among the
+    /// ports of its own kind IN THIS READING, which is what a family wants
+    /// when every reading reads the same rectangle. Two readings that read
+    /// one kind at DIFFERENT WIDTHS need different indices, because the
+    /// engine seats one rectangle per `(kind, index)` for the whole plan —
+    /// z_image's `vae.encode` takes its pixel clip at voxel index 1 so that
+    /// `vae.decode`'s 16-wide latent keeps index 0. Stating an index also
+    /// moves the positional counter past it.
+    pub at: Option<u8>,
 }
 
 /// Which `RuntimeInput` kind a port is (mirrors `engine::fire::PortKind`).
@@ -202,6 +221,59 @@ pub enum PortKind {
     Context,
     /// `RuntimeInput::AxisPositions`: `[rows, axes]` f32, `1..=4` axes.
     AxisPositions,
+    /// `RuntimeInput::Voxels` (design D8): `[t·h·w, channels]` on the voxel
+    /// axis, one clip per lane — a VAE's tile. The channel is
+    /// `[t, h, w, channels]` (or `[h, w, channels]` for a still), which is
+    /// how the clip's box reaches the engine beside its rows.
+    Voxels,
+}
+
+/// What one axis of an `AxisPositions` port means. The rotary space a DiT
+/// was trained in is 1..=4 axes wide and every family orders them
+/// differently; this names them so a guest can fill the grid without
+/// knowing the family.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AxisRole {
+    /// Frame / reference / sequence index (FLUX's `T`, Z-Image's `t`).
+    Time,
+    /// The latent grid's row.
+    Height,
+    /// The latent grid's column.
+    Width,
+    /// A plain row-ordinal axis carried by one lane's rows alone (FLUX's
+    /// fourth `L` axis, which numbers the text rows).
+    Index,
+}
+
+/// **WHERE A READING'S LANES SIT IN THE ROTARY SPACE.**
+///
+/// A denoise reading's `AxisPositions` port takes one coordinate vector per
+/// row, and which coordinate goes where is a family contract the guest must
+/// not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s `(L + 1, a, b)`). This
+/// states it once, so one model-agnostic builder
+/// (`inferlet::latent::positions_for`) fills every family's grid:
+///
+/// - a `Text`/`Context` lane's row `j` sits at `text_origin + j` on axis
+///   `text_axis` and at 0 on every other axis;
+/// - an `Image` lane's patch `(a, b)` sits at `a` on the `Height` axis and
+///   `b` on the `Width` axis; on `text_axis` it sits at `text_origin +
+///   text_rows` when `image_follows_text`, else 0; on every remaining
+///   axis, 0.
+///
+/// `axes` has exactly the port's `width` entries. A family whose positions
+/// do not fit this shape states `None` and its guests build their own — a
+/// reference lane's `T` stride, for one, is not stated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PositionConvention {
+    /// One role per axis of the positions port, in the port's own order.
+    pub axes: Vec<AxisRole>,
+    /// Which axis a text/context lane numbers its rows on.
+    pub text_axis: u32,
+    /// The coordinate that lane's FIRST row sits at.
+    pub text_origin: u32,
+    /// The image lane's coordinate on `text_axis` is `text_origin +
+    /// text_rows` (Z-Image) rather than 0 (FLUX.2, mini-dit).
+    pub image_follows_text: bool,
 }
 
 /// Which export seam a reading's epilogue reads.
@@ -213,6 +285,10 @@ pub enum ReadoutKind {
     Velocity,
     /// `seam::HIDDEN`, `intrinsics::hidden(width)`.
     Hidden,
+    /// `seam::PIXELS` (design D8): one row per output voxel of the lane's
+    /// clip, `[t'·h'·w', width]`, read back with the clip's output box
+    /// (`engine::fire::ReadoutSeam::Pixels`).
+    Pixels,
 }
 
 /// The latent space a family's denoiser works in: what one latent row is
@@ -249,6 +325,12 @@ pub struct ScheduleFact {
     /// A distilled model's pinned sigma list, descending, `1.0 -> 0.0`
     /// exclusive of the final zero; empty when the guest builds its own.
     pub pinned_sigmas: Vec<f32>,
+    /// The shift each STREAM's own grid is built at, for a family whose
+    /// modalities advance on different schedules inside one step (MiniMax
+    /// H3 runs video at 12 and audio at 3 in the same evaluation). Empty
+    /// when [`shift`](ScheduleFact::shift) serves every lane, which is
+    /// every other family; a stream absent from the list takes `shift`.
+    pub stream_shifts: Vec<(Stream, f32)>,
 }
 
 /// Which prediction target the schedule's velocity is.
@@ -326,6 +408,7 @@ macro_rules! skus {
 static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
     [
         deepseek_v4::skus(),
+        flux_2::skus(),
         gemma_4::skus(),
         gemma_4_diffusion::skus(),
         glm_5::skus(),
@@ -337,6 +420,8 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         // A diffusers pipeline reads under `dit.`/`te.` prefixes no text row
         // spells, so the generative rows identify nothing above them.
         z_image::skus(),
+        wan_2::skus(),
+        minimax_h3::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),

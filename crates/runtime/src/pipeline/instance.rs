@@ -6,7 +6,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-
 use super::program::RegisteredProgram;
 
 /// Process-wide monotonic instance-id source (0 reserved as null). Each
@@ -37,7 +36,6 @@ pub struct Instance {
 }
 
 impl Instance {
-
     /// Assemble host-known per-channel values for a fire's geometry map:
     /// seeded channels carry their seed; everything else is host-unknown
     /// (`None`), left for the engine to resolve.
@@ -200,8 +198,13 @@ pub struct PortBinding {
     /// The channel's engine-registered id (`ChannelCell::global_id`).
     pub channel_id: u64,
     /// The channel's leading extent for a `[rows, width]` port; `None` for
-    /// a lane vector.
+    /// a lane vector. For a `Voxels` port it is the clip's VOXELS
+    /// (`t·h·w`), which are not the lane's token rows.
     pub rows: Option<u32>,
+    /// The clip box `[t, h, w]` a `Voxels` port's channel states (design
+    /// D8) — a channel cell carries no grid, so the box travels beside the
+    /// feed as `StepVoxels::clips`. `None` for every other port kind.
+    pub clip: Option<[u32; 3]>,
 }
 
 impl PortBinding {
@@ -239,6 +242,25 @@ impl LaneFacts {
     }
 }
 
+/// The size of attention group `group`'s cohort in this process: every
+/// `ForwardPass` in the table that names it, bound or not (a sibling still
+/// to bind will submit; the gate's leash bounds the wait for one that never
+/// does). `None` for a pass in no group. Stamped on a request at submit —
+/// not at bind, when the siblings may not have named the group yet.
+#[must_use]
+pub fn cohort_of(
+    table: &mut wasmtime::component::ResourceTable,
+    group: Option<u32>,
+) -> Option<u32> {
+    let group = group?;
+    let members = table
+        .iter_mut()
+        .filter_map(|entry| entry.downcast_ref::<ForwardPass>())
+        .filter(|pass| pass.bindings.group == Some(group))
+        .count();
+    Some(u32::try_from(members).unwrap_or(u32::MAX).max(1))
+}
+
 /// A catalog stream as the engine's lane stream (codes agree).
 #[must_use]
 pub fn lane_stream_of(stream: models::Stream) -> ::engine::fire::LaneStream {
@@ -273,8 +295,15 @@ pub fn stream_of_lane(stream: ::engine::fire::LaneStream) -> models::Stream {
 /// float fire path (`pipeline::fire::float`) rather than the KV one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FloatLane {
-    /// The lane's row count: the latents port's channel rows.
+    /// The lane's row count: the latents port's channel rows. A VAE
+    /// reading (design D8) states no `[rows, ·]` port at all and takes ONE
+    /// dummy token row: its rows are its clips' voxels, on the third axis,
+    /// and the token rectangle it seats is a formality the lane needs to
+    /// exist in the fire's composition.
     pub rows: u32,
+    /// The clips this lane submits on the voxel axis, in the order its
+    /// `Voxels` ports were bound; empty for a lane with no VAE tile.
+    pub clips: Vec<[u32; 3]>,
 }
 
 /// One staged self-conditioning payload: `canvas * taps` ids and weights,
@@ -570,4 +599,3 @@ impl Drop for BoundForwardPass {
         }
     }
 }
-

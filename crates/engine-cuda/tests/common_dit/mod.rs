@@ -285,7 +285,7 @@ pub struct HostRequest {
     pub positions: Vec<[f32; 2]>,
 }
 
-fn matmul_bf16(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
+pub fn matmul_bf16(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
     let mut y = vec![0f32; rows * n];
     for r in 0..rows {
         for c in 0..n {
@@ -299,7 +299,7 @@ fn matmul_bf16(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32
     y
 }
 
-fn matmul_f32(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
+pub fn matmul_f32(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32> {
     let mut y = vec![0f32; rows * n];
     for r in 0..rows {
         for c in 0..n {
@@ -313,7 +313,7 @@ fn matmul_f32(x: &[f32], rows: usize, k: usize, w: &[f32], n: usize) -> Vec<f32>
     y
 }
 
-fn sinusoid(t: f32) -> Vec<f32> {
+pub fn sinusoid(t: f32) -> Vec<f32> {
     let half = (FREQ / 2) as usize;
     let angles: Vec<f32> = (0..half)
         .map(|i| t * (-THETA.ln() * i as f32 / half as f32).exp())
@@ -324,13 +324,13 @@ fn sinusoid(t: f32) -> Vec<f32> {
     row
 }
 
-fn silu(x: &[f32]) -> Vec<f32> {
+pub fn silu(x: &[f32]) -> Vec<f32> {
     x.iter().map(|v| v / (1.0 + (-v).exp())).collect()
 }
 
 /// `layernorm_no_scale` then `modulate` (the fused pair): the normed row in
 /// f32, one bf16 rounding at the modulated store.
-fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
+pub fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
     let w = WIDTH as usize;
     let mut y = vec![0f32; rows * w];
     for r in 0..rows {
@@ -346,7 +346,7 @@ fn condition(x: &[f32], rows: usize, m: &[f32]) -> Vec<f32> {
     y
 }
 
-fn rope(x: &mut [f32], rows: usize, positions: &[[f32; 2]]) {
+pub fn rope(x: &mut [f32], rows: usize, positions: &[[f32; 2]]) {
     let hd = HEAD_DIM as usize;
     let block = hd / 2;
     for r in 0..rows {
@@ -366,7 +366,7 @@ fn rope(x: &mut [f32], rows: usize, positions: &[[f32; 2]]) {
 
 /// Non-causal attention over one group's packed rows, f32 softmax, `P`
 /// rounded to bf16 as the tensor core reads it, output rounded once.
-fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize) -> Vec<f32> {
+pub fn attention(q: &[f32], k: &[f32], v: &[f32], rows: usize) -> Vec<f32> {
     let hd = HEAD_DIM as usize;
     let mut o = vec![0f32; rows * hd];
     for i in 0..rows {
@@ -500,14 +500,42 @@ impl Rig {
     /// Load the miniature at these budgets (graphs on, bodies armed, golden
     /// checked — the load's default knobs).
     pub fn load(weights: &Weights, max_tokens: u32, buckets: Vec<u32>) -> Rig {
+        Rig::load_plan(trace(), weights, max_tokens, buckets)
+    }
+
+    /// [`Rig::load`] over another plan traced under [`NAME`] (its weights
+    /// drawn for it).
+    pub fn load_plan(plan: Trace, weights: &Weights, max_tokens: u32, buckets: Vec<u32>) -> Rig {
+        Rig::load_recording(
+            plan,
+            weights,
+            max_tokens,
+            buckets,
+            engine_cuda::Recording::default(),
+        )
+    }
+
+    /// [`Rig::load_plan`] with the recording knob stated. `Recording::Bodies
+    /// { mem_megabytes: 0 }` serves bodies but lets the arming pass arm none,
+    /// so every fire captures its own body and WALKS it — which is what a
+    /// flagship whose readings the arming pass cannot synthesize does, and
+    /// the only state in which a launch resolves its own boundary vector.
+    pub fn load_recording(
+        plan: Trace,
+        weights: &Weights,
+        max_tokens: u32,
+        buckets: Vec<u32>,
+        recording: engine_cuda::Recording,
+    ) -> Rig {
         let dir = tempfile::tempdir().expect("a scratch directory");
         let path = weights.write(dir.path());
-        let boot = engine_cuda::DeviceBoot::default();
+        let mut boot = engine_cuda::DeviceBoot::default();
+        boot.knobs.recording = recording;
         let mut engine =
             engine_cuda::open(boot, contract_for, classify_for).expect("the engine opens");
         let loaded = engine
             .load(LoadRequest {
-                trace: trace(),
+                trace: plan,
                 checkpoint: Checkpoint::Path(path.clone()),
                 budgets: Budgets {
                     max_lanes: 8,
@@ -545,24 +573,29 @@ impl Rig {
         if let Some(id) = self.programs.get(&rows) {
             return *id;
         }
-        let bound = bind(epilogue(rows), self.profile().clone()).expect("the epilogue binds");
+        let id = self.register(epilogue(rows), u64::from(rows));
+        self.programs.insert(rows, id);
+        id
+    }
+
+    /// Compile and register any epilogue container against this load's
+    /// profile; `salt` keeps two programs' hashes apart.
+    pub fn register(&mut self, container: TraceContainer, salt: u64) -> u64 {
+        let bound = bind(container, self.profile().clone()).expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let backend = Backend::parse("cuda").expect("the cuda backend");
         let registration = ProgramRegistration {
-            program_hash: 0xd17 ^ u64::from(rows),
+            program_hash: 0xd17 ^ salt,
             emitted_kernels: emit_program(backend, &stages, &bound),
             emitter_version: backend.emitter_version(),
             region_analysis: eta_compiler::codegen::cuda::region_analysis::analyze_program(&stages),
             launch,
             ..Default::default()
         };
-        let id = self
-            .engine
+        self.engine
             .register_program(&registration)
-            .expect("the program registers");
-        self.programs.insert(rows, id);
-        id
+            .expect("the program registers")
     }
 
     fn channel(&mut self, shape: Vec<u32>, host_role: HostRole) -> u64 {
@@ -586,10 +619,16 @@ impl Rig {
     /// One lane's instance: its four channels registered and bound.
     pub fn lane(&mut self, rows: u32) -> LaneHandles {
         let program = self.program(rows);
+        self.lane_of(program, rows, WIDTH)
+    }
+
+    /// [`Rig::lane`] over a stated program, with an out channel `width`
+    /// wide.
+    pub fn lane_of(&mut self, program: u64, rows: u32, width: u32) -> LaneHandles {
         let latent = self.channel(vec![rows, WIDTH], HostRole::Writer);
         let timestep = self.channel(vec![1, 1], HostRole::Writer);
         let positions = self.channel(vec![rows, 2], HostRole::Writer);
-        let out = self.channel(vec![rows, WIDTH], HostRole::Reader);
+        let out = self.channel(vec![rows, width], HostRole::Reader);
         let bound = self
             .engine
             .bind_instance(&InstanceBinding {

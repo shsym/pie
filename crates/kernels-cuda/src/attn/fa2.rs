@@ -40,7 +40,9 @@ fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     }
     Err(refuse(
         op,
-        format!("no fa2 unit is stamped at head width {head_dim}; the lattice holds 64/128/256/512"),
+        format!(
+            "no fa2 unit is stamped at head width {head_dim}; the lattice holds 64/128/256/512"
+        ),
     ))
 }
 
@@ -118,6 +120,14 @@ pub enum RaggedArm {
     /// only keys past it. `MaskMode::kCustom`, so the mask is asked on every
     /// kv tile.
     ReferenceSelfOnly,
+    /// `RaggedMask::ReferenceTags`: a query tagged `t >= 0` sees only keys
+    /// tagged `t`, an untagged query every key — several reference lanes
+    /// per group, each to itself. `MaskMode::kCustom`, like the tail form.
+    ReferenceTags,
+    /// `RaggedMask::RelativeBias`: every row sees every key of its group,
+    /// and `bias[h][kj − qi + max_len − 1]` is added to each scaled logit
+    /// through the variant's transform hook. `MaskMode::kNone`, like `Full`.
+    RelativeBias,
 }
 
 /// The ragged prefill instantiation: the paged kernel's traits (the traits
@@ -132,6 +142,8 @@ fn prefill_ragged_symbol(
     let (mask, variant, params) = match arm {
         RaggedArm::Full => ("kNone", "VariantFull", "RaggedParams"),
         RaggedArm::ReferenceSelfOnly => ("kCustom", "ReferenceSelfOnly", "RaggedRefParams"),
+        RaggedArm::ReferenceTags => ("kCustom", "ReferenceTags", "RaggedTagParams"),
+        RaggedArm::RelativeBias => ("kNone", "RelativeBias", "RaggedBiasParams"),
     };
     Ok(symbol(&format!(
         "::flashinfer::BatchPrefillWithRaggedKVCacheKernel<\
@@ -420,8 +432,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
 
     ctx.fire(
         op,
-        Fire::at(FILE, instantiation)
-            .apply(Launch::grid([blocks, 1, 1], [bdx, bdy, 1]).smem(smem)),
+        Fire::at(FILE, instantiation).apply(Launch::grid([blocks, 1, 1], [bdx, bdy, 1]).smem(smem)),
         &[
             ArgValue::Ptr(split.tmp_v),
             ArgValue::Ptr(split.tmp_s),

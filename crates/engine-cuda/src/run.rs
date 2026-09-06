@@ -249,16 +249,18 @@ impl RsSeat<'_> {
                 let in_page = token % page_tokens;
                 let take = (page_tokens - in_page).min(count - done);
                 // The run's page `page` is whatever slot the list names, not `first_page + page`.
-                let page_slot = *pages.get(page as usize).ok_or(crate::error::Fault::Ceiling {
-                    what: "rs buffer pages",
-                    need: u64::from(page) + 1,
-                    have: pages.len() as u64,
-                })?;
+                let page_slot = *pages
+                    .get(page as usize)
+                    .ok_or(crate::error::Fault::Ceiling {
+                        what: "rs buffer pages",
+                        need: u64::from(page) + 1,
+                        have: pages.len() as u64,
+                    })?;
                 let slab = self.buffers.row(plane, page_slot, in_page)?;
-                let rows_at = rows.ptr
-                    + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
-                let bytes = usize::try_from(u64::from(take) * plane.width * elem)
-                    .unwrap_or(usize::MAX);
+                let rows_at =
+                    rows.ptr + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
+                let bytes =
+                    usize::try_from(u64::from(take) * plane.width * elem).unwrap_or(usize::MAX);
                 let (dst, src) = match verb {
                     RsMove::Scatter { .. } => (slab, rows_at),
                     _ => (rows_at, slab),
@@ -382,6 +384,9 @@ pub struct Ceilings<'c> {
     /// Which regions this fire's body actually holds. Captured stretches run from the graph; the islands between are re-issued eagerly.
     pub admits: &'c [Admit],
 
+    /// Per `Trace::values` id: which region's launch READS that attention schedule ([`crate::exports::regions_launching_schedules`]), or `None` for a schedule no launch reads and for one two regions read. [`Run::planning`] carves a schedule at THIS region's standing and not at the standing of the prepare region that builds it — the two are never the same region, and only the launcher is handed a boundary vector.
+    pub readers: &'c [Option<u32>],
+
     /// What this fire's body key says each class may be carved over — this fire's own class table. `None` for every fire off the bodies path, and then [`Standing`] takes no ceiling at all.
     pub carve: Option<Carve<'c>>,
 }
@@ -469,6 +474,33 @@ impl Standing {
         matches!(self.held, Held::Captured { plane: true, .. })
     }
 
+    /// **DOES THIS REGION'S LAUNCH COUNT FROM THE FIRE'S OWN ZERO?** — true
+    /// for a region a graph holds that either moves its own base
+    /// ([`plane`](Standing::plane)) or has nothing to move because its window
+    /// IS the fire ([`whole`](Standing::whole)).
+    ///
+    /// The one predicate the schedule and the launch that reads it must both
+    /// answer, and they answer it about the SAME region ([`Run::planning`]
+    /// resolves the launcher's standing, never the builder's). Where it is
+    /// true, [`Run::planning`] carves the schedule at the key's lane ceiling
+    /// and [`Run::ragged_q`] hands the launch the fire's whole boundary
+    /// vector, padded to that ceiling — the pair `attn::lanes_carry` checks.
+    /// Where it is false, the schedule takes this fire's own live lanes and
+    /// the launch takes the window's own rebased vector. Either way the two
+    /// agree by construction; it is answering them off two regions that made
+    /// them disagree.
+    ///
+    /// `whole` earns its half honestly: a window that covers every row of the
+    /// fire covers every lane of it too, at lane offset zero, so its rebased
+    /// vector IS the absolute one over the fire's lanes and the padded
+    /// reading merely runs further.
+    fn absolute(&self) -> bool {
+        match self.held {
+            Held::Eager => false,
+            Held::Captured { plane, .. } => plane || self.whole,
+        }
+    }
+
     /// Does this region own a retirement? True for a region a graph holds whose window is the whole fire, or whose ops read the seat's start; nothing else.
     fn armed(&self) -> bool {
         match self.held {
@@ -495,10 +527,7 @@ impl Standing {
 
     /// How many rows a launch in this region is gridded over, or `None` for the window's own row count — a shifting region takes its classes' rungs capped at the fire's bucket.
     pub(crate) fn rows(&self, span: MaskSpan) -> Option<u32> {
-        let Held::Captured {
-            plane, ceiling, ..
-        } = self.held
-        else {
+        let Held::Captured { plane, ceiling, .. } = self.held else {
             return None;
         };
         assert!(
@@ -656,9 +685,35 @@ impl<'c> Run<'c> {
         standing
     }
 
+    /// The [`Standing`] one attention schedule is carved at: the standing of the region whose launch READS it ([`Ceilings::readers`]), at this run.
+    ///
+    /// Falls back to an eager standing — no row ceiling, no lane ceiling, no plane base — for a schedule no launch reads, for one two regions read, and for a reader region this fire did not cut this run of. All three carve the plan at the fire's own live geometry, which every launch can honour whatever its own standing turns out to be.
+    fn reading_standing(&self, plan: ValueId) -> Standing {
+        let run = self.place.run.get();
+        let here = self.place.region.get();
+        let eager = || self.standing_as(here, run, false);
+        let Some(region) = self
+            .ceilings
+            .readers
+            .get(plan.0 as usize)
+            .copied()
+            .flatten()
+        else {
+            return eager();
+        };
+        if run >= self.windows.runs(region) {
+            return eager();
+        }
+        self.standing_at(region, run)
+    }
+
     /// [`Standing`] for any `(region, run)` of this fire, off the same [`Ceilings`] the walk reads, so the ledger and the launch resolve one answer.
     pub(crate) fn standing_at(&self, region: u32, run: u32) -> Standing {
-        self.standing_as(region, run, matches!(self.ceilings.admit(region), Some(Admit::Captured)))
+        self.standing_as(
+            region,
+            run,
+            matches!(self.ceilings.admit(region), Some(Admit::Captured)),
+        )
     }
 
     /// `standing_at` with the captured clause stated by the caller: the grid ledger records every non-island region as captured.
@@ -728,7 +783,6 @@ impl<'c> Run<'c> {
         self.place.region.get()
     }
 
-
     /// The FIRE-WIDE rectangle a value names, before any window is applied — what a copy's gather reads from and its scatter writes back to.
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
         self.whole(id)
@@ -790,6 +844,11 @@ impl<'c> Run<'c> {
         self.standing().plane()
     }
 
+    /// Does this region's launch count rows and lanes from the fire's own zero — [`Standing::absolute`], the predicate the schedule's carve is gated on too. Wider than [`plane_base`](Run::plane_base) by exactly the whole-fire windows, which have nothing to shift.
+    fn absolute_base(&self) -> bool {
+        self.standing().absolute()
+    }
+
     /// Where this region's live row count is read from, or `0` — [`here`](Run::here)'s twin, bounding how far below its extent a launch may stop.
     fn live_at(&self) -> u64 {
         let at = self
@@ -835,7 +894,8 @@ impl<'c> Run<'c> {
 
     /// The window the node being dispatched runs over — this region's, cut at the run the walk is on.
     pub(crate) fn window(&self) -> &'c Window {
-        self.windows.at(self.place.region.get(), self.place.run.get())
+        self.windows
+            .at(self.place.region.get(), self.place.run.get())
     }
 
     /// The rows of this window that are actually the node's, for a region answered `Fallback::Grouped`; `None` otherwise — an arm that takes this list must honour it.
@@ -1051,7 +1111,11 @@ impl<'c> Run<'c> {
     }
 
     /// One selection's D2 packing tables, as this fire staged them.
-    pub(crate) fn packing(&self, at: usize, select: model_ir::Selection) -> crate::inputs::PackingHandles {
+    pub(crate) fn packing(
+        &self,
+        at: usize,
+        select: model_ir::Selection,
+    ) -> crate::inputs::PackingHandles {
         self.fire
             .packings
             .iter()
@@ -1063,21 +1127,6 @@ impl<'c> Run<'c> {
                      fire staged none of; the load carves one per selection the plan reads"
                 )
             })
-    }
-
-    /// The D2 reference tails (`[groups]` i32, the row of each group where its reference rows begin) of the selection a `ReferenceTag` input names — what the ragged kernel's reference mask reads.
-    pub(crate) fn reference_start_of(&self, tags: ValueId) -> Tensor {
-        let at = tags.0 as usize;
-        match &self.values[at].def {
-            Def::Input(RuntimeInput::Geometry {
-                kind: GeomKind::ReferenceTag { select },
-                ..
-            }) => self.packing(at, *select).reference_start,
-            other => panic!(
-                "value {at} is {other:?}, and a ragged reference mask names a `ReferenceTag` \
-                 table on its query side"
-            ),
-        }
     }
 
     /// One float port's rectangle, carved at this fire's rows or lanes.
@@ -1175,16 +1224,12 @@ impl<'c> Run<'c> {
             // Bound only when a lane of this fire carried an adapter; a fire none did stages nothing and never dispatches a node that would reach this arm (the correction's window is empty).
             Def::Input(RuntimeInput::AdapterRoutes) => {
                 self.fire.adapter_routes.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's adapter ids, which no lane of it carried"
-                    )
+                    panic!("value {at} reads this fire's adapter ids, which no lane of it carried")
                 })
             }
             // The second row axis's runtime inputs, bound from what `enqueue` wrote; a fire whose lanes submitted no image binds none of them.
             Def::Input(RuntimeInput::Patches) => self.fire.patches.unwrap_or_else(|| {
-                panic!(
-                    "value {at} reads this fire's patch rows, which no lane of it submitted"
-                )
+                panic!("value {at} reads this fire's patch rows, which no lane of it submitted")
             }),
             Def::Input(RuntimeInput::PatchSegments) => {
                 self.fire.patch_segments.unwrap_or_else(|| {
@@ -1194,14 +1239,12 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::PatchRoutes) => {
-                self.fire.patch_routes.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads where this fire's tower rows land, and no lane of it \
+            Def::Input(RuntimeInput::PatchRoutes) => self.fire.patch_routes.unwrap_or_else(|| {
+                panic!(
+                    "value {at} reads where this fire's tower rows land, and no lane of it \
                          submitted an image"
-                    )
-                })
-            }
+                )
+            }),
             Def::Input(RuntimeInput::PatchEmbedRows) => {
                 self.fire.patch_embed_rows.unwrap_or_else(|| {
                     panic!(
@@ -1263,11 +1306,22 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::Voxels { .. }) => self.fire.voxels.unwrap_or_else(|| {
-                panic!("value {at} reads this fire's voxel port, which no lane of it fed")
-            }),
+            Def::Input(RuntimeInput::Voxels { channels, .. }) => {
+                let port = self.fire.voxels.unwrap_or_else(|| {
+                    panic!("value {at} reads this fire's voxel port, which no lane of it fed")
+                });
+                assert_eq!(
+                    port.width, *channels,
+                    "value {at} reads a {channels}-wide voxel port and this fire fed a {}-wide \
+                     one: the clips ran in another reading's class",
+                    port.width
+                );
+                port
+            }
             // The D2 row permutation of one selection: `[Tokens]` i32, fire-wide, staged per fire.
-            Def::Input(RuntimeInput::RowPermutation { select }) => self.packing(at, *select).permutation,
+            Def::Input(RuntimeInput::RowPermutation { select }) => {
+                self.packing(at, *select).permutation
+            }
             // The D3 float ports: rectangles the fire path filled from channel cells.
             Def::Input(RuntimeInput::Latents { port, .. }) => {
                 self.port(at, engine::fire::PortKind::Latents, *port)
@@ -1287,11 +1341,17 @@ impl<'c> Run<'c> {
                     GeomKind::RequestOfToken => return self.fire.lane_of_row,
                     GeomKind::GroupOfLane => {
                         return self.fire.group_of_lane.unwrap_or_else(|| {
-                            panic!("value {at} reads the group table, which this fire staged none of")
+                            panic!(
+                                "value {at} reads the group table, which this fire staged none of"
+                            )
                         });
                     }
-                    GeomKind::GroupIndptr { select } => return self.packing(at, *select).group_indptr,
-                    GeomKind::LaneIndptr { select } => return self.packing(at, *select).lane_indptr,
+                    GeomKind::GroupIndptr { select } => {
+                        return self.packing(at, *select).group_indptr;
+                    }
+                    GeomKind::LaneIndptr { select } => {
+                        return self.packing(at, *select).lane_indptr;
+                    }
                     GeomKind::ReferenceTag { select } => {
                         return self.packing(at, *select).reference_tag;
                     }
@@ -1355,10 +1415,11 @@ impl<'c> Run<'c> {
         }
     }
 
-    /// The FA2 query axis's own reading of the same pairing — boundaries chosen by whether this region moves its own plane. FA2 has no seat offset, so its CSR must count from wherever `q` counts from. Goes over whole, never cut at `lane_offset`.
+    /// The FA2 query axis's own reading of the same pairing — boundaries chosen by whether this region counts from the fire's own zero ([`Standing::absolute`]). FA2 has no seat offset, so its CSR must count from wherever `q` counts from, and it must run as far as the schedule this launch reads was carved: the two are one predicate, asked of one region.
     pub(crate) fn ragged_q(&self, id: ValueId) -> RaggedTensor {
-        let indptr = if self.plane_base() {
-            self.qo_indptr_absolute().unwrap_or_else(|| self.qo_indptr())
+        let indptr = if self.absolute_base() {
+            self.qo_indptr_absolute()
+                .unwrap_or_else(|| self.qo_indptr())
         } else {
             self.qo_indptr()
         };
@@ -1491,7 +1552,13 @@ impl<'c> Run<'c> {
                 slab,
                 table,
                 counts,
-            }) => (self.cut(id, slab), ExpertTable { table, hits: counts }),
+            }) => (
+                self.cut(id, slab),
+                ExpertTable {
+                    table,
+                    hits: counts,
+                },
+            ),
             Some(WeightRow::Planes { .. }) => panic!(
                 "value {at} is weight {row}, a split-plane bank; a dense routed select \
                  does not read one"
@@ -1511,7 +1578,8 @@ impl<'c> Run<'c> {
                     return KvPool {
                         page_indptr: seat.map_or(pool.page_indptr, |seat| seat.page_indptr),
                         page_indices: seat.map_or(pool.page_indices, |seat| seat.page_indices),
-                        last_page_lens: seat.map_or(pool.last_page_lens, |seat| seat.last_page_lens),
+                        last_page_lens: seat
+                            .map_or(pool.last_page_lens, |seat| seat.last_page_lens),
                         row_valid: skip(pool.row_valid, 0, window.rows),
                         ..*pool
                     };
@@ -1696,13 +1764,25 @@ impl<'c> Run<'c> {
         let window = self.window();
         let span = window.span();
         // How wide this schedule may be carved: the key's ceilings for any plan the bodies path can serve, `None` otherwise — keeps the hash stable across batch sizes.
-        let standing = self.standing();
+        //
+        // THE CARVE IS THE LAUNCHER'S STANDING, NOT THE BUILDER'S. A region
+        // holds one phase, so the `Phase::Prepare` region a plan op stands in
+        // is never the region the launch stands in — and a prepare region
+        // holds nothing but `crate::PLANNED` ops, which makes it read as
+        // shifting for free (it names no kernel that could address the wrong
+        // row) even where the trunk region reading its schedule does not.
+        // Carving at the builder's ceiling would name 32 requests to a launch
+        // `Run::ragged_q` hands a one-lane vector, which `attn::lanes_carry`
+        // refuses. `no_schedule_straddles_its_readers` pins the two regions to
+        // one mask, so they see one window and one span; it does not pin them
+        // to one region, and `shifted`/`lane_shifted` are per region.
+        let standing = self.reading_standing(plan);
         let carve = standing.ceiling();
         // The same arithmetic read as lanes. The lane reading is the token axis's alone; a patch region takes its window's own lane pair.
         let carve_lanes = standing.lane_carve();
         // How many lanes, and where they count from: `(origin, count)`, or `None` for this window's own pair — gated on graph-held, resolved span, and plane-base.
         let ceiling: Option<(u32, u32)> = standing
-            .plane()
+            .absolute()
             .then_some(carve_lanes)
             .flatten()
             .and_then(|(before, own)| {
@@ -1727,7 +1807,11 @@ impl<'c> Run<'c> {
             .map(|(_, own)| own.min(standing.pad.bucket))
             .filter(|rows| *rows >= span.rows);
         // A gathered window's twins are re-cut with its lanes: page bounds as a fresh prefix sum, kv lengths in gathered order.
-        let (kv_indptr, kv_len) = match window.gathered.as_ref().and_then(|g| g.spaces.get(*space as usize)) {
+        let (kv_indptr, kv_len) = match window
+            .gathered
+            .as_ref()
+            .and_then(|g| g.spaces.get(*space as usize))
+        {
             Some(gathered) => (
                 gathered.page_indptr_host.as_slice(),
                 gathered.kv_len_host.as_slice(),
@@ -1760,20 +1844,31 @@ impl<'c> Run<'c> {
         };
         let live = Live {
             requests: span.lanes,
-            lane_offset: if standing.plane() { span.lane_offset } else { 0 },
+            lane_offset: if standing.plane() {
+                span.lane_offset
+            } else {
+                0
+            },
             row_offset: if standing.plane() { span.row_offset } else { 0 },
             // What this fire brought; [`Planning::rows`] is the carved twin.
             rows: span.rows,
         };
         // The two channels may part in exactly one direction: a carve is wider than the fire or the same, never narrower.
-        assert!(shape.num_requests >= live.requests, "a carve is never narrower than the fire");
-        assert!(shape.lane_offset >= live.lane_offset, "a carve starts at or before the fire");
         assert!(
-            shape.lane_offset + shape.num_requests >= live.lane_offset + live.requests
+            shape.num_requests >= live.requests,
+            "a carve is never narrower than the fire"
         );
+        assert!(
+            shape.lane_offset >= live.lane_offset,
+            "a carve starts at or before the fire"
+        );
+        assert!(shape.lane_offset + shape.num_requests >= live.lane_offset + live.requests);
         let rows = rows_ceiling.unwrap_or(span.rows);
         // The row axis's half of the same pin: a carve is wider than the fire or the same, never narrower.
-        assert!(rows >= live.rows, "a row carve is never narrower than the fire");
+        assert!(
+            rows >= live.rows,
+            "a row carve is never narrower than the fire"
+        );
         Planning {
             kv_indptr,
             kv_len,
@@ -1849,8 +1944,14 @@ impl<'c> Run<'c> {
                 StructSlot::Prefill(p) => write!(
                     sink,
                     "p{:?}{:?}{:?}{:?}{}{}{}{:?}",
-                    p.info, p.workspace, p.shape, p.window, p.total_tokens, p.causal,
-                    p.graph_capturable, p.mask_indptr
+                    p.info,
+                    p.workspace,
+                    p.shape,
+                    p.window,
+                    p.total_tokens,
+                    p.causal,
+                    p.graph_capturable,
+                    p.mask_indptr
                 ),
                 StructSlot::PrefillSm90(p) => write!(
                     sink,
@@ -1889,14 +1990,17 @@ impl<'c> Run<'c> {
     /// One built slot, whichever kind it holds — for the arm that routes on the kind (prefill's fa2/sm90 fork); the typed accessors below are the single-kind reads.
     pub(crate) fn slot(&self, id: ValueId) -> &StructSlot {
         let at = self.struct_at(id);
-        self.structs[at].as_ref().map(|(_, slot)| slot).unwrap_or_else(|| {
-            panic!(
-                "value {} holds no plan payload for run {} of its window; its plan \
+        self.structs[at]
+            .as_ref()
+            .map(|(_, slot)| slot)
+            .unwrap_or_else(|| {
+                panic!(
+                    "value {} holds no plan payload for run {} of its window; its plan \
                  op has not fired, and the prepare phase runs first",
-                id.0,
-                self.place.run.get(),
-            )
-        })
+                    id.0,
+                    self.place.run.get(),
+                )
+            })
     }
 
     /// The decode plan a consuming arm names.

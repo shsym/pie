@@ -1,11 +1,22 @@
-//! Z-Image's traced arithmetic: three readings of one plan, selected per
+//! Z-Image's traced arithmetic: five readings of one plan, selected per
 //! lane by the reading bits of the fact word (design D1, D5).
 //!
 //! | reading | lanes (stream) | binds | reads back |
 //! |---|---|---|---|
 //! | `text` | one, `Text` | `embed(ids)`, `attention(kv)` | `hidden` `[L, 2560]`: Qwen3 layer −2 |
 //! | `refine` | one, `Context` | `caption` `[L32, 2560]`, `pad` `[L32, 1]`, `positions` `[L32, 3]` | `hidden` `[L32, 3840]`: the refined caption |
-//! | `denoise` | `Image` + `Context`, one group | image: `latents` `[N32, 64]`, `pad` `[N32, 1]`, `positions`, `timestep`; context: `context` `[L32, 3840]`, `positions`, `timestep` | `velocity` `[N32, 64]` on the image lane |
+//! | `denoise` | `Image` + `Context`, one group | image: `pad` `[N32, 1]`, `latents` `[N32, 64]`, `positions`, `timestep`; context: `context` `[L32, 3840]`, `positions`, `timestep` | `velocity` `[N32, 64]` on the image lane |
+//! | `vae.decode` | one, `Image`, one clip `{1, h, w}` | `latent` `[h·w, 16]` on the voxel axis | `pixels` `[8h·8w, 3]` in `[-1, 1]` |
+//! | `vae.encode` | one, `Image`, one clip `{1, H, W}` | `pixels` `[H·W, 3]` on the voxel axis | `pixels` `[H/8·W/8, 16]`: the posterior mean |
+//!
+//! (Port ORDER within a reading is load-bearing — an index is a port's
+//! position among its kind — and `(kind, index)` is seated once per plan
+//! at one width; `super::model::port` says how the readings share.)
+//!
+//! The two VAE readings ([`super::vae`]) exist on the flagship only (the
+//! miniature has no VAE) and run on the voxel axis: a lane submits one
+//! clip, its `Voxels` port's channel is `[h, w, C]`, and it reads its
+//! pixels back with the clip's output box.
 //!
 //! `L32`/`N32` are the caption / image row counts padded up to a multiple of
 //! [`super::model::SEQ_MULTIPLE`]. **The pad rows are the guest's to
@@ -13,18 +24,19 @@
 //! arrives already padded, its `pad` port flags each row (`0.0` real, `1.0`
 //! pad), and the plan overwrites every flagged row with the learned
 //! `x_pad_token` / `cap_pad_token` after its embedder (the reference's
-//! `torch.where(mask, pad_token, feats)`), at rotary position `(0, 0, 0)` —
-//! which the guest's positions must state. The pad rows are attended (study
+//! `torch.where(mask, pad_token, feats)`). The pad rows are attended (study
 //! §C.3); the velocity rows they produce are discarded by the guest. The
 //! `denoise` context lane binds no `pad`: its rows are the `refine`
 //! readout, pads included. The `timestep` is bound by BOTH denoise lanes
 //! (the same cell): the joint trunk modulates every row by its own lane's
 //! vector, caption rows included.
 //!
-//! Positions (`AxisPositions`, `[rows, 3]` f32, `(t, h, w)`): caption row
-//! `j` is `(1 + j, 0, 0)`; image patch `(a, b)` is `(L32 + 1, a, b)` — the
-//! image's temporal index depends on the caption's padded length (study
-//! §C.5); pad rows `(0, 0, 0)`.
+//! Positions (`AxisPositions`, `[rows, 3]` f32, `(t, h, w)`), as the
+//! reference's `_pad_with_ids` states them: caption row `j` is
+//! `(1 + j, 0, 0)` for EVERY row `j < L32`, pads included (the caption's
+//! coordinate grid spans its padded length); image patch `(a, b)` is
+//! `(L32 + 1, a, b)` — the image's temporal index depends on the caption's
+//! padded length (study §C.5) — and an image pad row is `(0, 0, 0)`.
 //!
 //! The timestep port takes the SCHEDULER timestep `σ · 1000` (what a generic
 //! `FlowMatchEuler` guest holds); the plan performs the reference's time
@@ -50,8 +62,8 @@ use model_dsl::{
 };
 
 use crate::{
-    Generative, LatentSpace, PortFact, PortKind, ReadingFact, ReadoutKind, ScheduleFact,
-    ScheduleKind,
+    AxisRole, Generative, LatentSpace, PortFact, PortKind, PositionConvention, ReadingFact,
+    ReadoutKind, ScheduleFact, ScheduleKind,
 };
 
 use super::model::{
@@ -65,11 +77,12 @@ use super::model::{CHANNELS, PATCH, SPATIAL_COMPRESSION};
 /// streams, of which this text names Text, Image and Context.
 pub const STREAM_BASE: u8 = 0;
 
-/// The two bits the reading index lives in, as a plain binary code: bit
-/// [`READING_LO`] is its low bit, [`READING_HI`] its high bit. Four codes,
-/// three readings and one reserved for the VAE.
+/// The three bits the reading index lives in, as a plain binary code: bit
+/// [`READING_LO`] is its low bit, [`READING_MID`] the middle one,
+/// [`READING_HI`] its high bit. Eight codes, five readings on the flagship.
 pub const READING_LO: u8 = 6;
-pub const READING_HI: u8 = 7;
+pub const READING_MID: u8 = 7;
+pub const READING_HI: u8 = 8;
 
 /// Which reading index means what, per row. The word packs the index the
 /// runtime stamps (`Request::reading`) and nothing else — `Classify::of` has
@@ -80,9 +93,9 @@ pub struct Readings {
     pub text: Option<u8>,
     pub refine: u8,
     pub denoise: u8,
-    /// Reserved: the VAE decode reading, once the voxel axis is read by
-    /// this text. No node is guarded on it today.
-    pub vae_decode: u8,
+    /// The VAE readings, on a row that carries the VAE.
+    pub vae_decode: Option<u8>,
+    pub vae_encode: Option<u8>,
 }
 
 impl Model {
@@ -90,19 +103,24 @@ impl Model {
     /// order (what `validate_generative` demands).
     #[must_use]
     pub fn readings(&self) -> Readings {
-        match self.te {
-            Some(_) => Readings {
-                text: Some(0),
-                refine: 1,
-                denoise: 2,
-                vae_decode: 3,
-            },
-            None => Readings {
-                text: None,
-                refine: 0,
-                denoise: 1,
-                vae_decode: 2,
-            },
+        let mut next = 0u8;
+        let mut take = |present: bool| {
+            present.then(|| {
+                next += 1;
+                next - 1
+            })
+        };
+        let text = take(self.te.is_some());
+        let refine = take(true).unwrap_or(0);
+        let denoise = take(true).unwrap_or(0);
+        let vae_decode = take(self.vae.is_some());
+        let vae_encode = take(self.vae.is_some());
+        Readings {
+            text,
+            refine,
+            denoise,
+            vae_decode,
+            vae_encode,
         }
     }
 
@@ -116,6 +134,7 @@ impl Model {
             kind,
             width,
             streams: streams.to_vec(),
+            at: None,
         };
         let mut readings = Vec::new();
         if let (Some(index), Some(te)) = (codes.text, &self.te) {
@@ -127,6 +146,7 @@ impl Model {
                 streams: vec![Stream::Text],
                 // A sequence lane: ids and kv, no float port.
                 ports: vec![],
+                positions: None,
                 readout: ReadoutKind::Hidden,
                 readout_width: te.hidden,
             });
@@ -155,6 +175,14 @@ impl Model {
                     &[Stream::Context],
                 ),
             ],
+            // `(t, h, w)`, one lane: caption row `j` at `(1 + j, 0, 0)`,
+            // a pad row at the origin (study §C.5).
+            positions: Some(PositionConvention {
+                axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+                text_axis: 0,
+                text_origin: 1,
+                image_follows_text: false,
+            }),
             readout: ReadoutKind::Hidden,
             readout_width: d.dim,
         });
@@ -165,14 +193,17 @@ impl Model {
             takes_tokens: false,
             streams: vec![Stream::Image, Stream::Context],
             ports: vec![
+                port("pad", PortKind::Latents, 1, &[Stream::Image]),
                 port(
                     "latents",
                     PortKind::Latents,
                     PATCH_FEATURES,
                     &[Stream::Image],
                 ),
-                port("pad", PortKind::Latents, 1, &[Stream::Image]),
-                port("context", PortKind::Context, d.dim, &[Stream::Context]),
+                // A Latents port (index 2), not a Context one: the plan's
+                // Context 0 is the raw caption at `cap_width`, and a
+                // `(kind, index)` pair is seated once per plan.
+                port("context", PortKind::Latents, d.dim, &[Stream::Context]),
                 port(
                     "timestep",
                     PortKind::LaneVector,
@@ -186,9 +217,58 @@ impl Model {
                     &[Stream::Image, Stream::Context],
                 ),
             ],
+            // `(t, h, w)`: the caption rides the TIME axis ahead of the
+            // image — caption row `j` at `(1 + j, 0, 0)`, image patch
+            // `(a, b)` at `(L32 + 1, a, b)` — so the image's time index
+            // follows the caption's padded length (study §C.5). Pad rows
+            // sit at the origin, which the guest's grid states.
+            positions: Some(PositionConvention {
+                axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
+                text_axis: 0,
+                text_origin: 1,
+                image_follows_text: true,
+            }),
             readout: ReadoutKind::Velocity,
-            readout_width: PATCH_FEATURES,
+            readout_width: Tap::width(Tap::from_env().as_deref(), d),
         });
+        if let (Some(decode), Some(encode), Some(_)) =
+            (codes.vae_decode, codes.vae_encode, &self.vae)
+        {
+            readings.push(ReadingFact {
+                name: "vae.decode",
+                index: decode,
+                has_kv: false,
+                takes_tokens: false,
+                streams: vec![Stream::Image],
+                ports: vec![port("latent", PortKind::Voxels, CHANNELS, &[Stream::Image])],
+                // A VAE tile is a box on the voxel axis, not rows in a
+                // rotary space: it takes no positions and states no
+                // convention.
+                positions: None,
+                readout: ReadoutKind::Pixels,
+                readout_width: super::vae::RGB,
+            });
+            readings.push(ReadingFact {
+                name: "vae.encode",
+                index: encode,
+                has_kv: false,
+                takes_tokens: false,
+                streams: vec![Stream::Image],
+                // Voxel index ONE: the engine seats one rectangle per
+                // `(kind, index)` for the whole plan, and `vae.decode`'s
+                // latent clip is 16 wide at index 0.
+                ports: vec![PortFact {
+                    name: "pixels",
+                    kind: PortKind::Voxels,
+                    width: super::vae::RGB,
+                    streams: vec![Stream::Image],
+                    at: Some(super::model::port::PIXEL_VOXELS),
+                }],
+                positions: None,
+                readout: ReadoutKind::Pixels,
+                readout_width: CHANNELS,
+            });
+        }
         Generative {
             readings,
             latent: Some(LatentSpace {
@@ -205,6 +285,8 @@ impl Model {
                 train_steps: TRAIN_STEPS,
                 boundary: None,
                 pinned_sigmas: turbo_sigmas(self.shift),
+                // One backbone, one schedule: every lane takes `shift`.
+                stream_shifts: vec![],
             }),
             // 2048² at 16 px per row is 16 384 image rows, plus the widest
             // caption; the miniature's reference grid is 8 × 8.
@@ -229,11 +311,62 @@ pub fn turbo_sigmas(shift: f32) -> Vec<f32> {
         .collect()
 }
 
+/// **THE PARITY HARNESS'S BISECTION KNOB**, the `mini_dit::forward::Tap`
+/// idiom spelled for this row. Thirty-four blocks between a caption and a
+/// velocity say nothing about WHERE two runs diverged, so
+/// `PIE_Z_IMAGE_TAP=<key>` makes the `denoise` reading plant
+/// [`seam::VELOCITY`] on ONE intermediate and stop there; the guest's
+/// `velocity(width)` then reads that rectangle off its own lane's rows and
+/// `scripts/imagegen/zimage_parity.py` diffs it against the matching
+/// `zimage_golden.py --taps` key.
+///
+/// The keys, in the order the arm computes them: `latents` (the port as it
+/// landed), `x_linear` (`x_embedder`, the golden's `x.embed`), `x_embed`
+/// (its pad rows substituted), `normed0` / `scaled0` and `b0.{q,k,v,attn,
+/// out,norm2,res1,ffn,ffn_norm2,res2}` inside noise refiner 0, `refiner{l}`,
+/// `x_refined` (the golden's `x.refined`), `layer{l}` (joint block `l`, the
+/// golden's `layer{l}.out` — this one carries BOTH lanes, so a guest that
+/// reads the context lane back too gets its caption half), `final_norm` and
+/// `final_linear` (the golden's `out.0`, before the sign flip).
+///
+/// **A tap TRUNCATES the plan.** The seam is an export that runs at the end
+/// of the plan, so a seam planted on a live intermediate while the rest of
+/// the arm still runs reads whatever recycled that buffer — the tap must be
+/// the last thing the arm computes. Truncating drops the ports the rest of
+/// the arm would have read, so a tapped arm reads the context port up front
+/// and merges the tapped rectangle with it: the plan keeps declaring the
+/// port the context lane feeds, and the merge covers both classes.
+///
+/// This is the one place this family reads the environment, and it is read
+/// at catalog time, for a row nothing real is served by.
+pub struct Tap;
+
+impl Tap {
+    /// The environment variable, read at catalog time.
+    pub const ENV: &'static str = "PIE_Z_IMAGE_TAP";
+
+    /// The requested tap, or `None` for the model as it is.
+    #[must_use]
+    pub fn from_env() -> Option<String> {
+        std::env::var(Self::ENV).ok().filter(|key| !key.is_empty())
+    }
+
+    /// The width of the rectangle a tap exports: the patch features at the
+    /// arm's own two rectangles, the trunk width everywhere else.
+    #[must_use]
+    pub fn width(key: Option<&str>, d: &Dims) -> u32 {
+        match key {
+            None | Some("latents") | Some("final_linear") => PATCH_FEATURES,
+            Some(_) => d.dim,
+        }
+    }
+}
+
 /// The per-lane facts: which stream the lane's rows are, and which reading
 /// its pass runs.
 pub struct Facts {
     pub stream: Stream,
-    /// The reading index, `0..4` (a wider index is truncated to two bits).
+    /// The reading index, `0..8` (a wider index is truncated to three bits).
     pub reading: u8,
 }
 
@@ -259,6 +392,12 @@ impl Facts {
         Predicate::fact(READING_LO)
     }
 
+    /// The middle reading bit.
+    #[must_use]
+    pub fn reading_mid() -> Predicate {
+        Predicate::fact(READING_MID)
+    }
+
     /// The high reading bit.
     #[must_use]
     pub fn reading_hi() -> Predicate {
@@ -270,12 +409,12 @@ impl Classify for Facts {
     fn of(r: &Request) -> Facts {
         Facts {
             stream: r.stream(),
-            reading: r.reading() & 3,
+            reading: r.reading() & 7,
         }
     }
 
     fn word(&self) -> u64 {
-        self.stream.word(STREAM_BASE) | (u64::from(self.reading & 3) << READING_LO)
+        self.stream.word(STREAM_BASE) | (u64::from(self.reading & 7) << READING_LO)
     }
 }
 
@@ -298,12 +437,17 @@ impl ForwardHybrid for Model {
 
     fn forward(&self, inputs: Input<Facts>) -> Value {
         let codes = self.readings();
-        // Four arms by reading code, each a conjunction of the two reading
-        // literals (so every arm names a `Selection` the host can pack).
+        // Eight arms by reading code, each a conjunction of the three
+        // reading literals (so every arm names a `Selection` the host can
+        // pack); a code no reading claims runs no node.
         let (hi, lo) = inputs.split(&Facts::reading_hi());
-        let (c3, c2) = hi.split(&Facts::reading_lo());
-        let (c1, c0) = lo.split(&Facts::reading_lo());
-        let arms = [c0, c1, c2, c3];
+        let (hi_mid, hi_low) = hi.split(&Facts::reading_mid());
+        let (lo_mid, lo_low) = lo.split(&Facts::reading_mid());
+        let (c7, c6) = hi_mid.split(&Facts::reading_lo());
+        let (c5, c4) = hi_low.split(&Facts::reading_lo());
+        let (c3, c2) = lo_mid.split(&Facts::reading_lo());
+        let (c1, c0) = lo_low.split(&Facts::reading_lo());
+        let arms = [c0, c1, c2, c3, c4, c5, c6, c7];
         let arm = |code: u8| &arms[usize::from(code)];
 
         if let (Some(code), Some(te)) = (codes.text, &self.te) {
@@ -311,7 +455,12 @@ impl ForwardHybrid for Model {
         }
         refine(arm(codes.refine), &self.dims, &self.dit);
         let velocity = denoise(arm(codes.denoise), &self.dims, &self.dit);
-        vae_decode(arm(codes.vae_decode));
+        if let (Some(decode), Some(encode), Some(vae)) =
+            (codes.vae_decode, codes.vae_encode, &self.vae)
+        {
+            super::vae::decode(arm(decode), vae);
+            super::vae::encode(arm(encode), vae);
+        }
         velocity
     }
 }
@@ -372,7 +521,7 @@ fn text_encode(arm: &Input<Facts>, te: &TextEncoder) {
 /// unmodulated context-refiner blocks over the lane; `hidden` planted on
 /// the result inside the last block's layer mark.
 fn refine(arm: &Input<Facts>, d: &Dims, m: &Dit) {
-    let c = arm.context(port::CONTEXT, d.cap_width);
+    let c = arm.context(port::CAPTION, d.cap_width);
     let c = ops::elemwise::rmsnorm(&c, &m.cap_norm, NORM_EPS);
     let c = linear(&m.cap_embed, &c);
     let c = pad_rows(
@@ -434,13 +583,27 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
         mask: RaggedMask::None,
     };
     let x = img.latents(port::LATENTS, PATCH_FEATURES, Dtype::Bf16);
+    // [`Tap`]: the bisect's context rows, read up front so a TRUNCATED plan
+    // still declares the port the context lane feeds.
+    let tap = Tap::from_env().unwrap_or_default();
+    let c_early = (!tap.is_empty()).then(|| ctx.latents(port::CONTEXT_REFINED, d.dim, Dtype::Bf16));
+    // `tap!(key, value)`: under [`Tap`] `key`, seam the image rectangle
+    // merged with the context lane's own (narrowed to the same width, so
+    // the merge is one rectangle) and return there.
+    macro_rules! tap {
+        ($name:expr, $v:expr) => {
+            if tap == $name {
+                return seam_tapped($v, c_early.expect("a tapped arm reads the context port"));
+            }
+        };
+    }
+    tap!("latents", x.clone());
     let x = linear(&m.x_embed, &x);
-    let mut x = pad_rows(
-        &x,
-        &img.latents(port::PAD_IMAGE, 1, Dtype::Bf16),
-        &m.x_pad_mod,
-    );
-    for (_, block) in img.walk_layers(&m.noise_refiner) {
+    tap!("x_linear", x.clone());
+    let flag = img.latents(port::PAD_IMAGE, 1, Dtype::Bf16);
+    let mut x = pad_rows(&x, &flag, &m.x_pad_mod);
+    tap!("x_embed", x.clone());
+    for (l, block) in img.walk_layers(&m.noise_refiner) {
         let mods = adaln4(
             &linear(
                 block.ada.as_ref().expect("a noise refiner is modulated"),
@@ -448,15 +611,34 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
             ),
             d.dim,
         );
-        x = run_block(&x, block, Some((&mods, &img_lanes)), d, &own);
+        if l == 0 {
+            tap!(
+                "normed0",
+                ops::elemwise::rmsnorm(&x, &block.attn_norm1, NORM_EPS)
+            );
+            tap!("scaled0", {
+                let h = ops::elemwise::rmsnorm(&x, &block.attn_norm1, NORM_EPS);
+                ops::elemwise::modulate(&h, &mods.scale_msa, Some(&img_lanes), ModulateForm::Scale)
+            });
+        }
+        let want = if l == 0 { tap.as_str() } else { "" };
+        let (next, hit) = run_block_tapped(&x, block, Some((&mods, &img_lanes)), d, &own, want);
+        if let Some(hit) = hit {
+            return seam_tapped(hit, c_early.expect("a tapped arm reads the context port"));
+        }
+        x = next;
+        tap!(format!("refiner{l}"), x.clone());
     }
 
+    tap!("x_refined", x.clone());
     // ---- the caption lane: already refined, pads included ---------------
-    let c = ctx.context(port::CONTEXT, d.dim);
+    let c = c_early
+        .clone()
+        .unwrap_or_else(|| ctx.latents(port::CONTEXT_REFINED, d.dim, Dtype::Bf16));
 
     // ---- the joint trunk over `[image ‖ caption]` ------------------------
     let mut u = Value::merge(vec![x, c]);
-    for (_, block) in arm.walk_layers(&m.layers) {
+    for (l, block) in arm.walk_layers(&m.layers) {
         let mods = adaln4(
             &linear(
                 block.ada.as_ref().expect("a joint block is modulated"),
@@ -465,6 +647,14 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
             d.dim,
         );
         u = run_block(&u, block, Some((&mods, &lanes)), d, &joint);
+        if tap == format!("layer{l}") {
+            // Both lanes already: the merge is `u`'s own two classes, so
+            // the context lane reads its caption half of the same seam.
+            let (ui, ci) = u.split(&Facts::image());
+            let both = Value::merge(vec![ui, ci]);
+            seam::at(seam::VELOCITY, &[&both]);
+            return both;
+        }
     }
 
     // ---- the final layer, image rows only ---------------------------------
@@ -473,27 +663,21 @@ fn denoise(arm: &Input<Facts>, d: &Dims, m: &Dit) -> Value {
     let scale = linear(&m.final_ada, &ops::elemwise::silu(&temb));
     let (scale_img, _) = scale.split(&Facts::image());
     let (ui, _) = u.split(&Facts::image());
+
     let h = ops::elemwise::modulate(
         &ops::elemwise::layernorm_no_scale(&ui, FINAL_LN_EPS),
         &scale_img,
         Some(&img_lanes),
         ModulateForm::Scale,
     );
+    tap!("final_norm", h.clone());
     let v = linear(&m.final_linear, &h);
+    tap!("final_linear", v.clone());
     // The reference pipeline's `noise_pred = -noise_pred`.
     let velocity = ops::elemwise::mul_scalar(-1.0, &v);
     seam::at(seam::VELOCITY, &[&velocity]);
     velocity
 }
-
-/// The `vae.decode` reading: NOT WIRED. The FLUX `AutoencoderKL` decoder is
-/// a voxel-axis text (`IMAGEGEN_CONTRACT.md` §6: `spatial::conv3d`,
-/// `group_norm`, `upsample_nearest`, the mid-block attention) that this
-/// family will state under this arm once the `vae.` tensors are declared
-/// (`import.rs` lists them). Until then a lane stamped with this code runs
-/// no node at all; the reading is reserved in [`Readings`] and absent from
-/// the facts, so a guest cannot name it.
-fn vae_decode(_arm: &Input<Facts>) {}
 
 /// The tables one attention sublayer needs: the rows' rotary coordinates,
 /// the arm's row permutation, the CSR its segments pair by, and the mask.
@@ -507,6 +691,22 @@ struct Geom {
 /// One biased projection.
 fn linear(w: &Linear, x: &Value) -> Value {
     ops::elemwise::add_bias(&w.bias, &ops::linear::matmul(x, &w.w))
+}
+
+/// [`Tap`]'s seam: the tapped image rectangle merged with the context
+/// lane's rows narrowed to the same width — the plan then declares the port
+/// that lane feeds (a truncated arm never reaches its own read of it) and
+/// every class of the merge is covered.
+fn seam_tapped(image: Value, context: Value) -> Value {
+    let width = u32::try_from(image.width()).unwrap_or(u32::MAX);
+    let context = if u64::from(width) < context.width() {
+        ops::layout::split_rows(&context, width).0
+    } else {
+        context
+    };
+    let both = Value::merge(vec![image, context]);
+    seam::at(seam::VELOCITY, &[&both]);
+    both
 }
 
 /// Overwrite the flagged rows with the learned pad token: the `[rows, 1]`
@@ -555,6 +755,28 @@ fn adaln4(m: &Value, dim: u32) -> Mods {
 /// `to_qkv` → per-head QK RMSNorm → three-axis interleaved rope → ragged
 /// attention over the packed segments → `to_out`; the MLP is SwiGLU.
 fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &Geom) -> Value {
+    run_block_tapped(x, b, mods, d, g, "").0
+}
+
+/// [`run_block`] with a [`Tap`] hook: the second half of the answer is the
+/// tapped intermediate, for the caller to seam and return there (a seam
+/// planted while the rest of the arm still runs reads a recycled buffer).
+fn run_block_tapped(
+    x: &Value,
+    b: &Block,
+    mods: Option<(&Mods, &Value)>,
+    d: &Dims,
+    g: &Geom,
+    tap: &str,
+) -> (Value, Option<Value>) {
+    let mut hit: Option<Value> = None;
+    macro_rules! tap {
+        ($name:expr, $v:expr) => {
+            if tap == $name {
+                hit = Some($v);
+            }
+        };
+    }
     let dim = d.dim;
     let hd = d.head_dim;
     let scaled = |normed: &Value, s: &Value, lanes: &Value| {
@@ -579,6 +801,9 @@ fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &
         )
     };
     let (q, k) = (turn(&q, &b.attn.q_norm), turn(&k, &b.attn.k_norm));
+    tap!("b0.q", q.clone());
+    tap!("b0.k", k.clone());
+    tap!("b0.v", v.clone());
     let o = ops::attn::ragged(
         &ops::layout::pack_rows(&q, &g.perm),
         &ops::layout::pack_rows(&k, &g.perm),
@@ -590,12 +815,16 @@ fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &
         g.mask,
     );
     let o = ops::layout::unpack_rows(&o, &g.perm);
+    tap!("b0.attn", o.clone());
     let o = ops::linear::matmul(&o, &b.attn.out);
+    tap!("b0.out", o.clone());
     let o = ops::elemwise::rmsnorm(&o, &b.attn_norm2, NORM_EPS);
+    tap!("b0.norm2", o.clone());
     let x = match mods {
         Some((m, lanes)) => ops::elemwise::gated_residual_add(x, &m.gate_msa, &o, Some(lanes)),
         None => ops::elemwise::residual_add(&o, x),
     };
+    tap!("b0.res1", x.clone());
 
     let h = ops::elemwise::rmsnorm(&x, &b.ffn_norm1, NORM_EPS);
     let h = match mods {
@@ -606,11 +835,15 @@ fn run_block(x: &Value, b: &Block, mods: Option<(&Mods, &Value)>, d: &Dims, g: &
         &ops::linear::mlp_swiglu(&ops::linear::matmul(&h, &b.mlp.gate_up), d.inter),
         &b.mlp.down,
     );
+    tap!("b0.ffn", f.clone());
     let f = ops::elemwise::rmsnorm(&f, &b.ffn_norm2, NORM_EPS);
-    match mods {
+    tap!("b0.ffn_norm2", f.clone());
+    let out = match mods {
         Some((m, lanes)) => ops::elemwise::gated_residual_add(&x, &m.gate_mlp, &f, Some(lanes)),
         None => ops::elemwise::residual_add(&f, &x),
-    }
+    };
+    tap!("b0.res2", out.clone());
+    (out, hit)
 }
 
 // `TE_HIDDEN` is the caption width the flagship's `refine` port states;

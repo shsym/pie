@@ -169,6 +169,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
                 Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
                     ("AxisPositions", *port, u32::from(*axes))
                 }
+                Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
                 _ => continue,
             };
             traced.insert((kind.to_string(), port, width));
@@ -218,7 +219,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         );
         assert_eq!(
             at(denoise, "context"),
-            (model::port::CONTEXT, PortKind::Context, d.dim)
+            (model::port::CONTEXT_REFINED, PortKind::Latents, d.dim)
         );
         assert_eq!(
             at(denoise, "timestep"),
@@ -235,8 +236,24 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         );
         assert_eq!(
             at(refine, "caption"),
-            (model::port::CONTEXT, PortKind::Context, d.cap_width)
+            (model::port::CAPTION, PortKind::Context, d.cap_width)
         );
+
+        // A `(kind, index)` pair is seated once per PLAN, at one width
+        // (`IMAGEGEN_CONTRACT.md` §2): two readings sharing a pair must
+        // agree on its width, or the second reader lands in the first's
+        // rectangle.
+        let mut widths: std::collections::BTreeMap<(String, u8), u32> =
+            std::collections::BTreeMap::new();
+        for (kind, index, width) in &traced {
+            if let Some(have) = widths.insert((kind.clone(), *index), *width) {
+                assert_eq!(
+                    have, *width,
+                    "{sku}: {kind} port {index} is read at two widths ({have} and {width}); \
+                     the engine seats one rectangle per (kind, index)"
+                );
+            }
+        }
         assert_eq!(
             at(refine, "positions"),
             (model::port::POSITIONS, PortKind::AxisPositions, axes)
@@ -576,9 +593,17 @@ fn every_row_bakes() {
                     .collect(),
                 max_adapters: 0,
             };
-            let compiled =
-                model_compiler::compile(&plan, &budget, &model_compiler::DeviceProfile::default())
-                    .unwrap_or_else(|why| panic!("{sku} {platform:?}: does not bake: {why}"));
+            // The flagship's VAE readings run on the voxel axis: a ladder
+            // of one 64x64 latent's worth of voxels (`the_z_image_vae_bakes`
+            // sizes it properly); the miniature states no voxel row.
+            let budgets = model_compiler::Budgets::of(budget)
+                .with_voxels(model_compiler::VoxelLadder::new(4096, 4));
+            let compiled = model_compiler::compile_axes(
+                &plan,
+                &budgets,
+                &model_compiler::DeviceProfile::default(),
+            )
+            .unwrap_or_else(|why| panic!("{sku} {platform:?}: does not bake: {why}"));
             assert!(
                 !compiled.regions.is_empty(),
                 "{sku} {platform:?}: a bake with no regions"
@@ -604,7 +629,7 @@ fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
         let facts = row(sku).generative.as_ref().expect("facts");
         let names: Vec<&str> = facts.readings.iter().map(|r| r.name).collect();
         let want: Vec<&str> = if sku == TURBO {
-            vec!["text", "refine", "denoise"]
+            vec!["text", "refine", "denoise", "vae.decode", "vae.encode"]
         } else {
             vec!["refine", "denoise"]
         };
