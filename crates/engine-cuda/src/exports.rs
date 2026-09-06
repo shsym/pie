@@ -43,6 +43,12 @@ use crate::error::{Fault, Result};
 pub(crate) const OUT_SEAM: &str = model_compiler::EXPORT_SEAMS[0];
 pub(crate) const MTP_SEAM: &str = model_compiler::EXPORT_SEAMS[1];
 pub(crate) const SCORES_SEAM: &str = model_compiler::EXPORT_SEAMS[2];
+/// The float readouts a plan may carry instead of `out` (`velocity`,
+/// `hidden`): a plan with one of these and no `out` still computes
+/// something a reader takes.
+pub(crate) const FLOAT_READOUT_SEAMS: [&str; 3] = model_compiler::FLOAT_READOUT_SEAMS;
+/// The VAE decode readout (D8): the pixel plane and its grid.
+pub(crate) const PIXELS_SEAM: &str = model_compiler::EXPORT_SEAMS[6];
 
 /// One declared export, resolved against this load's plan and bake.
 ///
@@ -67,9 +73,12 @@ pub struct Export {
 /// This load's declared exports (design §9), resolved once at boot.
 #[derive(Debug, Clone)]
 pub(crate) struct Exports {
-    /// The trunk's logits. Required: a plan with no `out` seam computes
-    /// nothing a reader can take.
-    pub(crate) out: ValueId,
+    /// The trunk's logits. `None` for a plan whose readout is a float seam
+    /// (`velocity`, `hidden`) — a denoiser has no logits — and a plan with
+    /// neither is refused at boot, since a fire would compute nothing a
+    /// reader can take. M0: reading the float seams back is the runtime
+    /// agent's; this shell reads logits only.
+    pub(crate) out: Option<ValueId>,
     /// The draft head's logits over the draft window, for a SKU whose model
     /// text declares one (palo C3).
     pub(crate) mtp: Option<Export>,
@@ -80,6 +89,50 @@ pub(crate) struct Exports {
     /// lane's word must land in, and empty for an artifact with no capture
     /// arm at all.
     pub(crate) capturing: model_ir::ClassSet,
+    /// The denoiser's prediction (`seam::VELOCITY`), for a plan that plants
+    /// one (design D3): the eta `velocity()` intrinsic and the
+    /// `ReadoutSeam::Velocity` readback point at it.
+    pub(crate) velocity: Option<Export>,
+    /// The hidden-state exports (`seam::HIDDEN`), one per layer they were
+    /// planted in, in plan order. The LAST one is what a `hidden()`
+    /// intrinsic and a `ReadoutSeam::Hidden` readback read.
+    pub(crate) hidden: Vec<Export>,
+    /// The pixel plane and its `[Clips, 4]` grid (D8), for a plan whose
+    /// text plants `seam::PIXELS` on both; `None` otherwise.
+    pub(crate) pixels: Option<(ValueId, ValueId)>,
+}
+
+/// Which seam a fire's host readback mirrors, and the value it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadoutSeam {
+    pub(crate) seam: engine::fire::ReadoutSeam,
+    pub(crate) value: ValueId,
+}
+
+impl Exports {
+    /// The seam a lane's rows are read back from: `out` when the plan has
+    /// one, else `velocity`, else the last `hidden` — a plan with none was
+    /// refused at [`Exports::of`].
+    #[must_use]
+    pub(crate) fn readout(&self) -> Option<ReadoutSeam> {
+        use engine::fire::ReadoutSeam as Seam;
+        if let Some(out) = self.out {
+            return Some(ReadoutSeam {
+                seam: Seam::Logits,
+                value: out,
+            });
+        }
+        if let Some(velocity) = &self.velocity {
+            return Some(ReadoutSeam {
+                seam: Seam::Velocity,
+                value: velocity.value,
+            });
+        }
+        self.hidden.last().map(|hidden| ReadoutSeam {
+            seam: Seam::Hidden,
+            value: hidden.value,
+        })
+    }
 }
 
 impl Exports {
@@ -87,18 +140,27 @@ impl Exports {
     ///
     /// # Errors
     ///
-    /// [`Fault::Unbound`] for a plan with no `out` seam.
+    /// [`Fault::Unbound`] for a plan with no export at all: neither an
+    /// `out` seam nor a float readout.
     pub(crate) fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Exports> {
         let out = trace
             .seams
             .iter()
             .find(|seam| seam.seam == OUT_SEAM)
-            .and_then(|seam| seam.values.first().copied())
-            .ok_or_else(|| Fault::Unbound {
+            .and_then(|seam| seam.values.first().copied());
+        let float_readout = trace
+            .seams
+            .iter()
+            .any(|seam| FLOAT_READOUT_SEAMS.contains(&seam.seam.as_str()) && !seam.values.is_empty());
+        if out.is_none() && !float_readout {
+            return Err(Fault::Unbound {
                 what: format!(
-                    "no `{OUT_SEAM}` seam, so a fire would compute nothing a reader can take"
+                    "no `{OUT_SEAM}` seam and no float readout ({}), so a fire would compute \
+                     nothing a reader can take",
+                    FLOAT_READOUT_SEAMS.join(", ")
                 ),
-            })?;
+            });
+        }
         let named = |name: &str| -> Vec<Export> {
             trace.seams
                 .iter()
@@ -123,11 +185,22 @@ impl Exports {
                 capturing.insert(class);
             }
         }
+        let pixels = trace
+            .seams
+            .iter()
+            .find(|seam| seam.seam == PIXELS_SEAM)
+            .and_then(|seam| match seam.values.as_slice() {
+                [plane, grid, ..] => Some((*plane, *grid)),
+                _ => None,
+            });
         Ok(Exports {
             out,
             mtp: named(MTP_SEAM).into_iter().next(),
             scores,
             capturing,
+            velocity: named(FLOAT_READOUT_SEAMS[0]).into_iter().next(),
+            hidden: named(FLOAT_READOUT_SEAMS[1]),
+            pixels,
         })
     }
 }
@@ -245,25 +318,45 @@ pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> model_ir
     })
 }
 
+/// How many declared readings (`Request::in_reading`) the enumeration
+/// tries per stream. The IR declares no reading count, so every reading a
+/// family could index below this is classified; one past the family's last
+/// lands where the family's classifier puts it (the default arm, or a word
+/// no class has, which is dropped).
+const READINGS: u8 = 8;
+
 /// Every request shape, classified by the model: per class, the requests
 /// that land in it, fewest flags first. A class no request reaches is one
-/// no caller can bring, and the arming pass does not synthesize it.
+/// no caller can bring, and the arming pass does not synthesize it. The
+/// seven boolean facts, every [`model_ir::Stream`] and [`READINGS`] readings
+/// are enumerated, so a class only a stream or a reading selects (design
+/// D2: the image lanes' arm of an MM-DiT) is reachable by the arming pass.
 #[must_use]
 pub(crate) fn landing_requests(
     classify: model_ir::ClassifyFn,
     classes: &model_ir::ClassTable,
 ) -> Vec<Vec<model_ir::Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
-    for bits in 0..128u32 {
-        let request = model_ir::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
-            .adapted(bits & 4 != 0)
-            .drafting(bits & 8 != 0)
-            .capturing_scores(bits & 16 != 0)
-            .with_media(bits & 32 != 0)
-            .denoising(bits & 64 != 0);
-        let word = classify(&request) & classes.mask;
-        if let Some(class) = classes.class_of(word) {
-            landing[class].push(request);
+    for reading in 0..READINGS {
+        for stream in model_ir::Stream::ALL {
+            for bits in 0..128u32 {
+                let request =
+                    model_ir::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
+                        .adapted(bits & 4 != 0)
+                        .drafting(bits & 8 != 0)
+                        .capturing_scores(bits & 16 != 0)
+                        .with_media(bits & 32 != 0)
+                        .denoising(bits & 64 != 0)
+                        .on_stream(stream)
+                        .in_reading(reading);
+                let word = classify(&request) & classes.mask;
+                if let Some(class) = classes.class_of(word) {
+                    // A stream or reading the family packs no bit for lands
+                    // on its default's word; the extra entries sort after
+                    // it (`request_flags`) and cost a text family nothing.
+                    landing[class].push(request);
+                }
+            }
         }
     }
     for requests in &mut landing {
@@ -280,6 +373,8 @@ fn request_flags(request: &model_ir::Request) -> u32 {
         + u32::from(request.captures_scores())
         + u32::from(request.has_media())
         + u32::from(request.denoise())
+        + u32::from(request.stream() != model_ir::Stream::Text)
+        + u32::from(request.reading() != 0)
 }
 
 /// The DECODE classes: every request that lands in one carries a single
@@ -469,6 +564,141 @@ fn classes_running(
             for class in region.mask.iter() {
                 classes.insert(class);
             }
+        }
+    }
+    classes
+}
+
+/// **THE FLOAT PORTS AND THE PACKING SELECTIONS A PLAN READS** (design
+/// D2/D3), read once off the plan at load: what the inputs store carves, and
+/// what `prepare` builds per fire.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Feeds {
+    /// Every float port the plan declares, with the classes whose window
+    /// runs a node reading it — the classes a lane must feed it in.
+    pub(crate) ports: Vec<(crate::inputs::PortSeat, model_ir::ClassSet)>,
+    /// Every row selection a packing table is keyed by, in first-seen order
+    /// (the order the inputs store carves them in).
+    pub(crate) selections: Vec<model_ir::Selection>,
+    /// The selections whose `ReferenceTag` table a `RaggedMask::ReferenceSelfOnly`
+    /// reads on its query side — the ones whose groups may hold at most one
+    /// reference lane on this shell (the kernel has one tail per group).
+    pub(crate) reference_masked: Vec<model_ir::Selection>,
+}
+
+impl Feeds {
+    #[must_use]
+    pub(crate) fn of(trace: &Trace, compiled: &CompiledModel) -> Feeds {
+        use model_ir::{Def, GeomKind, RuntimeInput, Ty};
+        let mut feeds = Feeds::default();
+        for (at, decl) in trace.values.iter().enumerate() {
+            let Def::Input(input) = &decl.def else {
+                continue;
+            };
+            let dtype = match &decl.ty {
+                Ty::Tensor { dtype, .. } => *dtype,
+                Ty::Struct(_) => continue,
+            };
+            let seat = match *input {
+                RuntimeInput::Latents { port, width } => Some(crate::inputs::PortSeat {
+                    kind: engine::fire::PortKind::Latents,
+                    port,
+                    width,
+                    dtype,
+                }),
+                RuntimeInput::LaneVector { port, width } => Some(crate::inputs::PortSeat {
+                    kind: engine::fire::PortKind::LaneVector,
+                    port,
+                    width,
+                    dtype,
+                }),
+                RuntimeInput::Context { port, width } => Some(crate::inputs::PortSeat {
+                    kind: engine::fire::PortKind::Context,
+                    port,
+                    width,
+                    dtype,
+                }),
+                RuntimeInput::AxisPositions { port, axes } => Some(crate::inputs::PortSeat {
+                    kind: engine::fire::PortKind::AxisPositions,
+                    port,
+                    width: u32::from(axes),
+                    dtype,
+                }),
+                RuntimeInput::RowPermutation { select }
+                | RuntimeInput::Geometry {
+                    kind:
+                        GeomKind::GroupIndptr { select }
+                        | GeomKind::LaneIndptr { select }
+                        | GeomKind::ReferenceTag { select },
+                    ..
+                } => {
+                    if !feeds.selections.contains(&select) {
+                        feeds.selections.push(select);
+                    }
+                    None
+                }
+                _ => None,
+            };
+            if let Some(seat) = seat {
+                let readers = reader_classes(trace, compiled, ValueId(at as u32));
+                match feeds
+                    .ports
+                    .iter_mut()
+                    .find(|(have, _)| have.kind == seat.kind && have.port == seat.port)
+                {
+                    Some((_, classes)) => {
+                        for class in readers.iter() {
+                            classes.insert(class);
+                        }
+                    }
+                    None => feeds.ports.push((seat, readers)),
+                }
+            }
+        }
+        for node in &trace.nodes {
+            if let model_ir::Operation::Attention(model_ir::Attention::Ragged {
+                mask: model_ir::RaggedMask::ReferenceSelfOnly { q_tags, .. },
+                ..
+            }) = &node.op
+                && let Def::Input(RuntimeInput::Geometry {
+                    kind: GeomKind::ReferenceTag { select },
+                    ..
+                }) = &trace.values[q_tags.0 as usize].def
+                && !feeds.reference_masked.contains(select)
+            {
+                feeds.reference_masked.push(*select);
+            }
+        }
+        feeds
+    }
+
+    /// The port seats alone, in the store's order.
+    #[must_use]
+    pub(crate) fn seats(&self) -> Vec<crate::inputs::PortSeat> {
+        self.ports.iter().map(|(seat, _)| *seat).collect()
+    }
+}
+
+/// The classes whose window runs a node that READS `value` —
+/// [`writer_classes`]'s mirror, for the ports: a lane of one of these
+/// classes must feed the port, a lane of any other need not.
+fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> model_ir::ClassSet {
+    let mut inputs: Vec<ValueId> = Vec::new();
+    let mut readers: Vec<u32> = Vec::new();
+    for (at, node) in trace.nodes.iter().enumerate() {
+        inputs.clear();
+        node.op.inputs(&mut inputs);
+        if inputs.contains(&value) {
+            readers.push(u32::try_from(at).unwrap_or(u32::MAX));
+        }
+    }
+    let mut classes = model_ir::ClassSet::default();
+    for region in compiled.template() {
+        if !region.nodes.clone().any(|node| readers.contains(&node)) {
+            continue;
+        }
+        for class in region.mask.iter() {
+            classes.insert(class);
         }
     }
     classes

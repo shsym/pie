@@ -6,8 +6,8 @@ use crate::arena::Arena;
 use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::{
-    Exports, corrected_classes, decoding_of, landing_requests, masked_classes, media_classes,
-    regions_lane_shifting, regions_shifting,
+    Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
+    media_classes, regions_lane_shifting, regions_shifting,
 };
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
@@ -54,6 +54,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     let budgets = Budgets {
         tokens: boot.budget.clone(),
         patches: boot.patches.clone(),
+        voxels: boot.voxels.clone(),
     };
     // The peepholes (`model_ir::fuse`) run on the trace this load keeps, so
     // the compile and every node index taken off `boot.trace` below share
@@ -63,6 +64,23 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // lands the traced launches instead.
     if fuse_chains() {
         boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
+        boot.trace = model_ir::fuse::gemm_epilogues(boot.trace.clone());
+        // The adaLN peepholes (design D6): a scale-free norm into its
+        // modulation, and the gated fold into both.
+        boot.trace = model_ir::fuse::modulation(boot.trace.clone());
+    }
+    if std::env::var_os("PIE_TRACE_CENSUS").is_some() {
+        let mut census: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        for node in &boot.trace.nodes {
+            *census
+                .entry(model_ir::Operands::name(&node.op))
+                .or_insert(0) += 1;
+        }
+        eprintln!(
+            "[trace-census] {} nodes: {census:?}",
+            boot.trace.nodes.len()
+        );
     }
     // `PTIR_GUMBEL_DIRECT=0`: keep a program's Gumbel-max head as the
     // launches it was traced as (see `eta_compiler::codegen::cuda::fused`).
@@ -195,6 +213,9 @@ impl Shell {
             ),
             decode_dense,
         )?;
+        // The convolution weights (D8) relabelled once into the tap-major
+        // order the spatial kernels read, before anything reads them.
+        crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
         let arena = Arena::reserve(&compiled.arena)?;
         let pools = Pools::reserve(
@@ -261,12 +282,21 @@ impl Shell {
             )
         });
         let patch_fold = patch_fold(&boot.trace);
+        // The voxel seat (D8): the deployment's ceilings, the plan's own port.
+        let voxels = match boot.voxels.as_ref() {
+            Some(ladder) if compiled.order_for(model_ir::RowAxis::Voxels).is_some() => Some(
+                crate::voxels::Store::reserve(crate::voxels::Seat::of(&boot.trace, ladder))?,
+            ),
+            _ => None,
+        };
         let drops_patch_rows = boot.trace.nodes.iter().any(|node| {
             matches!(
                 node.op,
                 model_ir::Operation::Layout(model_ir::Layout::ScatterLiveRows { .. })
             )
         });
+        // The float ports and packing selections the plan reads (D2/D3).
+        let feeds = Feeds::of(&boot.trace, &compiled);
         let inputs = Inputs::reserve(
             &boot.budget,
             paging,
@@ -281,6 +311,9 @@ impl Shell {
             patch_seat,
             mrope_seat,
             u64::from(self_cond_taps),
+            &feeds.seats(),
+            feeds.selections.len(),
+            !masked.is_empty(),
         )?;
 
         let exports = Exports::of(&boot.trace, &compiled)?;
@@ -316,6 +349,7 @@ impl Shell {
         let adapter_seats = weights.adapter_seats();
         let adapter_fact = adapter_fact(&compiled.classes, &corrected);
         let compiled_towered = compiled.order_for(model_ir::RowAxis::Patches).is_some();
+        let voxel_plan = voxels.is_some();
         let mut shell = Shell {
             device,
             accounting,
@@ -329,6 +363,7 @@ impl Shell {
             drops_patch_rows,
             towered: compiled_towered,
             patch_fold,
+            voxels,
             weights,
             arena,
             pools,
@@ -338,6 +373,7 @@ impl Shell {
             facts,
             spaces,
             masked,
+            feeds,
             adapter_fact,
             corrected,
             decoding,
@@ -358,12 +394,16 @@ impl Shell {
             pad: boot.knobs.pad(),
             golden: boot.knobs.golden(),
             golden_arm: Golden::Off,
-            bodies: boot.knobs.bodies(),
+            // M0 (D8): a plan on the voxel axis is served eagerly — the
+            // arming pass fires synthetic lanes that carry no clip, and the
+            // spatial kernels read no seat, so no body could replay one.
+            bodies: boot.knobs.bodies() && !voxel_plan,
             // Megabytes to bytes, once, at the seam the boot document crosses.
             bodies_mem: (boot.knobs.bodies_mem() as usize).saturating_mul(1 << 20),
             arming: false,
             armed_body: None,
             segments: std::collections::HashMap::new(),
+            windows_memo: Vec::new(),
             last: FireCost::default(),
             cache: {
                 let mut cache = GraphCache::new();

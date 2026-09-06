@@ -12,7 +12,7 @@ use crate::declare::Weight;
 use crate::record::Value;
 use model_ir::{
     Attention, Collective, CustomCuda, Dim, Dtype, Elementwise, GateActivation, Layout, Linear,
-    MropeForm, StructKind, Ty, ValueId,
+    ModulateForm, MropeForm, RaggedMask, RopeForm, StructKind, Ty, ValueId,
 };
 
 pub mod attn;
@@ -21,6 +21,7 @@ pub mod custom;
 pub mod elemwise;
 pub mod layout;
 pub mod linear;
+pub mod spatial;
 
 /// A two-axis tensor type: the whole surviving shape algebra is `[rows, width]`.
 fn tensor(rows: Dim, width: impl Into<u64>, dtype: Dtype) -> Ty {

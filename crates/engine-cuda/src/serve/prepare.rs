@@ -14,14 +14,27 @@ use crate::store::kv::{self, Seat};
 use crate::window::Windows;
 
 use super::{
-    Enqueued, FireCost, MROPE_COORDS, Media, PATCH_ROUTE_DROP, Prepared, RsFire, Settled, Shell,
-    StepView,
+    Enqueued, FireCost, MROPE_COORDS, Media, PATCH_ROUTE_DROP, PortFeedPlan, Prepared, RsFire,
+    Settled, Shell, StepView,
 };
 
 /// `prepare`: host-only (gate, ports, compose, lane loop, geometry, windows,
 /// mask). `enqueue`: stream-only (prologue, memsets, staging write, tables,
 /// schedule, the walk). `settle`: post-sync (readback, capture, epilogue,
 /// `held`).
+/// How many resolved window tables a shell keeps (see step 4 of `prepare`).
+const WINDOWS_MEMO: usize = 8;
+
+/// One resolved window table and what it was resolved from.
+pub(super) struct WindowsMemo {
+    tables: [model_exec::fire::WindowTable; 3],
+    indptr_host: Vec<i32>,
+    bucket: u32,
+    copies: bool,
+    windows: Windows,
+    packed: Vec<i32>,
+}
+
 impl FrameShell for Shell {
     type Step<'a> = StepView<'a>;
     type Prepared<'a> = Prepared<'a>;
@@ -44,6 +57,7 @@ impl FrameShell for Shell {
             lanes,
             attachments,
             media,
+            ..
         } = step;
         let arming = self.arming;
         let copies = self.copies;
@@ -92,6 +106,7 @@ impl FrameShell for Shell {
         {
             self.reap_guests_at("prepare")?;
         }
+        super::btrace::mark("reap");
         let mut resolved: Vec<crate::program::Envelope> = Vec::new();
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         for attached in attachments {
@@ -218,6 +233,33 @@ impl FrameShell for Shell {
             }
         }
 
+        // The voxel-axis submission (D8): one entry per lane at most, only
+        // against a load that seats the axis, the payload one port row per
+        // voxel. Laid out in fire order once the composition has placed it.
+        let mut clips_of: Vec<Option<crate::voxels::Clips<'_>>> = vec![None; lanes.len()];
+        for shot in step.voxels {
+            let at = shot.lane as usize;
+            if at >= lanes.len() {
+                return Err(Fault::VoxelPayload {
+                    lane: shot.lane,
+                    what: "the lane index is past the submission",
+                });
+            }
+            if clips_of[at].is_some() {
+                return Err(Fault::VoxelPayload {
+                    lane: shot.lane,
+                    what: "a lane's clips are one submission",
+                });
+            }
+            if shot.clips.iter().any(|b| b.contains(&0)) {
+                return Err(Fault::VoxelPayload {
+                    lane: shot.lane,
+                    what: "a clip's box has a zero side",
+                });
+            }
+            clips_of[at] = Some(*shot);
+        }
+
         // The patch-axis submission is checked here, before anything
         // launches: past this, `layout.scatter_rows` is an unchecked
         // indexed write.
@@ -320,24 +362,205 @@ impl FrameShell for Shell {
             media_of[at] = Some(shot);
         }
 
+        super::btrace::mark("ports");
         // 1. Lane words in; `compose_axes` seriates the patch axis beside
         // the token one.
         let submitted: Vec<FireLane> = lanes
             .iter()
             .zip(&lane_rows)
             .enumerate()
-            .map(|(at, (seated, &rows))| match media_of[at] {
-                None => FireLane::new(seated.lane.word, rows),
-                Some(shot) => FireLane::with_images(
+            .map(|(at, (seated, &rows))| match (media_of[at], clips_of[at]) {
+                (None, None) => FireLane::new(seated.lane.word, rows),
+                (Some(shot), _) => FireLane::with_images(
                     seated.lane.word,
                     rows,
                     shot.rows.len() as u32,
                     shot.rows.iter().sum(),
                 ),
+                (None, Some(clips)) => FireLane::with_clips(
+                    seated.lane.word,
+                    rows,
+                    clips.clips.len() as u32,
+                    u32::try_from(clips.voxels()).unwrap_or(u32::MAX),
+                ),
             })
             .collect();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
         let descriptor = FireDescriptor::of(&composition);
+
+        // 1b. The D2 packing tables: which group each fire lane joins, and
+        // per selection the plan reads, the packed order and its CSRs. Built
+        // over the composition's fire order from the `(stream, group)` the
+        // runtime stated per lane. A plan reading no table builds none.
+        let lane_facts: Vec<model_exec::fire::LaneFacts> = lanes
+            .iter()
+            .map(|seated| model_exec::fire::LaneFacts {
+                stream: seated.stream,
+                group: seated.group,
+            })
+            .collect();
+        let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let groups = model_exec::fire::group_of_lane(composition.lanes(), &lane_facts);
+            let mut packings = Vec::with_capacity(self.feeds.selections.len());
+            for &select in &self.feeds.selections {
+                let packed = model_exec::fire::pack(
+                    select,
+                    composition.lanes(),
+                    &lane_facts,
+                    &groups,
+                    composition.rows(),
+                )
+                .map_err(model_exec::Error::Fire)?;
+                // The CUDA ragged kernel's reference mask is one tail per
+                // group: a group with two reference lanes would let them see
+                // each other, which the contract forbids, so it is refused
+                // here rather than computed wrong.
+                if self.feeds.reference_masked.contains(&select)
+                    && let Some((group, count)) = packed
+                        .references
+                        .iter()
+                        .enumerate()
+                        .find(|(_, count)| **count > 1)
+                {
+                    return Err(Fault::program(
+                        "serve::packing",
+                        format!(
+                            "attention group {group} carries {count} reference lanes, and \
+                             this shell's `attention.ragged` reference mask is one tail per \
+                             group (every reference row of a group would see every other's); \
+                             submit one reference lane per group"
+                        ),
+                    ));
+                }
+                packings.push(packed);
+            }
+            (groups, packings)
+        };
+
+        // 1c. The D3 port feeds: every port a lane's class reads must be fed
+        // from one of its channels, through the instance attached to it (the
+        // `SelfCondInput::channels` precedent); the cell must be exactly the
+        // lane's rows of the port's width. Checked here, before any stream
+        // is touched; the cell's address is resolved at `enqueue`, after the
+        // prologue, so it is the cell the instance's own `take` would read.
+        let mut port_feeds: Vec<PortFeedPlan> = Vec::new();
+        for (fire_lane, row) in composition.lanes().iter().enumerate() {
+            let seated = &lanes[row.source as usize];
+            for feed in seated.ports {
+                if !self
+                    .feeds
+                    .ports
+                    .iter()
+                    .any(|(seat, _)| seat.kind == feed.kind && seat.port == feed.port)
+                {
+                    return Err(Fault::program(
+                        "serve::ports",
+                        format!(
+                            "lane {} feeds {:?} port {} and this plan declares no such port",
+                            row.source, feed.kind, feed.port
+                        ),
+                    ));
+                }
+            }
+            for (seat, readers) in &self.feeds.ports {
+                if !readers.contains(row.class as usize) {
+                    continue;
+                }
+                let Some(feed) = seated
+                    .ports
+                    .iter()
+                    .find(|feed| feed.kind == seat.kind && feed.port == seat.port)
+                else {
+                    // The arming pass feeds nothing: its synthetics compute
+                    // nobody's numbers, and the rectangle stands as the load
+                    // left it (zeros) or the last fire's.
+                    if arming {
+                        continue;
+                    }
+                    return Err(Fault::program(
+                        "serve::ports",
+                        format!(
+                            "lane {} runs a class that reads {:?} port {} and feeds it no \
+                             channel; a declared port is fed from a channel cell at every \
+                             submit (`Lane::ports`)",
+                            row.source, seat.kind, seat.port
+                        ),
+                    ));
+                };
+                let instance = attachments
+                    .iter()
+                    .find(|attached| attached.lane == row.source)
+                    .map(|attached| attached.instance)
+                    .ok_or_else(|| {
+                        Fault::program(
+                            "serve::ports",
+                            format!(
+                                "lane {} feeds {:?} port {} off channel {} but attaches no \
+                                 instance; a port cell is read through the instance that \
+                                 carries the channel",
+                                row.source, seat.kind, seat.port, feed.channel
+                            ),
+                        )
+                    })?;
+                let rows = if seat.per_lane() { 1 } else { row.rows };
+                let bytes = u64::from(rows) * seat.row_bytes();
+                // A cell in the port's own element copies; an f32 cell into
+                // a bf16 port (design D3: latents stay f32 masters on the
+                // ring, a text may read them in bf16) is cast on the way.
+                let f32_bytes = u64::from(rows) * u64::from(seat.width) * 4;
+                let cell = self.programs.feed_cell_bytes(instance, feed.channel)?;
+                let cast = cell != bytes && seat.dtype == model_ir::Dtype::Bf16 && cell == f32_bytes;
+                if cell != bytes && !cast {
+                    return Err(Fault::program(
+                        "serve::ports",
+                        format!(
+                            "lane {} feeds {:?} port {} off channel {} whose cell is {cell} \
+                             bytes, and the port wants {rows} row(s) x {} {:?} = {bytes} \
+                             bytes (the lane's rows by the port's width; an f32 cell of \
+                             {f32_bytes} bytes would be cast)",
+                            row.source, seat.kind, seat.port, feed.channel, seat.width, seat.dtype
+                        ),
+                    ));
+                }
+                port_feeds.push(PortFeedPlan {
+                    seat: *seat,
+                    first: if seat.per_lane() {
+                        fire_lane as u32
+                    } else {
+                        row.row_offset
+                    },
+                    rows,
+                    bytes,
+                    cast,
+                    channel: feed.channel,
+                    instance,
+                });
+            }
+        }
+        // The voxel tables, in fire order. M0: every spatial launch runs over
+        // the whole voxel rectangle (`crate::voxels`), so the clips of one
+        // fire must fall in one class.
+        let voxel_tables = if composition.voxel_rows() == 0 {
+            crate::voxels::Tables::default()
+        } else {
+            let Some(store) = self.voxels.as_ref() else {
+                return Err(Fault::VoxelPayload {
+                    lane: clips_of.iter().position(Option::is_some).unwrap_or(0) as u32,
+                    what: "this load seats no voxel axis",
+                });
+            };
+            if composition.voxel_classes().present_in_order().count() > 1 {
+                return Err(Fault::VoxelPayload {
+                    lane: clips_of.iter().position(Option::is_some).unwrap_or(0) as u32,
+                    what: "the clips of one fire fall in two classes, and a spatial launch \
+                           runs over the whole voxel rectangle (M0: one voxel class per fire)",
+                });
+            }
+            let slot_of: Vec<u32> = lanes.iter().map(|seated| seated.lane.slot).collect();
+            crate::voxels::Tables::of(&store.seat(), composition.lanes(), &clips_of, &slot_of)?
+        };
 
         // The composition places each lane's images independently of token
         // order: `patch_offset` is where its rows begin in the fire's patch
@@ -847,12 +1070,17 @@ impl FrameShell for Shell {
             (ids, ws)
         };
 
+        super::btrace::mark("lanes");
         // 2b. Admission: the union demand of this step, committed atomically
         // before any of it runs. A demand is a watermark (highest addressed
         // page/slot + 1), not a count, since the arenas grow at the tail.
         let page_size = u64::from(self.pools.paging().page_size).max(1);
+        // A plan with no kv space (a denoiser, a VAE) seats no page: its
+        // lanes' rows are latents, bounded by the token ceiling alone, and
+        // its demand on the pools is nothing.
+        let kv_less = self.spaces == 0;
         let demand = Demand {
-            kv_pages: seats
+            kv_pages: if kv_less { 0 } else { seats
                 .iter()
                 .zip(&tables)
                 .map(|(seat, table)| {
@@ -872,7 +1100,7 @@ impl FrameShell for Shell {
                     }
                 })
                 .max()
-                .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)),
+                .map_or(0, |pages| u32::try_from(pages).unwrap_or(u32::MAX)) },
             state_slots: seats
                 .iter()
                 .map(|seat| seat.slot.saturating_add(1))
@@ -884,7 +1112,7 @@ impl FrameShell for Shell {
         // a slot's run for a shell-owned block, each tabled id for a
         // runtime-tabled one — not under every page below the watermark.
         let mut kv_ranges: Vec<(u64, u64)> = Vec::new();
-        for (seat, table) in seats.iter().zip(&tables) {
+        for (seat, table) in seats.iter().zip(&tables).filter(|_| !kv_less) {
             let after = u64::from(seat.have).saturating_add(u64::from(seat.rows));
             let pages = after.div_ceil(page_size).max(1);
             if table.is_empty() {
@@ -896,6 +1124,7 @@ impl FrameShell for Shell {
             }
         }
         self.pools.commit_frame(demand, &kv_ranges)?;
+        super::btrace::mark("commit_frame");
 
         // 3. Page arithmetic, once per kv space.
         let indptr_host = kv::indptr(&seats)?;
@@ -904,6 +1133,7 @@ impl FrameShell for Shell {
         let mut geometries = (0..self.spaces)
             .map(|_| kv::geometry_with(&paging, &seats, &table_refs))
             .collect::<Result<Vec<_>>>()?;
+        super::btrace::mark("page_arith");
         // 3b. Explicit write descriptor overrides the derived `have + r`
         // landing, since several lanes appending into one shared pool would
         // otherwise collide at `have + 0`.
@@ -937,6 +1167,7 @@ impl FrameShell for Shell {
             .first()
             .map_or(0, |geometry| geometry.indices.len() as u32);
 
+        super::btrace::mark("admit");
         // 4. Windows: every template region resolved against this
         // composition's class table. A region that doesn't seat whole gets
         // `Fallback::Split` unless copies are enabled and the fallback table
@@ -955,24 +1186,69 @@ impl FrameShell for Shell {
         // key; only `self.copies` (toggled per fire by `Shell::set_copies`)
         // sits outside it.
         let copies_here = copies && masks.iter().all(|lane| lane.mask.is_none());
-        let mut windows = Windows::of(
-            &self.trace,
-            &self.compiled,
-            // One table per row axis, addressed by the axis.
-            model_ir::PerAxis::new([
-                composition.table(model_ir::RowAxis::Tokens),
-                composition.table(model_ir::RowAxis::Patches),
-            ]),
-            &indptr_host,
-            crate::window::Copies {
-                bucket,
-                enabled: copies_here,
-                spaces: &geometries,
-            },
-            // Fixed-width slots, so a recorded body's baked `indptr`
-            // pointer is right for every fire of its key.
-            self.inputs.window_slots(),
-        )?;
+        // **THE SAME COMPOSITION RESOLVES THE SAME WINDOWS.** Everything
+        // `Windows::of` reads besides the load constants is the two class
+        // tables, the row prefix sums, the bucket and the copy flag — and a
+        // steady decode frame hands it the same four every step. Resolving
+        // afresh walked every template region for ~110 us a frame, so the
+        // last few answers are kept and handed back by equality (no hash to
+        // collide). A table with a gathered window is never memoised: its
+        // payload is built from this fire's page geometry.
+        let class_tables = [
+            composition.table(model_ir::RowAxis::Tokens),
+            composition.table(model_ir::RowAxis::Patches),
+            composition.table(model_ir::RowAxis::Voxels),
+        ];
+        let held = self.windows_memo.iter().position(|memo| {
+            memo.bucket == bucket
+                && memo.copies == copies_here
+                && memo.indptr_host == indptr_host
+                && memo.tables[0] == *class_tables[0]
+                && memo.tables[1] == *class_tables[1]
+                && memo.tables[2] == *class_tables[2]
+        });
+        let (mut windows, boundaries) = match held {
+            Some(at) => {
+                let memo = &self.windows_memo[at];
+                (memo.windows.clone(), memo.packed.clone())
+            }
+            None => {
+                let windows = Windows::of(
+                    &self.trace,
+                    &self.compiled,
+                    // One table per row axis, addressed by the axis.
+                    model_ir::PerAxis::new([class_tables[0], class_tables[1], class_tables[2]]),
+                    &indptr_host,
+                    crate::window::Copies {
+                        bucket,
+                        enabled: copies_here,
+                        spaces: &geometries,
+                    },
+                    // Fixed-width slots, so a recorded body's baked `indptr`
+                    // pointer is right for every fire of its key.
+                    self.inputs.window_slots(),
+                )?;
+                let packed = windows.packed();
+                if windows.copied() == 0 {
+                    if self.windows_memo.len() >= WINDOWS_MEMO {
+                        self.windows_memo.remove(0);
+                    }
+                    self.windows_memo.push(WindowsMemo {
+                        tables: [
+                            class_tables[0].clone(),
+                            class_tables[1].clone(),
+                            class_tables[2].clone(),
+                        ],
+                        indptr_host: indptr_host.clone(),
+                        bucket,
+                        copies: copies_here,
+                        windows: windows.clone(),
+                        packed: packed.clone(),
+                    });
+                }
+                (windows, packed)
+            }
+        };
         // The synthetic pass is not the last fire anybody means.
         if !arming {
             self.last = FireCost {
@@ -980,11 +1256,12 @@ impl FrameShell for Shell {
                 copied: windows.copied(),
             };
         }
-        let boundaries = windows.packed();
+        super::btrace::mark("windows_of");
 
         // 4b. Mask bits, expanded here once, off the same `have`/`rows` the
         // page geometry used. `None` means no lane masked.
         let staged = crate::mask::stage(&masks)?;
+        super::btrace::mark("mask");
 
         // Body key's class ladder, built from the key's own coordinates
         // (bucket, decode class, lane ceiling), not this fire's actual
@@ -1016,6 +1293,7 @@ impl FrameShell for Shell {
         } else {
             (Vec::new().into(), true)
         };
+        super::btrace::mark("segmentation");
         let bodied = records_bodies
             && !rs_moves.iter().any(|verb| !matches!(verb, RsMove::None))
             && Self::keyable_units(&self.compiled)
@@ -1027,6 +1305,7 @@ impl FrameShell for Shell {
             // operator), through a memo since it's a function of the key.
             && !self.cache.body_refused(&key)
             && self.cuttable(&key, admits.as_ref());
+        super::btrace::mark("cuttable");
 
         // Arming pins the key a synthetic fire landed on
         // (`Shell::arm_bodies`).
@@ -1045,6 +1324,14 @@ impl FrameShell for Shell {
         } else {
             composition.rows()
         };
+        // The row-to-lane map, `[carve rows]`: each lane's rows name its fire
+        // lane; the carve's padding names lane 0, a lane that exists, so a
+        // padded row a retirement misses still reads a real vector.
+        let mut lane_of_row: Vec<i32> = Vec::with_capacity(carve_rows as usize);
+        for (fire_lane, row) in composition.lanes().iter().enumerate() {
+            lane_of_row.extend(std::iter::repeat_n(fire_lane as i32, row.rows as usize));
+        }
+        lane_of_row.resize(carve_rows as usize, 0);
         if carve_rows > rows {
             tokens.resize(carve_rows as usize, 0);
             positions.resize(carve_rows as usize, 0);
@@ -1071,8 +1358,10 @@ impl FrameShell for Shell {
         // Ceiling = sum of every present class's rung, each capped at the
         // load's lane ceiling, then clamped to `max_lanes`.
         let mut qo_absolute: Vec<i32> = Vec::new();
+        let mut lane_carve = composition.lane_count();
         if bodied {
             let ceiling = ladder.lane_reach(lane_ceiling).min(self.budget.max_lanes) as usize;
+            lane_carve = lane_carve.max(ceiling as u32);
             for geometry in &mut geometries {
                 geometry.pad_to(ceiling);
             }
@@ -1086,11 +1375,22 @@ impl FrameShell for Shell {
         }
         let geometries = geometries;
 
+        super::btrace::mark("windows");
         // 5. Staging slot, claimed last (after every possible refusal above
         // has had its chance), host only. The slot's pinned bytes back the
         // async H2D `enqueue` issues, so nothing may reuse them until the
         // device has passed that copy.
         let slot = self.inputs.claim()?;
+        let packing_fires: Vec<crate::inputs::PackingFire<'_>> = packings
+            .iter()
+            .map(|packed| crate::inputs::PackingFire {
+                group_indptr: &packed.group_indptr,
+                lane_indptr: &packed.lane_indptr,
+                reference_start: &packed.reference_start,
+                reference_tag: &packed.reference_tag,
+                permutation: &packed.permutation,
+            })
+            .collect();
         let staged_lens = self.inputs.write_host(
             &slot,
             &crate::inputs::Fire {
@@ -1110,6 +1410,9 @@ impl FrameShell for Shell {
                 // How far this fire's own rows go before the bucket's
                 // padding starts.
                 live_rows: rows,
+                lane_of_row: &lane_of_row,
+                group_of_lane: &group_of_lane,
+                packings: &packing_fires,
             },
         )?;
 
@@ -1138,6 +1441,7 @@ impl FrameShell for Shell {
             composition,
             descriptor,
             patch_payload,
+            voxel_tables,
             patch_segments,
             patch_routes,
             patch_positions,
@@ -1147,6 +1451,9 @@ impl FrameShell for Shell {
             self_cond_rows,
             self_cond_weights,
             self_cond_feeds,
+            packings,
+            port_feeds,
+            lane_carve,
             windows,
             seats,
             tables,

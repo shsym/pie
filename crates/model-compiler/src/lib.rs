@@ -18,13 +18,17 @@ mod fixture;
 
 use model_ir::{ClassTable, Def, Operands, Operation, Trace, Ty, resolve_classes};
 
-pub use arena::{ArenaMap, Concurrency, EXPORT_SEAMS, FireRows, RowExpr, Placement, Span, Extent};
+pub use arena::{
+    ArenaMap, Concurrency, EXPORT_SEAMS, Extent, FLOAT_READOUT_SEAMS, FireRows, Placement,
+    RowExpr, Span,
+};
 pub use compiled::{
     AxisPlan, CompiledModel, EventId, Fallback, FallbackRow, FallbackTable, ClassOrder, Lowering,
     Phase, Region,
 };
 pub use budget::{
     Budget, Budgets, DeviceProfile, FamilyCosts, Ladder, PATCH_LATTICE_FLOOR, PatchLadder,
+    VoxelLadder,
 };
 /// Re-exported under its own name rather than restated, so there is only one
 /// answer to "which axis is this".
@@ -124,7 +128,26 @@ pub fn compile_axes(
         budget.max_tokens,
         profile,
     );
-    let patches = patch_axis(trace, &regions, &units_of, &units, &classes, budgets, profile);
+    let patches = axis_plan(
+        RowAxis::Patches,
+        trace,
+        &regions,
+        &units_of,
+        &units,
+        &classes,
+        budgets,
+        profile,
+    );
+    let voxels = axis_plan(
+        RowAxis::Voxels,
+        trace,
+        &regions,
+        &units_of,
+        &units,
+        &classes,
+        budgets,
+        profile,
+    );
 
     let arena = arena::carve(trace, budgets, &classes, &concurrency)?;
 
@@ -140,6 +163,7 @@ pub fn compile_axes(
         units,
         units_of,
         patches,
+        voxels,
     })
 }
 
@@ -164,12 +188,14 @@ fn regions_on(
         .collect()
 }
 
-/// `layout` on the patch axis, or `None` for a plan that states no patch row.
-/// Uses the patch axis's own ladder rather than the token one, since
-/// `layout::menu`'s answer is bucket-dependent (copy below the crossover,
-/// split above it) and would otherwise key the tower's fallback rows to the
-/// trunk's rungs.
-fn patch_axis(
+/// `layout` on a secondary axis (patches, voxels), or `None` for a plan
+/// that states no row of it. Uses the axis's own ladder rather than the
+/// token one, since `layout::menu`'s answer is bucket-dependent (copy below
+/// the crossover, split above it) and would otherwise key the tower's
+/// fallback rows to the trunk's rungs.
+#[allow(clippy::too_many_arguments)]
+fn axis_plan(
+    axis: RowAxis,
     trace: &Trace,
     regions: &[Region],
     units_of: &[u32],
@@ -178,11 +204,11 @@ fn patch_axis(
     budgets: &Budgets,
     profile: &DeviceProfile,
 ) -> Option<AxisPlan> {
-    let ladder = budgets.ladder(RowAxis::Patches)?;
-    if !units.contains(&RowAxis::Patches) {
+    let ladder = budgets.ladder(axis)?;
+    if !units.contains(&axis) {
         return None;
     }
-    let on_axis = regions_on(regions, units_of, units, RowAxis::Patches);
+    let on_axis = regions_on(regions, units_of, units, axis);
     // This axis's own ladder; `accept` already refused a non-ascending
     // lattice or a rung past ceiling on this axis.
     let (order, fallback) = layout::seriate(
@@ -194,7 +220,7 @@ fn patch_axis(
         profile,
     );
     Some(AxisPlan {
-        axis: RowAxis::Patches,
+        axis,
         order,
         fallback,
     })
@@ -333,6 +359,14 @@ const LADDER_WORDS: model_ir::PerAxis<LadderWords> = model_ir::PerAxis::new([
                           patch row",
         unsorted: "list a patch lattice that does not strictly ascend",
         past_ceiling: "list a patch bucket past the patch ceiling",
+    },
+    LadderWords {
+        no_lanes: "admit a voxel axis with no clips, and a voxel row is a row of one",
+        no_rows: "admit a voxel axis with no voxel rows, so every VAE rectangle is empty",
+        lanes_past_rows: "admit more clips than voxel rows, and a clip carries at least one \
+                          voxel row",
+        unsorted: "list a voxel lattice that does not strictly ascend",
+        past_ceiling: "list a voxel bucket past the voxel ceiling",
     },
 ]);
 

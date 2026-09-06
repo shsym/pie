@@ -1,6 +1,6 @@
 //! What one fire submits: lanes, their seats, guest attachments and images.
 
-use engine::fire::{Boundary, Masking, RsReset, RsVerb, SelfCondInput};
+use engine::fire::{Boundary, Masking, PortFeed, RsReset, RsVerb, SelfCondInput};
 
 /// One request inside a fire.
 #[derive(Debug, Clone, Copy)]
@@ -12,6 +12,11 @@ pub struct Lane<'a> {
     /// The token ids this fire feeds it.
     pub tokens: &'a [u32],
 }
+
+/// One lane's VAE clips (D8): the boxes and the voxel port's rows, in the
+/// port's element. Re-exported from [`crate::voxels`], where the layout
+/// rules live.
+pub type Clips<'a> = crate::voxels::Clips<'a>;
 
 /// One request inside a fire, with the page table its caller owns.
 #[derive(Debug, Clone)]
@@ -44,6 +49,14 @@ pub struct Seated<'a> {
     /// Which of this lane's rows the device readout is pointed at, by index
     /// within the lane; `None` for the last row.
     pub readout: Option<&'a [u32]>,
+    /// Which stream this lane's rows are (`model_ir::Stream::code()`; `0`
+    /// is text). Decides the packed order beside the group (design D2).
+    pub stream: u8,
+    /// The attention group this lane joins; `None` is a group of its own.
+    pub group: Option<u32>,
+    /// The float ports this lane feeds from its channels' committed cells
+    /// (design D3); empty for a lane of a plan that reads none.
+    pub ports: &'a [PortFeed],
 }
 
 impl<'a> Seated<'a> {
@@ -64,6 +77,9 @@ impl<'a> Seated<'a> {
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
             readout: None,
+            stream: 0,
+            group: None,
+            ports: &[],
         }
     }
 

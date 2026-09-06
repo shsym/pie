@@ -535,15 +535,39 @@ pub fn rmsnorm_residual_add(
             "false",
         ),
     };
+    // The eight-wide form for bf16 rows that are whole vectors on aligned
+    // planes: one block a row still, `chunks` vectors a thread.
+    let mut aligned = vec![x.ptr, w0.ptr, t.ptr, y.ptr];
+    if let Some((_, scaled)) = &scale {
+        aligned.push(scaled.ptr);
+    }
+    if let Some(post) = &post {
+        aligned.extend([post.weight.ptr, post.out.ptr]);
+    }
+    let vectors = y.dtype == Dtype::Bf16
+        && y.width % VEC_WIDTH == 0
+        && aligned.iter().all(|&at| aligned16(at));
+    let (entrypoint, block) = if vectors {
+        let nvec = y.width / VEC_WIDTH;
+        let block = nvec.clamp(WARP, 512).next_power_of_two();
+        let chunks = nvec.div_ceil(block);
+        (
+            format!(
+                "::pie::elemwise::rmsnorm_residual_add_vec8<{block}, {chunks}, {has_scale}, {has_post}, {plus}>"
+            ),
+            block,
+        )
+    } else {
+        (
+            format!(
+                "::pie::elemwise::rmsnorm_residual_add<{ty}, {BLOCK}, {per_thread}, {has_scale}, {has_post}, {plus}>"
+            ),
+            BLOCK,
+        )
+    };
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!(
-                "::pie::elemwise::rmsnorm_residual_add<{ty}, {BLOCK}, {per_thread}, {has_scale}, {has_post}, {plus}>"
-            )),
-        )
-        .apply(Launch::per_row(rows, BLOCK)),
+        Fire::at(FILE, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),
         &[
             x.arg(),
             w0.arg(),
@@ -565,12 +589,15 @@ pub fn rmsnorm_residual_add(
 /// `out += bias` per row, in place on `out`.
 pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elementwise.add_bias";
-    let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    // f32 planes are the lane-axis vectors (a timestep MLP's rows): the same
+    // kernel body, one element type wider.
+    let t = dtype_dispatch!(OP, out.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
+    let tb = dtype_dispatch!(OP, bias.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     nonzero(OP, "rows", out.rows)?;
     let width = stated(OP, nonzero(OP, "the biased row's width", out.width)?)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::elemwise::add_bias<{t}>")))
+        Fire::at(FILE, symbol(&format!("::pie::elemwise::add_bias<{t}, {tb}>")))
             .apply(route_rows(out.rows, out.width)),
         &[
             out.arg(),

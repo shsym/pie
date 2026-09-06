@@ -18,7 +18,8 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
+    Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{
@@ -27,7 +28,7 @@ use engine::program::{
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
 use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
 use eta_ir::types::Dtype;
-use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
+use model_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
 use model_ir::Trace;
 
 use crate::error::Fault;
@@ -201,7 +202,7 @@ impl Cuda {
         self.boot.world.rank
     }
 
-        /// Rank 0's endpoint for channel `id`, for a follower to adopt.
+    /// Rank 0's endpoint for channel `id`, for a follower to adopt.
     #[must_use]
     pub fn endpoint(&self, id: ChannelId) -> Option<Arc<crate::program::Endpoint>> {
         self.channels.get(&id).cloned()
@@ -378,7 +379,9 @@ fn fault(fault: Fault) -> Error {
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
             Error::Program(fault.to_string())
         }
-        Fault::Fire(_) | Fault::PatchPayload { .. } => Error::Invalid(fault.to_string()),
+        Fault::Fire(_) | Fault::PatchPayload { .. } | Fault::VoxelPayload { .. } => {
+            Error::Invalid(fault.to_string())
+        }
     }
 }
 
@@ -478,6 +481,38 @@ pub fn patch_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<PatchLadder>
     })
 }
 
+/// The voxel ladder (D8) a load bakes against, or `None` for a plan that
+/// states no voxel row. As [`patch_ladder`]: the plan asks, the deployment's
+/// stated ceilings win, and an unstated ceiling is derived — a tile of
+/// `DERIVED_VOXEL_CEILING` port voxels and one clip per lane.
+#[must_use]
+pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<VoxelLadder> {
+    /// A `16 x 64 x 64` latent tile — one 512 px image at an 8x VAE, or a
+    /// short video chunk.
+    const DERIVED_VOXEL_CEILING: u32 = 65_536;
+
+    let declares_voxels = trace.values.iter().any(|decl| {
+        matches!(&decl.ty, model_ir::Ty::Tensor { shape, .. }
+            if shape.first().and_then(|dim| dim.axis()) == Some(model_ir::RowAxis::Voxels))
+    });
+    if !declares_voxels {
+        return None;
+    }
+    let max_voxels = budgets
+        .max_voxels
+        .unwrap_or(DERIVED_VOXEL_CEILING)
+        .max(1);
+    Some(VoxelLadder {
+        max_voxels,
+        // Served eagerly this phase: one rung at the ceiling.
+        buckets: Vec::new(),
+        max_clips: budgets
+            .max_clips
+            .unwrap_or(budgets.max_lanes)
+            .clamp(1, max_voxels),
+    })
+}
+
 /// The guest-visible profile of a loaded plan, read off the plan and the
 /// budgets (`num_layers` from node `layer` stamps, `vocab` from the `out`
 /// seam's width) rather than reconstructed from capability flags.
@@ -489,7 +524,14 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         .filter_map(|node| node.layer)
         .max()
         .map_or(0, |top| top + 1);
-    let vocab = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
+    // A plan whose readout is a float seam (a denoiser) has no vocabulary:
+    // its `logits()` is refused at bind by the zero width, and its
+    // `velocity()` is gated below.
+    let vocab = match shell.out_width() {
+        Ok(width) => u32::try_from(width).unwrap_or(u32::MAX),
+        Err(_) if shell.readout_seam().is_some() => 0,
+        Err(why) => return Err(fault(why)),
+    };
     Ok(ModelProfile {
         vocab,
         page_size: budgets.page_size,
@@ -516,6 +558,12 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         // attached lane. A load with no bank refuses by name
         // (`Fault::Adapterless`).
         has_lora: true,
+        // The velocity seam is the model text's: a plan that plants
+        // `seam::VELOCITY` binds the `velocity()` intrinsic at its width
+        // (design D3), and one that does not refuses a guest's `velocity()`
+        // at bind rather than at its first fire.
+        has_velocity: shell.velocity_width().is_some(),
+        velocity_width: shell.velocity_width().unwrap_or(0),
         kernels: Vec::new(),
     })
 }
@@ -659,8 +707,12 @@ intended for diagnostics, not serving",
         // Derived BEFORE the trace moves into the boot — the ladder is a
         // reading of the plan, so it is taken while the plan is still here.
         let patches = patch_ladder(&trace, &budgets);
+        let voxels = voxel_ladder(&trace, &budgets);
         let classify = (self.classify_for)(&trace.name).ok_or_else(|| {
-            Error::Load(format!("this build ships no classifier for {:?}", trace.name))
+            Error::Load(format!(
+                "this build ships no classifier for {:?}",
+                trace.name
+            ))
         })?;
         let mut shell = Shell::load(Boot {
             classify,
@@ -671,6 +723,7 @@ intended for diagnostics, not serving",
             // The plan's own declaration decides; a text-only SKU still
             // gets the literal `None` G4 depends on.
             patches,
+            voxels,
             // `None` takes this device's measured SM count.
             profile: None::<DeviceProfile>,
             page_size: budgets.page_size,
@@ -1364,6 +1417,12 @@ impl Cuda {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
+                    // The D2/D3 facts, carried through as stated: the word
+                    // already packs the stream (the family's `Classify`),
+                    // and the shell builds the packing tables off the pair.
+                    stream: lane.stream as u8,
+                    group: lane.group,
+                    ports: &lane.ports,
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;
@@ -1432,6 +1491,37 @@ impl Cuda {
                 })?);
             }
         }
+        // The voxel-axis submissions (D8), the same way: `f32` rows in the
+        // contract, the port's element on the device.
+        let mut voxel_bytes: Vec<Vec<u8>> = Vec::new();
+        if !submission.voxels.is_empty() {
+            let Some(element) = shell.voxel_element() else {
+                return Err(fault(crate::error::Fault::from(model_exec::Error::Fire(
+                    model_exec::fire::Fault::Vaeless {
+                        lane: submission.voxels[0].lane,
+                    },
+                ))));
+            };
+            voxel_bytes.reserve(submission.voxels.len());
+            for row in &submission.voxels {
+                voxel_bytes.push(crate::voxels::port_bytes(&row.payload, element).map_err(
+                    |why| Error::Unsupported {
+                        verb: why,
+                        engine: "cuda",
+                    },
+                )?);
+            }
+        }
+        let voxels: Vec<crate::serve::Clips<'_>> = submission
+            .voxels
+            .iter()
+            .zip(&voxel_bytes)
+            .map(|(row, payload)| crate::serve::Clips {
+                lane: row.lane,
+                clips: &row.clips,
+                payload,
+            })
+            .collect();
         let media: Vec<crate::serve::Media<'_>> = submission
             .media
             .iter()
@@ -1456,6 +1546,7 @@ impl Cuda {
                     lanes: &seated,
                     attachments: &attached,
                     media: &media,
+                    voxels: &voxels,
                 },
                 None,
             )
@@ -1572,6 +1663,24 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
         } else {
             u32::try_from(values.len() / rows as usize).unwrap_or(u32::MAX)
         };
+        // A lane that decoded a VAE tile answers its pixels (D8), whatever
+        // its logits policy says: the pixels are the fire's whole answer.
+        if let Some((pixels, clips)) = step.settled.pixels.get(lane).filter(|(_, c)| !c.is_empty())
+        {
+            let voxels: usize = clips
+                .iter()
+                .map(|[t, h, w]| *t as usize * *h as usize * *w as usize)
+                .sum();
+            out.push(LaneReadout {
+                rows: u32::try_from(voxels).unwrap_or(u32::MAX),
+                width: u32::try_from(pixels.len() / voxels.max(1)).unwrap_or(u32::MAX),
+                values: pixels.clone(),
+                scores,
+                seam: engine::fire::ReadoutSeam::Pixels,
+                clips: clips.clone(),
+            });
+            continue;
+        }
         out.push(match want {
             // The shell mirrored nothing, but the capture still crosses.
             Readout::None => LaneReadout {
@@ -1583,6 +1692,8 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
                 width,
                 values,
                 scores,
+                seam: step.settled.seam,
+                clips: Vec::new(),
             },
         });
     }
@@ -1676,7 +1787,6 @@ mod tests {
         assert_eq!(raised.max_patches, PATCH_LATTICE_FLOOR);
         assert_eq!(raised.buckets, vec![PATCH_LATTICE_FLOOR]);
     }
-
 }
 
 /// The artifact must be for this deployment, asked before a plane lands.
@@ -1753,8 +1863,8 @@ mod serving_stamp_tests {
     fn an_artifact_for_another_shell_is_refused_before_anything_is_opened() {
         let dir = tmp("cross");
         let foreign = artifact(&dir, "metal", "qwen_3");
-        let why = refuse(&foreign, "cuda", "qwen_3")
-            .expect_err("a metal artifact is not servable here");
+        let why =
+            refuse(&foreign, "cuda", "qwen_3").expect_err("a metal artifact is not servable here");
         let said = format!("{why}");
         for wanted in [
             "backend",
@@ -1772,5 +1882,4 @@ mod serving_stamp_tests {
             .expect("a cuda artifact serves on cuda");
         std::fs::remove_dir_all(&dir).ok();
     }
-
 }

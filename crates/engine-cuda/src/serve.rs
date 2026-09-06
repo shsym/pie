@@ -17,6 +17,7 @@
 
 mod arming;
 mod boot;
+pub(crate) mod btrace;
 mod enqueue;
 mod lanes;
 mod load;
@@ -30,7 +31,7 @@ pub use arming::{Armed, Kind, Seal};
 pub use boot::{
     Boot, DEFAULT_BODIES_MEGABYTES, DEFAULT_GPU_MEM_UTILIZATION, Golden, Graphs, Knobs, Recording,
 };
-pub use lanes::{Attached, Lane, Media, Seated};
+pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
 pub(crate) use settle::Readback;
 pub use settle::{Done, Settled};
@@ -89,6 +90,8 @@ pub struct Shell {
     towered: bool,
     /// How many patch rows the plan folds into one (`1` for none).
     patch_fold: u32,
+    /// The voxel axis's tables (D8), or `None` for a plan with no voxel row.
+    voxels: Option<crate::voxels::Store>,
     /// Both axes' ceilings; `budgets.tokens == budget`.
     budgets: Budgets,
     weights: Weights,
@@ -105,6 +108,8 @@ pub struct Shell {
     spaces: usize,
     /// The classes whose window runs an `attention.masked` arm.
     masked: model_ir::ClassSet,
+    /// The float ports and packing selections the plan reads (D2/D3).
+    feeds: crate::exports::Feeds,
     /// The classes whose window runs a `linear.lora_correct` arm.
     corrected: model_ir::ClassSet,
     /// The classes whose window runs a one-row-per-lane op.
@@ -151,6 +156,8 @@ pub struct Shell {
     armed_body: Option<record::BodyKey>,
     /// The segmentation of every key this load has derived one for.
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
+    /// The last few resolved window tables, by what they were resolved from.
+    windows_memo: Vec<prepare::WindowsMemo>,
     /// What the last fire's window table cost.
     last: FireCost,
     cache: GraphCache,
@@ -445,6 +452,36 @@ impl Shell {
         self.fire_media(&seated, &[], &[], &mut Vec::new())
     }
 
+    /// [`Shell::fire_media`] with VAE clips on the voxel axis (D8): the
+    /// lanes' clips in, every lane's pixels (its `pixels` seam rows, one
+    /// `f32` row per output voxel, clips in submission order) out, beside
+    /// each clip's output box — empty for a lane that submitted no clip.
+    ///
+    /// # Errors
+    ///
+    /// As [`Shell::fire_media`], plus [`Fault::VoxelPayload`] for clips the
+    /// fire cannot seat.
+    pub fn fire_voxels(
+        &mut self,
+        lanes: &[Seated<'_>],
+        voxels: &[Clips<'_>],
+    ) -> Result<Vec<Pixels>> {
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes,
+                attachments: &[],
+                media: &[],
+                voxels,
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        let mut settled = FrameShell::settle(self, enqueued)?;
+        Shell::read_out(self, &mut settled)?;
+        Ok(std::mem::take(&mut settled.pixels))
+    }
+
     /// The one fire door: seated lanes, guest attachments, images, and the
     /// capture columns read back into `scores` (one entry per submitted lane).
     ///
@@ -472,6 +509,7 @@ impl Shell {
                 lanes,
                 attachments,
                 media,
+                voxels: &[],
             },
             None,
         )?;
@@ -521,6 +559,10 @@ impl Drop for Shell {
     }
 }
 
+/// One lane's decoded pixels (D8): one `f32` row per output voxel of its
+/// clips in submission order, beside each clip's output box.
+pub type Pixels = (Vec<f32>, Vec<[u32; 3]>);
+
 /// One step's submission, as the shell reads it.
 #[derive(Clone, Copy)]
 pub struct StepView<'a> {
@@ -530,6 +572,9 @@ pub struct StepView<'a> {
     pub attachments: &'a [Attached],
     /// The images this step's lanes submitted; empty for a text-only fire.
     pub media: &'a [Media<'a>],
+    /// The clips this step's lanes submitted on the voxel axis (D8); empty
+    /// for a fire with no VAE tile.
+    pub voxels: &'a [Clips<'a>],
 }
 
 /// One fire's recurrent-state plan, resolved on the host; the default is the plain path.
@@ -553,6 +598,26 @@ struct RsFire<'a> {
     buffered: bool,
 }
 
+/// One float port's feed for one lane: which port rectangle, which row (or
+/// lane) of it, how many bytes, and where they come from.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PortFeedPlan {
+    pub(crate) seat: crate::inputs::PortSeat,
+    /// The first fire row (token ports) or the fire lane (a lane vector)
+    /// the cell lands at.
+    pub(crate) first: u32,
+    /// How many rows of the rectangle the cell fills.
+    pub(crate) rows: u32,
+    /// The rectangle bytes those rows are.
+    pub(crate) bytes: u64,
+    /// The cell is f32 and the port bf16: cast on the way rather than copied.
+    pub(crate) cast: bool,
+    /// The engine-registered channel id.
+    pub(crate) channel: u64,
+    /// The instance the channel is read through.
+    pub(crate) instance: u64,
+}
+
 /// Every host decision one step needs, made — and not one stream touched.
 pub struct Prepared<'a> {
     /// The step this was prepared from.
@@ -565,6 +630,8 @@ pub struct Prepared<'a> {
     descriptor: FireDescriptor,
     /// The patch payload, in fire order; empty for a fire with no image.
     patch_payload: Vec<u8>,
+    /// The voxel axis's host tables, in fire order; empty for a fire with no clip.
+    voxel_tables: crate::voxels::Tables,
     patch_segments: Vec<i32>,
     patch_routes: Vec<i32>,
     patch_positions: Vec<i32>,
@@ -580,6 +647,14 @@ pub struct Prepared<'a> {
     /// rows channel, weights channel, instance)`, copied device to device
     /// over the zeros staged for them, after `stage_self_cond`.
     self_cond_feeds: Vec<(usize, usize, u64, u64, u64)>,
+    /// The D2 packing tables, one per selection the plan reads, in the
+    /// load's order; empty for a plan reading none.
+    packings: Vec<model_exec::fire::Packed>,
+    /// The D3 port feeds: one copy per (lane, port) the lane's class reads.
+    port_feeds: Vec<PortFeedPlan>,
+    /// How many lanes every `[Lanes, ·]` rectangle is carved at this fire:
+    /// the fire's own count, or the key's lane ceiling for a bodied fire.
+    lane_carve: u32,
     /// Every region's rows and lanes, bound to a device address only in `enqueue`.
     windows: Windows,
     /// One per lane, in fire (seriated) order.

@@ -9,8 +9,13 @@ mod dense;
 
 pub mod gemm;
 
+/// The lane-axis projection over an f32 activation (a lane vector's chain).
+pub mod lane_gemm;
+
 #[cfg(feature = "cuda")]
 mod gemv;
+/// The skinny bf16 projection with its epilogue folded in.
+pub mod skinny;
 
 /// The correction class: `y += B[a]·(A[a]·x)` over a routed adapter bank.
 pub mod lora;

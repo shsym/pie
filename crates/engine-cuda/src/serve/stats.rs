@@ -50,9 +50,35 @@ impl Shell {
         self.device.device().num_sm
     }
 
-    /// The `out` seam's row width — the vocabulary; errors on a symbolic width.
+    /// The `out` seam's row width — the vocabulary; errors on a symbolic
+    /// width, or on a plan whose readout is a float seam and has no `out`.
     pub fn out_width(&self) -> Result<u64> {
-        kv::width_of(&self.trace, self.exports.out)
+        let out = self.exports.out.ok_or_else(|| crate::error::Fault::Unbound {
+            what: "a plan with no `out` seam has no vocabulary width".to_string(),
+        })?;
+        kv::width_of(&self.trace, out)
+    }
+
+    /// The width of one velocity row (`seam::VELOCITY`, design D3), or
+    /// `None` for a plan that plants none — gates `IntrinsicId::Velocity`.
+    #[must_use]
+    pub fn velocity_width(&self) -> Option<u32> {
+        let export = self.exports.velocity.as_ref()?;
+        kv::width_of(&self.trace, export.value)
+            .ok()
+            .and_then(|width| u32::try_from(width).ok())
+    }
+
+    /// Which export seam this load's readout rows come off, and the width of
+    /// one row: `out`'s vocabulary, or the float seam a plan plants instead
+    /// (`velocity`, then the last `hidden`).
+    #[must_use]
+    pub fn readout_seam(&self) -> Option<(engine::fire::ReadoutSeam, u32)> {
+        let readout = self.exports.readout()?;
+        let width = kv::width_of(&self.trace, readout.value)
+            .ok()
+            .and_then(|width| u32::try_from(width).ok())?;
+        Some((readout.seam, width))
     }
 
     /// Does this load's model text declare a draft head — gates `IntrinsicId::MtpLogits`.
@@ -71,6 +97,13 @@ impl Shell {
     #[must_use]
     pub fn patch_element(&self) -> Option<model_ir::Dtype> {
         self.patch_seat.map(|seat| seat.dtype)
+    }
+
+    /// The element the voxel port computes in (D8), or `None` for a load
+    /// whose plan states no voxel row.
+    #[must_use]
+    pub fn voxel_element(&self) -> Option<model_ir::Dtype> {
+        self.voxels.as_ref().map(|store| store.seat().dtype)
     }
 
     /// Can this load serve `IntrinsicId::AttnScore`? Only if the artifact declares a capture column AND the slab was carved.

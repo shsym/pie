@@ -26,8 +26,10 @@ pub use forward::*;
 /// for the class sweep every merge must survive), and removed when nothing
 /// does.
 pub use model_ir::{
-    Attention, BlockDrafter, CacheRow, Def, Dtype, GateActivation, Layout, Linear, MropeForm, Operands, Operation,
-    Param, ParamSource, Trace, Platform, Shard, ValueId, resolve_classes,
+    Attention, BlockDrafter, CacheRow, Def, Dim, Dtype, Elementwise, GateActivation, GeomKind,
+    Guard, Layout, Linear, ModulateForm, MropeForm, Operands, Operation, Param, ParamSource,
+    Platform, RaggedMask, RopeForm, RuntimeInput, Selection, Shard, Stream, Trace, Ty, ValueId,
+    resolve_classes,
 };
 pub use record::{Recorder, Refine, SplitSpec, Value};
 
@@ -106,6 +108,35 @@ pub mod seam {
     pub const SCORES: Def = Def {
         name: "attn.scores",
     };
+
+    /// The velocity readout of a denoise reading (D3): the `[rows, C·p^k]`
+    /// float plane a flow-matching backbone predicts, read by the epilogue's
+    /// `velocity()` as `logits()` reads [`OUT`]. A text plants it on the
+    /// value its forward returns — in which case [`trace_hybrid`] plants no
+    /// `out` on that value, since a denoiser has no logits — or beside
+    /// [`OUT`] when a plan carries both an encoder and a denoiser arm.
+    pub const VELOCITY: Def = Def { name: "velocity" };
+
+    /// The hidden-state readout of an encoder stage (D3): the `[rows, W]`
+    /// plane at the layer(s) the family declares — the context a denoiser
+    /// consumes, read by the epilogue's `hidden()`. Planted per layer where
+    /// several taps are wanted (`Seam::layer` tells them apart). Like
+    /// [`VELOCITY`], it may stand in for [`OUT`] on the returned value.
+    pub const HIDDEN: Def = Def { name: "hidden" };
+
+    /// The pixel readout of a VAE decode reading (D8): a `[Voxels·k, C]`
+    /// float plane on the voxel axis — `C = 3` for an image decoder — read
+    /// back per clip. Planted on TWO values: the plane first, its
+    /// `[Clips, 4]` grid second, so the reader knows which rows are which
+    /// clip's voxels at the output resolution (`seam::at(PIXELS, &[&y,
+    /// &y_grid])`). Like [`VELOCITY`], it stands in for [`OUT`] on the
+    /// returned value.
+    pub const PIXELS: Def = Def { name: "pixels" };
+
+    /// The seams a forward may return its value under instead of [`OUT`]:
+    /// the float readouts. What [`trace_hybrid`] checks before planting
+    /// `out` on a returned value.
+    pub const FLOAT_READOUTS: [&str; 3] = [VELOCITY.name, HIDDEN.name, PIXELS.name];
 
     /// Plant a seam on the values it names. The first one carries the recorder
     /// — every value of one trace carries the same one — so the slice must not

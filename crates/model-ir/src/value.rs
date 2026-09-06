@@ -20,7 +20,8 @@ pub use dtype::Dtype;
 pub use dtype::{BIASES, SCALES, TILED_BAND, TILED_STEP};
 
 /// The shape algebra's symbolic dims, sized by runtime budgets (`Tokens` →
-/// max_tokens, `Lanes` → max_lanes, `Patches` → max_patches) when the arena
+/// max_tokens, `Lanes` → max_lanes, `Patches` → max_patches, `Voxels` →
+/// max_voxels) when the arena
 /// is cut. Which axis a value lives on is read off its type
 /// ([`Dim::axis`]) rather than declared beside it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -46,6 +47,23 @@ pub enum Dim {
     Images,
     /// Indptr-shaped on the patch axis: `images + 1`.
     ImagesPlus(u32),
+    /// This fire's voxel count at the voxel port — the rows of the third
+    /// row axis, one row per voxel `(t, h, w)` of every clip every lane
+    /// submitted, `w` fastest, clips contiguous in fire order. A VAE's
+    /// activations live here (`[Voxels, channels]`); the per-clip box is
+    /// the `[Clips, 4]` grid table ([`RuntimeInput::Grid`]).
+    Voxels,
+    /// `voxels * k`: a rectangle an upsample, a pixel shuffle or an
+    /// unpatchify grew by a fixed factor from the port's count. An op that
+    /// shrinks rows (a strided conv, an unshuffle) keeps its input's dim and
+    /// over-allocates; the grid table says which rows are live.
+    VoxelsTimes(u32),
+    /// The voxel axis's own lane space: how many clips (images or videos)
+    /// this fire carries. `Clips` is to [`Voxels`](Dim::Voxels) what
+    /// `Images` is to `Patches`.
+    Clips,
+    /// Indptr-shaped on the voxel axis: `clips + k`.
+    ClipsPlus(u32),
 }
 
 /// Which row space a symbolic dim sizes — the discriminator every per-axis
@@ -57,6 +75,9 @@ pub enum RowAxis {
     Tokens,
     /// The patch rectangle: `Patches`, `Images`, `ImagesPlus(k)`.
     Patches,
+    /// The voxel rectangle: `Voxels`, `VoxelsTimes(k)`, `Clips`,
+    /// `ClipsPlus(k)` — the VAE's row space (design D8).
+    Voxels,
 }
 
 impl RowAxis {
@@ -68,7 +89,7 @@ impl RowAxis {
     /// per row space iterates, and what [`PerAxis`] is laid out along.
     /// `ALL[axis as usize] == axis`, so a `PerAxis` entry is reachable by
     /// the same integer the variant is.
-    pub const ALL: [RowAxis; 2] = [RowAxis::Tokens, RowAxis::Patches];
+    pub const ALL: [RowAxis; 3] = [RowAxis::Tokens, RowAxis::Patches, RowAxis::Voxels];
 
     /// How many row spaces there are — [`ALL`](RowAxis::ALL)'s length, and
     /// the width of every [`PerAxis`].
@@ -80,6 +101,7 @@ impl RowAxis {
         match self {
             RowAxis::Tokens => "tokens",
             RowAxis::Patches => "patches",
+            RowAxis::Voxels => "voxels",
         }
     }
 }
@@ -165,6 +187,9 @@ impl Dim {
                 Some(RowAxis::Tokens)
             }
             Dim::Patches | Dim::Images | Dim::ImagesPlus(_) => Some(RowAxis::Patches),
+            Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_) => {
+                Some(RowAxis::Voxels)
+            }
         }
     }
 }
@@ -201,6 +226,98 @@ pub enum GeomKind {
     WritePage,
     /// Per-token in-page offset of a kv write; read by the `kv_append` ops.
     WriteOffset,
+    /// Which ATTENTION GROUP each lane belongs to: `[Dim::Lanes]` `i32`, one
+    /// group id per lane in fire order, ascending and dense from 0. A lane is
+    /// `(request, stream)`; the lanes one request submitted share its group
+    /// and attend together through `attention.ragged`. Space 0 only — the
+    /// token axis's own table, whether or not a cache joined it.
+    GroupOfLane,
+    /// Per-GROUP bounds over the PACKED rows of one row selection:
+    /// `[Dim::LanesPlus(1)]` `i32` (a fire has at most as many groups as
+    /// lanes), where group `g`'s packed rows are `[indptr[g], indptr[g+1])`.
+    /// Packed order is what [`RuntimeInput::RowPermutation`] of the same
+    /// selection states: selected lanes sorted by `(group, stream, lane)`,
+    /// each lane's rows contiguous. Groups no selected lane belongs to are
+    /// skipped, so the CSR is over the groups present, ascending. Read by
+    /// `attention.ragged`.
+    GroupIndptr { select: Selection },
+    /// Per-LANE bounds over the packed rows of one row selection:
+    /// `[Dim::LanesPlus(1)]` `i32`, the finer CSR beneath
+    /// [`GroupIndptr`](GeomKind::GroupIndptr) — selected lane `j` (in
+    /// packed order) owns packed rows `[indptr[j], indptr[j+1])`. What a
+    /// lane-block-diagonal ragged attention passes as its indptr.
+    LaneIndptr { select: Selection },
+    /// Per packed row of one selection, the fire lane index of the row when
+    /// its lane's stream is [`Reference`](crate::request::Stream::Reference)
+    /// and `-1` otherwise: `[Dim::Tokens]` `i32`. Read by `attention.ragged`
+    /// under [`RaggedMask::ReferenceSelfOnly`](crate::ops::attn::RaggedMask).
+    ReferenceTag { select: Selection },
+}
+
+/// A set of lanes named by their fact words: the lanes whose word satisfies
+/// `word & mask == value`. What a row-packing input is keyed by, and the
+/// spelling every guard a split arm carries has (a conjunction of fact
+/// literals) — [`Selection::of`] reads one off such a guard. `mask == 0` is
+/// every lane.
+///
+/// A pair of words rather than a `Guard` so the input stays `Copy`, `Hash`
+/// and self-describing to the host: a fire evaluates it per lane with one
+/// `and` and one compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Selection {
+    /// The fact bits the selection reads.
+    pub mask: u32,
+    /// What those bits must be.
+    pub value: u32,
+}
+
+impl Selection {
+    /// Every lane of the fire.
+    pub const ALL: Selection = Selection { mask: 0, value: 0 };
+
+    /// The selection a guard states, when the guard is a conjunction of
+    /// fact literals (`Always`, `Fact`, `Not(Fact)`, `And` of those) — the
+    /// shape every split arm's guard has. `None` for a guard with an `Or`
+    /// or a negated conjunction, which no single mask/value pair spells.
+    #[must_use]
+    pub fn of(guard: &Guard) -> Option<Selection> {
+        let mut select = Selection::ALL;
+        select.gather(guard).then_some(select)
+    }
+
+    fn gather(&mut self, guard: &Guard) -> bool {
+        match guard {
+            Guard::Always => true,
+            Guard::Fact(bit) => self.literal(*bit, true),
+            Guard::Not(inner) => match inner.as_ref() {
+                Guard::Fact(bit) => self.literal(*bit, false),
+                _ => false,
+            },
+            Guard::And(a, b) => self.gather(a) && self.gather(b),
+            Guard::Or(..) => false,
+        }
+    }
+
+    fn literal(&mut self, bit: u8, set: bool) -> bool {
+        if bit >= 32 {
+            return false;
+        }
+        let one = 1u32 << bit;
+        let want = if set { one } else { 0 };
+        // The same bit stated twice must agree, else the guard is empty.
+        if self.mask & one != 0 && self.value & one != want {
+            return false;
+        }
+        self.mask |= one;
+        self.value |= want;
+        true
+    }
+
+    /// Whether a lane with fact word `word` is in the selection.
+    #[must_use]
+    pub fn holds(self, word: u64) -> bool {
+        (word as u32) & self.mask == self.value
+    }
 }
 
 /// What the engine binds each fire. Geometry is a declared input, not implicit
@@ -261,6 +378,62 @@ pub enum RuntimeInput {
     /// step's probabilities of those ids. `f32` because it is a weight, not
     /// the activation element.
     SelfCondWeights,
+    /// The row order that packs one selection's rows by attention group:
+    /// `[Dim::Tokens]` `i32`, where packed row `i` (for `i` below the
+    /// selection's row count) is fire row `perm[i]`, and every later entry
+    /// is `-1`. Selected lanes are ordered `(group, stream, lane)` with each
+    /// lane's rows contiguous, so a group's rows are one contiguous run —
+    /// what the ragged attention kernel's CSR wants. Read by
+    /// `layout.pack_rows` (gather) and `layout.unpack_rows` (its inverse
+    /// scatter). The host builds it from the lanes' words
+    /// ([`Selection::holds`]) and [`GeomKind::GroupOfLane`].
+    RowPermutation { select: Selection },
+    /// A float port on the token axis: `[Dim::Tokens, width]`, `f32` or
+    /// `bf16` as the model text states at the reader. The latent rows of a
+    /// denoise reading, fed device-to-device from a guest channel cell at
+    /// every submit. `port` is the family's index for the port (its first
+    /// or only latent port is 0), so a text with two latent streams of one
+    /// width (video and audio) declares two.
+    Latents { port: u8, width: u32 },
+    /// A float port on the lane axis: `[Dim::Lanes, width]` `f32`, one row
+    /// per lane — a timestep, a guidance scale, a per-modality sigma. `port`
+    /// as for [`Latents`](RuntimeInput::Latents).
+    LaneVector { port: u8, width: u32 },
+    /// A context lane's rows: `[Dim::Tokens, width]` `bf16` — an encoder's
+    /// output or reference tokens, channel-fed and constant across steps.
+    /// Only the rows of lanes whose stream is `Context` carry data; the
+    /// rest of the rectangle is unwritten. `port` as for
+    /// [`Latents`](RuntimeInput::Latents).
+    Context { port: u8, width: u32 },
+    /// Per-axis rotary positions as the guest states them: `[Dim::Tokens,
+    /// axes]` `f32`, `axes <= 4` — `(t, h, w[, l])` per token row, fractional
+    /// where a text wants it. Read by `elementwise.rope_axes`. A third
+    /// position stream beside `Positions` (`[Tokens]` i32) and
+    /// `MropePositions` (`[Tokens, 3]` i32), which keep their names.
+    AxisPositions { port: u8, axes: u8 },
+    /// The voxel axis's lane table: `[Dim::Clips, 4]` `i32`, one row per
+    /// clip in fire order, `{t, h, w, row_offset}` — the clip's box at the
+    /// voxel PORT's resolution and the first row of its voxels in the
+    /// `[Dim::Voxels, ·]` rectangle (clips contiguous, offsets a prefix sum
+    /// of `t·h·w`). What every `spatial.*` kernel reads to find a row's
+    /// lane and `(t, h, w)`; derived grids of later resolutions are
+    /// computed on the device by `spatial.grid`. The host builds it from
+    /// the clips each lane submitted.
+    Grid,
+    /// A float port on the voxel axis: `[Dim::Voxels, channels]`, `f32` or
+    /// `bf16` as the reader states — a VAE's input tile (latents to decode,
+    /// pixels to encode), one row per voxel of [`Grid`](RuntimeInput::Grid).
+    /// `port` as for [`Latents`](RuntimeInput::Latents).
+    Voxels { port: u8, channels: u32 },
+    /// The clip table at TOKEN resolution: `[Dim::Clips, 4]` `i32`, one
+    /// row per clip in fire order, `{t/pt, h/ph, w/pw, token_row_offset}`
+    /// for the patch `p` the reader states — the token side of
+    /// `spatial.patchify` / `spatial.unpatchify`. A clip's tokens are its
+    /// lane's token rows, clips of one lane consecutive in clip order, so
+    /// the offset is the lane's first token row plus the earlier clips'
+    /// token counts; the host checks that a lane's token count is the sum
+    /// of its clips' and refuses a clip whose box does not divide by `p`.
+    TokenGrid { p: [u32; 3] },
 }
 
 /// Raggedness is not a `Ty` — a leading symbolic `Dim` means the value is
@@ -299,14 +472,35 @@ pub struct ValueDecl {
 
 #[cfg(test)]
 mod tests {
-    use super::{Dim, PerAxis, RowAxis};
+    use super::{Dim, Guard, PerAxis, RowAxis, Selection};
+
+    /// A split arm's guard — a conjunction of fact literals — reads as one
+    /// mask/value pair that admits exactly the lanes the guard admits; an
+    /// `Or` has no such pair and says so.
+    #[test]
+    fn a_selection_is_a_split_arms_guard_as_two_words() {
+        let arm = Guard::and(Guard::Fact(3), Guard::not(Guard::Fact(5)));
+        let select = Selection::of(&arm).expect("a conjunction of literals");
+        assert_eq!(select, Selection { mask: 0b101000, value: 0b001000 });
+        for word in 0..64u64 {
+            assert_eq!(select.holds(word), arm.holds(word), "word {word:#b}");
+        }
+        assert_eq!(Selection::of(&Guard::Always), Some(Selection::ALL));
+        assert!(Selection::ALL.holds(u64::MAX));
+        assert_eq!(Selection::of(&Guard::or(Guard::Fact(0), Guard::Fact(1))), None);
+        assert_eq!(
+            Selection::of(&Guard::and(Guard::Fact(0), Guard::not(Guard::Fact(0)))),
+            None,
+            "a contradiction admits no lane and is not a selection"
+        );
+    }
 
     /// The index is the variant's own integer, both ways: every axis reads
     /// back what was filled at it, and `Dim::axis` lands each symbolic dim
     /// on the entry its row space owns.
     #[test]
     fn a_per_axis_reads_back_what_each_axis_was_filled_with() {
-        let mut table = PerAxis::new(["tokens", "patches"]);
+        let mut table = PerAxis::new(["tokens", "patches", "voxels"]);
         assert_eq!(table[RowAxis::Tokens], "tokens");
         assert_eq!(table[RowAxis::Patches], "patches");
         assert_eq!(table.as_slice().len(), RowAxis::COUNT);
@@ -325,9 +519,10 @@ mod tests {
         let named = PerAxis::from_fn(RowAxis::name);
         assert_eq!(named[RowAxis::Tokens], "tokens");
         assert_eq!(named[RowAxis::Patches], "patches");
+        assert_eq!(named[RowAxis::Voxels], "voxels");
 
         // What a cut indexes with: every symbolic dim's own axis.
-        let cut = PerAxis::new([10u32, 20]);
+        let cut = PerAxis::new([10u32, 20, 30]);
         for (dim, want) in [
             (Dim::Tokens, 10),
             (Dim::TokensTimes(2), 10),
@@ -336,6 +531,10 @@ mod tests {
             (Dim::Patches, 20),
             (Dim::Images, 20),
             (Dim::ImagesPlus(1), 20),
+            (Dim::Voxels, 30),
+            (Dim::VoxelsTimes(8), 30),
+            (Dim::Clips, 30),
+            (Dim::ClipsPlus(1), 30),
         ] {
             assert_eq!(cut[dim.axis().expect("a symbolic dim names a row space")], want);
         }

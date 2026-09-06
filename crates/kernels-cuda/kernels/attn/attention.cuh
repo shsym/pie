@@ -142,6 +142,59 @@ template <class KTraits>
 __device__ unsigned smem_bytes_paged =
     static_cast<unsigned>(sizeof(typename KTraits::SharedStoragePaged));
 
+// ── the ragged (unpaged) prefill: `attention.ragged` ──────────────────────
+//
+// `BatchPrefillWithRaggedKVCacheKernel` reads k/v straight out of two
+// row-major rectangles through `kv_indptr`, no page table anywhere. It takes
+// the same `KernelTraits` as the paged kernel (`PagedTraits` above is only
+// an alias for those) and picks its own shared storage
+// (`KTraits::SharedStorage`, which for head widths at or below 256 is
+// byte-identical to `SharedStoragePaged`). The host mirror of this parameter
+// block is `fa2_abi::PrefillRaggedParams`; the static assertion pins the
+// layout the Rust side is written against, so a drift fails the NVRTC
+// compile rather than misreading a field on the device.
+
+using RaggedParams = ::flashinfer::BatchPrefillRaggedParams<DTypeQ, DTypeKV, DTypeO, IdType>;
+
+static_assert(sizeof(RaggedParams) == 312,
+              "fa2_abi::PrefillRaggedParams mirrors a 312-byte BatchPrefillRaggedParams");
+static_assert(alignof(RaggedParams) == 8,
+              "fa2_abi::PrefillRaggedParams mirrors an 8-byte-aligned BatchPrefillRaggedParams");
+
+// `RaggedMask::ReferenceSelfOnly`: the block plus one per-group table.
+// `ref_start[g]` is the row of group `g` (local to the group, the same
+// number on the query and the key side) where its reference rows begin: a
+// query row at or past it sees only keys at or past it; every other row
+// sees every key. Group-relative on both sides, so the mask is for the
+// self-attention reading, where q and kv tables agree.
+struct RaggedRefParams : RaggedParams {
+    const IdType* ref_start = nullptr;
+};
+
+static_assert(sizeof(RaggedRefParams) == 320,
+              "fa2_abi::PrefillRaggedRefParams mirrors a 320-byte RaggedRefParams");
+
+/// The full-attention variant with the reference mask on top. Instantiated
+/// under `MaskMode::kCustom`, which is what makes the kernel ask
+/// `LogitsMask` on every kv tile rather than only the causal frontier; the
+/// custom-mask bit plane itself is never read (this variant overrides the
+/// mask outright).
+struct ReferenceSelfOnly : VariantFull {
+    std::uint32_t ref_start = 0;
+
+    template <typename Params>
+    __device__ __host__ ReferenceSelfOnly(
+        const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
+        : VariantFull(params, batch_idx, smem_ptr) {
+        const IdType at = params.ref_start[batch_idx];
+        ref_start = at < 0 ? 0u : static_cast<std::uint32_t>(at);
+    }
+
+    REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+        return qo_idx < ref_start || kv_idx >= ref_start;
+    })
+};
+
 }
 
 namespace merge_lse {

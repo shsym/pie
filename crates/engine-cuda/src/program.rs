@@ -23,7 +23,7 @@ use crate::error::{Fault, Result};
 
 pub use compile::{Cache, Compiled, Disk, Module, Region, Stage, Target};
 pub use endpoint::Endpoint;
-pub use launch::{ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes};
+pub use launch::{ChannelShape, Cursor, Prepared, Rings, describe_values, scratch_bytes, scratch_offsets};
 pub use ports::Envelope;
 pub use session::{Fired, Launched, Session, seeds_of};
 pub use wave::Wave;
@@ -140,6 +140,58 @@ impl Plane {
             out[slot] = address;
         }
         Ok((out[0], out[1]))
+    }
+}
+
+impl Plane {
+    /// The dense slot channel `id` (the caller's id) holds in `instance`, or
+    /// a named refusal.
+    fn dense_channel(&self, instance: u64, id: u64, what: &str) -> Result<(&Bound, u32)> {
+        let bound = self.instances.get(&instance).ok_or_else(|| {
+            Fault::program("program::plane", format!("{what} of unbound instance {instance}"))
+        })?;
+        let dense = bound.ids.iter().position(|&held| held == id).ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!("{what} names channel {id}, which instance {instance} does not carry"),
+            )
+        })?;
+        Ok((bound, dense as u32))
+    }
+
+    /// How many bytes one committed cell of channel `id` (the caller's id)
+    /// of `instance` holds — a float port's feed checks its rectangle
+    /// against this before the stream is touched.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an unbound instance or a channel it lacks.
+    pub fn feed_cell_bytes(&self, instance: u64, id: u64) -> Result<u64> {
+        let (bound, dense) = self.dense_channel(instance, id, "float-port feed")?;
+        bound.session.cell_bytes(dense)
+    }
+
+    /// The device address a float port's feed reads channel `id`'s
+    /// committed cell from this fire (the cell at the consumer head, what
+    /// the instance's own `take` would read), or a named refusal when the
+    /// ring holds no committed cell.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Program`] for an unbound instance, a channel it lacks, or
+    /// an empty ring.
+    pub fn feed_cell(&self, instance: u64, id: u64) -> Result<(u64, u64)> {
+        let (bound, dense) = self.dense_channel(instance, id, "float-port feed")?;
+        bound.session.feed_cell(dense)?.ok_or_else(|| {
+            Fault::program(
+                "program::plane",
+                format!(
+                    "float-port feed channel {id} of instance {instance} holds no committed \
+                     cell; a port is fed from the cell the instance's own `take` would read \
+                     this fire, so publish (or `put`) one before submitting"
+                ),
+            )
+        })
     }
 }
 

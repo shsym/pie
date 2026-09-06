@@ -106,6 +106,48 @@ fn prefill_symbol(
     )))
 }
 
+/// The ragged (unpaged) prefill's arms: non-causal, no window, no soft cap,
+/// with or without the per-group reference mask. Each names its mask mode,
+/// variant and parameter block together, since the block's width follows
+/// the variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RaggedArm {
+    /// Every row of a group sees every key of the group.
+    Full,
+    /// `RaggedMask::ReferenceSelfOnly`: rows past a group's `ref_start` see
+    /// only keys past it. `MaskMode::kCustom`, so the mask is asked on every
+    /// kv tile.
+    ReferenceSelfOnly,
+}
+
+/// The ragged prefill instantiation: the paged kernel's traits (the traits
+/// are storage-agnostic; the kernel picks `SharedStorage` itself) under
+/// `BatchPrefillWithRaggedKVCacheKernel` with the unpaged parameter block.
+fn prefill_ragged_symbol(
+    op: &'static str,
+    g: &PrefillGeometry,
+    arm: RaggedArm,
+) -> Result<&'static str, Error> {
+    instantiated(op, g.head_dim)?;
+    let (mask, variant, params) = match arm {
+        RaggedArm::Full => ("kNone", "VariantFull", "RaggedParams"),
+        RaggedArm::ReferenceSelfOnly => ("kCustom", "ReferenceSelfOnly", "RaggedRefParams"),
+    };
+    Ok(symbol(&format!(
+        "::flashinfer::BatchPrefillWithRaggedKVCacheKernel<\
+         ::pie::attn::fa2::PagedTraits<::flashinfer::MaskMode::{mask}, \
+         {q}, {mmaq}, {kv}, {dqk}, {dvo}, {wq}, {wkv}, \
+         ::pie::attn::fa2::{variant}>, ::pie::attn::fa2::{params}>",
+        q = g.cta_tile_q,
+        mmaq = g.num_mma_q,
+        kv = g.num_mma_kv,
+        dqk = g.num_mma_d_qk,
+        dvo = g.num_mma_d_vo,
+        wq = g.num_warps_q,
+        wkv = g.num_warps_kv,
+    )))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DecodePoint {
     pub head_dim: u32,
@@ -175,6 +217,49 @@ pub(crate) fn prefill(
     ctx.fire(
         op,
         Fire::at(FILE, prefill_symbol(op, &geometry, at.arm)?).apply(
+            Launch::grid(
+                PrefillGeometry::grid(at.padded_batch_size, at.num_kv_heads),
+                geometry.block(),
+            )
+            .smem(geometry.smem_bytes),
+        ),
+        &[block(params)],
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RaggedPoint {
+    pub head_dim: u32,
+    pub cta_tile_q: u32,
+    pub arm: RaggedArm,
+    pub padded_batch_size: u32,
+    pub num_kv_heads: u32,
+    pub device: Device,
+}
+
+/// The ragged prefill launch: one parameter block (`PrefillRaggedParams`
+/// or its reference-masked extension, whichever the arm names) at a
+/// [`RaggedPoint`], the grid being `[padded_batch_size, 1, num_kv_heads]`
+/// exactly as the paged kernel's. The shared storage is the paged formula's:
+/// `KernelTraits::SharedStorage` and `SharedStoragePaged` differ only past
+/// head width 256, which the ragged entry refuses.
+pub(crate) fn prefill_ragged<P>(
+    ctx: &Ctx,
+    op: &'static str,
+    at: RaggedPoint,
+    params: &P,
+) -> Result<(), Error> {
+    let geometry = PrefillGeometry::derive(
+        op,
+        at.head_dim,
+        at.cta_tile_q,
+        KvWidth::BF16,
+        false,
+        &at.device,
+    )?;
+    ctx.fire(
+        op,
+        Fire::at(FILE, prefill_ragged_symbol(op, &geometry, at.arm)?).apply(
             Launch::grid(
                 PrefillGeometry::grid(at.padded_batch_size, at.num_kv_heads),
                 geometry.block(),
@@ -358,6 +443,25 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<(), 
 #[cfg(feature = "cuda")]
 #[must_use]
 pub fn decode_blocks_per_sm(head_dim: u32, group_size: u32, device: &Device) -> Option<u32> {
+    // Three driver calls a query, and every decode plan asks: memoised per
+    // instantiation and device.
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(u32, u32, u32), Option<u32>>>,
+    > = std::sync::OnceLock::new();
+    let key = (head_dim, group_size, device.num_sm);
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Some(known) = cache.lock().ok().and_then(|held| held.get(&key).copied()) {
+        return known;
+    }
+    let answer = decode_blocks_per_sm_uncached(head_dim, group_size, device);
+    if let Ok(mut held) = cache.lock() {
+        held.insert(key, answer);
+    }
+    answer
+}
+
+#[cfg(feature = "cuda")]
+fn decode_blocks_per_sm_uncached(head_dim: u32, group_size: u32, device: &Device) -> Option<u32> {
     use cudarc::driver::sys as dr;
 
     const OP: &str = "attention.plan_decode";
