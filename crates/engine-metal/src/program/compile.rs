@@ -108,6 +108,25 @@ pub enum Form {
     /// Grouped library sampler (nucleus/top-k): same eleven bindings, one
     /// threadgroup per (lane, row), requires exactly 256 threads.
     GroupedLibrary,
+    /// Streamed: the grouped bindings plus a step word at 11, dispatched once
+    /// per entry of [`Region::steps`] over a grid of (element blocks × lanes).
+    Streamed,
+}
+
+/// One dispatch of a streamed region, resolved from the emitted step table
+/// against the plan's ops: which op, how it runs, and the values whose
+/// descriptors size its grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamedStep {
+    /// The value the emitter sized this step by; `M4Step::index` is the
+    /// step's position in the table.
+    pub node: u32,
+    pub kind: eta_compiler::codegen::metal::StepKind,
+    /// The value whose length sizes a `Wide` grid: the op's result, or its
+    /// first operand for an op with none (a put).
+    pub result: u32,
+    /// The value a reduction folds, whose row width fixes its levels.
+    pub input: u32,
 }
 
 /// The include line every emitted kernel carries.
@@ -186,6 +205,12 @@ impl Module {
         self.pipeline.maxTotalThreadsPerThreadgroup()
     }
 
+    /// The SIMD width this pipeline executes at.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn execution_width(&self) -> usize {
+        self.pipeline.threadExecutionWidth()
+    }
+
     /// Compile one owned MSL source and build the pipeline for `entry`. A
     /// rejected source is remembered in the negative tier; any other failure
     /// is not.
@@ -200,6 +225,13 @@ impl Module {
         let options = MTLCompileOptions::new();
         // Metal defaults fast math on; turn it off for determinism.
         set_safe_math(&options);
+        // `PIE_KERNEL_DUMP=<dir>`: every generated source, as `<entry>.metal`,
+        // for a standalone harness to time or inspect. A failed write is not
+        // a compile failure.
+        if let Some(dir) = std::env::var_os("PIE_KERNEL_DUMP") {
+            let path = std::path::Path::new(&dir).join(format!("{entry}.metal"));
+            let _ = std::fs::write(path, source);
+        }
         let text = crate::device::ctx::nsstring(source);
         let library = device
             .newLibraryWithSource_options_error(&text, Some(&options))
@@ -282,6 +314,8 @@ pub struct Region {
     /// Index into the plan's fused partition. The grouped emitter names its
     /// fused-region kernels at `singleton.len() + region_index`.
     pub region_index: u32,
+    /// The streamed form's dispatch table, in order; empty for every other form.
+    pub steps: Arc<Vec<StreamedStep>>,
     /// Which emitted form this region's pipeline was built from.
     pub form: Form,
     /// The compiled library and its pipeline.
@@ -519,6 +553,22 @@ impl Cache {
             }) {
                 continue;
             }
+            if let Some(region) =
+                self.streamed_region(context, stage_index, region_index, plan, index)?
+            {
+                if region_trace() {
+                    eprintln!(
+                        "region: stage {stage_index} region {region_index} takes the Streamed \
+                         form ({} step(s), {} op(s), widest value {} element(s)): {}",
+                        region.steps.len(),
+                        region_ops(plan, region_index),
+                        region_widest(plan, region_index),
+                        region_tags(plan, region_index),
+                    );
+                }
+                regions.push(region);
+                continue;
+            }
             let grouped_declined =
                 match self.grouped_region(context, stage_index, region_index, plan, index)? {
                     GroupedAnswer::Served(region) => {
@@ -547,7 +597,7 @@ impl Cache {
                 );
             }
             let (source, entry) = match index.get(KERNEL_FUSED, stage_index, region_index) {
-                Slot::Kernel { source, entry } => (source, entry),
+                Slot::Kernel { source, entry, .. } => (source, entry),
                 // A declined region has no fallback path; skipping it would
                 // silently run with the fire's memset zeros.
                 Slot::Refused(why) => {
@@ -582,6 +632,7 @@ impl Cache {
             let module = self.region_module(context, entry, source)?;
             regions.push(Region {
                 region_index,
+                steps: Arc::new(Vec::new()),
                 form: Form::Fused,
                 module,
             });
@@ -667,7 +718,7 @@ impl Cache {
             }
         };
         let (source, entry) = match index.get(KERNEL_GROUPED, stage_index, slot) {
-            Slot::Kernel { source, entry } => (source, entry),
+            Slot::Kernel { source, entry, .. } => (source, entry),
             Slot::Refused(why) => {
                 return Ok(GroupedAnswer::Declined(format!(
                     "the grouped emitter declined it too ({why})"
@@ -701,11 +752,81 @@ impl Cache {
         }
         Ok(GroupedAnswer::Served(Region {
             region_index,
+            steps: Arc::new(Vec::new()),
             form: if library {
                 Form::GroupedLibrary
             } else {
                 Form::Grouped
             },
+            module,
+        }))
+    }
+
+    /// The streamed kernel for one fused region, when it applies: the region
+    /// is not a library sampler (those keep their hand-written kernels), the
+    /// plan's grouped path covers the stage (the streamed form shares its
+    /// tables), and the emitter answered a kernel with a step table.
+    /// Otherwise `None`, and the caller tries the grouped and single-lane
+    /// forms as before. Width is no longer a condition: a 64-element region
+    /// of eighteen ops was a millisecond on the single-lane form's one
+    /// thread and is a few dispatches of a few microseconds here.
+    fn streamed_region(
+        &mut self,
+        context: &Context,
+        stage_index: u32,
+        region_index: u32,
+        plan: &LaunchStagePlan,
+        index: &Emitted<'_>,
+    ) -> std::result::Result<Option<Region>, Failure> {
+        if !plan.needs.grouped_valid {
+            return Ok(None);
+        }
+        if plan.fused.get(region_index as usize).is_none() {
+            return Ok(None);
+        }
+
+        let (source, entry, table) =
+            match index.get(KernelKind::Streamed, stage_index, region_index) {
+                Slot::Kernel {
+                    source,
+                    entry,
+                    steps,
+                } => (source, entry, steps),
+                _ => return Ok(None),
+            };
+        let mut steps = Vec::with_capacity(table.len());
+        for &word in table {
+            // The emitter names the value that sizes each dispatch outright:
+            // a wide pass's result, a reduction's input.
+            let value = eta_compiler::codegen::metal::step_value(word);
+            let Some(kind) = eta_compiler::codegen::metal::step_kind(word) else {
+                return Ok(None);
+            };
+            steps.push(StreamedStep {
+                node: value,
+                kind,
+                result: value,
+                input: value,
+            });
+        }
+        let module = self.region_module(context, entry, source)?;
+        #[cfg(target_vendor = "apple")]
+        if module.execution_width() != 32 {
+            // The streamed reductions fold a chunk across a SIMD group of
+            // exactly 32 lanes; the grouped forms make no such assumption.
+            if region_trace() {
+                eprintln!(
+                    "region: stage {stage_index} region {region_index} declines the Streamed \
+                     form: the pipeline's execution width is {}, not 32",
+                    module.execution_width()
+                );
+            }
+            return Ok(None);
+        }
+        Ok(Some(Region {
+            region_index,
+            steps: Arc::new(steps),
+            form: Form::Streamed,
             module,
         }))
     }

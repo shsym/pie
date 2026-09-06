@@ -14,7 +14,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::error::Error;
 use cudarc::cublas::sys::{
     cublasComputeType_t, cublasContext, cublasGemmAlgo_t, cublasGemmEx, cublasGetVersion_v2,
-    cublasHandle_t, cublasOperation_t, cublasSetStream_v2, cublasStatus_t, cudaDataType,
+    cublasHandle_t, cublasOperation_t, cublasSetStream_v2, cublasSetWorkspace_v2, cublasStatus_t,
+    cudaDataType,
 };
 use cudarc::cublaslt::sys as lt;
 use cudarc::runtime::sys::{
@@ -123,6 +124,19 @@ pub(crate) fn act_x_wt(
         Ok(ws) if !ws.is_null() => (ws, want),
         _ => (std::ptr::null_mut(), 0),
     };
+    // The same slab is cuBLAS's workspace too. Left to its own, cuBLAS takes
+    // one from its pool eagerly but under stream capture allocates a graph
+    // node — and once that is refused, falls back to a 16 KiB entry — and its
+    // heuristic follows the bytes it has: the eager walk and the capture of
+    // ONE GEMM could land on different kernels (split-K vs not), whose sums
+    // round differently. The golden reads a replay bit for bit against its
+    // walk, so both arms must see the same workspace. A null slab binds a
+    // zero-byte workspace, which is the same answer both ways.
+    // SAFETY: `handle` is this context's live cuBLAS handle, bound to
+    // `stream`; `ws` is a device slab of `ws_bytes` the context owns.
+    unsafe {
+        cublasSetWorkspace_v2(handle, ws, ws_bytes);
+    }
     if let Some(tactic) = tactic
         && run_tactic(
             handle,
@@ -432,6 +446,73 @@ fn build_lt_plan(
         return None;
     }
     heuristics.truncate((returned as usize).min(HEURISTICS));
+    // The heuristic rarely offers split-K for a skinny decode GEMM, and a
+    // 64-row `[20480 x 2560]` runs at 78% of the card's bandwidth as one
+    // wave and a half of 128x64 tiles. So every heuristic that supports it
+    // is also offered split 2, 4 and 8 ways (reduced in the compute type),
+    // each checked by cuBLASLt for this shape and workspace; the tuner races
+    // them with the rest. Fixed order behind the heuristics, since the disk
+    // cache names a tactic by its index here.
+    let mut augmented: Vec<lt::cublasLtMatmulHeuristicResult_t> = Vec::new();
+    for heuristic in &heuristics {
+        let mut supports: i32 = 0;
+        let mut written: usize = 0;
+        let asked = unsafe {
+            lt::cublasLtMatmulAlgoCapGetAttribute(
+                std::ptr::from_ref(&heuristic.algo),
+                lt::cublasLtMatmulAlgoCapAttributes_t::CUBLASLT_ALGO_CAP_SPLITK_SUPPORT,
+                std::ptr::from_mut(&mut supports).cast(),
+                std::mem::size_of::<i32>(),
+                &raw mut written,
+            )
+        };
+        if asked != ok || supports == 0 {
+            continue;
+        }
+        for split in [2i32, 4, 8] {
+            let mut algo = heuristic.algo;
+            let scheme = lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+            let set_split = unsafe {
+                lt::cublasLtMatmulAlgoConfigSetAttribute(
+                    &raw mut algo,
+                    lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                    std::ptr::from_ref(&split).cast(),
+                    std::mem::size_of::<i32>(),
+                )
+            };
+            let set_scheme = unsafe {
+                lt::cublasLtMatmulAlgoConfigSetAttribute(
+                    &raw mut algo,
+                    lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                    std::ptr::from_ref(&scheme).cast(),
+                    std::mem::size_of::<lt::cublasLtReductionScheme_t>(),
+                )
+            };
+            if set_split != ok || set_scheme != ok {
+                continue;
+            }
+            let mut result: lt::cublasLtMatmulHeuristicResult_t = unsafe { core::mem::zeroed() };
+            let checked = unsafe {
+                lt::cublasLtMatmulAlgoCheck(
+                    lt_handle,
+                    plan.op_desc,
+                    plan.a_desc,
+                    plan.b_desc,
+                    plan.c_desc,
+                    plan.c_desc,
+                    &raw const algo,
+                    &raw mut result,
+                )
+            };
+            if checked != ok || result.state != ok || result.workspaceSize > workspace_bytes {
+                clear_error();
+                continue;
+            }
+            result.algo = algo;
+            augmented.push(result);
+        }
+    }
+    heuristics.extend(augmented);
     plan.heuristics = heuristics;
     Some(plan)
 }
@@ -502,7 +583,14 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
             Arc::new(Mutex::new(Device {
                 lt: LtCtx {
                     handle: std::ptr::null_mut(),
-                    workspace_bytes: 64 * 1024 * 1024,
+                    // Eight MiB, not sixty-four: the slab is cut once per
+                    // recorded region (`jit::device` keys scratch by region
+                    // so a captured graph's address stays put), and a
+                    // deployment arms a hundred-odd bodies — at 64 MiB that
+                    // was 7.5 GB of workspace on a 46 GB card, the memory
+                    // that refused an eighth diffusion canvas. Ada's Lt
+                    // heuristics want a few MiB for these shapes.
+                    workspace_bytes: 8 * 1024 * 1024,
                 },
                 plans: HashMap::new(),
                 chosen: HashMap::new(),
@@ -608,14 +696,22 @@ fn tune(
     plan: Option<&LtPlan>,
     call: Call,
 ) -> Tactic {
+    // Ties go to the earlier candidate, so the order is a preference:
+    // `GemmEx` LAST. Under stream capture `cublasGemmEx` records a memory
+    // node for its own workspace (~10 MiB a body on gemma-4-E4B), and the
+    // arming pass pays that off the ceiling's spare — 173 bodies took
+    // 1.8 GiB and left the wide compositions unarmed. An explicit Lt
+    // algorithm runs in the slab the handle was given and records nothing,
+    // so `GemmEx` wins only where it is more than 2% faster than every
+    // explicit form.
     let mut candidates = Vec::new();
     if call.m == 1 {
         candidates.push(Tactic::Gemv);
     }
-    candidates.push(Tactic::GemmEx);
     if let Some(plan) = plan {
         candidates.extend((0..plan.heuristics.len()).map(Tactic::Lt));
     }
+    candidates.push(Tactic::GemmEx);
 
     let mut arena = TuneArena::empty();
     if !arena.init(handle, caller_stream, lt.workspace_bytes, call) {
@@ -963,7 +1059,7 @@ fn signature() -> String {
         .to_string_lossy()
         .into_owned();
     format!(
-        "# pie-dense-gemm v4 sm{}{} cublas={version} dev={name}",
+        "# pie-dense-gemm v5 sm{}{} cublas={version} dev={name}",
         prop.major, prop.minor
     )
 }

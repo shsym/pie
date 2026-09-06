@@ -59,6 +59,17 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // the compile and every node index taken off `boot.trace` below share
     // one numbering; see the Metal shell's `load` for the argument.
     boot.trace = model_ir::fuse::residual_norm(boot.trace.clone());
+    // The chain fusions behind it; `PIE_FUSE_CHAINS=0` is the A/B arm that
+    // lands the traced launches instead.
+    if fuse_chains() {
+        boot.trace = model_ir::fuse::residual_chains(boot.trace.clone());
+    }
+    // `PTIR_GUMBEL_DIRECT=0`: keep a program's Gumbel-max head as the
+    // launches it was traced as (see `eta_compiler::codegen::cuda::fused`).
+    if std::env::var("PTIR_GUMBEL_DIRECT").is_ok_and(|value| value == "0") {
+        eta_compiler::codegen::cuda::fused::GUMBEL_DIRECT
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     let compiled = model_compiler::compile_axes(&boot.trace, &budgets, &profile)?;
     Ok(Baked {
         device,
@@ -153,10 +164,20 @@ impl Shell {
         let shifted = regions_shifting(&boot.trace, &compiled);
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
         let paging = Paging::of(boot.page_size, boot.context, boot.slots, u64::from(boot.pages))?;
+        // A model that denoises fires every projection at a canvas of
+        // rows; its 8-bit dense projections are decoded to bf16 once here
+        // rather than on every fire (`weights::decoded_dense_bytes`).
+        let decode_dense = landing.iter().flatten().any(model_ir::Request::denoise);
+        let decoded_dense = if decode_dense {
+            crate::weights::decoded_dense_bytes(&boot.trace)
+        } else {
+            0
+        };
         // The accounting sentence refuses ahead of every allocation.
         let accounting = crate::store::admit_the_card(
             boot.knobs.gpu_mem_utilization,
             boot.residency.device_demand(),
+            decoded_dense,
             &boot.trace,
             paging,
         )?;
@@ -172,6 +193,7 @@ impl Shell {
                 boot.world.rank,
                 boot.world.size,
             ),
+            decode_dense,
         )?;
         weights.rotate(&boot.trace, &compiled)?;
         let arena = Arena::reserve(&compiled.arena)?;
@@ -461,4 +483,11 @@ pub(super) struct Baked {
     pub(super) device: Context,
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
+}
+
+/// Whether the load folds the norm-add-scale-norm and per-layer-input chains
+/// (`model_ir::fuse::residual_chains`). On unless `PIE_FUSE_CHAINS=0`.
+pub(crate) fn fuse_chains() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !std::env::var("PIE_FUSE_CHAINS").is_ok_and(|value| value == "0"))
 }

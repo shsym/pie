@@ -602,6 +602,44 @@ inline void m1_reduce_integer_part(
   }
 }
 
+// A scatter's read-modify-write over its indices, after the base has been
+// copied into the result: one thread owns it, since indices may repeat. The
+// streamed form runs the copy as a grid pass and this on a threadgroup of
+// its own; the single-lane and grouped walks call it from thread 0.
+inline void m1_scatter_rmw(
+    uint tag,
+    const device uchar* a1,
+    const device uchar* a2,
+    device uchar* o0,
+    const M1ValueDesc d0,
+    const M1ValueDesc d1,
+    const M1ValueDesc d2) {
+  const uint rest = d0.rank == 0 ? 1u : d0.len / max(d0.dims[0], 1u);
+  const uint n0 = d0.rank == 0 ? 1u : d0.dims[0];
+  const bool scalar = d2.len == 1 && d1.len * rest != 1;
+  for (uint k = 0; k < d1.len; ++k) {
+    const long index = m1_load_index(a1, k, d1.dtype);
+    if (index < 0 || uint(index) >= n0) continue;
+    for (uint r = 0; r < rest; ++r) {
+      const uint dst = uint(index) * rest + r;
+      const uint src = scalar ? 0u : k * rest + r;
+      if (d0.dtype == 0) {
+        const float value = m1_load_f(a2, src, d2.dtype);
+        m1_store_f(o0, dst, tag == 0x62 ? m1_load_f(o0, dst, 0) + value : value);
+      } else if (d0.dtype == 1) {
+        const int value = m1_load_i(a2, src, d2.dtype);
+        m1_store_i(o0, dst, tag == 0x62 ? int(uint(m1_load_i(o0, dst, 1)) + uint(value)) : value);
+      } else if (d0.dtype == 2) {
+        const uint value = m1_load_u(a2, src, d2.dtype);
+        m1_store_u(o0, dst, tag == 0x62 ? m1_load_u(o0, dst, 2) + value : value);
+      } else {
+        const bool value = m1_load_b(a2, src, d2.dtype);
+        m1_store_b(o0, dst, value);
+      }
+    }
+  }
+}
+
 // One op, walked by `nthreads` threads of which this is `tid`. `0, 1` is the
 // serial walk every single-lane kernel takes. Every op whose elements are
 // independent strides its loop by `nthreads`; an op whose walk carries state
@@ -1209,30 +1247,7 @@ inline void ptir_m1_execute_part(
     m1_copy_typed_range(a0, o0, d0.len, d0.dtype, tid, nthreads);
     if (nthreads > 1u) threadgroup_barrier(mem_flags::mem_device);
     if (tid != 0) return;
-    const uint rest = d0.rank == 0 ? 1u : d0.len / max(d0.dims[0], 1u);
-    const uint n0 = d0.rank == 0 ? 1u : d0.dims[0];
-    const bool scalar = d2.len == 1 && d1.len * rest != 1;
-    for (uint k = 0; k < d1.len; ++k) {
-      const long index = m1_load_index(a1, k, d1.dtype);
-      if (index < 0 || uint(index) >= n0) continue;
-      for (uint r = 0; r < rest; ++r) {
-        const uint dst = uint(index) * rest + r;
-        const uint src = scalar ? 0u : k * rest + r;
-        if (d0.dtype == 0) {
-          const float value = m1_load_f(a2, src, d2.dtype);
-          m1_store_f(o0, dst, p.tag == 0x62 ? m1_load_f(o0, dst, 0) + value : value);
-        } else if (d0.dtype == 1) {
-          const int value = m1_load_i(a2, src, d2.dtype);
-          m1_store_i(o0, dst, p.tag == 0x62 ? int(uint(m1_load_i(o0, dst, 1)) + uint(value)) : value);
-        } else if (d0.dtype == 2) {
-          const uint value = m1_load_u(a2, src, d2.dtype);
-          m1_store_u(o0, dst, p.tag == 0x62 ? m1_load_u(o0, dst, 2) + value : value);
-        } else {
-          const bool value = m1_load_b(a2, src, d2.dtype);
-          m1_store_b(o0, dst, value);
-        }
-      }
-    }
+    m1_scatter_rmw(p.tag, a1, a2, o0, d0, d1, d2);
     return;
   }
   if (p.tag == 0x64) {
@@ -1316,6 +1331,795 @@ inline void ptir_m1_execute(
                        o1, temporary, 0u, 1u);
 }
 
+// `m1_sort_better` as a fold: the better of two candidates, an absent one
+// losing to any present one. A strict total order, so a tree over any
+// partition lands on the same element the serial scan does.
+inline M1ArgmaxCandidate m1_sort_pick(M1ArgmaxCandidate left, M1ArgmaxCandidate right) {
+  if (right.have == 0u) return left;
+  if (left.have == 0u) return right;
+  return m1_sort_better(right.value, right.index, left.value, left.index) ? right : left;
+}
+
+// The descending-mass selection of `0x58` / `pred_tag == 1`, across a
+// threadgroup. Each pick is the best remaining element under
+// `m1_sort_better` — a strict total order, so the threadgroup's tree lands on
+// the element the serial scan lands on, and the keep bits and the running
+// mass come out bit-identical. The serial form visited the whole row once per
+// pick on one thread: at 171 picks over a 248,320-wide row that was 42M
+// dependent loads, most of a program's twelve seconds. Every thread runs every
+// iteration: the loop bounds are uniform, and the barriers inside are reached
+// by all of them.
+inline void m1_nucleus_select_mt(
+    const device uchar* a0,
+    const device uchar* a1,
+    device uchar* o0,
+    const M1ValueDesc d0,
+    const M1ValueDesc d1,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  for (uint row = 0; row < d0.rows; ++row) {
+    const uint base = row * d0.last;
+    const float threshold = m1_load_f(a1, m1_pick(d1.len, row), d1.dtype);
+    for (uint i = tid; i < d0.last; i += nthreads) m1_store_b(o0, base + i, false);
+    threadgroup_barrier(mem_flags::mem_device);
+    float exclusive = 0.0f;
+    float prev_value = 0.0f;
+    uint prev_index = 0;
+    bool have_prev = false;
+    for (uint position = 0; position < d0.last && exclusive < threshold; ++position) {
+      M1ArgmaxCandidate best = {0.0f, 0u, 0u, 0u};
+      for (uint candidate = tid; candidate < d0.last; candidate += nthreads) {
+        const float value = m1_load_f(a0, base + candidate, d0.dtype);
+        if (have_prev && !m1_sort_better(prev_value, prev_index, value, candidate)) continue;
+        best = m1_sort_pick(best, M1ArgmaxCandidate{value, candidate, 1u, 0u});
+      }
+      tgbuf[tid] = best;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+        if ((tid % (2u * stride)) == 0u && tid + stride < nthreads) {
+          tgbuf[tid] = m1_sort_pick(tgbuf[tid], tgbuf[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      const M1ArgmaxCandidate found = tgbuf[0];
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      if (found.have == 0u) break;
+      if (tid == 0) m1_store_b(o0, base + found.index, exclusive < threshold);
+      exclusive += found.value;
+      prev_value = found.value;
+      prev_index = found.index;
+      have_prev = true;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+  }
+}
+
+// The radix top-k of `0x58` / `pred_tag == 0`, across a threadgroup: the
+// same four 8-bit passes over `m1_desc_key`, with the histogram built by
+// every thread through threadgroup atomics and the bucket scan repeated by
+// every thread (a uniform 256-step loop, cheaper than publishing one result).
+// Counts do not depend on visit order, so `prefix` and the keep bits are the
+// serial form's exactly. The histogram borrows the argmax buffer's storage.
+inline void m1_topk_select_mt(
+    const device uchar* a0,
+    const device uchar* a1,
+    device uchar* o0,
+    const M1ValueDesc d0,
+    const M1ValueDesc d1,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  threadgroup atomic_uint* histogram = reinterpret_cast<threadgroup atomic_uint*>(tgbuf);
+  for (uint row = 0; row < d0.rows; ++row) {
+    const uint base = row * d0.last;
+    const int signed_k = m1_load_i(a1, m1_pick(d1.len, row), d1.dtype);
+    uint k = signed_k <= 0 ? 0u : uint(signed_k);
+    if (k > d0.last) k = d0.last;
+    if (k == 0u) {
+      for (uint i = tid; i < d0.last; i += nthreads) m1_store_b(o0, base + i, false);
+      continue;
+    }
+    uint prefix = 0u;
+    uint target = k;
+    for (int pass = 0; pass < 4; ++pass) {
+      const int shift = 24 - 8 * pass;
+      const uint high_mask = (pass == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+      for (uint bucket = tid; bucket < 256u; bucket += nthreads)
+        atomic_store_explicit(histogram + bucket, 0u, memory_order_relaxed);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint j = tid; j < d0.last; j += nthreads) {
+        const uint key = m1_desc_key(m1_load_f(a0, base + j, d0.dtype));
+        if ((key & high_mask) == (prefix & high_mask))
+          atomic_fetch_add_explicit(histogram + ((key >> shift) & 0xFFu), 1u,
+                                    memory_order_relaxed);
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      uint run = 0u;
+      uint chosen = 255u;
+      for (uint bucket = 0u; bucket < 256u; ++bucket) {
+        const uint count = atomic_load_explicit(histogram + bucket, memory_order_relaxed);
+        if (run + count >= target) { chosen = bucket; break; }
+        run += count;
+      }
+      target -= run;
+      prefix |= chosen << shift;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = tid; i < d0.last; i += nthreads) {
+      const float value = m1_load_f(a0, base + i, d0.dtype);
+      m1_store_b(o0, base + i, !isnan(value) && m1_desc_key(value) <= prefix);
+    }
+  }
+}
+
+// ── The streamed form's multi-dispatch shapes ──────────────────────────────
+//
+// A streamed region runs each op as its own dispatch over a grid; a fixed-tree
+// reduction cannot cross threadgroups inside one dispatch, so it runs as one
+// dispatch per level. Level `l` reads what level `l - 1` wrote and folds every
+// 32-wide chunk of it pairwise from offset 16 down — the same chunks, the same
+// lanes, the same folds as `m1_reduce_float`, so the result is bit-identical;
+// only which thread folds which chunk changes. Levels alternate between two
+// planes of `temporary`, pitched per row by the level-0 chunk count.
+
+inline uint m4_reduce_count(uint last, uint level) {
+  uint count = last;
+  for (uint l = 0; l < level; ++l) count = (count + 31u) / 32u;
+  return count;
+}
+
+// The identity of a fixed-tree reduction, as the bits of its element type.
+inline uint m4_reduce_identity(uint tag, uint dtype) {
+  if (dtype == 0) return as_type<uint>(tag == 0x30 ? 0.0f : (tag == 0x31 ? -INFINITY : INFINITY));
+  if (tag == 0x30) return 0u;
+  if (dtype == 1) return tag == 0x31 ? uint(INT_MIN) : uint(INT_MAX);
+  return tag == 0x31 ? 0u : UINT_MAX;
+}
+
+// One 32-wide chunk of the fixed tree, folded across a SIMD group: lane `l`
+// holds element `l` of the chunk and, for `offset` 16 down to 1, lanes below
+// `offset` fold `lanes[l] op lanes[l + offset]` — the serial tree's pairs in
+// the serial tree's order, so lane 0 ends with its bits. `simd_shuffle_down`
+// needs every lane of the group here; the callers keep the control flow
+// around it uniform. Requires an execution width of 32 (the engine checks).
+inline uint m4_fold_chunk(uint tag, uint dtype, uint bits) {
+  if (dtype == 0) {
+    float v = as_type<float>(bits);
+    for (uint offset = 16u; offset > 0u; offset >>= 1) {
+      const float other = simd_shuffle_down(v, offset);
+      if (tag == 0x30) v = v + other;
+      else if (tag == 0x31) v = m1_canonical_max(v, other);
+      else v = m1_canonical_min(v, other);
+    }
+    return as_type<uint>(v);
+  }
+  uint v = bits;
+  for (uint offset = 16u; offset > 0u; offset >>= 1) {
+    const uint other = simd_shuffle_down(v, offset);
+    if (tag == 0x30) v = v + other;
+    else if (dtype == 1) {
+      const int left = int(v), right = int(other);
+      v = uint(tag == 0x31 ? max(left, right) : min(left, right));
+    } else {
+      v = tag == 0x31 ? max(v, other) : min(v, other);
+    }
+  }
+  return v;
+}
+
+// Level-`level + 1` chunks one threadgroup of a reduce dispatch owns. The
+// engine sizes the grid by the same number (`launch::REDUCE_CHUNKS_PER_GROUP`).
+#define M4_REDUCE_CHUNKS_PER_GROUP 4u
+
+// Two levels of the fixed tree in one dispatch, SIMD-folded. Threadgroup
+// `group` owns level-`level` chunks `[128 group, 128 group + 128)`: four
+// level-`level + 1` chunks. Its SIMD groups take the 128 chunks in rounds,
+// each lane loading one element (coalesced) and the group folding it; the
+// 128 results land in threadgroup memory and four SIMD groups fold those
+// into the next level's values — plane or result. Same chunks, same pairs,
+// same order as the serial tree: bit-identical. The threadgroup is a power
+// of two of at least 32 (the engine rounds it), so the rounds divide.
+// Levels alternate between two planes of `temporary`, pitched per row by the
+// level-0 chunk count. Rows are walked in a uniform outer loop.
+inline void m4_reduce_two_levels(
+    uint tag,
+    const device uchar* input,
+    device uchar* output,
+    device uchar* temporary,
+    const M1ValueDesc d,
+    uint level,
+    uint group,
+    uint tid,
+    uint threads,
+    threadgroup M1ArgmaxCandidate* tgbuf,
+    uint simd_lane,
+    uint simd_id) {
+  const uint count = m4_reduce_count(d.last, level);
+  const uint chunks = (count + 31u) / 32u;
+  const uint pitch = (d.last + 31u) / 32u;
+  const uint next_chunks = (chunks + 31u) / 32u;
+  const uint identity = m4_reduce_identity(tag, d.dtype);
+  const device uint* plane = reinterpret_cast<const device uint*>(temporary);
+  device uint* planes = reinterpret_cast<device uint*>(temporary);
+  device uint* result = reinterpret_cast<device uint*>(output);
+  if (count <= 1u) {
+    // An empty row is the identity; a one-element row is copied untouched —
+    // the serial walk moves it through `work` without a fold, so `-0.0`
+    // stays `-0.0`.
+    if (group != 0u) return;
+    for (uint row = tid; row < d.rows; row += threads) {
+      if (count == 0u) {
+        result[row] = identity;
+      } else {
+        result[row] = level == 0u
+            ? reinterpret_cast<const device uint*>(input)[row * d.last]
+            : plane[((level - 1u) & 1u) * d.rows * pitch + row * pitch];
+      }
+    }
+    return;
+  }
+  const uint span = 32u * M4_REDUCE_CHUNKS_PER_GROUP;
+  if (group * M4_REDUCE_CHUNKS_PER_GROUP >= next_chunks) return;
+  threadgroup uint* tg = reinterpret_cast<threadgroup uint*>(tgbuf);
+  const uint simds = threads / 32u;
+  const uint rounds = span / simds;
+  for (uint row = 0; row < d.rows; ++row) {
+    const device uint* src = level == 0u
+        ? reinterpret_cast<const device uint*>(input) + row * d.last
+        : plane + ((level - 1u) & 1u) * d.rows * pitch + row * pitch;
+    // Every lane's loads first, so they overlap; then the folds.
+    uint held[8];
+    for (uint k = 0; k < 8u; ++k) {
+      const uint chunk = group * span + simd_id + k * simds;
+      const uint at = chunk * 32u + simd_lane;
+      held[k] = (k < rounds && chunk < chunks && at < count) ? src[at] : identity;
+    }
+    for (uint k = 0; k < 8u; ++k) {
+      if (k < rounds) {
+        const uint folded = m4_fold_chunk(tag, d.dtype, held[k]);
+        if (simd_lane == 0u) tg[simd_id + k * simds] = folded;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (simd_id < M4_REDUCE_CHUNKS_PER_GROUP) {
+      const uint next_chunk = group * M4_REDUCE_CHUNKS_PER_GROUP + simd_id;
+      const uint folded = m4_fold_chunk(tag, d.dtype, tg[simd_id * 32u + simd_lane]);
+      if (simd_lane == 0u && next_chunk < next_chunks) {
+        if (next_chunks == 1u) result[row] = folded;
+        else planes[((level + 1u) & 1u) * d.rows * pitch + row * pitch + next_chunk] = folded;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+// ── A reduction split across two dispatches at the tree's first level ─────
+//
+// A streamed dispatch is a sequence of grid-strided passes sharing one
+// thread↔element mapping (element `i` is thread `i mod grid`). A reduction's
+// level 0 fits that mapping — each SIMD group holds a whole 32-chunk — so it
+// runs as one more pass in the producer's dispatch, writing one word per
+// chunk to a plane in `temporary`. The remaining levels need every chunk, so
+// they run at the start of the NEXT dispatch, inside each threadgroup
+// redundantly, and the result reaches the consumer's registers without a
+// dispatch of its own. Same chunks, same pairs, same order: bit-identical.
+
+// Level 0 over a single row of `n` elements: chunk `i0 / 32` per SIMD group.
+// `gtid - simd_lane` is the group's first element, so `i0` is 32-aligned
+// when the threadgroup is a multiple of 32 wide (the engine's promise).
+inline void m4_reduce_partial(
+    uint tag, uint dtype, const device uchar* input, device uint* plane, uint n,
+    uint gtid, uint gthreads, uint simd_lane) {
+  const uint identity = m4_reduce_identity(tag, dtype);
+  const device uint* src = reinterpret_cast<const device uint*>(input);
+  // Eight chunks' loads in flight before any fold: a rolled loop would wait
+  // on each load before issuing the next.
+  uint i0 = gtid - simd_lane;
+  for (; i0 < n; i0 += 8u * gthreads) {
+    uint held[8];
+    for (uint k = 0; k < 8u; ++k) {
+      const uint i = i0 + k * gthreads + simd_lane;
+      held[k] = i < n ? src[i] : identity;
+    }
+    for (uint k = 0; k < 8u; ++k) {
+      const uint chunk0 = i0 + k * gthreads;
+      if (chunk0 < n) {
+        const uint folded = m4_fold_chunk(tag, dtype, held[k]);
+        if (simd_lane == 0u) plane[chunk0 >> 5] = folded;
+      }
+    }
+  }
+}
+
+// Levels 1 and up over the `(n + 31) / 32` level-0 words in `plane`, folded
+// through threadgroup memory (`tgbuf`, 2048 words) by one threadgroup, the
+// result's bits returned to every thread of it. Uniform control flow: every
+// bound here is a function of `n`. A row of one element is copied untouched,
+// as the serial walk copies it (`-0.0` stays `-0.0`); an empty row is the
+// identity. A row past what the memory holds faults and answers the identity.
+inline uint m4_reduce_final(
+    uint tag, uint dtype, const device uchar* input, uint n, const device uint* plane,
+    device M1Status* status, uint threads, uint simd_lane, uint simd_id,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  const uint identity = m4_reduce_identity(tag, dtype);
+  if (n == 0u) return identity;
+  if (n == 1u) return reinterpret_cast<const device uint*>(input)[0];
+  uint count = (n + 31u) / 32u;
+  if (count == 1u) return plane[0];
+  if (count > 32768u) {
+    if (simd_lane == 0u && simd_id == 0u) m1_fault(status, 0xB4u);
+    return identity;
+  }
+  threadgroup uint* tg = reinterpret_cast<threadgroup uint*>(tgbuf);
+  const uint simds = threads / 32u;
+  uint next = (count + 31u) / 32u;
+  // Level 1 reads the plane from device memory: sixteen chunks' loads in
+  // flight per SIMD group before any fold.
+  for (uint c0 = simd_id; c0 < next; c0 += 16u * simds) {
+    uint held[16];
+    for (uint k = 0; k < 16u; ++k) {
+      const uint at = (c0 + k * simds) * 32u + simd_lane;
+      held[k] = (c0 + k * simds < next && at < count) ? plane[at] : identity;
+    }
+    for (uint k = 0; k < 16u; ++k) {
+      const uint c = c0 + k * simds;
+      if (c < next) {
+        const uint folded = m4_fold_chunk(tag, dtype, held[k]);
+        if (simd_lane == 0u) tg[c] = folded;
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  uint src_at = 0u, dst_at = 1024u;
+  count = next;
+  while (count > 1u) {
+    next = (count + 31u) / 32u;
+    for (uint c = simd_id; c < next; c += simds) {
+      const uint at = c * 32u + simd_lane;
+      const uint folded = m4_fold_chunk(tag, dtype, at < count ? tg[src_at + at] : identity);
+      if (simd_lane == 0u) tg[dst_at + c] = folded;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint swap = src_at;
+    src_at = dst_at;
+    dst_at = swap;
+    count = next;
+  }
+  const uint result = tg[src_at];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return result;
+}
+
+// ── A pivot selection (`0x58`, rank or mass) across the grid ──────────────
+//
+// `m1_nucleus_select_mt` picks the best remaining element of the row once
+// per kept token, each pick a scan of the whole row by one threadgroup:
+// 171 kept tokens over a 248k row was 17 ms, most of a chat-completion
+// token. The streamed form selects instead: rounds of up to `M4_SEL_CAP`
+// candidates — the elements next in `m1_sort_better` order after the
+// previous round's last — found by a radix select over the grid on
+// `m1_desc_key`, compacted, sorted in one threadgroup, and walked in order
+// by one thread doing exactly the serial walk's additions (`exclusive +=
+// value`, keep while `exclusive < threshold`) or counts (keep the first k).
+// Same order, same sums, same keep bits. A row that outruns the rounds is
+// finished by the serial pick loop from where the rounds stopped; a
+// multi-row value takes the serial walk outright.
+
+#define M4_SEL_CAP 1024u
+#define M4_SEL_BYTES 16384u
+
+struct M4SelState {
+  uint fast;        // 1: one row, the rounds run; 0: the fallback does it all
+  uint done;        // 1: every keep bit is written
+  uint have_bound;  // 1: `bound_*` name the last element taken so far
+  uint bound_key;
+  uint bound_idx;
+  float exclusive;  // mass taken so far (mode 1)
+  uint taken;       // elements taken so far (mode 0)
+  uint want;        // candidates this round asks for
+  uint sel_prefix;  // the radix select's prefix so far
+  uint sel_remaining;
+  uint total_lt;    // candidates strictly below the pivot this round
+  uint held;        // candidates the round produced
+  uint pad[4];
+};
+
+inline device M4SelState* m4_sel_state(device uchar* base) {
+  return reinterpret_cast<device M4SelState*>(base);
+}
+inline device atomic_uint* m4_sel_hist(device uchar* base) {
+  return reinterpret_cast<device atomic_uint*>(base + 64u);
+}
+inline device atomic_uint* m4_sel_fill(device uchar* base) {
+  return reinterpret_cast<device atomic_uint*>(base + 64u + 2048u);
+}
+inline device uint* m4_sel_keys(device uchar* base) {
+  return reinterpret_cast<device uint*>(base + 64u + 2048u + 16u);
+}
+inline device uint* m4_sel_idx(device uchar* base) {
+  return reinterpret_cast<device uint*>(base + 64u + 2048u + 16u + 4096u);
+}
+
+// Is `(key, idx)` after the bound in the descending order (a candidate for
+// this round)?
+inline bool m4_sel_after(const device M4SelState* st, uint key, uint idx) {
+  if (st->have_bound == 0u) return true;
+  return key > st->bound_key || (key == st->bound_key && idx > st->bound_idx);
+}
+
+// Step 0 (grid): the mask cleared, the state seeded. `mode` 0 keeps the
+// first `k` (`a1` an integer), 1 keeps by mass (`a1` a float threshold).
+inline void m4_sel_init(
+    device uchar* base, device uchar* o0, const M1ValueDesc d0, const M1ValueDesc d1,
+    const device uchar* a1, uint mode, uint gtid, uint gthreads) {
+  const uint n = d0.rows * d0.last;
+  for (uint i = gtid; i < n; i += gthreads) m1_store_b(o0, i, false);
+  device atomic_uint* hist = m4_sel_hist(base);
+  for (uint b = gtid; b < 512u; b += gthreads) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+  if (gtid == 0u) {
+    device M4SelState* st = m4_sel_state(base);
+    st->fast = d0.rows == 1u ? 1u : 0u;
+    st->have_bound = 0u;
+    st->bound_key = 0u;
+    st->bound_idx = 0u;
+    st->exclusive = 0.0f;
+    st->taken = 0u;
+    st->sel_prefix = 0u;
+    st->sel_remaining = 0u;
+    st->total_lt = 0u;
+    st->held = 0u;
+    uint want = M4_SEL_CAP;
+    bool done = d0.last == 0u;
+    if (mode == 0u) {
+      const int signed_k = m1_load_i(a1, 0u, d1.dtype);
+      const uint k = signed_k <= 0 ? 0u : uint(signed_k);
+      want = min(k, M4_SEL_CAP);
+      if (k == 0u) done = true;
+    }
+    st->want = want;
+    st->done = done ? 1u : 0u;
+    atomic_store_explicit(&m4_sel_fill(base)[0], 0u, memory_order_relaxed);
+    atomic_store_explicit(&m4_sel_fill(base)[1], 0u, memory_order_relaxed);
+  }
+}
+
+// A histogram sweep of the candidates' keys: pass 0 the top byte, passes
+// 1–3 the next among keys matching the prefix. Bins land in threadgroup
+// memory first, then one device add per bin per group.
+inline void m4_sel_hist_pass(
+    device uchar* base, const device uchar* a0, const M1ValueDesc d0, uint pass,
+    uint gtid, uint gthreads, uint tid, uint threads, threadgroup atomic_uint* tg_hist) {
+  const device M4SelState* st = m4_sel_state(base);
+  if (st->done != 0u || st->fast == 0u) return;
+  const uint n = d0.last;
+  const uint shift = 24u - 8u * pass;
+  const uint prefix = st->sel_prefix;
+  for (uint b = tid; b < 256u; b += threads) atomic_store_explicit(&tg_hist[b], 0u, memory_order_relaxed);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint i0 = gtid; i0 < n; i0 += 8u * gthreads) {
+    float held[8];
+    for (uint u = 0u; u < 8u; ++u) {
+      const uint i = i0 + u * gthreads;
+      held[u] = i < n ? m1_load_f(a0, i, d0.dtype) : 0.0f;
+    }
+    for (uint u = 0u; u < 8u; ++u) {
+      const uint i = i0 + u * gthreads;
+      if (i >= n) break;
+      const uint key = m1_desc_key(held[u]);
+      if (!m4_sel_after(st, key, i)) continue;
+      if (pass == 0u || (key >> (shift + 8u)) == (prefix >> (shift + 8u)))
+        atomic_fetch_add_explicit(&tg_hist[(key >> shift) & 255u], 1u, memory_order_relaxed);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  device atomic_uint* hist = m4_sel_hist(base);
+  for (uint b = tid; b < 256u; b += threads) {
+    const uint c = atomic_load_explicit(&tg_hist[b], memory_order_relaxed);
+    if (c != 0u) atomic_fetch_add_explicit(&hist[b], c, memory_order_relaxed);
+  }
+}
+
+// One group: the bin holding the `want`-th candidate, the prefix extended,
+// the histogram cleared for the next byte.
+inline void m4_sel_pick(device uchar* base, uint pass, uint tid, uint threads) {
+  device M4SelState* st = m4_sel_state(base);
+  if (st->done != 0u || st->fast == 0u) return;
+  device atomic_uint* hist = m4_sel_hist(base);
+  if (tid == 0u) {
+    const uint shift = 24u - 8u * pass;
+    const uint remaining = pass == 0u ? st->want : st->sel_remaining;
+    uint before = 0u;
+    uint digit = 0u;
+    for (; digit + 1u < 256u; ++digit) {
+      const uint here = atomic_load_explicit(&hist[digit], memory_order_relaxed);
+      if (before + here >= remaining) break;
+      before += here;
+    }
+    st->sel_prefix = (pass == 0u ? 0u : st->sel_prefix) | (digit << shift);
+    st->sel_remaining = remaining - before;
+    if (pass == 3u) st->total_lt = st->want - (remaining - before);
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  for (uint b = tid; b < 512u; b += threads) atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+  if (tid == 0u) {
+    atomic_store_explicit(&m4_sel_fill(base)[0], 0u, memory_order_relaxed);
+    atomic_store_explicit(&m4_sel_fill(base)[1], 0u, memory_order_relaxed);
+  }
+}
+
+// The grid: every candidate below the pivot, and those equal to it while
+// they fit, appended unordered.
+inline void m4_sel_compact(
+    device uchar* base, const device uchar* a0, const M1ValueDesc d0, uint gtid, uint gthreads) {
+  const device M4SelState* st = m4_sel_state(base);
+  if (st->done != 0u || st->fast == 0u) return;
+  const uint n = d0.last;
+  const uint pivot = st->sel_prefix;
+  const uint total_lt = st->total_lt;
+  device atomic_uint* fill = m4_sel_fill(base);
+  device uint* keys = m4_sel_keys(base);
+  device uint* idx = m4_sel_idx(base);
+  for (uint i0 = gtid; i0 < n; i0 += 8u * gthreads) {
+    float held[8];
+    for (uint u = 0u; u < 8u; ++u) {
+      const uint i = i0 + u * gthreads;
+      held[u] = i < n ? m1_load_f(a0, i, d0.dtype) : 0.0f;
+    }
+    for (uint u = 0u; u < 8u; ++u) {
+      const uint i = i0 + u * gthreads;
+      if (i >= n) break;
+      const uint key = m1_desc_key(held[u]);
+      if (!m4_sel_after(st, key, i)) continue;
+      if (key < pivot) {
+        const uint slot = atomic_fetch_add_explicit(&fill[0], 1u, memory_order_relaxed);
+        if (slot < M4_SEL_CAP) { keys[slot] = key; idx[slot] = i; }
+      } else if (key == pivot) {
+        const uint slot = atomic_fetch_add_explicit(&fill[1], 1u, memory_order_relaxed);
+        if (total_lt + slot < M4_SEL_CAP) { keys[total_lt + slot] = key; idx[total_lt + slot] = i; }
+      }
+    }
+  }
+}
+
+// One group: the round's candidates sorted by `(key, index)`, then walked
+// in order by thread 0 exactly as the serial pick loop would have walked
+// them. Ties at the pivot beyond the room are recovered by an ordered walk.
+inline void m4_sel_finish(
+    device uchar* base, const device uchar* a0, const device uchar* a1, device uchar* o0,
+    const M1ValueDesc d0, const M1ValueDesc d1, uint mode,
+    uint tid, uint threads, threadgroup uint* tg_key, threadgroup uint* tg_idx, threadgroup uint* tg_scan) {
+  device M4SelState* st = m4_sel_state(base);
+  if (st->done != 0u || st->fast == 0u) return;
+  const uint n = d0.last;
+  const uint pivot = st->sel_prefix;
+  const uint total_lt = st->total_lt;
+  const uint want = st->want;
+  const uint remaining = st->sel_remaining;
+  const uint n_eq = atomic_load_explicit(&m4_sel_fill(base)[1], memory_order_relaxed);
+  const uint eq_room = M4_SEL_CAP - total_lt;
+  device uint* keys = m4_sel_keys(base);
+  device uint* idx = m4_sel_idx(base);
+  uint held = total_lt + min(n_eq, eq_room);
+  for (uint p = tid; p < held; p += threads) {
+    tg_key[p] = keys[p];
+    tg_idx[p] = idx[p];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (n_eq > eq_room) {
+    const uint chunk_begin = uint((ulong(n) * tid) / threads);
+    const uint chunk_end = uint((ulong(n) * (tid + 1u)) / threads);
+    uint mine = 0u;
+    for (uint i = chunk_begin; i < chunk_end; ++i) {
+      const uint key = m1_desc_key(m1_load_f(a0, i, d0.dtype));
+      mine += (key == pivot && m4_sel_after(st, key, i)) ? 1u : 0u;
+    }
+    tg_scan[tid] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+      uint run = 0u;
+      for (uint t = 0u; t < threads; ++t) {
+        const uint here = tg_scan[t];
+        tg_scan[t] = run;
+        run += here;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint at = tg_scan[tid];
+    for (uint i = chunk_begin; i < chunk_end; ++i) {
+      const uint key = m1_desc_key(m1_load_f(a0, i, d0.dtype));
+      if (key == pivot && m4_sel_after(st, key, i)) {
+        if (at < remaining) {
+          tg_key[total_lt + at] = pivot;
+          tg_idx[total_lt + at] = i;
+        }
+        ++at;
+      }
+    }
+    held = want;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  // The row may hold fewer candidates than the round asked for.
+  uint n_all = 1u;
+  while (n_all < held) n_all <<= 1u;
+  for (uint p = held + tid; p < n_all; p += threads) {
+    tg_key[p] = ~0u;
+    tg_idx[p] = ~0u;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint size = 2u; size <= n_all; size <<= 1u) {
+    for (uint stride = size >> 1u; stride > 0u; stride >>= 1u) {
+      for (uint t = tid; t < n_all / 2u; t += threads) {
+        const uint lo = 2u * stride * (t / stride) + (t % stride);
+        const uint hi = lo + stride;
+        const bool ascending = ((lo & size) == 0u);
+        const uint klo = tg_key[lo], khi = tg_key[hi];
+        const uint ilo = tg_idx[lo], ihi = tg_idx[hi];
+        const bool lo_greater = klo > khi || (klo == khi && ilo > ihi);
+        if (lo_greater == ascending) {
+          tg_key[lo] = khi; tg_key[hi] = klo;
+          tg_idx[lo] = ihi; tg_idx[hi] = ilo;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  if (tid == 0u) {
+    // Exactly the serial walk, over exactly its next `held` elements.
+    float exclusive = st->exclusive;
+    uint taken = st->taken;
+    bool done = false;
+    const float threshold = mode == 1u ? m1_load_f(a1, 0u, d1.dtype) : 0.0f;
+    uint k = 0u;
+    if (mode == 0u) {
+      const int signed_k = m1_load_i(a1, 0u, d1.dtype);
+      k = signed_k <= 0 ? 0u : uint(signed_k);
+    }
+    uint p = 0u;
+    for (; p < held; ++p) {
+      const uint index = tg_idx[p];
+      if (mode == 1u) {
+        if (!(exclusive < threshold)) { done = true; break; }
+        m1_store_b(o0, index, true);
+        exclusive += m1_load_f(a0, index, d0.dtype);
+      } else {
+        if (taken >= k) { done = true; break; }
+        m1_store_b(o0, index, true);
+        ++taken;
+      }
+    }
+    if (!done && (held < want || held == 0u)) done = true;  // the row is exhausted
+    if (!done && mode == 0u && taken >= k) done = true;
+    if (!done && mode == 1u && !(exclusive < threshold)) done = true;
+    if (!done && held > 0u) {
+      st->have_bound = 1u;
+      st->bound_key = tg_key[held - 1u];
+      st->bound_idx = tg_idx[held - 1u];
+    }
+    st->exclusive = exclusive;
+    st->taken = taken;
+    st->want = mode == 0u ? min(k - taken, M4_SEL_CAP) : M4_SEL_CAP;
+    st->held = held;
+    st->done = done ? 1u : 0u;
+  }
+}
+
+// One group: whatever the rounds left — a multi-row value, or a row whose
+// keep set outran them — by the serial pick loop, continued from the bound.
+inline void m4_sel_fallback(
+    device uchar* base, const device uchar* a0, const device uchar* a1, device uchar* o0,
+    const M1ValueDesc d0, const M1ValueDesc d1, uint mode,
+    uint tid, uint threads, threadgroup M1ArgmaxCandidate* tgbuf) {
+  device M4SelState* st = m4_sel_state(base);
+  if (st->done != 0u) return;
+  if (st->fast == 0u) {
+    if (mode == 1u) m1_nucleus_select_mt(a0, a1, o0, d0, d1, tid, threads, tgbuf);
+    else m1_topk_select_mt(a0, a1, o0, d0, d1, tid, threads, tgbuf);
+    return;
+  }
+  const uint n = d0.last;
+  const float threshold = mode == 1u ? m1_load_f(a1, 0u, d1.dtype) : 0.0f;
+  uint k = 0u;
+  if (mode == 0u) {
+    const int signed_k = m1_load_i(a1, 0u, d1.dtype);
+    k = signed_k <= 0 ? 0u : uint(signed_k);
+  }
+  float exclusive = st->exclusive;
+  uint taken = st->taken;
+  bool have_prev = st->have_bound != 0u;
+  // The bound as the previous pick: its value is recovered from the row.
+  float prev_value = have_prev ? m1_load_f(a0, st->bound_idx, d0.dtype) : 0.0f;
+  uint prev_index = st->bound_idx;
+  for (uint position = 0; position < n; ++position) {
+    if (mode == 1u ? !(exclusive < threshold) : taken >= k) break;
+    M1ArgmaxCandidate best = {0.0f, 0u, 0u, 0u};
+    for (uint candidate = tid; candidate < n; candidate += threads) {
+      const float value = m1_load_f(a0, candidate, d0.dtype);
+      if (have_prev && !m1_sort_better(prev_value, prev_index, value, candidate)) continue;
+      best = m1_sort_pick(best, M1ArgmaxCandidate{value, candidate, 1u, 0u});
+    }
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < threads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < threads)
+        tgbuf[tid] = m1_sort_pick(tgbuf[tid], tgbuf[tid + stride]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const M1ArgmaxCandidate found = tgbuf[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (found.have == 0u) break;
+    if (tid == 0) m1_store_b(o0, found.index, true);
+    exclusive += found.value;
+    ++taken;
+    prev_value = found.value;
+    prev_index = found.index;
+    have_prev = true;
+  }
+  if (tid == 0u) st->done = 1u;
+}
+
+// The f32 argmax in two dispatches: every threadgroup folds its grid-strided
+// share of a row to one candidate in `temporary` (order-free: the combine is
+// a strict total order), then one threadgroup folds the candidates.
+inline void m4_argmax_partial(
+    const device uchar* input,
+    device uchar* temporary,
+    const M1ValueDesc d,
+    uint group,
+    uint groups,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  device M1ArgmaxCandidate* partials = reinterpret_cast<device M1ArgmaxCandidate*>(temporary);
+  const device float* values = reinterpret_cast<const device float*>(input);
+  const uint span = groups * nthreads;
+  const uint begin = group * nthreads + tid;
+  for (uint row = 0; row < d.rows; ++row) {
+    const uint base = row * d.last;
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint i = begin; i < d.last; i += span) {
+      const float value = values[base + i];
+      best = m1_argmax_combine(best, M1ArgmaxCandidate{value, i, isnan(value) ? 0u : 1u, 0u});
+    }
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads)
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) partials[row * groups + group] = tgbuf[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+inline void m4_argmax_final(
+    const device uchar* temporary,
+    device uchar* output,
+    const M1ValueDesc d,
+    uint groups,
+    uint tid,
+    uint nthreads,
+    threadgroup M1ArgmaxCandidate* tgbuf) {
+  const device M1ArgmaxCandidate* partials =
+      reinterpret_cast<const device M1ArgmaxCandidate*>(temporary);
+  device int* result = reinterpret_cast<device int*>(output);
+  for (uint row = 0; row < d.rows; ++row) {
+    M1ArgmaxCandidate best = {-INFINITY, 0u, 0u, 0u};
+    for (uint j = tid; j < groups; j += nthreads)
+      best = m1_argmax_combine(best, partials[row * groups + j]);
+    tgbuf[tid] = best;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < nthreads; stride <<= 1) {
+      if ((tid % (2u * stride)) == 0u && tid + stride < nthreads)
+        tgbuf[tid] = m1_argmax_combine(tgbuf[tid], tgbuf[tid + stride]);
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) result[row] = int(tgbuf[0].index);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
 // The grouped region hands a lane a whole threadgroup. Every op whose
 // elements are independent is partitioned across it by `ptir_m1_execute_part`;
 // the two fixed-tree reductions are partitioned by a walk that reproduces the
@@ -1344,6 +2148,14 @@ inline void ptir_m1_execute_mt(
 
   if (p.tag == 0x33) {  // argmax: order-independent, so partition it
     m1_reduce_argmax_mt(a0, o0, temporary, d0, tid, nthreads, tgbuf);
+    return;
+  }
+  if (p.tag == 0x58 && nthreads > 1u && p.pred_tag != 2) {
+    // The two selections that walk a row with state: their picks are
+    // total-order maxima and their counts are order-free, so both partition.
+    const M1ValueDesc d1 = descriptors[p.a1];
+    if (p.pred_tag == 0) m1_topk_select_mt(a0, a1, o0, d0, d1, tid, nthreads, tgbuf);
+    else m1_nucleus_select_mt(a0, a1, o0, d0, d1, tid, nthreads, tgbuf);
     return;
   }
   ptir_m1_execute_part(generated_tag, status, descriptors, params, a0, a1, a2, o0,

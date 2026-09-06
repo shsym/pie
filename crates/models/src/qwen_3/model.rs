@@ -110,6 +110,86 @@ pub struct PreFc {
     pub eps: f32,
 }
 
+const SLIDING: Option<u32> = Some(2_048);
+
+/// `z-lab/Qwen3.6-27B-DFlash`: block sixteen, four sliding layers then one
+/// full, bidirectional over the block, argmax readout.
+pub const QWEN36_27B_DFLASH: dflash::Head = dflash::Head {
+    taps: &[1, 16, 31, 46, 61],
+    windows: &[SLIDING, SLIDING, SLIDING, SLIDING, None],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 17_408,
+    theta: 10_000_000.0,
+    block: 16,
+    mask_token: 248_070,
+    proposals_from: 1,
+    conv: None,
+    readout: dflash::Readout::Argmax,
+    attn_bias: false,
+};
+
+/// `z-lab/Qwen3.8-27B-DFlash2`: block eight, five sliding layers causal
+/// inside the block, a dynamic convolution around every sublayer, a
+/// candidate selector for the readout. Heads, widths, window, theta and the
+/// mask token are v1's.
+pub const QWEN38_27B_DFLASH2: dflash::Head = dflash::Head {
+    taps: &[5, 19, 33, 47, 61],
+    windows: &[SLIDING; 5],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 17_408,
+    theta: 10_000_000.0,
+    block: 8,
+    mask_token: 248_070,
+    proposals_from: 1,
+    conv: Some(dflash::Conv { taps: 2, group: 16 }),
+    readout: dflash::Readout::Selector { rank: 256, top_k: 16 },
+    attn_bias: false,
+};
+
+/// `DimInfer/Qwen3.8-27B-Dspark-v1`: the v1 backbone (its taps, five plain
+/// layers) with every layer full attention and the block bidirectional, a
+/// block of fifteen whose EVERY row proposes (row `i` predicts position
+/// `i + 1`, the anchor's row included), its own mask id, and a markov bigram
+/// head for the readout. Its confidence head is not read yet.
+pub const QWEN38_27B_DSPARK: dflash::Head = dflash::Head {
+    taps: &[1, 16, 31, 46, 61],
+    windows: &[None; 5],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 17_408,
+    theta: 10_000_000.0,
+    block: 15,
+    mask_token: 248_200,
+    proposals_from: 0,
+    conv: None,
+    readout: dflash::Readout::Markov { rank: 256, top_k: 16 },
+    attn_bias: false,
+};
+
+/// `z-lab/Qwen3.6-35B-A3B-DFlash`: the v1 shape against the 40-layer
+/// mixture — eight taps, six layers (five sliding at 4096, then one full),
+/// hidden 2048, MLP 6144, its own mask id.
+pub const QWEN36_35B_A3B_DFLASH: dflash::Head = dflash::Head {
+    taps: &[1, 6, 11, 16, 22, 27, 32, 37],
+    windows: &[Some(4_096), Some(4_096), Some(4_096), Some(4_096), Some(4_096), None],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 6_144,
+    theta: 10_000_000.0,
+    block: 16,
+    mask_token: 248_077,
+    proposals_from: 1,
+    conv: None,
+    readout: dflash::Readout::Argmax,
+    attn_bias: false,
+};
+
 /// Which draft-head recipe an artifact carries. Read by `Model::new` (which
 /// pieces to declare) and `import` (which tensors to bind); irrelevant once
 /// the trace is built.
@@ -136,7 +216,7 @@ pub enum Recipe {
     DFlash2,
     /// DSpark (`DimInfer/Qwen3.8-27B-Dspark-v1`): the v1 backbone, all
     /// layers full, a block of fifteen whose every row proposes, a markov
-    /// bigram readout. See [`crate::drafter::dflash::QWEN38_27B_DSPARK`].
+    /// bigram readout. See [`QWEN38_27B_DSPARK`].
     DSpark,
 }
 
@@ -448,7 +528,7 @@ impl Model {
     pub fn a3b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a3b_dims();
         d.draft = Some(Recipe::DFlash);
-        d.dflash_head = Some(&dflash::QWEN36_35B_A3B_DFLASH);
+        d.dflash_head = Some(&QWEN36_35B_A3B_DFLASH);
         Model::new(w, kv, tp, d)
     }
 
@@ -646,6 +726,72 @@ impl Model {
         )
     }
 
+    /// Qwen3.5-2B (`mlx-community/Qwen3.5-2B-4bit`): the 0.8B's layout at
+    /// hidden 2048 — 8 query heads over 2 kv, 16 × 128 for both GDN sides,
+    /// MLP 6144, tied embeddings.
+    pub fn d2b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 2048,
+                layers: 24,
+                attn_every: 4,
+                q_heads: 8,
+                kv_heads: 2,
+                head_dim: 256,
+                rotary_dim: 64,
+                theta: 10_000_000.0,
+                k_heads: 16,
+                v_heads: 16,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+                mlp: MlpDims::Dense { inter: 6144 },
+                vocab: 248_320,
+                tied: true,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
+    /// Qwen3.5-9B (`mlx-community/Qwen3.5-9B-4bit`): 32 layers at hidden
+    /// 4096, 16 query heads over 4 kv, GDN 16 key × 32 value heads of 128,
+    /// MLP 12288, its own `lm_head`.
+    pub fn d9b(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::new(
+            w,
+            kv,
+            tp,
+            Dims {
+                hidden: 4096,
+                layers: 32,
+                attn_every: 4,
+                q_heads: 16,
+                kv_heads: 4,
+                head_dim: 256,
+                rotary_dim: 64,
+                theta: 10_000_000.0,
+                k_heads: 16,
+                v_heads: 32,
+                k_dim: 128,
+                v_dim: 128,
+                conv_kernel: 4,
+                mlp: MlpDims::Dense { inter: 12288 },
+                vocab: 248_320,
+                tied: false,
+                norm_eps: 1e-6,
+                tower: None,
+                draft: None,
+                dflash_head: None,
+            },
+        )
+    }
+
     /// Qwen3.6-27B: a SKU of this family, not a separate one —
     /// `config.json` names itself `qwen3_5`. `attn_every = 4` (3 linear : 1
     /// full attention), `q_proj` is gated (`attn_output_gate`), `rotary_dim
@@ -730,9 +876,9 @@ impl Model {
             // The 27B heads: which one is the recipe's, since three are
             // published for this trunk.
             dflash_head: draft.and_then(|r| match r {
-                Recipe::DFlash => Some(&dflash::QWEN36_27B_DFLASH),
-                Recipe::DFlash2 => Some(&dflash::QWEN38_27B_DFLASH2),
-                Recipe::DSpark => Some(&dflash::QWEN38_27B_DSPARK),
+                Recipe::DFlash => Some(&QWEN36_27B_DFLASH),
+                Recipe::DFlash2 => Some(&QWEN38_27B_DFLASH2),
+                Recipe::DSpark => Some(&QWEN38_27B_DSPARK),
                 Recipe::Mtp | Recipe::Eagle => None,
             }),
         }

@@ -16,10 +16,19 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 /// fingerprint change that doesn't move the version fails
 /// `the_pinned_versions_are_the_compiled_ones` until someone updates it here.
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 28, 0x7c99_21ae_b678_f7ec),
-    // 44 -> 45: `ptir_m1_runtime.metal` (spliced into every emitted kernel)
-    // grew the threadgroup-partitioned op walk, so every emitted byte moved.
-    ("metal", 45, 0x2d2b_20af_8aba_05a5),
+    // 28 -> 29: `fused_block0.cuh` (spliced into every emitted kernel) grew
+    // `ptir_fast_gumbel_argmax_intrinsic`, and a Gumbel-max head emits a call
+    // to it instead of its four launches. 29 -> 32 (merged with 30/31):
+    // row-parallel streams through registers, the reshaped-row-vector
+    // broadcast fold and the pooled `top_k` select.
+    ("cuda", 32, 0x27d8_d2fd_45f0_9ca1),
+    // 44 -> 45 -> 46 -> 47: `ptir_m1_runtime.metal` (spliced into every
+    // emitted kernel) grew the threadgroup-partitioned op walk, then the
+    // partitioned selections, then the streamed form's level reductions and
+    // its own `ptir_m4` kernels joined the table. 49 -> 50 (merged with 45):
+    // the normalization fold reaches the metal output too. 50 -> 51: a
+    // gather is a direct op, a scalar runs mid-dispatch, a scatter splits.
+    ("metal", 51, 0x63b4_f718_bf13_f781),
 ];
 
 /// Everything an engine receives for both corpora, hashed. Includes the

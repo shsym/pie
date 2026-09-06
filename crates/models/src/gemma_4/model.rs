@@ -463,11 +463,37 @@ impl TowerDims {
     }
 }
 
+const SLIDING: Option<u32> = Some(2_048);
+
+/// `z-lab/gemma-4-26B-A4B-it-DFlash`: the v1 shape against a 30-layer
+/// trunk — six taps, a narrower MLP, theta 1e6, and the mask id 4 — read
+/// out through gemma's softcapped head (monotone, so the argmax is the
+/// head's own). The head is a Qwen3-style stack whatever the target.
+pub const GEMMA4_26B_A4B_DFLASH: dflash::Head = dflash::Head {
+    taps: &[1, 6, 11, 17, 22, 27],
+    windows: &[SLIDING, SLIDING, SLIDING, SLIDING, None],
+    q_heads: 32,
+    kv_heads: 8,
+    head_dim: 128,
+    inter: 5_632,
+    theta: 1_000_000.0,
+    block: 16,
+    mask_token: 4,
+    proposals_from: 1,
+    conv: None,
+    readout: dflash::Readout::Argmax,
+    attn_bias: false,
+};
+
 struct Dims {
     tower: Option<TowerDims>,
     /// Whether this text is DiffusionGemma's: the self-conditioning block
     /// beside the trunk, and a denoise reading of its rows.
     self_cond: bool,
+    /// The self-conditioning block's element type when it is not the dense
+    /// weights' (`None`): a published quantization may leave it at the
+    /// default bits while the dense stack sits at another.
+    self_cond_w: Option<Dtype>,
     /// Whether this SKU's artifact carries an `aux.*` overlay head.
     draft: bool,
     /// Whether it carries Google's assistant instead (see [`Assistant`]).
@@ -527,6 +553,7 @@ impl Model {
         Dims {
                 tower: None,
                 self_cond: false,
+                self_cond_w: None,
                 draft: false,
                 assistant: false,
                 dflash: None,
@@ -597,6 +624,7 @@ impl Model {
             Dims {
                 tower: None,
                 self_cond: false,
+                self_cond_w: None,
                 draft: false,
                 assistant: false,
                 dflash: None,
@@ -637,9 +665,32 @@ impl Model {
     /// self-conditioning block beside it, read as a block-diffusion text
     /// (`crate::gemma_4_diffusion`).
     pub fn a4b_diffusion(w: Dtype, kv: Dtype, tp: u32) -> Model {
+        Model::a4b_diffusion_experts(w, w, kv, tp)
+    }
+
+    /// The diffusion text with the routed experts in `xw` and the dense
+    /// weights in `w`.
+    pub fn a4b_diffusion_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a4b_dims();
         d.self_cond = true;
-        Model::new(w, kv, tp, d)
+        Model::new_with_experts(w, xw, kv, tp, d)
+    }
+
+    /// The diffusion text with the dense weights in `w`, the routed experts
+    /// in `xw` and the self-conditioning block in `sw` — the plan
+    /// `mlx-community/diffusiongemma-26B-A4B-it-4bit` ships (dense at 8
+    /// bits, experts and the block at the 4-bit default).
+    pub fn a4b_diffusion_experts_self_cond(
+        w: Dtype,
+        xw: Dtype,
+        sw: Dtype,
+        kv: Dtype,
+        tp: u32,
+    ) -> Model {
+        let mut d = Model::a4b_dims();
+        d.self_cond = true;
+        d.self_cond_w = Some(sw);
+        Model::new_with_experts(w, xw, kv, tp, d)
     }
 
     /// The mixture with Google's own drafter overlaid
@@ -655,7 +706,7 @@ impl Model {
     /// (`gemma-4-26B-A4B-it-DFlash`). A separate row for the same reason.
     pub fn a4b_dflash(w: Dtype, kv: Dtype, tp: u32) -> Model {
         let mut d = Model::a4b_dims();
-        d.dflash = Some(&dflash::GEMMA4_26B_A4B_DFLASH);
+        d.dflash = Some(&GEMMA4_26B_A4B_DFLASH);
         Model::new(w, kv, tp, d)
     }
 
@@ -671,6 +722,7 @@ impl Model {
             Dims {
                 tower: None,
                 self_cond: false,
+                self_cond_w: None,
                 draft: false,
                 assistant: false,
                 dflash: None,
@@ -702,6 +754,15 @@ impl Model {
     }
 
     fn new(w: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
+        Model::new_with_experts(w, w, kv, tp, d)
+    }
+
+    /// [`Model::new`] with the routed experts' banks in their own dtype:
+    /// the dense projections in `w`, `experts_gate_up`/`experts_down` in
+    /// `xw`. The diffusion rows use it to price precision where it is
+    /// spent — 4-bit experts triple a denoiser's step count (wiki §23)
+    /// while the dense weights are a tenth of the bytes.
+    fn new_with_experts(w: Dtype, xw: Dtype, kv: Dtype, tp: u32, d: Dims) -> Model {
         assert!(
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
@@ -836,13 +897,13 @@ impl Model {
                             gate_up: Weight::sym(
                                 n("experts_gate_up"),
                                 [m.experts as u64, 2 * mi, hidden],
-                                w,
+                                xw,
                             )
                             .bank([mi, mi]),
                             down: Weight::sym(
                                 n("experts_down"),
                                 [m.experts as u64, hidden, mi],
-                                w,
+                                xw,
                             )
                             .rows(),
                             experts: m.experts,
@@ -1080,13 +1141,14 @@ impl Model {
             // The dense MLP's shape and cut, under its own names.
             self_cond: d.self_cond.then(|| {
                 let iw = intermediate as u64;
+                let sw = d.self_cond_w.unwrap_or(w);
                 SelfCond {
                     taps: SELF_COND_TAPS,
                     pre_norm: Weight::sym("self_cond.pre_norm", [hidden], dense),
                     norm_eps: d.norm_eps,
-                    gate_up: Weight::sym("self_cond.gate_up", [2 * iw, hidden], w).packed([iw, iw]),
+                    gate_up: Weight::sym("self_cond.gate_up", [2 * iw, hidden], sw).packed([iw, iw]),
                     inter: intermediate,
-                    down: Weight::sym("self_cond.down", [hidden, iw], w).rows(),
+                    down: Weight::sym("self_cond.down", [hidden, iw], sw).rows(),
                 }
             }),
             // The block drafter's geometry is its OWN (`drafter::dflash`); it

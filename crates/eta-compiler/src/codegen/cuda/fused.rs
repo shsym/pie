@@ -155,6 +155,39 @@ pub(crate) struct ArgmaxScan {
     pub(crate) skipped: Vec<u8>,
     pub(crate) source_value: Vec<u32>,
     pub(crate) requires_single_row: Vec<u8>,
+    /// Per node: the Gumbel-max chain this `argmax` heads, if it heads one.
+    pub(crate) gumbel: Vec<Option<GumbelChain>>,
+}
+
+/// An `argmax` whose operand is `add([div(logits-chain, c)], rng_keyed
+/// gumbel)`: every value on the way read by nothing else, the logits chain
+/// reshapes only, `c` a single element. The scan reads the intrinsic
+/// straight and draws the noise per element (`ptir_fast_gumbel_argmax_intrinsic`),
+/// so the `add`, the `rng_keyed`, the `div` and the chain are elided — the
+/// same way a bare direct argmax elides its chain. Not exported to the
+/// engine's `DirectArgmax` records: those say the reduction may be folded
+/// into the LM head, and this one needs the logits themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GumbelChain {
+    pub(crate) intrinsic: u16,
+    /// The `[2]` U32 state the noise is keyed on.
+    pub(crate) state: u32,
+    /// The scalar the logits are divided by first, if they are.
+    pub(crate) divisor: Option<u32>,
+    /// The noise value (the `rng_keyed` result): its descriptor sizes the
+    /// element base a row block draws at.
+    pub(crate) noise: u32,
+}
+
+/// Whether a Gumbel-max head folds into the one-scan form. On unless an
+/// engine clears it (the CUDA shell does under `PTIR_GUMBEL_DIRECT=0`, the
+/// A/B arm that keeps the four launches the head was traced as). A static
+/// rather than an argument because the emitter is reached through the
+/// compile plane's cache key, which does not carry a per-boot flag.
+pub static GUMBEL_DIRECT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+fn gumbel_direct_enabled() -> bool {
+    GUMBEL_DIRECT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 pub(crate) fn analyze_direct_argmax(
@@ -179,6 +212,22 @@ pub(crate) fn analyze_direct_argmax(
         skipped: vec![0; ops.len()],
         source_value: vec![u32::MAX; ops.len()],
         requires_single_row: vec![0; ops.len()],
+        gumbel: vec![None; ops.len()],
+    };
+    let single_consumer = |value: u32, consumer: u32| -> bool {
+        (value as usize) < producers.len()
+            && producers[value as usize] != u32::MAX
+            && consumers[value as usize].len() == 1
+            && consumers[value as usize][0] == consumer
+    };
+    let one_element = |value: u32| -> bool {
+        stage
+            .normalized
+            .value_types
+            .get(value as usize)
+            .is_some_and(|ty| {
+                ty.dims.iter().all(|dim| matches!(dim, Dimension::Static(1)))
+            })
     };
 
     for &node in &region.nodes {
@@ -190,6 +239,59 @@ pub(crate) fn analyze_direct_argmax(
         let mut value = reduction.args[0];
         let mut expected_consumer = node as u32;
         let mut chain: Vec<u32> = Vec::new();
+        // The Gumbel-max head, if this is one: `add(l, n)` with `n` a Gumbel
+        // draw and `l` the logits, scaled or not. The chain walk below then
+        // starts at the logits with the head's nodes queued to be skipped.
+        let mut gumbel: Option<(u32, Option<u32>, u32)> = None;
+        if gumbel_direct_enabled()
+            && single_consumer(value, node as u32)
+            && ops[producers[value as usize] as usize].tag == tags::ADD
+        {
+            let add = producers[value as usize];
+            let add_op = &ops[add as usize];
+            if add_op.args.len() == 2 {
+                let is_gumbel = |v: u32| {
+                    single_consumer(v, add)
+                        && ops[producers[v as usize] as usize].tag == tags::RNG_KEYED
+                        && ops[producers[v as usize] as usize].kind == 1
+                        && !ops[producers[v as usize] as usize].args.is_empty()
+                };
+                let (logits, noise) = if is_gumbel(add_op.args[1]) {
+                    (add_op.args[0], Some(add_op.args[1]))
+                } else if is_gumbel(add_op.args[0]) {
+                    (add_op.args[1], Some(add_op.args[0]))
+                } else {
+                    (add_op.args[0], None)
+                };
+                if let Some(noise) = noise {
+                    let rng = producers[noise as usize];
+                    let state = ops[rng as usize].args[0];
+                    let mut head = vec![add, rng];
+                    let mut divisor = None;
+                    let mut source = logits;
+                    let mut consumer = add;
+                    if single_consumer(logits, add) {
+                        let scale = producers[logits as usize];
+                        let scale_op = &ops[scale as usize];
+                        if scale_op.tag == tags::DIV
+                            && scale_op.args.len() == 2
+                            && one_element(scale_op.args[1])
+                        {
+                            divisor = Some(scale_op.args[1]);
+                            source = scale_op.args[0];
+                            consumer = scale;
+                            head.push(scale);
+                        }
+                    }
+                    if single_consumer(source, consumer) {
+                        gumbel = Some((state, divisor, noise));
+                        chain.extend(head);
+                        value = source;
+                        expected_consumer = consumer;
+                    }
+                }
+            }
+        }
         while (value as usize) < producers.len()
             && producers[value as usize] != u32::MAX
             && consumers[value as usize].len() == 1
@@ -223,6 +325,24 @@ pub(crate) fn analyze_direct_argmax(
                 }
                 _ => false,
             };
+            if let Some((state, divisor, noise)) = gumbel {
+                // The draw keys each element by its place in the whole
+                // value, so the scan wants the logits and the noise to be
+                // one rectangle: the argmax's operand shape, or the one row
+                // of it a decode lane reads (the bare argmax's rule).
+                if exact_shape || runtime_single_row {
+                    analysis.gumbel[node] = Some(GumbelChain {
+                        intrinsic: op.intr,
+                        state,
+                        divisor,
+                        noise,
+                    });
+                    for &skipped in &chain {
+                        analysis.skipped[skipped as usize] = 1;
+                    }
+                }
+                break;
+            }
             if exact_shape || runtime_single_row {
                 analysis.intrinsic[node] = op.intr;
                 analysis.source_value[node] = bases[producer as usize];
@@ -235,6 +355,39 @@ pub(crate) fn analyze_direct_argmax(
         }
     }
     analysis
+}
+
+/// The row geometry a region is launched over, when it is row-parallel.
+pub(crate) fn row_geometry(stage: &CompiledStage, region: &Region) -> Option<(u64, u32)> {
+    region
+        .row_value
+        .and_then(|witness| stage.normalized.value_types.get(witness as usize))
+        .and_then(|ty| crate::plan::value_rows(&ty.dims))
+        .filter(|&(fixed, extent)| !(fixed == 1 && extent == u32::MAX))
+}
+
+/// Per value, how a row block of `geometry` sees it: 1 = its row of a value
+/// of the geometry, 2 = its element of a per-row vector, 0 = whole.
+pub(crate) fn row_kinds(stage: &CompiledStage, region: &Region, geometry: (u64, u32)) -> Vec<u8> {
+    let (fixed, extent) = geometry;
+    stage
+        .normalized
+        .value_types
+        .iter()
+        .map(|ty| {
+            let alias = region.row_alias;
+            if ty.dims.len() >= 2
+                && crate::plan::value_rows(&ty.dims)
+                    .is_some_and(|shape| crate::plan::same_rows(shape, (fixed, extent), alias))
+            {
+                1
+            } else if crate::plan::is_row_vector(&ty.dims, fixed, extent, alias) {
+                2
+            } else {
+                0
+            }
+        })
+        .collect()
 }
 
 /// `emit_fused_region_cuda`.
@@ -274,32 +427,11 @@ pub fn emit_fused_region(
     // vector (kind 2: what a row reduction writes one element of) as its
     // element, and everything else whole — through a block-local descriptor
     // table and a per-value byte shift, so the helpers below run unchanged.
-    let row_geometry = region
-        .row_value
-        .and_then(|witness| stage.normalized.value_types.get(witness as usize))
-        .and_then(|ty| crate::plan::value_rows(&ty.dims))
-        .filter(|&(fixed, extent)| !(fixed == 1 && extent == u32::MAX));
+    let row_geometry = row_geometry(stage, region);
     let row_parallel = row_geometry.is_some();
-    if let Some((fixed, extent)) = row_geometry {
-        let kinds: Vec<String> = stage
-            .normalized
-            .value_types
-            .iter()
-            .map(|ty| {
-                let alias = region.row_alias;
-                if ty.dims.len() >= 2
-                    && crate::plan::value_rows(&ty.dims)
-                        .is_some_and(|shape| crate::plan::same_rows(shape, (fixed, extent), alias))
-                {
-                    "1u"
-                } else if crate::plan::is_row_vector(&ty.dims, fixed, extent, alias) {
-                    "2u"
-                } else {
-                    "0u"
-                }
-                .to_string()
-            })
-            .collect();
+    let row_kinds: Vec<u8> = row_geometry.map_or_else(Vec::new, |geometry| row_kinds(stage, region, geometry));
+    if row_geometry.is_some() {
+        let kinds: Vec<String> = row_kinds.iter().map(|k| format!("{k}u")).collect();
         let count = kinds.len().max(1);
         let _ = writeln!(source, "  const m1_u8 ptir_rowkind[{count}u] = {{{}}};", kinds.join(", "));
         let _ = writeln!(source, "  __shared__ M1ValueDesc ptir_rowdesc[{count}u];");
@@ -345,12 +477,31 @@ pub fn emit_fused_region(
 ");
     }
 
-    for &node in &region.nodes {
-        let node = node.index();
+    // The barrier-and-status block every op (and every stream) ends with.
+    const TAIL: &str = "    __syncthreads();\n    if (status.state != 1u) {\n      if (threadIdx.x == 0u) *commit = 0u;\n      return;\n    }\n";
+    let streams = row_parallel.then(|| {
+        super::stream::Streams::new(stage, region, &ops, &bases, &row_kinds, &direct.intrinsic, &skipped)
+    });
+
+    let mut at = 0usize;
+    while at < region.nodes.len() {
+        let node = region.nodes[at].index();
+        at += 1;
         let op = &ops[node];
         let base = bases[node];
         if skipped[node] != 0 && op.tag != tags::RESHAPE {
             continue;
+        }
+        // A stream: this op and the elementwise run after it, one pass.
+        if let Some(streams) = &streams {
+            let mut pointer = |value: u32| {
+                let value = aliases.resolve(value);
+                format!("scratch + offsets[{value}] + ptir_rowshift[{value}]")
+            };
+            if let Some(covered) = super::stream::emit_stream(&mut source, streams, at - 1, &mut pointer, TAIL) {
+                at += covered - 1;
+                continue;
+            }
         }
         // A reshape's result element count must be no larger than its
         // source's (both runtimes copy the result's element count out of
@@ -368,13 +519,24 @@ pub fn emit_fused_region(
         }
 
         // Reshape aliases are resolved before indexing the offsets table.
-        let mut slots = Slots::of(op, base, |value| {
+        let resolve = |value: u32| {
             let value = aliases.resolve(value);
             if row_parallel {
                 format!("scratch + offsets[{value}] + ptir_rowshift[{value}]")
             } else {
                 format!("scratch + offsets[{value}]")
             }
+        };
+        let mut slots = Slots::of(op, base, resolve);
+        // A Gumbel-max head reads its state, its divisor and the noise's
+        // descriptor by value, past the op's own operand slots.
+        let gumbel = direct.gumbel[node].map(|chain| GumbelSlots {
+            intrinsic: chain.intrinsic,
+            state: resolve(chain.state),
+            state_desc: aliases.resolve(chain.state),
+            divisor: chain.divisor.map(resolve),
+            divisor_desc: chain.divisor.map(|d| aliases.resolve(d)),
+            noise_desc: aliases.resolve(chain.noise),
         });
 
         source.push_str("  {\n");
@@ -417,13 +579,9 @@ pub fn emit_fused_region(
                 "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
         }
 
-        emit_body(&mut source, stage, op, node, &direct.intrinsic, &slots);
+        emit_body(&mut source, stage, op, node, &direct.intrinsic, &slots, gumbel.as_ref());
 
-        source.push_str("    __syncthreads();\n");
-        source.push_str("    if (status.state != 1u) {\n");
-        source.push_str("      if (threadIdx.x == 0u) *commit = 0u;\n");
-        source.push_str("      return;\n");
-        source.push_str("    }\n");
+        source.push_str(TAIL);
         if op.tag == tags::CHAN_PUT {
             source.push_str("    if (threadIdx.x == 0u) pending_flags[channel_index] = 1u;\n");
             source.push_str("    __syncthreads();\n");
@@ -435,6 +593,17 @@ pub fn emit_fused_region(
 }
 
 /// The per-op body: one runtime helper call, or the single-thread fallback.
+/// What a Gumbel-max head's scan reads past its own operand slots, as the
+/// expressions the emitted body spells them with.
+struct GumbelSlots {
+    intrinsic: u16,
+    state: String,
+    state_desc: u32,
+    divisor: Option<String>,
+    divisor_desc: Option<u32>,
+    noise_desc: u32,
+}
+
 fn emit_body(
     source: &mut String,
     stage: &CompiledStage,
@@ -442,6 +611,7 @@ fn emit_body(
     node: usize,
     direct_intrinsic: &[u16],
     slots: &Slots,
+    gumbel: Option<&GumbelSlots>,
 ) {
     let Slots { a0, a1, a2, o0, o1 } = slots;
     let tag = op.tag;
@@ -512,7 +682,47 @@ fn emit_body(
             fallback(source);
         }
     } else if tag == tags::REDUCE_ARGMAX {
-        if direct_intrinsic[node] != u16::MAX {
+        if let Some(chain) = gumbel {
+            let _ = writeln!(
+                source,
+                "    const m1_u32 gumbel_intrinsic_index = dispatch_lane * {PTIR_INTRINSIC_SLOTS}u + {}u;",
+                chain.intrinsic
+            );
+            source.push_str("    ptir_fast_gumbel_argmax_intrinsic(
+");
+            source.push_str(
+                "        reinterpret_cast<const m1_u8*>(intrinsic_bases[gumbel_intrinsic_index]),
+",
+            );
+            let _ = writeln!(source, "        {o0},");
+            source.push_str("        descriptors[p.a0],
+");
+            source.push_str("        intrinsic_modes[gumbel_intrinsic_index],
+");
+            source.push_str("        intrinsic_strides[gumbel_intrinsic_index],
+");
+            source.push_str("        intrinsic_offsets[gumbel_intrinsic_index] + lane_row,
+");
+            let _ = writeln!(source, "        {},", chain.state);
+            let _ = writeln!(source, "        descriptors[{}u],", chain.state_desc);
+            match (&chain.divisor, chain.divisor_desc) {
+                (Some(divisor), Some(desc)) => {
+                    let _ = writeln!(source, "        {divisor},");
+                    let _ = writeln!(source, "        descriptors[{desc}u],");
+                }
+                _ => {
+                    source.push_str("        nullptr,
+");
+                    source.push_str("        descriptors[p.a0],
+");
+                }
+            }
+            let _ = writeln!(
+                source,
+                "        lane_row * descriptors[{}u].len);",
+                chain.noise_desc
+            );
+        } else if direct_intrinsic[node] != u16::MAX {
             let _ = writeln!(
                 source,
                 "    const m1_u32 direct_intrinsic_index = dispatch_lane * {PTIR_INTRINSIC_SLOTS}u + {}u;",

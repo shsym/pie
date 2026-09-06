@@ -420,6 +420,44 @@ impl Frame {
     /// [`Fault::Deviceless`] off Apple, [`Fault::Device`] when the command
     /// buffer would not open a blit pass.
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+    /// Zero `len` bytes of `slab` from `at` on the device, in this command
+    /// buffer's order: what a host `memset` through the shared mapping
+    /// would do, without the host doing it or the device waiting on it. The
+    /// compute pass is closed for the blit; the caller reopens one with
+    /// [`Frame::next_pass`].
+    #[cfg_attr(not(target_vendor = "apple"), allow(unused_variables))]
+    pub(crate) fn fill(&mut self, slab: &super::alloc::Slab, at: u64, len: u64) -> Result<()> {
+        #[cfg(target_vendor = "apple")]
+        {
+            if len == 0 {
+                return Ok(());
+            }
+            if self.blit.is_none() {
+                if let Some(encoder) = self.encoder.take() {
+                    encoder.endEncoding();
+                }
+                self.blit = Some(self.buffer.blitCommandEncoder().ok_or(Fault::Device {
+                    call: "blitCommandEncoder",
+                    why: "the command buffer would not open a blit pass".to_string(),
+                })?);
+            }
+            let blit = self.blit.as_deref().expect("just opened");
+            blit.fillBuffer_range_value(
+                slab,
+                objc2_foundation::NSRange {
+                    location: at as usize,
+                    length: len as usize,
+                },
+                0,
+            );
+            Ok(())
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            Err(Fault::Deviceless)
+        }
+    }
+
     pub(crate) fn copy(
         &mut self,
         source: &super::alloc::Slab,
@@ -634,6 +672,24 @@ impl Pending {
     /// # Errors
     ///
     /// [`Fault::Device`] carrying the command buffer's own sentence.
+    /// The device's own span for this buffer, `(start, end)` in microseconds
+    /// of the GPU clock, once it has completed; zeros before that or off
+    /// Apple. What `PIE_FIRE_TRACE` prints beside the host's view.
+    #[must_use]
+    pub fn gpu_span_us(&self) -> (u64, u64) {
+        #[cfg(target_vendor = "apple")]
+        {
+            // SAFETY: documented safe to read after completion; both are plain
+            // `CFTimeInterval` getters.
+            let (start, end) = (self.buffer.GPUStartTime(), self.buffer.GPUEndTime());
+            ((start * 1e6) as u64, (end * 1e6) as u64)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            (0, 0)
+        }
+    }
+
     pub fn wait(&self) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
