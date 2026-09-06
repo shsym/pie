@@ -65,6 +65,53 @@ impl Buffer {
         }
     }
 
+    /// [`Buffer::zeroed`] with the fill ordered on `stream` instead of
+    /// against the whole device.
+    ///
+    /// `cudaMemset` is synchronous: it waits for everything already queued,
+    /// which on a host running frames ahead of the device is tens of
+    /// milliseconds — and a buffer a boundary is about to write and then
+    /// read on one stream needs no more order than that stream's.
+    ///
+    /// # Errors
+    ///
+    /// [`Fault::Device`] for the allocation or the fill.
+    pub fn zeroed_on(stream: *mut core::ffi::c_void, bytes: usize) -> Result<Buffer> {
+        if bytes == 0 {
+            return Ok(Buffer { ptr: 0, bytes: 0 });
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::runtime::sys as rt;
+
+            let mut base: *mut core::ffi::c_void = core::ptr::null_mut();
+            // SAFETY: `base` is a live local; the allocation is this buffer's, freed exactly once in `Drop`.
+            let allocated = unsafe {
+                crate::device::ctx::check("cudaMalloc", rt::cudaMalloc(&raw mut base, bytes))
+            };
+            if let Err(fault) = allocated {
+                return Err(out_of_room(fault, bytes));
+            }
+            // SAFETY: `base` is the allocation just made, of `bytes` bytes, and
+            // `stream` is the one every later read of it is ordered on.
+            unsafe {
+                crate::device::ctx::check(
+                    "cudaMemsetAsync",
+                    rt::cudaMemsetAsync(base, 0, bytes, stream.cast()),
+                )?;
+            }
+            Ok(Buffer {
+                ptr: base as u64,
+                bytes,
+            })
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = stream;
+            Err(Fault::Runtimeless)
+        }
+    }
+
     /// The base address.
     #[must_use]
     pub fn ptr(&self) -> u64 {
@@ -740,6 +787,40 @@ pub fn write_raw(at: u64, bytes: &[u8]) -> Result<()> {
 }
 
 /// One device-to-device copy, on `stream`. A free function since callers hold only resolved device addresses, not an owned [`Buffer`]; always async since synchronous would order against every stream in the process. # Errors: [`Fault::Device`] for the copy, [`Fault::Runtimeless`] with no runtime selected.
+/// Copy host `bytes` to device address `dst` on `stream` — [`Buffer::stage`] for a span the caller addresses itself. Async on the stream; a pageable source is staged before the call returns.
+///
+/// # Errors
+///
+/// [`Fault::Device`] for a refused copy.
+pub fn stage_raw(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    #[cfg(feature = "cuda")]
+    {
+        use cudarc::runtime::sys as rt;
+
+        // SAFETY: `bytes` is a live host slice for the call; the destination span is the caller's own scratch.
+        unsafe {
+            crate::device::ctx::check(
+                "cudaMemcpyAsync",
+                rt::cudaMemcpyAsync(
+                    dst as *mut core::ffi::c_void,
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    stream.cast(),
+                ),
+            )
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (stream, dst);
+        Err(Fault::Runtimeless)
+    }
+}
+
 pub fn copy_d2d(
     stream: *mut core::ffi::c_void,
     dst: u64,

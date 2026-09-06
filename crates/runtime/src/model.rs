@@ -582,6 +582,36 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "flux_2",
     },
+    // HunyuanImage 3 (M6). Its trunk IS its text model, so `vocab` is the
+    // real logits width the AR phases sample from and `layers` the trunk's
+    // depth. The `-tp4` rows serve the same plan across four ranks; the
+    // one-rank row is what `pie model import` converts through.
+    Row {
+        id: "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16",
+        layers: 32,
+        vocab: 133_120,
+        arch: "hunyuan_image_3_moe",
+    },
+    Row {
+        id: "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4",
+        layers: 32,
+        vocab: 133_120,
+        arch: "hunyuan_image_3_moe",
+    },
+    Row {
+        id: "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4",
+        layers: 32,
+        vocab: 133_120,
+        arch: "hunyuan_image_3_moe",
+    },
+    // The miniature: two layers, the real vocabulary (the checkpoint's
+    // special ids live above 128 000, so `nn.Embedding` cannot shrink it).
+    Row {
+        id: "hunyuanimage3-mini-bf16-kv-bf16",
+        layers: 2,
+        vocab: 133_120,
+        arch: "hunyuan_image_3_moe",
+    },
     // MiniMax H3 (M5), the `FL2VA/` partition. `layers` is the encoder's
     // depth the plan runs (its `hidden` tap is addressed by layer, at 49);
     // `vocab` is Qwen3-VL-32B's embedding width, which the `text` reading
@@ -612,6 +642,48 @@ pub const ROWS: &[Row] = &[
         vocab: 0,
         arch: "minimax_h3",
     },
+    // Wan 2.2 TI2V-5B (M3). `layers` is the umT5-xxl encoder's depth the
+    // `text` reading runs; `vocab` is that encoder's embedding width, which
+    // the reading embeds by — no reading of this family has logits.
+    Row {
+        id: "wan22-ti2v-5b-bf16-kv-bf16",
+        layers: 24,
+        vocab: 256_384,
+        arch: "wan_2",
+    },
+    // The miniatures: the transformer alone, two blocks, no encoder and so
+    // no vocabulary.
+    Row {
+        id: "wan22-mini-d128-bf16-kv-bf16",
+        layers: 2,
+        vocab: 0,
+        arch: "wan_2",
+    },
+    Row {
+        id: "wan22-mini-nano-bf16-kv-bf16",
+        layers: 2,
+        vocab: 0,
+        arch: "wan_2",
+    },
+    // LTX-2.5 (M4). `layers` is the DiT's dual-stream block count; `vocab`
+    // is zero because no reading of this family has logits — the denoise
+    // reading answers `seam::VELOCITY` and the two connector readings
+    // answer `seam::HIDDEN`, both sized off the plan. The Gemma-4 trunk
+    // that feeds the connectors is not a reading of this text yet
+    // (`models::ltx_2::model`), so nothing here embeds by a vocabulary.
+    Row {
+        id: "ltx25-bf16-kv-bf16",
+        layers: 48,
+        vocab: 0,
+        arch: "ltx_2",
+    },
+    // The miniature: two blocks a side, one connector layer.
+    Row {
+        id: "ltx25-mini-bf16-kv-bf16",
+        layers: 2,
+        vocab: 0,
+        arch: "ltx_2",
+    },
     // The synthetic generative row (M0). `layers` is its three blocks;
     // `vocab` is zero because a denoise pass has no logits and nothing sizes
     // a sampler from it — its readout is `seam::VELOCITY`, whose width comes
@@ -621,6 +693,64 @@ pub const ROWS: &[Row] = &[
         layers: 3,
         vocab: 0,
         arch: "mini_dit",
+    },
+    // The same text two and four ranks wide (design D14's bring-up rows):
+    // two heads per rank, then one. `layers`/`vocab`/`arch` do not shard, so
+    // they are the one-rank row's.
+    Row {
+        id: "mini-dit-bf16-kv-bf16-tp2",
+        layers: 3,
+        vocab: 0,
+        arch: "mini_dit",
+    },
+    Row {
+        id: "mini-dit-bf16-kv-bf16-tp4",
+        layers: 3,
+        vocab: 0,
+        arch: "mini_dit",
+    },
+    // Muse Glimmer: the 30B text (`models::muse_glimmer`), 52 layers, its
+    // logits the head's 202 048 rows. No vision front-end reads the arch.
+    Row {
+        id: "muse-glimmer-30b-bf16-kv-bf16",
+        layers: 52,
+        vocab: 202_048,
+        arch: "muse_glimmer",
+    },
+    Row {
+        id: "muse-glimmer-30b-bf16-kv-bf16-tp2",
+        layers: 52,
+        vocab: 202_048,
+        arch: "muse_glimmer",
+    },
+    Row {
+        id: "muse-glimmer-30b-u4g64-kv-bf16",
+        layers: 52,
+        vocab: 202_048,
+        arch: "muse_glimmer",
+    },
+    // The parity miniature: layers 0-3 and 48-51 of the 30B.
+    Row {
+        id: "muse-glimmer-30b-mini-l8-bf16-kv-bf16",
+        layers: 8,
+        vocab: 202_048,
+        arch: "muse_glimmer",
+    },
+    // Inkling: the text (`models::inkling`), 66 layers; the logits are the
+    // UNPADDED head (200 058 of the 201 024 stored rows), which is what the
+    // sampler sees.
+    Row {
+        id: "inkling-bf16-kv-bf16",
+        layers: 66,
+        vocab: 200_058,
+        arch: "inkling",
+    },
+    // The parity miniature: layers 0-6, eight routed experts.
+    Row {
+        id: "inkling-mini-l7-e8-bf16-kv-bf16",
+        layers: 7,
+        vocab: 200_058,
+        arch: "inkling",
     },
 ];
 
@@ -940,7 +1070,14 @@ pub fn pixels_facts(readings: &[models::ReadingFact]) -> (bool, u32) {
     let Some(first) = widths.next() else {
         return (false, 0);
     };
-    (true, if widths.all(|width| width == first) { first } else { 0 })
+    (
+        true,
+        if widths.all(|width| width == first) {
+            first
+        } else {
+            0
+        },
+    )
 }
 
 /// Returns the single registered model. Panics if called before bootstrap

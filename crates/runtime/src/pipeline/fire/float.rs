@@ -1,7 +1,7 @@
 //! The float-lane fire path (imagegen design D1/D3): a pass whose reading
-//! declares no KV space and embeds no tokens — a DiT's denoise step, a VAE
-//! tile — fires ONE lane whose rows are its latents port's and whose only
-//! state is its channels. Nothing here is a sequence: no geometry ports,
+//! declares no KV space — a DiT's denoise step, a VAE tile, a CACHELESS
+//! ENCODER — fires ONE lane whose rows are its latents port's (or its ids')
+//! and whose only state is its channels. Nothing here is a sequence: no geometry ports,
 //! no KV grant, no page projection, no recurrent state. What remains of
 //! the ordinary path is kept exactly: the pipeline FIFO and its failure
 //! poisoning, channel wiring, the seat book (a lane is still one of the
@@ -10,7 +10,8 @@
 //! host shadow's advance.
 //!
 //! The lane the engine sees: `tokens` is `rows` zeros (a `Lane`'s row
-//! count is its token count, and the reading's class never embeds them),
+//! count is its token count, and most readings on this path embed none) or,
+//! for a cacheless encoder, the ids themselves,
 //! `kv` is the default (no pages: the shell owns nothing for it), `mask`
 //! is `None`, `readout` is every row (the epilogue reads a velocity or a
 //! hidden row per latent row), and `reading`/`stream`/`group`/`ports` are
@@ -58,7 +59,18 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         return Ok(Err(error));
     }
 
-    let (rows, clips, lane_facts, ws_rep, cells, accesses, instance_id, scheduler, fwd_rep) = {
+    let (
+        rows,
+        clips,
+        embed_ids,
+        lane_facts,
+        ws_rep,
+        cells,
+        accesses,
+        instance_id,
+        scheduler,
+        fwd_rep,
+    ) = {
         let pass = ctx.resources().get(&fwd)?;
         if let Some(error) = &pass.failed {
             return Ok(Err(format!(
@@ -78,6 +90,25 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         (
             float.rows,
             float.clips.clone(),
+            // A CACHELESS ENCODER's ids: the `embed_tokens` port's value,
+            // resolved the way every other host-known descriptor is (the
+            // container's const payload, or the seed of the channel it
+            // binds). `None` for every other float lane, whose token
+            // rectangle is a formality.
+            float.embed.then(|| {
+                let container = &pass.instance.program.bound.container;
+                let values = pass.instance.channel_values();
+                container
+                    .ports
+                    .iter()
+                    .find(|binding| binding.port == eta_ir::registry::Port::EmbedTokens)
+                    .and_then(|binding| match &binding.source {
+                        eta_ir::container::PortSource::Const { data, .. } => Some(data.clone()),
+                        eta_ir::container::PortSource::Channel(chan) => {
+                            values.get(*chan as usize).cloned().flatten()
+                        }
+                    })
+            }),
             pass.lane.clone(),
             pass.kv_ws,
             pass.cells.clone(),
@@ -113,12 +144,37 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         }
     };
 
+    // A CACHELESS ENCODER's rows ARE its ids, so its token rectangle is the
+    // ids themselves; every other float lane seats a rectangle of zeros
+    // whose only job is to give the lane `rows` rows.
+    let tokens: Vec<u32> = match embed_ids {
+        Some(Some(bytes)) => bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect(),
+        Some(None) => {
+            return Ok(Err(
+                "pipeline: this lane embeds tokens and its `embed_tokens` port binds a \
+                 channel with no host-known value; a cacheless encoder's ids are a seeded \
+                 channel's"
+                    .to_string(),
+            ));
+        }
+        None => vec![0; rows as usize],
+    };
+    if tokens.len() != rows as usize {
+        return Ok(Err(format!(
+            "pipeline: this lane was bound for {rows} row(s) and its token channel holds {}",
+            tokens.len()
+        )));
+    }
+
     // One lane, `rows` rows, every row read out. The word is stamped once
     // the lane facts are on it.
     let mut req = crate::engine::FireRequest {
         boundary_program: true,
         lanes: vec![::engine::Lane {
-            tokens: vec![0; rows as usize],
+            tokens,
             readout: ::engine::Readout::Rows((0..rows).collect()),
             // A float lane binds no kv space: the shell seats no tokens
             // for it and carries no count between fires.
@@ -140,7 +196,8 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         ..crate::engine::FireRequest::default()
     };
     lane_facts.stamp(&mut req);
-    req.cohort = crate::pipeline::instance::cohort_of(ctx.resources(), lane_facts.group);
+    req.cohort =
+        crate::pipeline::instance::cohort_of(ctx.resources(), lane_facts.group, lane_facts.peer);
     {
         let pass = ctx.resources().get(&fwd)?;
         let program = &pass.instance.program;

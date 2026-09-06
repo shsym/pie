@@ -300,6 +300,34 @@ impl Run<'_> {
                 *out_scale,
                 &mut self.tensor(*y_scaled),
             ),
+            Elementwise::EmbedScaleAddSelect {
+                ids,
+                table,
+                vocab,
+                e,
+                embed_scale,
+                e_scaled,
+                stacked,
+                layer,
+                width,
+                y_out,
+                out_scale,
+                y_scaled,
+            } => kernels_cuda::layout::embed_scale_add_select(
+                self.ctx(),
+                self.tensor(*ids),
+                self.tensor(*table),
+                *vocab,
+                &mut self.tensor(*e),
+                *embed_scale,
+                &mut self.tensor(*e_scaled),
+                self.tensor(*stacked),
+                *layer,
+                *width,
+                &mut self.tensor(*y_out),
+                *out_scale,
+                &mut self.tensor(*y_scaled),
+            ),
             Elementwise::MulScalar { s, x, x_out: _ } => {
                 elemwise::norm::mul_scalar(self.ctx(), *s, &mut self.tensor(*x))
             }
@@ -413,6 +441,27 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
+            Elementwise::RmsnormRopePartialQ {
+                x,
+                weight,
+                head_dim,
+                eps,
+                positions,
+                rotary_dim,
+                theta,
+                y,
+                q_out: _,
+            } => elemwise::rope::rmsnorm_rope_partial_q(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*weight),
+                *head_dim,
+                *eps,
+                self.tensor(*positions),
+                *rotary_dim,
+                *theta,
+                &mut self.tensor(*y),
+            ),
             Elementwise::RopePartialLast {
                 q,
                 positions,
@@ -472,6 +521,19 @@ impl Run<'_> {
                 let fan = self.plane_fan(self.tensor(*x).rows);
                 elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), fan, &mut self.tensor(*x))
             }
+            Elementwise::GateSigmoidMulHeads {
+                x,
+                gate,
+                head_dim,
+                scale,
+                x_out: _,
+            } => elemwise::gate::sigmoid_mul_heads(
+                self.ctx(),
+                self.tensor(*gate),
+                *head_dim,
+                *scale,
+                &mut self.tensor(*x),
+            ),
             // hc
             Elementwise::RmsnormGroupedPlusOne {
                 x,
@@ -725,6 +787,7 @@ impl Run<'_> {
                     RopeForm::Interleaved => elemwise::rope_axes::RopeForm::Interleaved,
                     RopeForm::Neox => elemwise::rope_axes::RopeForm::Neox,
                     RopeForm::Split => elemwise::rope_axes::RopeForm::Split,
+                    RopeForm::SplitLadder => elemwise::rope_axes::RopeForm::SplitLadder,
                 },
                 *rotary_dim,
                 *head_dim,

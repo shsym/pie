@@ -7,10 +7,14 @@ pub mod gemma_4_diffusion;
 pub mod glm_5;
 pub mod glm_5_next;
 pub mod gpt_oss;
+pub mod hunyuan_image_3;
+pub mod inkling;
 pub mod kimi_k3;
+pub mod ltx_2;
 pub mod media;
 pub mod mini_dit;
 pub mod minimax_h3;
+pub mod muse_glimmer;
 pub mod published;
 pub mod qwen_3;
 pub mod qwen_4;
@@ -148,14 +152,11 @@ impl ReadingFact {
     /// the `(PortKind, port)` pair `RuntimeInput` reads it by.
     #[must_use]
     pub fn port(&self, name: &str) -> Option<(u8, &PortFact)> {
-        let port = self.ports.iter().find(|port| port.name == name)?;
-        let index = self
-            .ports
-            .iter()
-            .take_while(|p| p.name != name)
-            .filter(|p| p.kind == port.kind)
-            .count();
-        Some((u8::try_from(index).unwrap_or(u8::MAX), port))
+        // Through `ports_indexed`, so a port that STATES its index
+        // (`PortFact::at`) resolves to the index the trace reads it at and
+        // not to its position — the two differ exactly when two readings
+        // read one kind at different widths.
+        self.ports_indexed().find(|(_, port)| port.name == name)
     }
 
     /// Every port with its kind-relative index, in declaration order.
@@ -207,6 +208,20 @@ pub struct PortFact {
     /// `vae.decode`'s 16-wide latent keeps index 0. Stating an index also
     /// moves the positional counter past it.
     pub at: Option<u8>,
+    /// **THE ROW COUNT THIS PORT'S CHANNEL MUST CARRY, when the family
+    /// fixes it.** `None` — nearly always — means the lane's own rows: a
+    /// latents port is as tall as the picture's grid, a context port as
+    /// tall as the prompt.
+    ///
+    /// A few families PAD instead. Wan 2.2 zero-pads its umT5 rows to 512
+    /// and the transformer attends every one of the 512 keys, so a context
+    /// lane of the prompt's real length is a DIFFERENT model: the pad rows
+    /// go through `text_embedder` into a nonzero constant that carries real
+    /// attention mass. The IR cannot grow a lane, so the pad is the
+    /// GUEST's — and this is the fact that lets a family-blind guest build
+    /// it without spelling 512 (design D13, "text padding is a model
+    /// contract").
+    pub rows: Option<u32>,
 }
 
 /// Which `RuntimeInput` kind a port is (mirrors `engine::fire::PortKind`).
@@ -414,7 +429,10 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         glm_5::skus(),
         glm_5_next::skus(),
         gpt_oss::skus(),
+        hunyuan_image_3::skus(),
+        inkling::skus(),
         kimi_k3::skus(),
+        muse_glimmer::skus(),
         qwen_3::skus(),
         qwen_4::skus(),
         // A diffusers pipeline reads under `dit.`/`te.` prefixes no text row
@@ -422,6 +440,7 @@ static SKUS: LazyLock<Vec<Sku>> = LazyLock::new(|| {
         z_image::skus(),
         wan_2::skus(),
         minimax_h3::skus(),
+        ltx_2::skus(),
         // Last: the synthetic parity row identifies nothing an operator
         // ships, and identification is catalog order.
         mini_dit::skus(),

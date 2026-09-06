@@ -12,9 +12,9 @@ use engine::fire::Boundary;
 use crate::arena::Arena;
 use crate::device::{Buffer, Context, graph::Event};
 use crate::error::{Fault, Result};
-use crate::exports::{Exports, MTP_SEAM, SCORES_SEAM};
+use crate::exports::{DRAFTS_SEAM, Exports, MTP_SEAM, SCORES_SEAM};
 use crate::inputs::{Handles, Inputs, PatchHandles, SlotGuard};
-use crate::program::launch::INTRINSIC_STORAGE_RAW_BF16;
+use crate::program::launch::{INTRINSIC_STORAGE_RAW_BF16, INTRINSIC_STORAGE_RAW_I32};
 use crate::program::{Fired, Plane as ProgramPlane};
 use crate::record::{self, Bodies as GraphCache};
 use crate::run::{
@@ -40,6 +40,71 @@ pub(super) struct GuestBatch {
     seq: u64,
 }
 
+/// Which fire lane a `peer` names: the lane of attention group `want` that
+/// carries the SAME STREAM as the asking lane.
+///
+/// Guidance names a group rather than a lane because its two branches must
+/// not attend each other — they are two independent denoisings of one
+/// canvas, one holding the prompt and one the negative one, and one
+/// attention group would make each see the other's rows. So they are two
+/// groups of one fire, and the stream picks the branch's own rectangle out
+/// of the group (a group also seats its context lane, which predicts no
+/// velocity).
+///
+/// Refused, never guessed, in three cases a guest can write: a peer group
+/// this fire seats no same-stream lane of, one it seats several of, and the
+/// asking lane's own group. The last matters most — it is guidance quietly
+/// becoming `u + s(u − u)`, a picture that looks fine and is unguided.
+fn seating(lanes: &[super::Seated<'_>]) -> String {
+    let mut out = String::new();
+    for (at, lane) in lanes.iter().enumerate() {
+        if at > 0 {
+            out.push_str(", ");
+        }
+        match lane.group {
+            Some(group) => out.push_str(&format!("lane {at} group {group} stream {}", lane.stream)),
+            None => out.push_str(&format!("lane {at} ungrouped stream {}", lane.stream)),
+        }
+    }
+    out
+}
+
+fn peer_lane(lanes: &[super::Seated<'_>], at: usize, want: u32) -> Result<usize> {
+    if lanes[at].group == Some(want) {
+        return Err(Fault::program(
+            "serve::readback",
+            format!(
+                "lane {at} names attention group {want} as its peer and is itself a \
+                 lane of {want}; guidance combines two independent denoisings"
+            ),
+        ));
+    }
+    let stream = lanes[at].stream;
+    let mut found: Vec<usize> = (0..lanes.len())
+        .filter(|other| lanes[*other].group == Some(want) && lanes[*other].stream == stream)
+        .collect();
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(Fault::program(
+            "serve::readback",
+            format!(
+                "lane {at} names attention group {want} as its peer, and this fire \
+                 seats no lane of {want} on stream {stream} for it to read; this \
+                 fire seats {}",
+                seating(lanes)
+            ),
+        )),
+        many => Err(Fault::program(
+            "serve::readback",
+            format!(
+                "lane {at} names attention group {want} as its peer, and this fire \
+                 seats {many} lanes of {want} on stream {stream}; which one is the \
+                 peer is not the shell's to guess"
+            ),
+        )),
+    }
+}
+
 impl Shell {
     /// `enqueue`'s body — see the wrapper for what it does not do.
     ///
@@ -54,6 +119,20 @@ impl Shell {
         // The step this fire settles at, stamped onto the cache before anything launches.
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
+        // The read path's scratch, grown to this fire's extended rows before
+        // the frame is cut — after a drain, since a step still on the stream
+        // may be reading the old one.
+        if p.rs.rows_ext > 0 {
+            let need = crate::run::RsScratch::need(
+                p.rs.rows_ext,
+                self.buffers.as_ref().map_or(0, Buffers::ext_row_bytes),
+            );
+            if self.rs_scratch.as_ref().is_none_or(|have| (have.bytes() as u64) < need) {
+                self.drain()?;
+                self.rs_scratch = Some(Buffer::zeroed(usize::try_from(need).unwrap_or(usize::MAX))?);
+            }
+        }
+        let rs_scratch = self.rs_scratch.as_ref().map(|have| (have.ptr(), have.bytes() as u64));
         let mut fire = FireCtx {
             device: &self.device,
             trace: &self.trace,
@@ -73,6 +152,7 @@ impl Shell {
             voxels: self.voxels.as_mut(),
             held: &mut self.held,
             buffers: self.buffers.as_ref(),
+            rs_scratch,
             predicate: &mut self.predicate,
             readout_rows: &mut self.readout_rows,
             budget: &self.budget,
@@ -119,6 +199,8 @@ struct FireCtx<'a> {
     voxels: Option<&'a mut crate::voxels::Store>,
     held: &'a mut [u32],
     buffers: Option<&'a Buffers>,
+    /// The read path's scratch span `(ptr, bytes)`, grown before this frame was cut.
+    rs_scratch: Option<(u64, u64)>,
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
     budget: &'a Budget,
@@ -235,7 +317,9 @@ impl FireCtx<'_> {
 
         // The first stream touch: commit the slot `prepare` wrote, in front of
         // the launches that read it.
-        let handles = self.inputs.commit(self.device.stream(), slot, &p.lengths)?;
+        let handles =
+            self.inputs
+                .commit(self.device.stream(), slot, &p.lengths, &p.token_injects)?;
         p.windows.bind(handles.windows);
         p.windows.bind_live(handles.live_rows);
         p.windows.bind_qo_absolute(handles.qo_absolute);
@@ -434,6 +518,7 @@ impl FireCtx<'_> {
                 images: u64::from(p.composition.images()),
                 voxels: u64::from(p.composition.voxel_rows()),
                 clips: u64::from(p.composition.clips()),
+                readouts: p.readout_rows.len() as u64,
             },
         );
         // The ports merged straight into a stream land in their merged
@@ -577,6 +662,7 @@ impl FireCtx<'_> {
             tokens: handles.tokens,
             positions: handles.positions,
             adapter_routes: handles.adapter_routes,
+            readout_rows: handles.readout_rows,
             patches: staged.patches.as_ref().map(|seats| seats.patches),
             patch_segments: staged.patches.as_ref().map(|seats| seats.segments),
             patch_routes: staged.patches.as_ref().map(|seats| seats.routes),
@@ -701,12 +787,17 @@ impl FireCtx<'_> {
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }
+        let rs_scratch = (p.rs.rows_ext > 0)
+            .then(|| self.rs_scratch.map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes)))
+            .flatten();
         if p.rs.buffered
             && let Some(pool) = self.buffers
         {
             run = run.buffered(RsSeat {
                 buffers: pool,
                 lanes: &p.rs.moves,
+                replays: &p.rs.replays,
+                scratch: rs_scratch.as_ref(),
             });
         }
         super::btrace::mark("run_new");
@@ -865,19 +956,28 @@ impl FireCtx<'_> {
                 ));
             }
         }
-        // Which rows of the arena's readout rectangles each submitted lane
-        // reads and owns, and the class its word landed in.
+        // **THE READOUT RECTANGLE IS THE GATHERED ONE, NOT THE FIRE'S ROWS.**
+        // The head runs over `layout.gather_rows`' output, so a lane's rows
+        // here are its run of THAT rectangle — the readouts `prepare` laid
+        // out — and every reader below (the host readback, the guest's
+        // `Logits` intrinsic) indexes it the same way. For a decode lane the
+        // two coincide; for a prefill lane the run is one row where the fire
+        // carries hundreds. The class its word landed in still comes off the
+        // composition.
         let lane_count = p.lanes.len();
         let mut last_row = vec![0u32; lane_count];
         let mut first_row = vec![0u32; lane_count];
         let mut lane_rows = vec![0u32; lane_count];
         let mut lane_class = vec![0usize; lane_count];
         for row in p.composition.lanes() {
-            let at = row.source as usize;
-            last_row[at] = row.row_offset + row.rows - 1;
-            first_row[at] = row.row_offset;
-            lane_rows[at] = row.rows;
-            lane_class[at] = row.class as usize;
+            lane_class[row.source as usize] = row.class as usize;
+        }
+        for lane in 0..lane_count {
+            let first = p.readout_first.get(lane).copied().unwrap_or(0);
+            let count = p.readout_count.get(lane).copied().unwrap_or(0);
+            first_row[lane] = first;
+            lane_rows[lane] = count;
+            last_row[lane] = first + count.saturating_sub(1);
         }
         // One export rectangle, as the carve placed it, checked for an
         // element this shell can read back or point an intrinsic at.
@@ -994,31 +1094,31 @@ impl FireCtx<'_> {
             self.guest_landed,
             "enqueue.epilogue",
         )?;
+        super::btrace::mark("epi_reap");
         let mut epilogues = AirborneFires::default();
         for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
             // The guest's own rows, by index within the lane.
             let lane = attached.lane as usize;
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             let stated = p.lanes.get(lane).and_then(|seated| seated.readout);
+            // The gather laid this lane's readouts out in the order it
+            // stated them, so the rows it wants are its run, in order — a
+            // consecutive one, which is why no pointer table is minted for
+            // a multi-row readout any more.
             let wanted: Vec<u32> = match stated {
                 None => vec![last_row[lane]],
+                Some(rows) if rows.is_empty() => vec![last_row[lane]],
                 Some(rows) => {
-                    let mut arena_rows = Vec::with_capacity(rows.len());
-                    for &row in rows {
-                        if row >= owned {
-                            return Err(Fault::Ceiling {
-                                what: "rows in the lane a readout names",
-                                need: u64::from(row) + 1,
-                                have: u64::from(owned),
-                            });
-                        }
-                        arena_rows.push(first_row[lane] + row);
+                    if rows.len() as u32 > owned {
+                        return Err(Fault::Ceiling {
+                            what: "rows in the lane a readout names",
+                            need: rows.len() as u64,
+                            have: u64::from(owned),
+                        });
                     }
-                    // A stated-but-empty list still reads the row it always had.
-                    if arena_rows.is_empty() {
-                        arena_rows.push(last_row[lane]);
-                    }
-                    arena_rows
+                    (0..rows.len() as u32)
+                        .map(|i| first_row[lane] + i)
+                        .collect()
                 }
             };
             // A consecutive run is a base and an offset; only a list a stride
@@ -1053,6 +1153,26 @@ impl FireCtx<'_> {
                     plane.width,
                     first_row[lane],
                 )?;
+                // GUIDANCE. A lane that named a peer reads that lane's rows
+                // off the SAME plane at the SAME stride — only the first row
+                // differs. There is no ordering to arrange: this rectangle
+                // was written by the forward walk, on this stream, before any
+                // epilogue block started. (A cross-lane CHANNEL read is the
+                // other question, and it is not this one: a put lands in
+                // `pending_cell` and commits at `Wave::land`, after every
+                // lane's regions, and two lanes are two CTAs of one launch.)
+                if let Some(peer_group) = p.lanes[lane].peer {
+                    let peer = peer_lane(p.lanes, lane, peer_group)?;
+                    self.programs.bind_intrinsic(
+                        attached.instance,
+                        eta_ir::op::IntrinsicId::PeerVelocity,
+                        plane.ptr,
+                        storage_of(plane),
+                        plane.width,
+                        plane.width,
+                        first_row[peer],
+                    )?;
+                }
             }
             if let Some(plane) = hidden {
                 self.programs.bind_intrinsic(
@@ -1130,6 +1250,58 @@ impl FireCtx<'_> {
                     first_row[attached.lane as usize],
                 )?;
             }
+            // The token plane: the emitted gather copies `depth` ints off the
+            // base it is handed and applies no row arithmetic of its own, so
+            // the base is the lane's readout row of the plane (Metal's
+            // `plane + at * depth * 4`). Which row is the readout's is what
+            // `wanted` already resolved for the logits.
+            if self.programs.needs_mtp_drafts(attached.instance)? {
+                let export = self.exports.drafts.as_ref().ok_or_else(|| {
+                    Fault::program(
+                        "serve::enqueue",
+                        format!(
+                            "instance {} reads the `mtp_drafts` intrinsic and this load \
+                             declares no `{DRAFTS_SEAM}` export; the attachment gate was \
+                             supposed to have refused it",
+                            attached.instance
+                        ),
+                    )
+                })?;
+                let plane = slots.0[export.value.0 as usize].ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "value {}, the `{DRAFTS_SEAM}` export, which the carve gave no rectangle",
+                        export.value.0
+                    ),
+                })?;
+                if plane.dtype != Dtype::I32 {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "a `{DRAFTS_SEAM}` export landed as {:?}, and the draft ids are \
+                             read as i32",
+                            plane.dtype
+                        ),
+                    });
+                }
+                let depth = self.exports.drafts_depth;
+                if plane.width != depth {
+                    return Err(Fault::Unbound {
+                        what: format!(
+                            "the `{DRAFTS_SEAM}` export landed {} wide and the text declared \
+                             {depth}",
+                            plane.width
+                        ),
+                    });
+                }
+                self.programs.bind_intrinsic(
+                    attached.instance,
+                    eta_ir::op::IntrinsicId::MtpDrafts,
+                    plane.ptr + u64::from(wanted[0]) * u64::from(depth) * 4,
+                    INTRINSIC_STORAGE_RAW_I32,
+                    depth,
+                    depth,
+                    0,
+                )?;
+            }
             // The observability door: the stride is the slab's, the rows the program's.
             if let Some(slab) = self.scores.filter(|_| {
                 p.lanes
@@ -1174,6 +1346,7 @@ impl FireCtx<'_> {
             }
         }
 
+        super::btrace::mark("epi_bind");
         // The epilogue boundary does not wait: its fires are parked and reaped
         // next frame; a mid-batch flush's verdicts are final now and read here.
         let mut settled: Vec<(usize, Fired)> = Vec::new();
@@ -1184,6 +1357,7 @@ impl FireCtx<'_> {
             self.seq,
             &mut settled,
         )?;
+        super::btrace::mark("epi_fly");
         for (lane, fired) in settled {
             let attached = p
                 .attachments
@@ -1496,11 +1670,8 @@ pub(super) fn reap_guest_fires(
     // reaped with no CUDA call at all, which is the steady state whenever the
     // host is not running ahead of the device.
     if !airborne.settled_past(batch.seq) {
-        // `PIE_REAP_TRACE=1`: which door waited, and how long, per reap.
-        let traced = {
-            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            *ON.get_or_init(|| std::env::var_os("PIE_REAP_TRACE").is_some())
-        };
+        // `reap-trace`: which door waited, and how long, per reap.
+        let traced = super::diag::on().reap_trace;
         let started = traced.then(std::time::Instant::now);
         landed.settle()?;
         super::btrace::mark("landed");

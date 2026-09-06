@@ -18,10 +18,10 @@
 mod arming;
 mod boot;
 pub(crate) mod btrace;
+pub mod diag;
 mod enqueue;
 mod lanes;
 mod load;
-pub(crate) use load::fuse_chains;
 mod prepare;
 mod segments;
 mod settle;
@@ -31,6 +31,7 @@ pub use arming::{Armed, Kind, Seal};
 pub use boot::{
     Boot, DEFAULT_BODIES_MEGABYTES, DEFAULT_GPU_MEM_UTILIZATION, Golden, Graphs, Knobs, Recording,
 };
+pub use diag::Diagnostics;
 pub use lanes::{Attached, Clips, Lane, Media, Seated};
 pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
 pub(crate) use settle::Readback;
@@ -99,6 +100,9 @@ pub struct Shell {
     pools: Pools,
     /// The buffered-activation pool, or `None` for a plan with nothing to buffer.
     buffers: Option<Buffers>,
+    /// The read path's extended-run scratch (`crate::run::RsScratch`), grown
+    /// to the largest extended fire so far; `None` until a lane replays.
+    rs_scratch: Option<crate::device::Buffer>,
     /// The fold predicate and the accepted lengths, resident at the lane ceiling.
     predicate: crate::store::rs::Predicate,
     inputs: Inputs,
@@ -165,6 +169,10 @@ pub struct Shell {
     last: FireCost,
     cache: GraphCache,
     /// The guest-program plane.
+    /// How far the host may run ahead of the device, from the boot document.
+    /// `serve::prepare` asks it once per fire — the single home of the
+    /// run-ahead decision, which used to be an environment read.
+    runahead: engine::runahead::Runahead,
     programs: ProgramPlane,
     /// One event per in-flight step.
     settlement: crate::settle::Settlement,
@@ -350,8 +358,9 @@ impl Shell {
         adopted: &[Option<std::sync::Arc<crate::program::Endpoint>>],
         ids: &[u64],
     ) -> Result<u64> {
+        let stream = self.device.stream();
         self.programs
-            .bind(program_id, seeds, extents, geometry, adopted, ids)
+            .bind(program_id, seeds, extents, geometry, adopted, ids, stream)
     }
 
     /// The first of `tickets` this instance's own prediction disagrees with.
@@ -382,7 +391,7 @@ impl Shell {
         self.reap_guests_at("shell.reap_guests")
     }
 
-    /// [`Shell::reap_guests`], naming the door for `PIE_REAP_TRACE`.
+    /// [`Shell::reap_guests`], naming the door for `reap-trace`.
     pub fn reap_guests_at(&mut self, site: &'static str) -> Result<()> {
         reap_guest_fires(
             &mut self.programs,
@@ -601,6 +610,12 @@ struct RsFire<'a> {
     splits: bool,
     /// Does any lane move buffered bytes? Such a fire cannot graph-replay.
     buffered: bool,
+    /// Buffered tokens each fire lane replays ahead of its rows (the read
+    /// path), in fire order; all zero for a fire without one.
+    replays: Vec<u32>,
+    /// The fire's rows plus every lane's replay — what the extended-run
+    /// scratch is sized by. Zero for a fire with no read path.
+    rows_ext: u32,
 }
 
 /// One float port's feed for one lane: which port rectangle, which row (or
@@ -670,6 +685,15 @@ pub struct Prepared<'a> {
     attachments: &'a [Attached],
     /// Words to classes, classes to an order, counts to prefix sums.
     composition: Composition,
+    /// Which token row each readout row gathers, in fire order — the rows
+    /// the trunk head runs over. Padded to the key's ceiling for a bodied
+    /// fire (`Prepared::readout_ceiling`).
+    readout_rows: Vec<i32>,
+    /// Per submitted lane: where its readouts start in `readout_rows`, and
+    /// how many it takes. What the readback turns a lane into a row of the
+    /// gathered logits rectangle with.
+    readout_first: Vec<u32>,
+    readout_count: Vec<u32>,
     /// What the walk reads to know which nodes have rows.
     descriptor: FireDescriptor,
     /// The patch payload, in fire order; empty for a fire with no image.
@@ -728,6 +752,9 @@ pub struct Prepared<'a> {
     slot: Option<crate::inputs::SlotGuard>,
     /// What went into that slot, as lengths.
     lengths: crate::inputs::Staged,
+    /// Device-to-device decode-token overwrites to apply after the slot's
+    /// H2D commit; empty on the (PIE_NO_RUNAHEAD) host round-trip path.
+    token_injects: Vec<crate::inputs::TokenInject>,
     /// Is this fire a body's? Decided here, because it decides the staging.
     bodied: bool,
     /// Which regions that body holds, per template region.

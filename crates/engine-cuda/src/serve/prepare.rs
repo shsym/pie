@@ -76,6 +76,20 @@ impl FrameShell for Shell {
                     ),
                 ));
             }
+            // A program reading the token plane needs a text that plants
+            // one; refused here, where nothing has launched, rather than at
+            // `Session::fire`'s unbound guard after the forward has run.
+            if self.exports.drafts.is_none() && self.programs.needs_mtp_drafts(attached.instance)? {
+                return Err(Fault::program(
+                    "serve::prepare",
+                    format!(
+                        "instance {} reads the `mtp_drafts` intrinsic and this load's model \
+                         text plants no `{}` export, so there is no token plane to point it at",
+                        attached.instance,
+                        crate::exports::DRAFTS_SEAM
+                    ),
+                ));
+            }
             if attachments[..index]
                 .iter()
                 .any(|earlier| earlier.instance == attached.instance)
@@ -93,11 +107,45 @@ impl FrameShell for Shell {
             }
         }
 
+        // Run-ahead (on wherever the boot document seats more than one frame
+        // in flight): a decode-envelope lane can be built from
+        // host state alone — the token is injected device-to-device (slice 1)
+        // and positions/kv_len are provably equal to what the host computes
+        // (`positions_for`'s natural check and `check_extent` enforce it). So
+        // its ports need no device read, the reap a read would force is
+        // skipped, and the host launches the next frame ahead of this
+        // epilogue. Only when EVERY attachment qualifies: a `DeviceGeometry`
+        // lane still derives its whole geometry on the device and must reap.
+        // (A decode-envelope instance is always single-lane — it never owns
+        // pages — so the per-lane injection needs no multi-lane handling.)
+        let can_runahead = self.runahead.runs_ahead()
+            && attachments.iter().all(|attached| {
+                match self.programs.geometry_of(attached.instance) {
+                    None | Some(eta_ir::registry::GeometryClass::Host) => true,
+                    Some(eta_ir::registry::GeometryClass::DecodeEnvelope) => {
+                        // Only a genuinely 1-wide decode lane: one token per
+                        // step, so positions (have+0) and kv_len (have+1) are
+                        // deterministic and the skipped checks are provably
+                        // redundant. A multi-row fire is a speculative verify
+                        // whose accepted count is the device's to decide — its
+                        // positions/kv_len are NOT host-derivable, so it keeps
+                        // the device read (and the reap) until the async
+                        // settle-validation path lands.
+                        self.programs.token_device_source(attached.instance).is_some()
+                            && lanes
+                                .get(attached.lane as usize)
+                                .is_some_and(|seated| seated.lane.tokens.len() == 1)
+                    }
+                    Some(eta_ir::registry::GeometryClass::DeviceGeometry) => false,
+                }
+            });
+
         // 0b. Descriptor ports, read off the rings the gate just approved.
         // Read here, before the prologue, since a prologue's commit would
         // move the cursors under a later read. A `GeometryClass::Host` lane
         // resolves `None` and reads the submission unchanged.
-        if self.owed.is_some()
+        if !can_runahead
+            && self.owed.is_some()
             && attachments.iter().any(|attached| {
                 self.programs
                     .geometry_of(attached.instance)
@@ -108,12 +156,31 @@ impl FrameShell for Shell {
         }
         super::btrace::mark("reap");
         let mut resolved: Vec<crate::program::Envelope> = Vec::new();
+        // Per submission lane: the device-side token source, when the token
+        // can be injected device-to-device instead of round-tripped through
+        // the host. Recorded whether the lane resolves its envelope (slice 1)
+        // or is built host-side under run-ahead.
+        let mut token_src_of: Vec<Option<(u64, u32)>> = vec![None; lanes.len()];
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
         for attached in attachments {
+            let first = attached.lane as usize;
+            let src = self.programs.token_device_source(attached.instance);
+            // Run-ahead builds a decode-envelope lane from host state: skip
+            // the device read, leave `envelope_of` `None` so the assembly
+            // takes the host path (submission placeholder token, overwritten
+            // device-side by the injection; positions host-computed).
+            if can_runahead
+                && self.programs.geometry_of(attached.instance)
+                    == Some(eta_ir::registry::GeometryClass::DecodeEnvelope)
+            {
+                if first < lanes.len() {
+                    token_src_of[first] = src;
+                }
+                continue;
+            }
             let Some(envelope) = self.programs.envelope(attached.instance)? else {
                 continue;
             };
-            let first = attached.lane as usize;
             let carried = envelope.lanes();
             if first + carried > lanes.len() {
                 return Err(Fault::program(
@@ -140,6 +207,9 @@ impl FrameShell for Shell {
                     ));
                 }
                 envelope_of[first + lane] = Some((held, lane));
+            }
+            if first < lanes.len() {
+                token_src_of[first] = src;
             }
             resolved.push(envelope);
         }
@@ -390,6 +460,50 @@ impl FrameShell for Shell {
             })
             .collect();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
+        // **THE ROWS A READER TAKES.** The trunk head runs over these and
+        // no others (`layout.gather_rows` compacts them out of the token
+        // rectangle), so a prefill's head is the size of a decode's rather
+        // than the size of its prompt. Laid out in FIRE row order, which
+        // makes the gather a monotone read; each submitted lane's run is
+        // recorded so the readback can turn a lane into a row of the
+        // gathered logits.
+        let mut readout_rows: Vec<i32> = Vec::with_capacity(lanes.len());
+        let mut readout_first = vec![0u32; lanes.len()];
+        let mut readout_count = vec![0u32; lanes.len()];
+        {
+            let mut placed: Vec<(u32, usize)> = composition
+                .lanes()
+                .iter()
+                .map(|row| (row.row_offset, row.source as usize))
+                .collect();
+            placed.sort_unstable();
+            for (row_offset, source) in placed {
+                let owned = composition
+                    .lanes()
+                    .iter()
+                    .find(|row| row.source as usize == source)
+                    .map_or(0, |row| row.rows);
+                let stated = lanes.get(source).and_then(|seated| seated.readout);
+                let wanted: Vec<u32> = match stated {
+                    Some(rows) if !rows.is_empty() => rows.to_vec(),
+                    // The default readout, and the one every decode lane
+                    // takes: the lane's last row.
+                    _ => vec![owned.saturating_sub(1)],
+                };
+                readout_first[source] = readout_rows.len() as u32;
+                readout_count[source] = wanted.len() as u32;
+                for row in wanted {
+                    if row >= owned {
+                        return Err(Fault::Ceiling {
+                            what: "rows in the lane a readout names",
+                            need: u64::from(row) + 1,
+                            have: u64::from(owned),
+                        });
+                    }
+                    readout_rows.push(i32::try_from(row_offset + row).unwrap_or(0));
+                }
+            }
+        }
         let descriptor = FireDescriptor::of(&composition);
 
         // 1b. The D2 packing tables: which group each fire lane joins, and
@@ -728,6 +842,10 @@ impl FrameShell for Shell {
         // One mask entry per lane, seriated with the rest.
         let mut masks: Vec<crate::mask::LaneMask<'_>> = Vec::with_capacity(lanes.len());
         let mut tokens: Vec<i32> = Vec::with_capacity(rows as usize);
+        // Device-to-device token injections, one per
+        // single-lane device-resolved decode row: filled as `tokens` is
+        // assembled so `dst_off` is that row's byte offset in the slab.
+        let mut token_injects: Vec<crate::inputs::TokenInject> = Vec::new();
         let mut positions: Vec<i32> = Vec::with_capacity(rows as usize);
         // `Some((page, offset))` for a row with its own resolved
         // `w_slot`/`w_off`; `None` where `store::kv::geometry_with` derives
@@ -872,33 +990,37 @@ impl FrameShell for Shell {
                     fold,
                     replay,
                 } => {
-                    // The buffer read path — buffered tokens replayed ahead
-                    // of this lane's rows — has no device half on this plane
-                    // yet: its recurrences initialize from the folded state
-                    // alone. Refused by name rather than run from the wrong
-                    // state.
-                    if *replay > 0 {
+                    // **The buffer read path**: `replay` buffered tokens at
+                    // `[at - replay, at)` are replayed through the recurrence
+                    // ahead of this lane's rows, so the rows start from
+                    // `folded (+) replay(buffer)`. The recurrent arms run over
+                    // the EXTENDED run `[replay | rows]` (`Run::rs_extend`),
+                    // and every count below — the fold, the split, the
+                    // truncation — is taken in that layout, as the verb
+                    // states it.
+                    if *replay > *at {
                         return Err(Fault::program(
                             "serve::rs",
                             format!(
-                                "lane {} replays {replay} buffered token(s) ahead of its rows \
-                                 (the buffer read path), which this plane does not serve; \
-                                 fold the buffer before appending to it",
+                                "lane {} replays {replay} buffered token(s) below buffer \
+                                 position {at}, which has only {at}",
                                 row.source
                             ),
                         ));
                     }
+                    let extended = replay.saturating_add(row.rows);
                     let fold = match fold {
                         FoldLen::Host(0) => 0,
-                        stated => resolve_fold_len(*stated, row.rows, fire_lane, port)?,
+                        stated => resolve_fold_len(*stated, extended, fire_lane, port)?,
                     };
                     (
                         RsMove::Scatter {
                             pages: pages.as_slice(),
                             at: *at,
                             fold,
+                            replay: *replay,
                         },
-                        if fold == 0 { row.rows } else { fold },
+                        if fold == 0 { extended } else { fold },
                     )
                 }
                 RsVerb::Window { .. } => {
@@ -982,7 +1104,14 @@ impl FrameShell for Shell {
             if seated.drafts && self.exports.mtp.is_none() {
                 return Err(Fault::Draftless { lane: row.source });
             }
-            if seated.drafts != runs_draft_arm {
+            // A BLOCK DRAFTER's column is not a class's: its `mtp` seam is the
+            // shared head's output split by the `block_draft` fact, so the
+            // writing region runs in every class and the arm costs a lane
+            // nothing unless its word carries the fact. The word already
+            // says which rows are the block's; there is no second axis to
+            // cross-check against.
+            let block_drafter = self.trace.drafter.is_some();
+            if seated.drafts != runs_draft_arm && !block_drafter {
                 return Err(Fault::DraftWord {
                     lane: row.source,
                     word: lane.word,
@@ -1015,6 +1144,21 @@ impl FrameShell for Shell {
             match ports.as_ref() {
                 Some(ports) => {
                     ports.check_extent(have.saturating_add(row.rows))?;
+                    // The token is already on the device-only ring; inject it
+                    // device-to-device at this row's offset rather than lean
+                    // on the host having read it back. Single-lane instances
+                    // only (a multi-lane cell packs several lanes' tokens),
+                    // and only when the cell's width matches this row's.
+                    let dst_off = tokens.len() as u64 * 4;
+                    if let Some((src, native)) = token_src_of[source]
+                        && native as usize == rows_here * 4
+                    {
+                        token_injects.push(crate::inputs::TokenInject {
+                            dst_off,
+                            src,
+                            bytes: native as usize,
+                        });
+                    }
                     for &token in ports.tokens_for(rows_here)? {
                         tokens.push(token as i32);
                     }
@@ -1036,6 +1180,21 @@ impl FrameShell for Shell {
                     }
                 }
                 None => {
+                    // Run-ahead: a decode-envelope lane arrives here (host
+                    // path) with a submission placeholder token whose VALUE
+                    // is overwritten device-side by the injection below; only
+                    // its count matters. Positions are the natural run the
+                    // device would have stated (`have + at`).
+                    let dst_off = tokens.len() as u64 * 4;
+                    if let Some((src, native)) = token_src_of[source]
+                        && native as usize == rows_here * 4
+                    {
+                        token_injects.push(crate::inputs::TokenInject {
+                            dst_off,
+                            src,
+                            bytes: native as usize,
+                        });
+                    }
                     for (at, token) in lane.tokens.iter().enumerate() {
                         tokens.push(*token as i32);
                         positions.push(narrow(u64::from(have) + at as u64));
@@ -1386,6 +1545,17 @@ impl FrameShell for Shell {
             && !self.cache.body_refused(&key)
             && self.cuttable(&key, admits.as_ref());
         super::btrace::mark("cuttable");
+        // **A BODY BAKES ITS READOUT GRID, SO THE COUNT MUST BE THE KEY'S.**
+        // The readout rectangle is carved and gridded at the lane ceiling —
+        // the same number the key already carries — and padded with row
+        // zero, which the gather reads and the readback never names. A fire
+        // wanting more readouts than that ceiling (a multi-row readout on
+        // many lanes) is not one a body can serve, so it walks.
+        let readout_ceiling = ladder.lane_reach(lane_ceiling).min(self.budget.max_lanes);
+        let bodied = bodied && readout_rows.len() <= readout_ceiling as usize;
+        if bodied {
+            readout_rows.resize(readout_ceiling as usize, 0);
+        }
 
         // Arming pins the key a synthetic fire landed on
         // (`Shell::arm_bodies`).
@@ -1477,6 +1647,7 @@ impl FrameShell for Shell {
                 tokens: &tokens,
                 positions: &positions,
                 windows: &boundaries,
+                readout_rows: &readout_rows,
                 // Padded to the bucket (step 4d); empty (no H2D) for an
                 // unbodied fire.
                 qo_absolute: &qo_absolute,
@@ -1498,19 +1669,34 @@ impl FrameShell for Shell {
         )?;
 
         // Bound only when it would truncate something — see `RsFire::truncates`.
+        // Both counted in the lane's extended layout `[replay | rows]`.
+        let rs_replays: Vec<u32> = rs_moves
+            .iter()
+            .map(|verb| match verb {
+                RsMove::Scatter { replay, .. } => *replay,
+                _ => 0,
+            })
+            .collect();
         let rs_truncates = rs_lens
             .iter()
             .zip(&seats)
-            .any(|(len, seat)| *len < narrow(u64::from(seat.rows)));
+            .zip(&rs_replays)
+            .any(|((len, seat), replay)| *len < narrow(u64::from(seat.rows) + u64::from(*replay)));
         // Split only when a boundary is strictly inside a row — see
         // `RsFire::splits`. `fold == rows` or `fold == 0` are both
         // single-call; only an interior boundary costs a second launch.
         let rs_splits = rs_moves.iter().zip(&seats).any(|(verb, seat)| {
-            matches!(verb, RsMove::Scatter { fold, .. } if *fold > 0 && *fold < seat.rows)
+            matches!(verb, RsMove::Scatter { fold, replay, .. } if *fold > 0 && *fold < seat.rows + *replay)
         });
+        let rs_rows_ext = if rs_replays.iter().any(|replay| *replay > 0) {
+            rows.saturating_add(rs_replays.iter().sum::<u32>())
+        } else {
+            0
+        };
         Ok(Prepared {
             slot: Some(slot),
             lengths: staged_lens,
+            token_injects,
             bodied,
             admits,
             ladder,
@@ -1520,6 +1706,9 @@ impl FrameShell for Shell {
             lanes,
             attachments,
             composition,
+            readout_rows,
+            readout_first,
+            readout_count,
             descriptor,
             patch_payload,
             voxel_tables,
@@ -1570,6 +1759,8 @@ impl FrameShell for Shell {
                 moves: rs_moves,
                 lens: rs_lens,
                 order: rs_order,
+                replays: rs_replays,
+                rows_ext: rs_rows_ext,
             },
         })
     }

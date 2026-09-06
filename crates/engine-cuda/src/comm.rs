@@ -12,21 +12,69 @@ use std::fmt;
 
 use crate::error::{Fault, Result};
 
+/// Which transport a group's ranks talk over — `[engine] nccl_transport`.
+///
+/// NCCL takes this as an environment variable and there is no other door into
+/// it, so pie WRITES `NCCL_P2P_DISABLE` on its behalf. What pie may not do is
+/// READ it: a shell that decided its own default from the environment took a
+/// knob from nowhere (article 9), so the policy is stated here and the write
+/// follows from the word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Transport {
+    /// Shared memory: pie writes `NCCL_P2P_DISABLE=1`. **The default**, and
+    /// not NCCL's — on PCIe boxes NCCL's P2P transport can wedge before it
+    /// falls back (observed on a 2×L40S pair and on a 4×RTX PRO 6000 one).
+    #[default]
+    Shm,
+    /// Peer-to-peer: pie writes `NCCL_P2P_DISABLE=0`. For a box whose links
+    /// are real (NVLink), where P2P is the whole point.
+    Peer,
+    /// Whatever NCCL decides for itself: pie writes nothing, and NCCL reads
+    /// its own environment. The door for a deployment that states an
+    /// `NCCL_*` policy in the shell it launches pie from — before this word
+    /// existed, an already-set `NCCL_P2P_DISABLE` was deferred to silently,
+    /// which is the same intent said out loud.
+    Nccl,
+}
+
+impl std::str::FromStr for Transport {
+    type Err = String;
+
+    /// `shm`, `peer`, or `nccl`; anything else refuses by name.
+    fn from_str(word: &str) -> std::result::Result<Transport, String> {
+        match word {
+            "shm" => Ok(Transport::Shm),
+            "peer" => Ok(Transport::Peer),
+            "nccl" => Ok(Transport::Nccl),
+            other => Err(format!(
+                "`{other}` does not name an NCCL transport; the spellings are \
+                 `shm` (P2P off, the default), `peer` (P2P on), and `nccl` \
+                 (whatever NCCL's own environment says)"
+            )),
+        }
+    }
+}
+
 /// `ncclUniqueId`: the 128 bytes every rank of one group opens with.
 #[derive(Clone)]
 pub struct Id(pub [u8; 128]);
 
 impl Id {
-    /// A fresh group identity, from rank 0's process.
+    /// A fresh group identity, from rank 0's process, over `transport`.
     ///
     /// # Errors
     ///
     /// [`Fault::Runtimeless`] with no runtime, [`Fault::Device`] when NCCL
     /// refused.
-    pub fn new() -> Result<Id> {
+    pub fn new(transport: Transport) -> Result<Id> {
         #[cfg(feature = "cuda")]
         {
             use cudarc::nccl::sys as nccl;
+            // Here rather than in `open`: this runs once, on the opener's
+            // own thread, before a rank thread exists — and `set_var` from
+            // the rank threads, which open concurrently, would be a data
+            // race on the environment.
+            transport_defaults(transport);
             let mut id = nccl::ncclUniqueId { internal: [0; 128] };
             // SAFETY: a live out-parameter of the exact type NCCL writes.
             let code = unsafe { nccl::ncclGetUniqueId(&raw mut id) };
@@ -34,7 +82,10 @@ impl Id {
             Ok(Id(id.internal.map(|byte| byte as u8)))
         }
         #[cfg(not(feature = "cuda"))]
-        Err(Fault::Runtimeless)
+        {
+            let _ = transport;
+            Err(Fault::Runtimeless)
+        }
     }
 }
 
@@ -65,7 +116,6 @@ impl Comm {
         #[cfg(feature = "cuda")]
         {
             use cudarc::nccl::sys as nccl;
-            transport_defaults();
             let unique = nccl::ncclUniqueId {
                 internal: id.0.map(|byte| byte as core::ffi::c_char),
             };
@@ -98,6 +148,26 @@ impl Comm {
     #[must_use]
     pub fn raw(&self) -> *mut c_void {
         self.raw
+    }
+
+    /// Abort the communicator: every collective pending or later issued on
+    /// it returns an error instead of waiting for peers that will never
+    /// arrive. The group's answer to a rank that refused before its
+    /// collective — its peers come back out of NCCL with an error rather
+    /// than sitting there forever. Idempotent; a closed handle is left
+    /// alone. The communicator is never destroyed after this (see `Drop`).
+    pub fn abort(&self) {
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::nccl::sys as nccl;
+            if self.raw.is_null() {
+                return;
+            }
+            // SAFETY: a live communicator this group opened; NCCL allows an
+            // abort from any thread while other threads are inside calls on
+            // the same communicator — that is what it is for.
+            let _ = unsafe { nccl::ncclCommAbort(self.raw.cast()) };
+        }
     }
 
     #[must_use]
@@ -138,17 +208,33 @@ impl PartialEq for Comm {
     }
 }
 
-/// The ranks of one group are threads of one process. On PCIe boxes NCCL's
-/// P2P transport can wedge before it falls back (observed on a 2x L40S pair),
-/// so shared memory is the default transport; an operator who has stated a
-/// policy keeps it.
+/// State the group's transport in the only place NCCL reads one: its own
+/// environment. `[engine] nccl_transport` decides what is written, and
+/// [`Transport::Nccl`] writes nothing at all.
+///
+/// **This is a write, not a read.** Article 9 is about a shell taking a knob
+/// from the environment; handing one to a library that has no other door is
+/// the opposite direction, and the word itself came off the boot document.
+/// What used to stand here read `NCCL_P2P_DISABLE` first and deferred to a
+/// stated one — a deployment that wants that keeps it by stating
+/// `nccl_transport = "nccl"`, which says the same thing where a reader can
+/// see it.
+///
+/// Called from [`Id::new`] alone, which is the group's first NCCL call and
+/// runs on the opener's thread before any rank thread starts: writing the
+/// environment from the rank threads, which open concurrently, would be a
+/// race.
 #[cfg(feature = "cuda")]
-fn transport_defaults() {
-    if std::env::var_os("NCCL_P2P_DISABLE").is_none() {
-        // SAFETY: called before any communicator exists, from the group
-        // opener, on the thread that starts the rank threads.
-        unsafe { std::env::set_var("NCCL_P2P_DISABLE", "1") };
-    }
+fn transport_defaults(transport: Transport) {
+    let disable_p2p = match transport {
+        Transport::Shm => "1",
+        Transport::Peer => "0",
+        // Not our environment to write.
+        Transport::Nccl => return,
+    };
+    // SAFETY: called before any communicator exists, from the group opener,
+    // on the thread that starts the rank threads.
+    unsafe { std::env::set_var("NCCL_P2P_DISABLE", disable_p2p) };
 }
 
 #[cfg(feature = "cuda")]

@@ -18,6 +18,76 @@ use crate::record;
 
 use super::{Lane, MROPE_COORDS, Media, PATCH_ROUTE_DROP, Seated, Shell};
 
+/// **THE ARMING PASS'S STOP IS A GROUP DECISION.**
+///
+/// A rank arms a rung by FIRING it, and a sharded plan's fire carries the
+/// plan's collectives. The bound that stops the pass — the card's spare
+/// beyond the elastic pool's growth — is read off the local device, so two
+/// ranks of one group whose cards hold different amounts of other work stop
+/// at different rungs. The rank that walks on then sits in `ncclAllReduce`
+/// waiting for a peer that has already finished its load: a hang until
+/// `group::LOAD_WAIT`, an hour later. (Seen on a 4x RTX PRO 6000 box where
+/// another job held 22 GiB of one card: gemma-4-E4B at two ranks armed 34
+/// bodies on one rank and never came back on the other.)
+///
+/// So every rung is voted on: each rank puts its own "I would stop" on the
+/// wire, the votes are summed, and any rank's stop stops them all. One
+/// `f32` all-reduce per rung — tens of microseconds over SHM, against a
+/// rung that costs milliseconds to fire.
+///
+/// A shell with no communicator (one rank) has nothing to agree with and
+/// votes its own bound, allocating nothing.
+struct Ballot {
+    /// The one-element f32 the vote rides on, or `None` at one rank (or if
+    /// the device would not lend four bytes, in which case the local bound
+    /// stands and a group is no worse off than before this existed).
+    slip: Option<crate::device::Buffer>,
+}
+
+impl Ballot {
+    /// Opens a ballot on `device`, or a local-only one where there is no
+    /// group to agree with.
+    fn open(device: &crate::device::Context) -> Ballot {
+        let grouped = device.ctx().comm("arming ballot").is_ok();
+        Ballot {
+            slip: grouped
+                .then(|| crate::device::Buffer::zeroed(4).ok())
+                .flatten(),
+        }
+    }
+
+    /// `true` when ANY rank of the group would stop here. At one rank, or
+    /// when the vote could not be put on the wire, this rank's own answer.
+    fn any(&mut self, device: &crate::device::Context, mine: bool) -> bool {
+        let Some(slip) = self.slip.as_mut() else {
+            return mine;
+        };
+        let vote: f32 = if mine { 1.0 } else { 0.0 };
+        let sum = (|| -> Result<f32> {
+            slip.write(0, &vote.to_le_bytes())?;
+            let mut wire = kernels_cuda::Tensor::new(slip.ptr(), 1, 1, model_ir::Dtype::F32);
+            kernels_cuda::collective::all_reduce(device.ctx(), &mut wire)
+                .map_err(crate::error::kernel)?;
+            device.synchronize()?;
+            let mut back = [0u8; 4];
+            slip.read(0, &mut back)?;
+            Ok(f32::from_le_bytes(back))
+        })();
+        match sum {
+            // Half a vote is nobody's: the sum is a count of ranks.
+            Ok(total) => total >= 0.5,
+            // The wire refused. Every rank's `all_reduce` refuses the same
+            // way (a communicator is a group-wide fact), so falling back to
+            // the local bound keeps the ranks together rather than parting
+            // them.
+            Err(_) => {
+                self.slip = None;
+                mine
+            }
+        }
+    }
+}
+
 /// One lane of a synthetic composition — the owned side of a [`Seated`] an
 /// arming pass borrows. Its launches are real even though it computes and
 /// reads back nothing.
@@ -753,6 +823,7 @@ impl Shell {
                 // stand as the load left them: zeros, or the last fire's).
                 stream: lane.stream,
                 group: None,
+                peer: None,
                 ports: &[],
             })
             .collect();
@@ -826,12 +897,12 @@ impl Shell {
         match evidence(&walked, &replayed) {
             None => Ok(()),
             Some(why) => {
-                // `PIE_GOLDEN_PROBE=1`: on a disagreement, two more questions
+                // `golden-probe`: on a disagreement, two more questions
                 // before the verdict — is each arm itself repeatable, and
                 // does the body's lane `i` answer some OTHER lane of the
                 // walk bit for bit (a lane order that moved, not a wrong
                 // number)?
-                if std::env::var_os("PIE_GOLDEN_PROBE").is_some() {
+                if super::diag::on().golden_probe {
                     let walked_again = fire(self, Golden::Eager);
                     let replayed_again = fire(self, Golden::Body);
                     let same = |a: &Vec<Vec<f32>>, b: &Vec<Vec<f32>>| {
@@ -1107,7 +1178,7 @@ impl Shell {
         if ceiling == 0 {
             return Ok(());
         }
-        if std::env::var_os("PIE_ARM_TRACE").is_some() {
+        if super::diag::on().arm_trace {
             // What `c<n>` names in every line below: the requests that land
             // in each class, the first being its representative.
             for (class, requests) in self.landing.iter().enumerate() {
@@ -1238,6 +1309,8 @@ impl Shell {
         // Which of the bounds stopped the pass.
         let mut belted = false;
         let mut starved: Option<u64> = None;
+        // Whether it was a PEER's bound rather than this rank's own.
+        let mut peer_stopped = false;
         // A body is driver memory outside the elastic pool, so every byte
         // captured is a byte the pool's next recalibration no longer finds.
         // The pass stops while the ceiling still holds the pool's declared
@@ -1246,6 +1319,10 @@ impl Shell {
         // the commit rounding of one wide fire — sixteen map units, or two
         // bodies at the going price if that is more.
         let unit_margin = self.pools.map_unit_bytes().saturating_mul(16);
+        // The vote a tensor-parallel rank casts on every rung (see
+        // [`Shell::agreed`]): the pass's stop is a GROUP decision, because
+        // every arming fire of a sharded plan is a collective.
+        let mut ballot = Ballot::open(&self.device);
         for (bucket, target) in targets {
             // Bytes, not seats: the live census reads device memory spent.
             let spent = self.cache.body_stats();
@@ -1253,16 +1330,20 @@ impl Shell {
             let price = (2 * spent.census.bytes / spent.census.bodies.max(1)) as u64;
             let margin = price.max(unit_margin);
             let headroom = spare < margin;
-            if spent.census.bodies >= record::MAX_BODIES
+            let mine = spent.census.bodies >= record::MAX_BODIES
                 || spent.census.bytes >= self.bodies_mem
-                || headroom
-            {
+                || headroom;
+            // A rank stops when ANY rank would: the rung it skips is a fire
+            // whose collectives its peers are already inside.
+            if ballot.any(&self.device, mine) {
                 if never == 0 {
                     never_from = bucket;
                     belted = spent.census.bodies >= record::MAX_BODIES;
                     if headroom && !belted && spent.census.bytes < self.bodies_mem {
                         starved = Some(spare);
                     }
+                    // Nothing of this rank's own stopped it: a peer's did.
+                    peer_stopped = !mine;
                 }
                 never += 1;
                 continue;
@@ -1300,7 +1381,7 @@ impl Shell {
                 if let Err(why) = fired.and(landed) {
                     // Every refusal, not just the last, so a boot log lists
                     // which compositions this deployment cannot arm.
-                    if std::env::var_os("PIE_ARM_TRACE").is_some() {
+                    if super::diag::on().arm_trace {
                         eprintln!("[arm-trace] refused bucket {bucket}, {target}: {why}");
                     }
                     refused = Some(format!("bucket {bucket}, {target}: {why}"));
@@ -1326,13 +1407,13 @@ impl Shell {
                     // have brought, which the synthetic cannot state.
                     .and_then(|()| self.golden_real(key, &owned));
                 if let Err(fault) = verdict {
-                    // `PIE_GOLDEN_SKIP=1`: a diagnostic arm. The body that
+                    // `golden-skip`: a diagnostic arm. The body that
                     // disagreed is dropped and its key refused — the key walks
                     // eagerly, as an unarmed one does — and the load goes on,
                     // so one boot lists EVERY body the golden disagrees with
                     // instead of stopping at the first. Off, the first
                     // disagreement fails the load, as it always has.
-                    if std::env::var_os("PIE_GOLDEN_SKIP").is_some() {
+                    if super::diag::on().golden_skip {
                         eprintln!("[arm-trace] golden refused {key}: {fault}");
                         self.cache.body_drop(key);
                     } else {
@@ -1343,7 +1424,7 @@ impl Shell {
             if key.as_ref().is_some_and(|key| self.cache.body_armed(key)) {
                 armed += 1;
                 tally[at].0 += 1;
-                if std::env::var_os("PIE_ARM_TRACE").is_some()
+                if super::diag::on().arm_trace
                     && let Some(key) = key.as_ref()
                 {
                     eprintln!("[arm-trace] armed {key}");
@@ -1391,6 +1472,7 @@ impl Shell {
             never_from,
             belted,
             starved,
+            peer_stopped,
             declines: stats.tally.declines,
             refusals: stats.tally.refusals,
             seal,
@@ -1813,6 +1895,11 @@ pub struct Armed {
     /// `Some(bytes)` when the card's spare — beyond the elastic pool's own
     /// growth — is what stopped the pass, with the spare it stopped at.
     pub starved: Option<u64>,
+    /// Whether a PEER RANK's bound stopped this rank's pass rather than its
+    /// own: under tensor parallelism the stop is agreed, because every
+    /// arming fire of a sharded plan is a collective and a rank that walked
+    /// on alone would sit in NCCL waiting for one that had stopped.
+    pub peer_stopped: bool,
     pub declines: u64,
     pub refusals: u64,
     /// What the seal stands for. See [`Seal`].
@@ -1888,6 +1975,8 @@ impl core::fmt::Display for Armed {
                 " [sealed partial: {never} key(s) never attempted, {} at bucket {}, and they \
                  walk eagerly for the life of this load]",
                 match self.starved {
+                    _ if self.peer_stopped =>
+                        "a peer rank's bound (the stop is agreed across the group)".to_string(),
                     Some(spare) => format!(
                         "the ceiling's spare ran out ({} MiB left beyond the elastic pool's growth)",
                         spare >> 20

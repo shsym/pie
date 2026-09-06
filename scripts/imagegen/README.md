@@ -16,12 +16,18 @@ scripts/imagegen/
   zimage_vae_parity.py M1 drives pie's `vae.decode` reading FROM A GUEST
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
+  ltx2_golden.py      M4  LTX-2.5 miniature: one joint video+audio step
+  ltx2_parity.py      M4  drives pie's `ltx25-mini` row against it
+  vendor/ltx_2/       M4  the LTX-2.5 reference, transcribed (see its header)
   h3_golden.py        M5  MiniMax H3 miniature forward (vendored reference)
   h3_parity.py        M5  drives pie's `minimax-h3-mini` row against it
   vendor/minimax_h3/      a dependency-free transcription of H3's DiT --
                           sglang's own package cannot be imported here
+  hy3_golden.py       M6  HunyuanImage 3 miniature: one prefill + one denoise step
+  hy3_parity.py       M6  drives pie's `hunyuanimage3-mini` row against it
   golden_common.py        shared tap/hook/manifest plumbing
   compare.py              npz-vs-npz diff with tolerance gates
+  gates.py                EVERY gate above, one command, one table (§6)
 ```
 
 ---
@@ -493,13 +499,14 @@ CUDA_VISIBLE_DEVICES=0 python flux2_klein_parity.py all \
     --out /tmp/flux2-klein-parity --config ~/.pie/config.flux2-klein.toml
 ```
 
-The config needs `[engine] max_model_len = 32768` (rows × submit depth),
-`[model] model` at the artifact, and — the one that is not obvious —
-`[runtime] submit_deadline = "10s"` with `silence_timeout = "300s"`: at the
-50 ms default the cohort gate seals the denoise group's FIRST frame with
-the image lane alone and the velocity comes back unconditioned (cos ≈ 0.535
-against the golden, cos 0.9999 against a no-text reference). `run` refuses a
-config that does not state it.
+The config needs `[engine] max_model_len = 32768` (rows × submit depth) and
+`[model] model` at the artifact. It needs nothing said about `[runtime]
+submit_deadline` any more: this parity used to demand `"10s"` because at the
+50 ms default the cohort gate sealed the denoise group's FIRST frame with
+the image lane alone and the velocity came back unconditioned (cos ≈ 0.535
+against the golden, cos 0.9999 against a no-text reference). A stated cohort
+is now fired whole or not at all — the deadline is a density knob again, and
+this harness runs at the default so that a partial group would show up here.
 
 Measured (bf16 pie vs the bf16 golden, `graphs = "on"`):
 
@@ -558,6 +565,82 @@ Both on latent `[1,16,5,16,16]` → S = 320 tokens, context `[1,32,64]`.
 | `wan22_mini_d128.safetensors` | 8,914,648 | `5707cde610525dbcec5ca1c95f21ec16` |
 | `wan22_mini_config.json` | 11,474 | `aab5a938c58f7864cbe2a03fe69bf47d` |
 
+### `ltx2_golden.py` → `/root/.cache/pie-imagegen/golden/ltx25/`
+
+**No `--full`.** The flagship needs the 201 GB snapshot and sglang's serving
+environment, and `import sglang` needs the whole stack (starlette, orjson, …)
+this box does not have. `vendor/ltx_2/modeling.py` is a self-contained
+transcription of the reference classes — provenance at the top of the file,
+the HUGGING FACE checkpoint's module names throughout, so ONE
+`crates/models/src/ltx_2/import.rs` reads both this miniature and
+`Lightricks/LTX-2.5-Diffusers`.
+
+`--mini` writes a random-init miniature (two blocks, two heads a side at the
+REAL head widths — video 128, audio 64 — the real 128-channel latents, a
+16-wide caption, one connector layer apiece) under the pipeline's own
+prefixes (`dit.`, `connectors.`), and dumps one joint video+audio denoise
+step (72 video rows over a 3x4x6 latent grid, 8 audio rows, 16 text rows at
+σ = 0.909375) plus one connector pass.
+
+**The fixture's initialisation is chosen to DISCRIMINATE**, not to imitate
+the reference's: the modulation tables are drawn at unit scale rather than
+`randn / sqrt(dim)` so every gate is O(1), and the across-heads QK gains sit
+at one rather than at 0.06 — under the reference's own init every gate is a
+whisper, every softmax is nearly uniform, and a dropped fold or a wrong rope
+hides under the tolerance. The trained tables are O(1) too.
+
+Keys: `mini.dit.in.{latents,audio_latents,context,audio_context,timestep,
+audio_timestep,positions,audio_positions}`, `mini.dit.out.{velocity,
+audio_velocity}`, `mini.conn.in.{text,positions}`, `mini.conn.out.{video,
+audio}`.
+
+**Positions are dumped already normalised** — `(2·midpoint/max − 1)·π/2`, in
+seconds and pixels — because that product is exactly what the pie port takes:
+`RopeForm::SplitLadder` multiplies it by `theta^(f/(F−1))` and nothing else.
+
+#### The pie side — `ltx2_parity.py`
+
+`tests/inferlets/ltx2-parity` is the `ltx25-mini` row's guest. A denoise case
+is FOUR lanes of one group, each on its own pipeline: `Video` (latents,
+three coordinates, timestep), `Audio` (latents, one coordinate, timestep),
+`Context` (the video text context, timestep) and `Reference` (the audio text
+context, timestep) — the two context lanes carry a timestep because they
+modulate their own rows. A `--refine` case is the two connector passes over
+one rectangle of packed trunk rows.
+
+```bash
+python ltx2_golden.py --mini
+# the golden dir needs a `config.json` and a tokenizer beside the weights
+pie model import "$PIE_IMAGEGEN_GOLDEN/ltx25/" --sku ltx25-mini-bf16-kv-bf16 \
+    --out ~/.cache/pie-imagegen/ltx2-mini.zt
+python ltx2_parity.py all          --out /tmp/ltx2-parity --config ~/.pie/config.ltx2-mini.toml
+python ltx2_parity.py all --refine --out /tmp/ltx2-parity --config ~/.pie/config.ltx2-mini.toml
+python ltx2_parity.py matters      --out /tmp/ltx2-parity --config ~/.pie/config.ltx2-mini.toml
+```
+
+Measured (bf16 pie vs the fp32 golden), under the mini-dit gate
+(`--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`):
+
+| case | max-abs | rel | cos |
+|---|---:|---:|---|
+| joint step, video velocity | 0.0247 | 0.0064 | 0.99998 |
+| joint step, audio velocity | 0.0266 | 0.0061 | 0.99998 |
+| `refine.video` | 0.0204 | 0.0043 | 0.99999 |
+| `refine.audio` | 0.0345 | 0.0047 | 0.99999 |
+
+The FLAGSHIP row's import is checked against the real 201 GB snapshot:
+`pie model import <snapshot> --sku ltx25-bf16-kv-bf16 --dry-run` lands every
+plane the flagship declares (13.0 GiB decoded — the reordered tables and the
+doubled head projection — and 28.3 GiB copied through). Nothing runs it yet:
+the arm has no `text` reading and no VAE.
+
+`matters` is the claim a parity gate cannot make on its own: **every
+conditioning stream moves the answer.** It perturbs each in turn and demands
+the velocity move by more than ten times the gate's own slack — the video by
+its text context (1.8e-2) and by the audio latents through the a2v fold
+(1.3e-2), the audio by its own text context (1.8e-2) and by the video
+latents through v2a (4.8e-3). A lane that never joined the fire's attention
+group would show zero there and still pass the tolerance gate.
 ### `h3_golden.py` → `/root/.cache/pie-imagegen/golden/minimax_h3/`
 
 **Miniature only, and the reference is VENDORED.** `sglang.multimodal_gen`
@@ -616,6 +699,142 @@ Gate: `--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`.
 
 ---
 
+## 4b. `hy3_golden.py` / `hy3_parity.py` (M6) -> `$PIE_IMAGEGEN_GOLDEN/hy3/`
+
+HunyuanImage 3.0 is an AR-plus-diffusion hybrid: one Hunyuan-A13B MoE trunk
+denoises an image *inside* an LLM token sequence.  `--mini` random-inits a
+two-layer, eight-expert `HunyuanImage3ForCausalMM` from the HF custom code
+(`$HY3_SRC`, default the GitHub package mirror), assembles the T2I sequence by
+hand -- no tokenizer, no pipeline, no flash-attn -- and dumps one causal text
+prefill and one denoise step tapped at the three seams pie reads back.
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python hy3_golden.py --mini      # seconds
+# a directory the importer can read: the weights, config.json, tokenizer.json
+pie model import $PIE_IMAGEGEN_GOLDEN/hy3/artifact \
+    --sku hunyuanimage3-mini-bf16-kv-bf16 --out .../hy3-mini.zt
+python hy3_parity.py all --out /tmp/hy3-parity --config ~/.pie/config.hy3-mini.toml
+```
+
+The config must be the run's OWN (its own `[server] port`), and
+`[engine] max_model_len` at least the sequence.
+
+**A whole denoise step, in three fires, each fed pie's own answer to the one
+before**: `image.in` (the conv `patch_embed` on the voxel axis), `denoise`
+(the trunk over the frozen prefix pages), `image.out` (the conv
+`final_layer`). Plus three more denoise fires that make two claims the golden
+diff cannot: `B` prefill(`<cfg>`-masked prompt) then denoise(t0) — THE PREFIX
+MATTERS; `C` denoise(t1) over A's pages and `D` denoise(t1) after a fresh
+prefill — THE PREFIX K/V IS REUSED EXACTLY.
+
+Measured 2026-09-06 (fp32 golden vs bf16 weights and bf16 activations):
+
+| tensor | shape | cos | max-abs |
+|---|---|---|---|
+| `image_in.rows` | (64, 256) | 0.999991 | 0.0012 |
+| `denoise.hidden.image` | (64, 256) | 0.999989 | 0.0016 |
+| `denoise.hidden.timestep_row` | (256,) | 0.999993 | 0.00046 |
+| `uncond.hidden.image` | (64, 256) | 0.999989 | 0.0015 |
+| `uncond.hidden.timestep_row` | (256,) | 0.999993 | 0.00047 |
+| **`image_out.velocity.rows`** | (64, 32) | **0.999997** | **0.00012** |
+| `encode.max` | (9,) | 0.999998 | 5.8e-05 |
+
+```
+[claim] PASS the prefix conditions the canvas: <cfg> moves the <timestep> row
+        rel 0.0214 (reference 0.0213, 0.1% off) and the image rows rel 0.0031
+        (reference 0.0020)
+[claim] PASS the prefix K/V is reused exactly: max-abs 0.000e+00
+```
+
+Two shell rules shape the voxel arms: the CUDA shell seats **one voxel width
+a fire**, so the timestep's sinusoid rides packed into the clip's own
+rectangle (`[h, w, 32 + 256]` going in, `[h, w, D + 256]` coming out) and the
+model text splits the columns; and a voxel-axis lane broadcast does not
+exist, which is why the sinusoid is per voxel at all.
+
+**The conditioning gate is stated against the reference, not as a constant.**
+On this two-layer random-init miniature the prompt moves the image rows by rel
+0.002 — below the bf16 parity floor — while it moves the `<timestep>` row,
+which is causal over the prefix and nothing else, by rel 0.021. A guessed
+absolute threshold would fail a correct model here and pass an unconditioned
+one on a deeper row.
+
+The one host round trip is between `denoise` and `image.out`: the trunk hands
+back `[h*w + 1, D]` token rows and the voxel arm wants `[h, w, D]` without the
+`<timestep>` row, and dropping a row is not something the guest can spell on
+the device today. A production loop would carry it in an epilogue.
+#### Measured — `wan22_parity.py`
+
+```bash
+pie model import <dir with wan22_mini_d128.safetensors, a config.json and a tokenizer> \
+    --sku wan22-mini-d128-bf16-kv-bf16 --out ~/.cache/pie-imagegen/wan22-mini-d128.zt
+python wan22_parity.py all --out /tmp/wan22-parity --config ~/.pie/config.wan22-mini.toml
+python wan22_parity.py all --pertoken --out /tmp/wan22-parity --config ...
+```
+
+`d128`, both forwards: max-abs 0.00949, rel 0.00605, **cos 0.999982** — under
+the gate (`--tol 0.1 --rel-tol 0.02 --cos-tol 0.9999`). The per-token forward
+(two video lanes of one group, the conditioning frame at timestep 0) lands the
+same number. `conditioning` passes at a move of 0.0065.
+
+**The real row passes too.** `wan22-ti2v-5b` against `dit.step0.out` answers
+**cos 0.999959** (max-abs 0.0625, rel 0.00914) under its own `--cos-tol 0.999`,
+and `conditioning` moves the velocity by **0.3233** where the reference — the
+same diffusers forward with the 512-row context zeroed — moves **0.3254**.
+Four consecutive flagship runs answered the same cosine to every printed digit.
+
+### The defect that used to hold it at cos 0.2740
+
+One vector, folded into thirty times. `elementwise.add_bias` folds its bias IN
+PLACE — the IR aliases `out_out` onto `out`, which is exactly what a biased
+projection wants of its own matmul output — and `denoise` computes
+`time_proj(silu(temb))` ONCE a fire and hands the same vector to every block.
+Each block added its `scale_shift_table` to it, so block `k` modulated by
+`timestep_proj + sum(table_0..table_k)` instead of `timestep_proj + table_k`.
+`wan_2::forward::copy_of` now hands each block a fresh copy (two elementwise
+ops on a `[lanes, 6·dim]` f32 vector), and `cargo test -p models --test
+every_wan_2_fold_owns_the_vector_it_folds_into` walks every wan_2 plan on every
+platform for another fold whose operand a later node still reads.
+
+The bisection that named it runs one 1×2×2 latent — ONE token, so the
+self-attention is the identity on V and DEPTH is the only variable — against
+diffusers with the same planes zeroed. "K blocks live" means every block from
+K on has its three output projections zeroed: all thirty still run, only the
+first K write to the residual.
+
+| live blocks K | before | after |
+|---:|---|---|
+| 0 (all neutralised) | 0.999998 | — |
+| 1 | 0.999991 | 0.999991 |
+| 2 | **0.98704** | 0.999991 |
+| 4 | 0.96408 | 0.999985 |
+| 8 | 0.86953 | 0.999985 |
+| 15 | 0.30741 | 0.999980 |
+| 30 | 0.16397 | 0.999970 |
+
+The break is at TWO blocks and deepens monotonically — the signature of
+something carried BETWEEN blocks, not inside one. It is also why the fixtures
+that came first all missed it: one live block has one table to fold, and
+"thirty blocks, one constant modulation" and "`time_proj` zeroed" both give
+every block the SAME table, which a cumulative sum cannot distinguish from a
+per-block one until the tables differ. On four whole-model cases (1, 1, 4 and
+390 tokens, context 0/0/11/11 rows) the same fix moves pie from cos
+0.16/0.23/0.30/0.30 to 0.99997/0.99996/0.99993/0.99978; repeat runs of those
+move the last digits by ~2e-5, and nothing worse was seen in ~20 runs.
+
+Two operational notes for the real row: `[engine] gpu_mem_utilization` must be
+0.95+ (every fire — a denoise step included — demands the VAE's whole
+causal-conv state watermark, ~6.4 GiB, because `state_slot_bytes` sums EVERY
+`Shape::State` row of the plan with no idea which reading's arms touch them:
+`crates/engine-cuda/src/store.rs`, consumed as `state_size` in
+`crates/runtime/src/bootstrap.rs`. Charging a reading only the state its own
+arms read is a real fix and still to be made), and the umT5 tokenizer is a
+SentencePiece Unigram model `pie model import` cannot compile, so the import
+needs a `tokenizer/` a BPE loader accepts (the row borrows `qwen_3`'s contract
+anyway — `models::wan_2::tokenizer`).
+
+---
+
 ## 5. `compare.py`
 
 ```bash
@@ -639,3 +858,116 @@ PASS
 
 For the Z-Image RMSNorm bit-exactness gate (`z-image.md` §K.2 asks for
 `torch.equal` on norm outputs, not a tolerance) use `--tol 0 --keys '*norm*'`.
+
+---
+
+## 6. `gates.py` — every gate above, one command
+
+Six families landed with their own harnesses, their own flags and their own
+idioms, and for a while nobody had run them together on one tree.  `gates.py`
+does: it drives every parity gate this effort built, in a fixed order, and
+prints one table plus a machine-readable summary line and an exit code.  A
+person should be able to run it and tell at a glance whether `dev` is healthy.
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python scripts/imagegen/gates.py            # all of it
+python scripts/imagegen/gates.py --list                            # the roster
+python scripts/imagegen/gates.py --only flux2-klein --only wan-mini
+python scripts/imagegen/gates.py --json /tmp/gates.json            # the table, as data
+```
+
+It re-implements nothing.  Every number in the table is printed by a harness
+or by `compare.py`, and every PASS/FAIL is a harness's own exit status; this
+file is the roster, the plumbing and the reaper.
+
+### The roster, and what each expected number means
+
+| gate | what it wraps | expected | what the number is |
+|---|---|---|---|
+| `mini-dit` | `mini_dit_parity.py all`, and `--euler` | cos ≥ 0.9999 (0.99996) | the M0 synthetic DiT, one step and the four-step Euler run, against the bf16-emulated reference (§3). The gate is the measured bf16 drift of a three-block trunk. |
+| `zimage-mini` | `zimage_parity.py --mode mini`, `--mode mini_pad` | ≥ 0.9999 (0.999985) | the random-init Z-Image miniature, once on exact rows and once on rows that NEED padding (48→64 image, 40→64 caption). |
+| `zimage-turbo` | `zimage_parity.py gate` | text 0.99999, turbo 0.9998, steps 0.9961–0.9972, PSNR 32.8–33.3 dB | the flagship: the `text` reading, the step-0 `denoise`, the whole text→refine→denoise `chain`, then the eight-step trajectory, then the VAE decode of both final latents. |
+| `flux2-mini` | `flux2_parity.py all` | 0.999991 | the FLUX.2 miniature's one denoise step over three lanes of one group (text, target, references). Re-measured 2026-09-06 after the guest gave each lane a pipeline of its own: the earlier 0.99999 was taken while all three passes rode ONE pipeline, so the group never formed and the image lane denoised alone — the miniature's random-init caption sat under the tolerance and the gate stayed green. `gates.py` caught it once the frame contract began refusing a group that cannot compose. |
+| `flux2-klein` | `flux2_klein_parity.py all` | per-step velocities ≥ 0.999, PSNR ≥ 34 dB | the real klein-4B row: `text.hidden`, `dit.step0.out` and `probe.step{0..3}.out` are gated; the four-step trajectory and the picture's PSNR are reported. |
+| `flux2-vae` | `cargo test -p engine-cuda --features cuda --test the_flux_2_vae_answers_the_reference` | decode 0.99999, encode 0.99995 | the autoencoder alone, host-fed, against the fp32 diffusers reference. |
+| `zimage-vae` | `zimage_vae_parity.py all`, then `the_z_image_vae_answers_the_reference` | 0.99998 | the same VAE reading twice: once fired FROM A GUEST through the real runtime, once from the host. The two roads must agree with the reference to the same distance. |
+| `wan-mini` | `wan22_parity.py all`, `all --pertoken` | 0.999982, and the conditioning must MOVE | the `d128` miniature under both timestep forms (scalar, and TI2V's per-token one), each followed by the `conditioning` claim: zeroing the umT5 context must move the velocity by more than the gate's own slack. |
+| `h3-mini` | `h3_parity.py all` | refined-text / video / audio ≥ 0.9999 | MiniMax H3's `refine` pass and one four-lane `denoise` step, three readouts. |
+| `hy3-mini` | `hy3_parity.py all` | velocity 0.999997, plus two claims | HunyuanImage 3's whole denoise step in three fires, plus `the prefix conditions the canvas` and `the prefix K/V is reused exactly` (D10's claim: after step 0 the prefix is never recomputed). |
+| `ltx2-mini` | `ltx2_parity.py all`, `all --refine`, `matters` | 0.999982 | the LTX-2.5 miniature's four-lane joint step, its two connector passes, and the claim that every conditioning stream moves the answer. 0.999982 is the figure measured 2026-09-06, recorded here because the family landed without one; the harness gates at `--cos-tol 0.9999`. |
+| `text-to-image` | the model-agnostic guest on `flux2-klein-4b.zt` | a real PNG | 4 steps at 1024², seed 0. FLUX.2 hands back the final latent (its VAE is traced, not a declared reading), so the gate finishes with `decode_latent.py` and then checks the PNG magic, its box and its size. |
+
+**The endpoint gates for distilled trajectories are BELOW the bf16 floor by
+design, and are reported rather than gated.**  Both `zimage`'s eight-step
+trajectory and `flux2-klein`'s four-step one integrate a schedule whose last
+step takes a large σ to 0, which amplifies a per-step velocity difference
+several-fold.  Each harness records its own measured **fp32-reference floor** —
+the distance the SAME diffusers transformer in fp32 reaches against the
+recorded bf16 dump:
+
+- `zimage_parity.py`, `TOLERANCES["steps"]`: replaying the eight steps in fp32
+  lands cos **0.99726** against the recorded `latent.final`. The gate is
+  `--cos-tol 0.995`; the per-STEP claims (`--stop 1` at 0.9999985, the step-0
+  velocity at 0.99966) are where 0.999 belongs.
+- `flux2_klein_parity.py`, its NUMERICS header: fp32 reads cos **0.999618** on
+  the velocity and **0.997510** on `latent.final` against the bf16 golden —
+  i.e. an exact fp32 computation is FARTHER from the golden than pie is. The
+  per-step velocities are gated at 0.999 and the endpoint is checked as PSNR
+  after the decode.
+
+A trajectory number below those floors is not a bug in the engine; a
+per-step velocity below 0.999 is.
+
+### The three rules the runner enforces itself
+
+Each has been paid for once already.
+
+- **Its own config, its own port.**  Every gate gets
+  `~/.pie/config.gates-<name>.toml`, written fresh each run, with its own
+  `[server] port` (probed free before it is written), its own
+  `fs_scratch_dir`, and `[engine] max_model_len` at rows × submit depth —
+  never the 4096 default, which kills a 1024² job on its second fire.  Several
+  agents share this box and a shared config file has been repointed at another
+  artifact mid-run, which reads exactly like a numerics regression.
+- **A missing artifact or golden is a `skip`, not a `FAIL`.**  Each gate names
+  the files it needs; when one is absent the row says `skip` and the reason
+  names the file and the command that would make it (`pie model import …`,
+  `python <family>_golden.py --mini`).  A red table means a regression.
+- **Every gate reaps its server in a `finally`.**  A failed `pie run` has left
+  a process holding 35 GiB of a card, and the NEXT gate then died with a
+  misleading elastic-memory message.  Each step runs in its own process
+  session, so the whole tree can be killed on a timeout, and afterwards the
+  runner sweeps `/proc` for any `pie` still carrying THIS gate's config path.
+  The config path is the marker, so a server belonging to another agent on the
+  box is never a candidate.
+
+### The output
+
+```
+gate      status  measured      expected                        note
+--------  ------  ------------  ------------------------------  ----
+mini-dit  pass    cos 0.999956  cos >= 0.9999 (landed 0.99996)
+
+gates: verdict=HEALTHY total=1 pass=1 fail=0 skip=0 error=0 seconds=18 mini-dit=pass
+```
+
+The last line is the machine-readable one: `key=value` pairs, then one
+`name=status` per gate.  Exit is 0 when nothing failed (a skip does not fail
+the run) and 1 otherwise.  `--json PATH` writes the same table as data, and the
+full transcript of every command — servers' logs included — lands in
+`<out>/gates.log`.
+
+### The state the roster found (2026-09-06)
+
+Eleven of the twelve gates pass and reproduce the number their family
+recorded, to the last digit the table prints.  The one red row is
+`flux2-mini`, and it is not drift: the guest
+`tests/inferlets/flux2-parity/src/lib.rs` submits all THREE passes of its one
+attention group down ONE `Pipeline`, and a pipeline is serial — the three
+arrive as one lane and count once.  `97bdf6185` (frame-seal) made that a
+named refusal ("attention group 0 never composed: 3 live forward passes name
+the group and only 1 of them reached the runtime on a lane of its own"); the
+0.99999 predates it, when the same shape silently fired the image lane alone
+and a random-init miniature's missing caption sat under the tolerance.  Its
+siblings — `mini-dit-parity`, `zimage-parity`, `flux2-klein-parity`,
+`ltx2-parity` — already give each lane a pipeline of its own.

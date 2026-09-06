@@ -109,7 +109,12 @@ impl Run<'_> {
             | Elementwise::Mul { .. }
             | Elementwise::Add { .. }
             | Elementwise::RopeAxes { .. }
+            | Elementwise::GateSigmoidMulHeads { .. }
             => Err(kernels_metal::Error::Unsupported { op: op.name() }),
+            | Elementwise::EmbedScaleAddSelect { .. }
+            | Elementwise::RmsnormRopePartialQ { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: op.name() })
+            }
             // qwen4's gated-residual family.
             Elementwise::RmsnormGroupedPlusOne {
                 x,

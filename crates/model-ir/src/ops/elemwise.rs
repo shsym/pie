@@ -180,6 +180,24 @@ pub enum Elementwise {
         out_scale: f32,
         y_scaled: ValueId,
     },
+    /// [`Elementwise::EmbedScaleAdd`] whose residual row is layer `layer`'s
+    /// `width`-wide slice of the stacked table `stacked`, read in place —
+    /// the `select` that copied it out folded away (`fuse::embed_select`).
+    /// `y_out` is a fresh row, not an alias.
+    EmbedScaleAddSelect {
+        ids: ValueId,
+        table: ValueId,
+        vocab: u32,
+        e: ValueId,
+        embed_scale: f32,
+        e_scaled: ValueId,
+        stacked: ValueId,
+        layer: u32,
+        width: u32,
+        y_out: ValueId,
+        out_scale: f32,
+        y_scaled: ValueId,
+    },
     AddBias {
         bias: ValueId,
         out: ValueId,
@@ -265,6 +283,19 @@ pub enum Elementwise {
         theta: f32,
         q_out: ValueId,
     },
+    /// `RmsnormPerHead` then the `RopePartialQ` over its result, one node
+    /// (`fuse::q_norm_rope`); `q_out` aliases `y`.
+    RmsnormRopePartialQ {
+        x: ValueId,
+        weight: ValueId,
+        head_dim: u32,
+        eps: f32,
+        positions: ValueId,
+        rotary_dim: u32,
+        theta: f32,
+        y: ValueId,
+        q_out: ValueId,
+    },
     /// Partial rope over the last `rotary_dim` lanes of each head.
     ///
     /// **`inverse` UNROTATES** — the angle is negated — for the one place a
@@ -309,6 +340,20 @@ pub enum Elementwise {
     GateSigmoidMul {
         x: ValueId,
         gate: ValueId,
+        x_out: ValueId,
+    },
+    /// `x[:, h·head_dim + j] *= scale · sigmoid(gate[:, h])`, in place on
+    /// `x` — a per-HEAD gate, one logit per head per row, broadcast across
+    /// the head's channels. `x` is `[rows, heads·head_dim]`, `gate` is
+    /// `[rows, heads]` at `x`'s dtype. The `scale` is the constant in front
+    /// of the sigmoid (LTX-2's gated attention is `out · 2σ(W·x)`; a plain
+    /// gate states `1.0`). fp32 sigmoid and product, one rounding at the
+    /// store.
+    GateSigmoidMulHeads {
+        x: ValueId,
+        gate: ValueId,
+        head_dim: u32,
+        scale: f32,
         x_out: ValueId,
     },
     // Hyper-connections: residual streams expanded, mixed by learned gates, and
@@ -623,9 +668,28 @@ pub enum RopeForm {
     /// MiniMax's layout (96 of 128 channels rotated).
     Neox,
     /// `rotate_half` WITHIN each block: pair `i` of axis `a` is `(b + i,
-    /// b + dims[a]/2 + i)` — Wan's and LTX's layout, and
-    /// [`MropeForm::Split`]'s pairing.
+    /// b + dims[a]/2 + i)` — Wan's layout, and [`MropeForm::Split`]'s
+    /// pairing.
     Split,
+    /// ONE frequency ladder across the whole `[rows, heads·rotary_dim]`
+    /// rectangle, the axes handed out round-robin along it — LTX-2's
+    /// layout, which no per-head rule states.
+    ///
+    /// The row's angle slots are numbered `g = head · rotary_dim/2 + i`
+    /// across every head. The first `pad` slots turn by nothing
+    /// (`cos = 1`, `sin = 0`); slot `g >= pad` belongs to axis
+    /// `a = (g − pad) mod axes` at ladder index `f = (g − pad) div axes`
+    /// and turns by `positions[a] · thetas[a]^(f / (F_a − 1))` — a
+    /// POSITIVE, endpoint-inclusive exponent (`torch.linspace(0, 1, F_a)`),
+    /// where `F_a = dims[a]/2` is how many frequencies axis `a` owns over
+    /// the WHOLE row. So `dims[a]` here counts the ROW's channels, not a
+    /// head's, and `pad = (heads · rotary_dim − Σ dims) / 2`; every live
+    /// axis owns the same count, and `rotary_dim == head_dim` because the
+    /// pairing is `rotate_half` within each head (`(i, i + rotary_dim/2)`).
+    /// The positions are the reference's already-normalised coordinates
+    /// (`(2·coord/max − 1) · π/2`), which is why they are fractional and
+    /// signed.
+    SplitLadder,
 }
 
 /// Which activation gates a [`RmsnormGated`](Elementwise::RmsnormGated) —
@@ -693,6 +757,12 @@ impl Operands for Elementwise {
                 }
             }
             Self::EmbedScaleAdd { ids, table, y, .. } => sink.extend([*ids, *table, *y]),
+            Self::EmbedScaleAddSelect {
+                ids,
+                table,
+                stacked,
+                ..
+            } => sink.extend([*ids, *table, *stacked]),
             Self::AddBias { bias, out, .. } => sink.extend([*bias, *out]),
             Self::Standardize { x, bias, scale, .. } => sink.extend([*x, *bias, *scale]),
             Self::MulScalar { x, .. } => sink.push(*x),
@@ -708,9 +778,16 @@ impl Operands for Elementwise {
             Self::RopePartial { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
             Self::RopeMrope { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
             Self::RopePartialQ { q, positions, .. } => sink.extend([*q, *positions]),
+            Self::RmsnormRopePartialQ {
+                x,
+                weight,
+                positions,
+                ..
+            } => sink.extend([*x, *weight, *positions]),
             Self::RopePartialLast { q, positions, .. } => sink.extend([*q, *positions]),
             Self::RopeYarn { q, k, positions, .. } => sink.extend([*q, *k, *positions]),
             Self::GateSigmoidMul { x, gate, .. } => sink.extend([*x, *gate]),
+            Self::GateSigmoidMulHeads { x, gate, .. } => sink.extend([*x, *gate]),
             Self::HcExpand { x, .. } => sink.push(*x),
             Self::HcRmsnormF32 { streams, .. } => sink.push(*streams),
             Self::HcProject { normed, weight, .. } => sink.extend([*normed, *weight]),
@@ -790,6 +867,13 @@ impl Operands for Elementwise {
                 y_scaled,
                 ..
             } => sink.extend([*e, *e_scaled, *y_out, *y_scaled]),
+            Self::EmbedScaleAddSelect {
+                e,
+                e_scaled,
+                y_out,
+                y_scaled,
+                ..
+            } => sink.extend([*e, *e_scaled, *y_out, *y_scaled]),
             Self::AddBias { out_out, .. } => sink.push(*out_out),
             Self::Standardize { x_out, .. } => sink.push(*x_out),
             Self::MulScalar { x_out, .. } => sink.push(*x_out),
@@ -800,9 +884,11 @@ impl Operands for Elementwise {
             Self::RopePartial { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::RopeMrope { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::RopePartialQ { q_out, .. } => sink.push(*q_out),
+            Self::RmsnormRopePartialQ { y, q_out, .. } => sink.extend([*y, *q_out]),
             Self::RopePartialLast { q_out, .. } => sink.push(*q_out),
             Self::RopeYarn { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
             Self::GateSigmoidMul { x_out, .. } => sink.push(*x_out),
+            Self::GateSigmoidMulHeads { x_out, .. } => sink.push(*x_out),
             Self::HcExpand { y, .. } => sink.push(*y),
             Self::HcRmsnormF32 { y, .. } => sink.push(*y),
             Self::HcProject { mixes, .. } => sink.push(*mixes),
@@ -848,6 +934,7 @@ impl Operands for Elementwise {
             // are fresh outputs, since an alias may name only an input.
             Self::RmsnormResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
             Self::EmbedScaleAdd { y_out, y, .. } => sink.push((*y_out, *y)),
+            Self::EmbedScaleAddSelect { .. } => {}
             Self::AddBias { out_out, out, .. } => sink.push((*out_out, *out)),
             Self::Standardize { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::MulScalar { x_out, x, .. } => sink.push((*x_out, *x)),
@@ -862,9 +949,11 @@ impl Operands for Elementwise {
                 sink.extend([(*q_out, *q), (*k_out, *k)]);
             }
             Self::RopePartialQ { q_out, q, .. } => sink.push((*q_out, *q)),
+            Self::RmsnormRopePartialQ { q_out, y, .. } => sink.push((*q_out, *y)),
             Self::RopePartialLast { q_out, q, .. } => sink.push((*q_out, *q)),
             Self::RopeYarn { q_out, q, k_out, k, .. } => sink.extend([(*q_out, *q), (*k_out, *k)]),
             Self::GateSigmoidMul { x_out, x, .. } => sink.push((*x_out, *x)),
+            Self::GateSigmoidMulHeads { x_out, x, .. } => sink.push((*x_out, *x)),
             Self::HcExpand { .. } => {}
             Self::HcRmsnormF32 { .. } => {}
             Self::HcProject { .. } => {}
@@ -908,6 +997,7 @@ impl Operands for Elementwise {
             Self::ResidualAddRmsnorm { .. } => "elementwise.residual_add_rmsnorm",
             Self::RmsnormResidualAdd { .. } => "elementwise.rmsnorm_residual_add",
             Self::EmbedScaleAdd { .. } => "elementwise.embed_scale_add",
+            Self::EmbedScaleAddSelect { .. } => "elementwise.embed_scale_add_select",
             Self::AddBias { .. } => "elementwise.add_bias",
             Self::Standardize { .. } => "elementwise.standardize",
             Self::MulScalar { .. } => "elementwise.mul_scalar",
@@ -918,9 +1008,11 @@ impl Operands for Elementwise {
             Self::RopePartial { .. } => "elementwise.rope_partial",
             Self::RopeMrope { .. } => "elementwise.rope_mrope",
             Self::RopePartialQ { .. } => "elementwise.rope_partial_q",
+            Self::RmsnormRopePartialQ { .. } => "elementwise.rmsnorm_rope_partial_q",
             Self::RopePartialLast { .. } => "elementwise.rope_partial_last",
             Self::RopeYarn { .. } => "elementwise.rope_yarn",
             Self::GateSigmoidMul { .. } => "elementwise.gate_sigmoid_mul",
+            Self::GateSigmoidMulHeads { .. } => "elementwise.gate_sigmoid_mul_heads",
             Self::HcExpand { .. } => "elementwise.hc_expand",
             Self::HcRmsnormF32 { .. } => "elementwise.hc_rmsnorm_f32",
             Self::HcProject { .. } => "elementwise.hc_project",

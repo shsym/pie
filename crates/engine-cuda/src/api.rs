@@ -143,8 +143,14 @@ pub struct Cuda {
 
 impl Cuda {
     /// An engine bound to nothing yet.
+    ///
+    /// The boot's diagnostics record is published here, before any load: the
+    /// traces read it through [`crate::serve::diag::on`] from places no boot
+    /// reaches, and an engine that is opened and never loaded still answers
+    /// for what it was asked to trace.
     #[must_use]
     pub fn new(boot: DeviceBoot, contract_for: ContractFor, classify_for: ClassifyFor) -> Cuda {
+        crate::serve::diag::publish(&boot.knobs.diagnostics);
         Cuda {
             boot,
             contract_for,
@@ -538,13 +544,14 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         activation: Dtype::F32,
         // Does this load's model text declare a draft head.
         has_mtp_logits: shell.drafts(),
-        // `MtpDrafts` is `[k]` i32 token ids, an argmax the guest can take
-        // for itself off `MtpLogits`; no device path here produces it.
-        mtp_depth: 0,
-        draft_block: 0,
-        draft_mask_token: 0,
-        draft_bidirectional: false,
-        draft_proposals_from: 1,
+        // `MtpDrafts` is the block drafter's token plane, `[depth]` i32 a
+        // lane, bound where the `mtp.drafts` export landed.
+        mtp_depth: shell.mtp_depth(),
+        // The block drafter's facts, stated by the text on its trace.
+        draft_block: trace.drafter.map_or(0, |d| d.rows),
+        draft_mask_token: trace.drafter.map_or(0, |d| d.mask_token),
+        draft_bidirectional: trace.drafter.is_some_and(|d| d.bidirectional),
+        draft_proposals_from: trace.drafter.map_or(1, |d| d.proposals_from),
         has_value_head: false,
         // Does this load export a capture column, and did the slab that
         // observes it get carved.
@@ -669,7 +676,7 @@ impl Engine for Cuda {
             frames_in_flight,
         } = request;
         let trace = model_ir::fuse::residual_norm(trace);
-        let trace = if crate::serve::fuse_chains() {
+        let trace = if self.boot.knobs.diagnostics.fuse_chains {
             model_ir::fuse::residual_chains(trace)
         } else {
             trace
@@ -740,13 +747,14 @@ intended for diagnostics, not serving",
                 self.boot.ordinal
             },
             graphs: self.boot.graphs,
-            knobs: self.boot.knobs,
+            knobs: self.boot.knobs.clone(),
             cache_dir: self.boot.cache_dir.as_deref(),
             // Clamps what the free-slot word cannot carry.
             runahead: engine::runahead::Runahead::of(frames_in_flight),
             // Carried whole rather than re-derived, so it cannot disagree
             // with the numbers `admit` was asked about.
             residency: plan,
+            deferred_tier: residency.deferred_tier,
             world: self.boot.world,
             comm: self
                 .boot
@@ -1426,6 +1434,7 @@ impl Cuda {
                     // and the shell builds the packing tables off the pair.
                     stream: lane.stream as u8,
                     group: lane.group,
+                    peer: lane.peer,
                     ports: &lane.ports,
                 })
             })

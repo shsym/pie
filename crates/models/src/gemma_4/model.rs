@@ -771,6 +771,42 @@ impl Model {
             matches!(tp, 1 | 2 | 4 | 8),
             "tp {tp} is not a world this catalog ships"
         );
+        // **The `tp` convention (design D14).** This text cuts BY HEADS and
+        // by the intermediate: `qkv` at its three seams, `o_proj` and `down`
+        // by rows (their partial products meet in the plan's `all_reduce`),
+        // `gate_up` at its gate/up seam, and every routed expert bank by its
+        // own intermediate. Norms, the embedding, the PLE planes and the
+        // vision tower are replicated.
+        //
+        // So `tp` must DIVIDE every count it cuts. It is checked here rather
+        // than left to integer division, which lands a zero-width band
+        // silently — a `[512, 0, 0]` `qkv` cut, weights that read as
+        // present, and a rank that attends to nothing. The KV heads are the
+        // binding count: E4B is 8 query heads over 2 KV heads, so it cuts at
+        // one and two ranks and REFUSES four. A 4-rank row for a GQA text
+        // this narrow needs a convention this tree does not have — a strided
+        // query-head cut with the KV planes replicated, or a band index that
+        // repeats across a group of ranks. See `.wiki/tp-verification.md`.
+        for (count, what) in [
+            (d.q_heads, "query heads"),
+            (d.kv_heads, "sliding KV heads"),
+            (d.global_kv_heads, "global KV heads"),
+            (d.intermediate, "the intermediate"),
+        ] {
+            assert!(
+                count.is_multiple_of(tp),
+                "tp {tp} does not divide this text's {count} {what}; a gemma-4 \
+                 row is cut by heads and by the intermediate, and every count \
+                 it cuts must divide the rank count"
+            );
+        }
+        if let Some(moe) = d.moe {
+            assert!(
+                moe.inter.is_multiple_of(tp),
+                "tp {tp} does not divide the routed experts' {} intermediate",
+                moe.inter
+            );
+        }
         // Everything declared here that is not a matmul bank: norms and the
         // per-layer scalar. See `crate::dense`.
         let dense = crate::dense(w);
@@ -1090,6 +1126,29 @@ impl Model {
             }
         });
 
+        // The tied table is banded on the VOCAB axis rather than replicated.
+        // It is the single biggest read a decode step makes — gemma's
+        // vocabulary is 262144, so a replicated tied head streams 1.3 GB per
+        // step PER RANK. Banded, each rank holds `vocab / tp` rows: the gather
+        // zeroes the ids outside its band (the forward all-reduces them back
+        // into one row) and the tied head lands a logits shard (the forward
+        // all-gathers it). Both are BITWISE identical to the replicated form —
+        // partitioning a GEMM's output changes no reduction, and the gather's
+        // zeros sum exactly.
+        //
+        // A self-conditioning SKU keeps the whole table: its soft-embedding
+        // gather is `layout.embed_weighted`, which has no banded form.
+        // `PIE_NO_VOCAB_SHARD` keeps the whole table on every rank, for
+        // bisecting a suspected banding fault against the replicated form.
+        let banded = tp > 1
+            && !d.self_cond
+            && std::env::var_os("PIE_NO_VOCAB_SHARD").is_none();
+        let vocab_rows = if banded {
+            (d.vocab / tp) as u64
+        } else {
+            d.vocab as u64
+        };
+
         Model {
             hidden: d.hidden,
             vocab: d.vocab,
@@ -1105,11 +1164,16 @@ impl Model {
             // gather (`layout.embed_weighted`) reads bf16/f16 tables only,
             // and the tied head pays the wider read. Revisit when the gather
             // learns a quantized table.
-            embed: Weight::sym(
-                "embed",
-                [d.vocab as u64, hidden],
-                if d.self_cond { dense } else { w },
-            ),
+            embed: {
+                let table = Weight::sym(
+                    "embed",
+                    [vocab_rows, hidden],
+                    if d.self_cond { dense } else { w },
+                );
+                // The cut axis is the vocabulary's; `forward` reads the band
+                // back off `dim(0) < vocab` rather than a second flag.
+                if banded { table.packed([vocab_rows]) } else { table }
+            },
             ple: d.ple_dim.map(|dim| {
                 let ple = dim as u64;
                 Ple {
