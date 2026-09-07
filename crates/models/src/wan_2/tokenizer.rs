@@ -19,18 +19,50 @@
 //! is the reference's own vector and the one `gates.py` feeds this row as
 //! `--prompt-ids`.
 //!
-//! **What is still not done: BAKING it into a `.zt`.** The canonical form
-//! (`pie.tokenizer/1`) states five objects and none of them holds a per-piece
-//! score — `MERGE_TABLE` is empty for a Unigram and reusing it would be
-//! exactly the reinterpretation that format exists to rule out. So
-//! `tokenizer::canonical` refuses a Unigram BY NAME, `pie model import`
-//! still cannot carry umT5's vocabulary into an artifact, and this row still
-//! borrows the smallest contract the build ships (`qwen_3`'s) as `mini_dit`
-//! does. Closing it is a sixth object plus the three readers of
-//! `canonical::OBJECTS` (`worker::weights`, `runtime::model`, and the
-//! format's own test).
+//! **And it BAKES now too.** `pie.tokenizer/1` grew a sixth object,
+//! `tokenizer/unigram_scores` — one `f32` a token id — which is OPTIONAL:
+//! a BPE tokenizer writes none, and that absence is what says "not a
+//! Unigram", so every artifact written before this keeps loading unchanged.
+//! Round-tripped on the real 256 300-piece vocabulary: bake, read back, and
+//! the ids are identical.
 //!
-//! Until then the `text` reading's ids come from outside (the goldens carry
-//! the reference's prompt embeds, so `denoise` parity needs no tokenizer).
+//! **And the contract is umT5's own now**, not the borrowed `qwen_3` one:
+//! `</s>` at 1, `<pad>` at 0 and `<unk>` at 3, pinned at their ids rather
+//! than merely by name. An artifact carrying somebody else's vocabulary
+//! answers a coherent picture of the WRONG prompt, and that is the failure
+//! a contract turns into a named refusal at boot.
+//!
+//! What is left is re-importing the shipped artifact from the real
+//! `tokenizer/`, which the staged snapshot replaced while the loader could
+//! not read one. After that a guest passes `--prompt` rather than
+//! `--prompt-ids`.
 
-pub use crate::qwen_3::tokenizer::CONTRACT;
+use ::tokenizer::contract::Contract;
+
+/// The end-of-sequence umT5's `TemplateProcessing` appends to every encode.
+/// Pinned at its id and not merely by name: `</s>` at any other id means a
+/// different vocabulary, and the DiT would be conditioned on rows that spell
+/// something else.
+pub const EOS: &str = "</s>";
+/// The pad the encoder's fixed 512-row context rectangle is filled with.
+pub const PAD: &str = "<pad>";
+/// What a character outside the 256 300 pieces becomes. `unk_id` in the
+/// tokenizer's own JSON, and the reason a Unigram can spell every string.
+pub const UNK: &str = "<unk>";
+
+/// Every marker this row cites, in one place so the contract and the reader
+/// spell them once.
+pub const MARKERS: &[&str] = &[EOS, PAD, UNK];
+
+/// The three ids that decide whether an artifact carries umT5's vocabulary
+/// or somebody else's. A row served against the wrong one produces a
+/// coherent picture of the wrong prompt, which is the failure a contract
+/// exists to turn into a named refusal at boot.
+pub const PINNED: &[(&str, u32)] = &[(PAD, 0), (EOS, 1), (UNK, 3)];
+
+/// **umT5's own contract**, replacing the borrowed `qwen_3` one this row
+/// used while `crates/tokenizer` could not read a Unigram.
+pub const CONTRACT: Contract = Contract {
+    markers: &[MARKERS],
+    pinned: PINNED,
+};

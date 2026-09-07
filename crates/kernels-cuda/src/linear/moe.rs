@@ -910,6 +910,106 @@ fn matmul_select_mxfp4(
     // warps' worth of the output width.
     let tile = (DECODE_BLOCK / WARP) * ROWS_PER_WARP;
     let act_div = if fan.by_token { fan.top_k } else { 1 };
+
+    // **THE ROUTES SORTED BY EXPERT**, the same pass the affine select
+    // fires and for the same reason — except that here the sorting is not
+    // what pays. At gpt-oss's shapes the per-route select already runs at a
+    // rate past this card's memory ceiling, so the L2 is serving most of
+    // the re-read and there is little traffic left to remove; what it does
+    // not have is any reuse to give its FMAs, and 4.8 TFLOP/s against the
+    // affine grouped select's 34 is the size of that. The order list is
+    // what lets one block hold an expert's plane and apply it to sixteen
+    // routes at a time.
+    const ROUTE_ORDER: &str = "moe_route_order";
+    const ORDER_BLOCK: u32 = 1024;
+    const EXPERT_CAP: u32 = 4096;
+    /// From this many routes on, one block per expert beats a block per
+    /// route — the affine twin's threshold, priced on its own shapes. A
+    /// decode step's handful of routes stays with the per-route select,
+    /// which is the right shape there.
+    const GROUPED_FROM: u32 = 16;
+    const GROUPED_TILE_N: u32 = 128;
+    const GROUPED_BLOCK: u32 = 256;
+    /// The work list's slice width. This entry does not walk the work list
+    /// (that is the tensor-core form's), but `moe_route_order` builds one
+    /// and must be told how wide to cut it.
+    const WMMA_ROUTES: u32 = 32;
+
+    let experts = codes.rows.clamp(1, EXPERT_CAP);
+    let order_words = fan.route_count as usize;
+    let offsets_at = order_words.next_multiple_of(64);
+    let work_cap = fan.route_count.div_ceil(WMMA_ROUTES) + experts;
+    let work_at = (offsets_at + experts as usize + 2).next_multiple_of(64);
+    let order = ctx.scratch(
+        op,
+        ROUTE_ORDER,
+        (work_at + work_cap as usize) * core::mem::size_of::<i32>(),
+    )? as usize as u64;
+    let offsets = order + (offsets_at * core::mem::size_of::<i32>()) as u64;
+    let work = order + (work_at * core::mem::size_of::<i32>()) as u64;
+    ctx.fire(
+        op,
+        Fire::at("linear/quant.cuh", symbol("::pie::linear::moe_route_order"))
+            .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
+        &[
+            routes.arg(),
+            ArgValue::Ptr(order),
+            ArgValue::Ptr(offsets),
+            ArgValue::Ptr(work),
+            stated(op, work_cap)?.arg(),
+            WMMA_ROUTES.arg(),
+            fan.top_k.arg(),
+            stated(op, fan.route_count)?.arg(),
+            stated(op, experts)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    if fan.route_count >= GROUPED_FROM && std::env::var_os("PIE_NO_MXFP4_GROUP").is_none() {
+        // bf16 activations take the tensor-core form, f16 the fp32 one —
+        // the affine twin's rule, and for its reason: `mma.sync` here is
+        // `bf16 x bf16 -> f32`.
+        // `PIE_MXFP4_NO_WMMA` takes the fp32 form on a bf16 activation. It
+        // is the only way to reach that kernel on a card whose rows all
+        // carry bf16 — without it the form would ship having never run,
+        // which is how the affine fp32 twin came to declare a shared array
+        // too big to compile.
+        let wmma = x.dtype == Dtype::Bf16 && std::env::var_os("PIE_MXFP4_NO_WMMA").is_none();
+        let entry = if wmma {
+            "::pie::linear::moe_matmul_select_mxfp4_wmma".to_string()
+        } else {
+            format!("::pie::linear::moe_matmul_select_mxfp4_grouped<{t}>")
+        };
+        // The tensor-core form walks the work list — one item per (expert,
+        // 32-route slice) — where the fp32 one takes an expert a block.
+        let mut args = vec![x.arg(), ArgValue::Ptr(order), ArgValue::Ptr(offsets)];
+        if wmma {
+            args.push(ArgValue::Ptr(work));
+        }
+        args.extend([
+            codes.arg(),
+            scales.arg(),
+            bias.map_or(ArgValue::ABSENT, |bias| bias.arg()),
+            y.arg(),
+            act_div.arg(),
+            n.arg(),
+            k.arg(),
+            stated(op, experts)?.arg(),
+            ArgValue::Ptr(seat.cell),
+            ArgValue::Ptr(seat.hits),
+        ]);
+        return ctx.fire(
+            op,
+            Fire::at("linear/quant.cuh", symbol(&entry)).apply(Launch::grid(
+                [
+                    if wmma { work_cap } else { experts },
+                    y.width.div_ceil(GROUPED_TILE_N),
+                    1,
+                ],
+                [GROUPED_BLOCK, 1, 1],
+            )),
+            &args,
+        );
+    }
     ctx.fire(
         op,
         Fire::at(
